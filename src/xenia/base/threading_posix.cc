@@ -1113,12 +1113,14 @@ class PosixCondition<Thread> final : public PosixConditionBase {
       std::unique_lock lock(state_mutex_);
       if (state_ == State::kFinished) {
         if (is_current_thread) {
-          // This is really bad. Some thread must have called Terminate() on us
-          // just before we decided to terminate ourselves
-          assert_always();
-          for (;;) {
-            // Wait for pthread_cancel() to actually happen.
-          }
+          // Another thread marked us finished just before we decided to
+          // terminate ourselves. The old code spun here forever waiting for a
+          // pthread_cancel that is not guaranteed to be sent, burning a core
+          // and never exiting. Leaving is what the caller asked for; drop the
+          // lock first so it is not held by a thread that no longer exists.
+          XELOGW("Terminate: thread was already marked finished; exiting");
+          lock.unlock();
+          pthread_exit(nullptr);
         }
         return;
       }
