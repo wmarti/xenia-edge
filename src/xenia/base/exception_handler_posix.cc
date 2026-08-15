@@ -28,6 +28,7 @@ bool signal_handlers_installed_ = false;
 struct sigaction original_sigill_handler_;
 struct sigaction original_sigsegv_handler_;
 struct sigaction original_sigbus_handler_;
+struct sigaction original_sigtrap_handler_;
 
 // This can be as large as needed, but isn't often needed.
 // As we will be sometimes firing many exceptions we want to avoid having to
@@ -170,6 +171,11 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   Exception ex;
   switch (signal_number) {
     case SIGILL:
+    // A breakpoint instruction (BRK on arm64, int3 on x86) raises SIGTRAP, not
+    // SIGILL. Both mean "the CPU refused to run the instruction at pc", and the
+    // backends already re-check the encoding before claiming the exception, so
+    // they share a code.
+    case SIGTRAP:
       ex.InitializeIllegalInstruction(&thread_context);
       break;
     case SIGBUS:
@@ -419,6 +425,9 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
     case SIGILL:
       original_handler = &original_sigill_handler_;
       break;
+    case SIGTRAP:
+      original_handler = &original_sigtrap_handler_;
+      break;
   }
   if (original_handler) {
     sigaction(signal_number, original_handler, nullptr);
@@ -448,6 +457,12 @@ void ExceptionHandler::Install(Handler fn, void* data) {
     }
     if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
       assert_always("Failed to install new SIGBUS handler");
+    }
+    // Guest breakpoints and OPCODE_TRAP are emitted as BRK, which raises
+    // SIGTRAP. Without a handler the default disposition kills the process, so
+    // the whole breakpoint and trap path was unreachable.
+    if (sigaction(SIGTRAP, &signal_handler, &original_sigtrap_handler_) != 0) {
+      assert_always("Failed to install new SIGTRAP handler");
     }
     signal_handlers_installed_ = true;
   }
@@ -491,6 +506,9 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
       }
       if (sigaction(SIGBUS, &original_sigbus_handler_, NULL) != 0) {
         assert_always("Failed to restore original SIGBUS handler");
+      }
+      if (sigaction(SIGTRAP, &original_sigtrap_handler_, NULL) != 0) {
+        assert_always("Failed to restore original SIGTRAP handler");
       }
       signal_handlers_installed_ = false;
     }
