@@ -259,7 +259,14 @@ bool DeallocFixed(void* base_address, size_t length,
 
   std::lock_guard guard(g_mapped_file_ranges_mutex);
   for (const auto& mapped_range : mapped_file_ranges) {
+    // Ranges are half-open: region_end is base + length, so an address equal
+    // to it is the *next* mapping, not this one. Without the strict test a
+    // length-0 release -- which is how memory_win.cc spells MEM_RELEASE, so
+    // callers legitimately pass it -- collapses to a point and gets captured
+    // by whatever file mapping happens to end exactly there. mmap hands out
+    // adjacent addresses routinely, so that is not a remote case.
     if (region_begin >= mapped_range.region_begin &&
+        region_begin < mapped_range.region_end &&
         region_end <= mapped_range.region_end) {
       switch (deallocation_type) {
         case DeallocationType::kDecommit:
