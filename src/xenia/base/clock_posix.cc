@@ -63,9 +63,26 @@ uint64_t Clock::QueryHostSystemTime() {
       now.tv_usec * 10);
 }
 
-uint64_t Clock::QueryHostUptimeMillis() {
-  return host_tick_count_platform() * 1000 / host_tick_frequency_platform();
+// Converts a host tick count to `units` per second without overflowing the
+// intermediate multiply. host_tick_count_platform() is a nanosecond counter on
+// Linux, so ticks * 10000000 overflows a uint64 after about 213 days of uptime.
+static uint64_t TicksTo(uint64_t ticks, uint64_t units) {
+  const uint64_t freq = Clock::host_tick_frequency_platform();
+  if (!freq) {
+    return 0;
+  }
+  return (ticks / freq) * units + ((ticks % freq) * units) / freq;
 }
 
-uint64_t Clock::QueryHostInterruptTime() { return host_tick_count_platform(); }
+uint64_t Clock::QueryHostUptimeMillis() {
+  return TicksTo(Clock::host_tick_count_platform(), 1000);
+}
+
+uint64_t Clock::QueryHostInterruptTime() {
+  // Must be in 100 ns units to match the Windows implementation, which reads
+  // KUSER_SHARED InterruptTime. Returning raw host ticks made guest
+  // KeQueryInterruptTime run at the ratio of the host timebase to 10 MHz --
+  // 2.4x fast on an Apple Silicon 24 MHz timebase.
+  return TicksTo(Clock::host_tick_count_platform(), 10000000ull);
+}
 }  // namespace xe
