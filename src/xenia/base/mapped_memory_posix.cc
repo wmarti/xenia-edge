@@ -63,6 +63,17 @@ class PosixMappedMemory : public MappedMemory {
       return nullptr;
     }
 
+    // Win32 CreateFileMapping grows the file to the mapping size, and callers
+    // rely on that: Emulator::SaveToFile creates an empty file and maps 2 GiB
+    // of it. mmap() past EOF succeeds but faults with SIGBUS on first touch, so
+    // extend the file here to match.
+    if (mode == Mode::kReadWrite && offset + map_length > file_size) {
+      if (ftruncate(file_descriptor, off_t(offset + map_length))) {
+        close(file_descriptor);
+        return nullptr;
+      }
+    }
+
     void* data =
         mmap(0, map_length, protection, MAP_SHARED, file_descriptor, offset);
     if (data == MAP_FAILED) {
