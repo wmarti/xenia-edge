@@ -371,17 +371,17 @@ void Win32A64CodeCache::InitializeUnwindEntry(
   uint8_t codes[32];
   size_t codes_length;
 
-  // Guest function prologs are exactly 4 instructions (16 bytes):
-  //   sub sp, sp, #N; str x30, [sp, #64]; str x0, [sp, #48]; str xzr, [sp, #56]
-  // The HostToGuest thunk has a much larger prolog that saves all
-  // callee-saved registers. We detect it by stack size.
-  // Other thunks (GuestToHost, ResolveFunction) have different layouts
-  // but are only called from within JIT'd code; stack-alloc-only unwind
-  // info is sufficient for them since the unwinder will walk up to the
-  // HostToGuest frame which has full unwind info.
-  bool is_host_to_guest_thunk =
-      (func_info.stack_size == StackLayout::THUNK_STACK_SIZE &&
-       func_info.code_size.prolog > 16);
+  // Only the HostToGuest thunk saves the full callee-saved set, so only it
+  // needs the full unwind description. The emitter marks it explicitly: frame
+  // size cannot distinguish it (a guest function with 144 bytes of locals has
+  // the same 224-byte frame) and neither can prolog size (the guest prolog runs
+  // PushStackpoint, so it is far longer than the 4 instructions this used to
+  // assume).
+  // Other thunks (GuestToHost, ResolveFunction) have different layouts but are
+  // only called from within JIT'd code; stack-alloc-only unwind info is
+  // sufficient for them since the unwinder will walk up to the HostToGuest
+  // frame which has full unwind info.
+  bool is_host_to_guest_thunk = func_info.is_host_to_guest_thunk;
 
   if (is_host_to_guest_thunk) {
     codes_length = BuildThunkUnwindCodes(codes);
