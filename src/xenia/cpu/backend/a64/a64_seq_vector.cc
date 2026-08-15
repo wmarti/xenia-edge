@@ -1938,6 +1938,15 @@ struct LVR_V128 : Sequence<LVR_V128, I<OPCODE_LVR, V128Op, I64Op>> {
     e.add(e.x0, e.GetMembaseReg(), addr);
     // w17 = offset
     e.and_(e.w17, e.w0, 0xF);
+
+    // lvrx with a zero byte offset reads no memory at all, so it must not
+    // touch the line either: memcpy tails routinely call it on an address one
+    // past the end of a buffer, where the next page can be unmapped. The x64
+    // backend skips the load the same way.
+    auto& done = e.NewCachedLabel();
+    e.movi(VReg(d).d2, 0);
+    e.cbz(e.w17, done);
+
     // Align and load.  v0=zeros (table reg 0), v1=mem (table reg 1).
     e.movi(VReg(0).d2, 0);
     e.and_(e.x0, e.x0, ~0xFull);
@@ -1955,6 +1964,7 @@ struct LVR_V128 : Sequence<LVR_V128, I<OPCODE_LVR, V128Op, I64Op>> {
 
     // 2-register TBL over {v0, v1}.
     e.tbl(VReg(d).b16, VReg(0).b16, 2, VReg(2).b16);
+    e.L(done);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_LVR, LVR_V128);
