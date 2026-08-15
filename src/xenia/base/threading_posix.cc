@@ -1062,7 +1062,10 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
     for (auto i = 0u; i < 64; i++) {
-      if (mask & (1 << i)) {
+      // uint64_t(1), not 1: `1 << i` is an int shift, undefined from i == 31
+      // and wrapping to the low 32 bits above it, so every CPU from 32 up was
+      // set from the wrong mask bit.
+      if (mask & (uint64_t(1) << i)) {
         CPU_SET(i, &cpu_set);
       }
     }
