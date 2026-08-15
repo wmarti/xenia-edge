@@ -383,12 +383,7 @@ struct ScopedMultiWaiter {
   class SuspendGate {
    public:
     SuspendGate() {
-#if XE_THREADING_SUSPEND_PIPE
-      if (pipe(fds_) == 0) {
-        fcntl(fds_[0], F_SETFD, FD_CLOEXEC);
-        fcntl(fds_[1], F_SETFD, FD_CLOEXEC);
-      }
-#else
+#if !XE_THREADING_SUSPEND_PIPE
       sem_init(&sem_, 0, 0);
 #endif
     }
@@ -397,9 +392,36 @@ struct ScopedMultiWaiter {
     SuspendGate(const SuspendGate&) = delete;
     SuspendGate& operator=(const SuspendGate&) = delete;
 
+    // Must be called from the suspending thread before the signal is raised,
+    // not from the handler. On the pipe implementation this is where the
+    // descriptors are allocated: threads are never suspended in the common
+    // case, and two descriptors per thread would be a real cost against macOS's
+    // low default descriptor limit. Returns false if the gate cannot be armed,
+    // in which case the caller must not suspend.
+    bool Arm() {
+#if XE_THREADING_SUSPEND_PIPE
+      std::lock_guard guard(create_mutex_);
+      if (fds_[0] >= 0) {
+        return true;
+      }
+      if (pipe(fds_) != 0) {
+        XELOGE("SuspendGate: pipe() failed: {}", strerror(errno));
+        fds_[0] = fds_[1] = -1;
+        return false;
+      }
+      fcntl(fds_[0], F_SETFD, FD_CLOEXEC);
+      fcntl(fds_[1], F_SETFD, FD_CLOEXEC);
+#endif
+      return true;
+    }
+
     // Async-signal-safe.
     void Wait() {
 #if XE_THREADING_SUSPEND_PIPE
+      // Arm() ran before the signal was raised, so the descriptors exist.
+      if (fds_[0] < 0) {
+        return;
+      }
       uint8_t token;
       ssize_t n;
       do {
@@ -416,6 +438,9 @@ struct ScopedMultiWaiter {
     // Async-signal-safe.
     void Post() {
 #if XE_THREADING_SUSPEND_PIPE
+      if (fds_[1] < 0) {
+        return;
+      }
       const uint8_t token = 1;
       ssize_t n;
       do {
@@ -447,6 +472,7 @@ struct ScopedMultiWaiter {
    private:
 #if XE_THREADING_SUSPEND_PIPE
     int fds_[2] = {-1, -1};
+    std::mutex create_mutex_;
 #else
     sem_t sem_;
     bool destroyed_ = false;
@@ -1332,6 +1358,13 @@ struct ScopedMultiWaiter {
       // Check if we're trying to suspend ourselves.
       bool is_current_thread = pthread_self() == thread_;
       bool already_suspended = false;
+
+      // Arm the park before anything observable happens. On the pipe
+      // implementation this allocates the descriptors, which must not happen
+      // inside the signal handler, and can fail.
+      if (!suspend_gate_.Arm()) {
+        return false;
+      }
 
       {
         std::unique_lock lock(state_mutex_);
