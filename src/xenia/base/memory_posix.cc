@@ -461,7 +461,9 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
       assert_always();
       return kFileMappingHandleInvalid;
   }
-  oflag |= O_CREAT;
+  // O_EXCL so an existing object with the same name is never adopted, and
+  // 0600 so no other user on the machine can map the guest's memory.
+  oflag |= O_CREAT | O_EXCL;
 
 #if XE_PLATFORM_MAC
   std::string shm_name = "/" + path.filename().string();
@@ -471,7 +473,7 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
     std::snprintf(hash_buf, sizeof(hash_buf), "/%016zx", h);
     shm_name = hash_buf;
   }
-  int ret = shm_open(shm_name.c_str(), oflag, 0777);
+  int ret = shm_open(shm_name.c_str(), oflag, 0600);
   if (ret < 0) {
     XELOGE("shm_open({}) failed: {} ({})", shm_name, strerror(errno), errno);
     return kFileMappingHandleInvalid;
@@ -492,7 +494,7 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
   return ret;
 #else
   auto full_path = "/" / path;
-  int ret = shm_open(full_path.c_str(), oflag, 0777);
+  int ret = shm_open(full_path.c_str(), oflag, 0600);
   if (ret < 0) {
     XELOGE("shm_open({}) failed: {} ({})", full_path.string(), strerror(errno),
            errno);
