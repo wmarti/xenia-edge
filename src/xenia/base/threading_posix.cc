@@ -401,6 +401,11 @@ struct ScopedMultiWaiter {
     bool Arm() {
 #if XE_THREADING_SUSPEND_PIPE
       std::lock_guard guard(create_mutex_);
+      if (destroyed_) {
+        // The thread has been joined. Nothing can park here again, and a pipe
+        // opened now would leak.
+        return false;
+      }
       if (fds_[0] >= 0) {
         return true;
       }
@@ -453,6 +458,10 @@ struct ScopedMultiWaiter {
 
     void Destroy() {
 #if XE_THREADING_SUSPEND_PIPE
+      // Same lock as Arm(): the two both mutate fds_, and Destroy() runs from
+      // post_execution_unlocked() with no other lock held.
+      std::lock_guard guard(create_mutex_);
+      destroyed_ = true;
       if (fds_[0] >= 0) {
         close(fds_[0]);
         fds_[0] = -1;
@@ -472,6 +481,7 @@ struct ScopedMultiWaiter {
    private:
 #if XE_THREADING_SUSPEND_PIPE
     int fds_[2] = {-1, -1};
+    bool destroyed_ = false;  // Guarded by create_mutex_.
     std::mutex create_mutex_;
 #else
     sem_t sem_;
