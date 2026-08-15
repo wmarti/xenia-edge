@@ -603,6 +603,11 @@ static void EmitFpBinOpWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1,
       e.fdiv(dest, s1, s2);
       break;
   }
+  // No canonicalisation needed. Neither input is a NaN on this path, so a NaN
+  // result can only come from an invalid operation, and AArch64 with FPCR.DN=0
+  // -- which DEFAULT_FPU_FPCR is, and which none of the fpcr_table entries set
+  // -- already produces 0x7FC00000, the PPC default QNaN. The code that used to
+  // sit here replaced that correct value with the NEGATIVE default QNaN.
   e.b(done);
 
   // Slow path: first NaN by position wins, quiet if SNaN.
@@ -649,6 +654,8 @@ static void EmitFpBinOpWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1,
       e.fdiv(dest, s1, s2);
       break;
   }
+  // See the F32 twin: the hardware result is already 0x7FF8000000000000, the
+  // PPC default QNaN. This used to overwrite it with the negative one.
   e.b(done);
 
   // Slow path: first NaN by position wins, quiet if SNaN.
