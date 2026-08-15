@@ -183,15 +183,19 @@ static void RememberReservation(void* base_address, size_t length) {
   g_reservations[base_address] = length;
 }
 
-static size_t LookupReservationLength(void* base_address) {
+// Removes the record and returns its length in one step. Looking up and
+// erasing separately left a window: once munmap returns, the address is free
+// and a concurrent AllocFixed can be handed it and register its own record,
+// which the late erase would then delete.
+static size_t TakeReservationLength(void* base_address) {
   std::lock_guard guard(g_reservations_mutex);
   auto it = g_reservations.find(base_address);
-  return it == g_reservations.end() ? 0 : it->second;
-}
-
-static void ForgetReservation(void* base_address) {
-  std::lock_guard guard(g_reservations_mutex);
-  g_reservations.erase(base_address);
+  if (it == g_reservations.end()) {
+    return 0;
+  }
+  const size_t length = it->second;
+  g_reservations.erase(it);
+  return length;
 }
 
 void* AllocFixed(void* base_address, size_t length,
@@ -277,21 +281,22 @@ bool DeallocFixed(void* base_address, size_t length,
       // zero length, which silently leaked the mapping. Look the reservation up
       // instead of guessing: QueryProtect would merge adjacent regions with the
       // same protection and unmap memory this reservation never owned.
-      size_t release_length = length;
+      const size_t recorded = TakeReservationLength(base_address);
+      const size_t release_length = length ? length : recorded;
       if (!release_length) {
-        release_length = LookupReservationLength(base_address);
-        if (!release_length) {
-          XELOGE(
-              "DeallocFixed: release of {} with length 0, but that address is "
-              "not a known reservation; refusing to guess",
-              base_address);
-          return false;
-        }
-      }
-      if (munmap(base_address, release_length) != 0) {
+        XELOGE(
+            "DeallocFixed: release of {} with length 0, but that address is "
+            "not a known reservation; refusing to guess",
+            base_address);
         return false;
       }
-      ForgetReservation(base_address);
+      if (munmap(base_address, release_length) != 0) {
+        // The mapping is still ours, so the record has to go back.
+        if (recorded) {
+          RememberReservation(base_address, recorded);
+        }
+        return false;
+      }
       return true;
     }
     default:
