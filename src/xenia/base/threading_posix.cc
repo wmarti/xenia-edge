@@ -1177,8 +1177,12 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     uint64_t result = 0;
     auto cpu_count = std::min(CPU_SETSIZE, 64);
     for (auto i = 0u; i < cpu_count; i++) {
-      auto set = CPU_ISSET(i, &cpu_set);
-      result |= set << i;
+      // uint64_t(1), not the int CPU_ISSET returns: `set << i` sign-extends
+      // at i == 31 and wraps above it, so this never round-tripped with
+      // set_affinity_mask() on a host with 32 or more CPUs.
+      if (CPU_ISSET(i, &cpu_set)) {
+        result |= uint64_t(1) << i;
+      }
     }
     return result;
 #endif
