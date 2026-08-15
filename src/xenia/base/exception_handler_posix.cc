@@ -170,12 +170,28 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
 
   Exception ex;
   switch (signal_number) {
-    case SIGILL:
-    // A breakpoint instruction (BRK on arm64, int3 on x86) raises SIGTRAP, not
-    // SIGILL. Both mean "the CPU refused to run the instruction at pc", and the
-    // backends already re-check the encoding before claiming the exception, so
-    // they share a code.
     case SIGTRAP:
+#if XE_ARCH_AMD64
+      // int3 is a trap, not a fault: the saved RIP is the byte after it, while
+      // Exception::pc() is defined as where the exception occurred, and every
+      // consumer reads the instruction there (X64Backend::ExceptionCallback
+      // checks for ud2, Emulator::ExceptionCallback maps it back to a guest
+      // address). arm64's BRK already reports its own address, so back x86 up
+      // to agree. Both tests must hold, because raise(SIGTRAP) also lands
+      // here and its RIP is not after a breakpoint: si_code > 0 means the
+      // kernel raised this (SI_KERNEL for int3 on Linux, TRAP_BRKPT
+      // elsewhere), while raise() and pthread_kill() are <= 0.
+      if (signal_info->si_code > 0 &&
+          *reinterpret_cast<const uint8_t*>(uintptr_t(thread_context.rip) -
+                                            1) == 0xCC) {
+        thread_context.rip -= 1;
+      }
+#endif  // XE_ARCH_AMD64
+      // Falls through: a breakpoint instruction (BRK on arm64, int3 on x86)
+      // means the same thing as SIGILL to the backends, which re-check the
+      // encoding before claiming the exception.
+      [[fallthrough]];
+    case SIGILL:
       ex.InitializeIllegalInstruction(&thread_context);
       break;
     case SIGBUS:
