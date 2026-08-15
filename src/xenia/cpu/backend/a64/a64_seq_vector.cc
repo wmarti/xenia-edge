@@ -1179,6 +1179,18 @@ EMITTER_OPCODE_TABLE(OPCODE_LOAD_VECTOR_SHR, LOAD_VECTOR_SHR_I8);
 // ============================================================================
 // OPCODE_PACK
 // ============================================================================
+// FMAXNM/FMINNM return the other operand only for a *quiet* NaN. A signalling
+// NaN propagates as a NaN instead, so the clamp below lets it through and the
+// following FMINNM then picks the wrong end of the range. x86 MAXPS/MINPS
+// return the second operand for any NaN, which is what these PACK sequences
+// rely on ("pack NaN as zero"; 5454082B depends on the order).
+//
+// FMAXNM(x, x) is the identity for every input except a signalling NaN, which
+// it quiets, so one instruction makes the two backends agree.
+static void EmitQuietSnan(A64Emitter& e, int d, int s) {
+  e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(s).s4);
+}
+
 struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     switch (i.instr->flags & hir::PACK_TYPE_MODE) {
@@ -1219,10 +1231,14 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     int s = SrcVReg(e, i.src1, 2);
     int d = i.dest.reg().getIdx();
     // Clamp to [3.0f, 3.0f + 255*2^-22].
-    // fmaxnm/fminnm: NaN operand returns the non-NaN value (pack NaN as zero).
+    // Quiet first, then clamp: NaN packs as zero (see EmitQuietSnan).
     e.fmov(VReg(0).s4, 3.0f);
     e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x404000FFu));  // 3.0f + 255*2^-22
+
+    EmitQuietSnan(e, d, s);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    LoadV128Const(e, 0, vec128i(0x404000FFu), 0);  // 3.0f + 255*2^-22
     e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL: extract low byte from each lane, reorder RGBA->ARGB in lane 3.
     // Control: bytes 0-11=0xFF (->0), bytes 12-15={0x08,0x04,0x00,0x0C}
@@ -1240,6 +1256,11 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     LoadV128Const(e, 0, vec128i(0x403F8001u));
     e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x40407FFFu));
+
+    LoadV128Const(e, 0, vec128i(0x403F8001u), 0);
+    EmitQuietSnan(e, d, s);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    LoadV128Const(e, 0, vec128i(0x40407FFFu), 0);
     e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL: extract low 2 bytes from lanes 0,1 -> pack into lane 3.
     // TBL ctrl for PACK_SHORT_2: bytes 12-15={0x04,0x05,0x00,0x01}, rest=0xFF
@@ -1256,6 +1277,11 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     LoadV128Const(e, 0, vec128i(0x403F8001u));
     e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x40407FFFu));
+
+    LoadV128Const(e, 0, vec128i(0x403F8001u), 0);
+    EmitQuietSnan(e, d, s);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    LoadV128Const(e, 0, vec128i(0x40407FFFu), 0);
     e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL ctrl for PACK_SHORT_4: bytes 8-11={0x04,0x05,0x00,0x01},
     // 12-15={0x0C,0x0D,0x08,0x09}
@@ -1371,14 +1397,15 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     int d = i.dest.reg().getIdx();
 
     // Clamp to valid range: fmaxnm(src, min) then fminnm(result, max).
-    // fmaxnm clamps NaN to min (NaN packs as the minimum value).
+    // Quiet first, so a signalling NaN also clamps to min.
     // XYZ min=0x403FFE01 (-511), max=0x404001FF (+511)
     // W   min=0x40400000 (0),    max=0x40400003 (+3)
     e.mov(e.x0, 0x403FFE01403FFE01ull);
     e.fmov(DReg(0), e.x0);
     e.mov(e.x0, 0x40400000403FFE01ull);
     e.ins(VReg(0).d2[1], e.x0);
-    e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
+    EmitQuietSnan(e, d, s);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
 
     e.mov(e.x0, 0x404001FF404001FFull);
     e.fmov(DReg(0), e.x0);
@@ -1420,7 +1447,8 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     e.fmov(DReg(0), e.x0);
     e.mov(e.x0, 0x4040000040380001ull);
     e.ins(VReg(0).d2[1], e.x0);
-    e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
+    EmitQuietSnan(e, d, s);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
 
     e.mov(e.x0, 0x4047FFFF4047FFFFull);
     e.fmov(DReg(0), e.x0);
