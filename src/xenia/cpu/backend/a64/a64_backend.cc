@@ -1140,11 +1140,16 @@ uint64_t A64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
 static constexpr uint32_t kArm64Brk0 = 0xD4200000;
 
 void A64Backend::InstallBreakpoint(Breakpoint* breakpoint) {
-  breakpoint->ForEachHostAddress([breakpoint](uint64_t host_address) {
+  breakpoint->ForEachHostAddress([this, breakpoint](uint64_t host_address) {
     auto ptr = reinterpret_cast<void*>(host_address);
     auto original_bytes = xe::load<uint32_t>(ptr);
     assert_true(original_bytes != kArm64Brk0);
-    xe::store<uint32_t>(ptr, kArm64Brk0);
+    // Must go through the code cache: the execute view is not writable, and
+    // ARM64 needs the I-cache invalidated before the patch takes effect.
+    if (!code_cache()->PatchCode(ptr, &kArm64Brk0, sizeof(kArm64Brk0))) {
+      assert_always();
+      return;
+    }
     breakpoint->backend_data().emplace_back(host_address, original_bytes);
   });
 }
@@ -1163,7 +1168,10 @@ void A64Backend::InstallBreakpoint(Breakpoint* breakpoint, Function* fn) {
   auto ptr = reinterpret_cast<void*>(host_address);
   auto original_bytes = xe::load<uint32_t>(ptr);
   assert_true(original_bytes != kArm64Brk0);
-  xe::store<uint32_t>(ptr, kArm64Brk0);
+  if (!code_cache()->PatchCode(ptr, &kArm64Brk0, sizeof(kArm64Brk0))) {
+    assert_always();
+    return;
+  }
   breakpoint->backend_data().emplace_back(host_address, original_bytes);
 }
 
@@ -1172,7 +1180,8 @@ void A64Backend::UninstallBreakpoint(Breakpoint* breakpoint) {
     auto ptr = reinterpret_cast<uint8_t*>(pair.first);
     auto instruction_bytes = xe::load<uint32_t>(ptr);
     assert_true(instruction_bytes == kArm64Brk0);
-    xe::store<uint32_t>(ptr, static_cast<uint32_t>(pair.second));
+    const uint32_t original_bytes = static_cast<uint32_t>(pair.second);
+    code_cache()->PatchCode(ptr, &original_bytes, sizeof(original_bytes));
   }
   breakpoint->backend_data().clear();
 }
