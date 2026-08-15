@@ -194,9 +194,11 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
   const bool wants_read =
       desired_access & (FileAccess::kGenericRead | FileAccess::kFileReadData |
                         FileAccess::kGenericExecute | FileAccess::kGenericAll);
+  // kFileAppendData is write intent too: without it an append-only open lands
+  // on O_RDONLY and every write fails.
   const bool wants_write =
       desired_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
-                        FileAccess::kGenericAll);
+                        FileAccess::kFileAppendData | FileAccess::kGenericAll);
   int open_access;
   if (wants_read && wants_write) {
     open_access = O_RDWR;
@@ -205,9 +207,9 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
   } else {
     open_access = O_RDONLY;
   }
-  if (desired_access & FileAccess::kFileAppendData) {
-    open_access |= O_APPEND;
-  }
+  // No O_APPEND. Every write goes through pwrite() with an explicit offset, and
+  // Linux documents that pwrite() ignores its offset on an O_APPEND handle, so
+  // setting it silently redirected positioned guest writes to the end of file.
   int handle = open(path.c_str(), open_access);
   if (handle == -1) {
     // TODO(benvanik): pick correct response.
