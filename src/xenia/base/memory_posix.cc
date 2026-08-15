@@ -259,7 +259,15 @@ bool Protect(void* base_address, size_t length, PageAccess access,
              PageAccess* out_old_access) {
   if (out_old_access) {
     size_t length_copy = length;
-    QueryProtect(base_address, length_copy, *out_old_access);
+    if (!QueryProtect(base_address, length_copy, *out_old_access)) {
+      // QueryProtect can fail without writing its out parameter. Callers use
+      // this value to restore protection afterwards, so leaving it undefined
+      // means restoring whatever was on the caller's stack. Fail closed and say
+      // so instead.
+      *out_old_access = PageAccess::kNoAccess;
+      XELOGW("Protect: could not read the current protection of {}; reporting "
+             "kNoAccess", base_address);
+    }
   }
 
   uint32_t prot = ToPosixProtectFlags(access);
@@ -272,6 +280,9 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+  // Every early return below leaves these alone otherwise.
+  access_out = PageAccess::kNoAccess;
+  length = 0;
 #if XE_PLATFORM_MAC
   mach_vm_address_t address = reinterpret_cast<mach_vm_address_t>(base_address);
   mach_vm_size_t region_size = 0;
@@ -345,6 +356,9 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
             access_out == ToXeniaProtectFlags(next_protection)) {
           length =
               next_map_region_end - reinterpret_cast<uintptr_t>(base_address);
+          // Advance, or the next iteration compares against the original end
+          // again and no third region can ever join.
+          map_region_end = next_map_region_end;
           continue;
         }
         break;
