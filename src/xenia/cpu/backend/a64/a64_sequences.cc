@@ -2120,7 +2120,9 @@ struct SHL_V128 : Sequence<SHL_V128, I<OPCODE_SHL, V128Op, V128Op, I8Op>> {
         return;
       }
       // Read carry before writing result (handles dest==src aliasing).
-      e.ushr(VReg(0).s4, VReg(s).s4, 32 - sh);
+      // The carry goes in v3, not v0: SrcVReg parks a constant src1 in v0, and
+      // the result shift below still has to read it.
+      e.ushr(VReg(3).s4, VReg(s).s4, 32 - sh);
       e.shl(VReg(d).s4, VReg(s).s4, sh);
     } else {
       // Variable shift: mask to 0-7, splat, use ushl.
@@ -2129,13 +2131,13 @@ struct SHL_V128 : Sequence<SHL_V128, I<OPCODE_SHL, V128Op, V128Op, I8Op>> {
       e.movi(VReg(2).s4, 32);
       e.sub(VReg(2).s4, VReg(2).s4, VReg(1).s4);   // 32-N
       e.neg(VReg(2).s4, VReg(2).s4);               // -(32-N) for right shift
-      e.ushl(VReg(0).s4, VReg(s).s4, VReg(2).s4);  // carry: lane >> (32-N)
+      e.ushl(VReg(3).s4, VReg(s).s4, VReg(2).s4);  // carry: lane >> (32-N)
       e.ushl(VReg(d).s4, VReg(s).s4, VReg(1).s4);  // result: lane << N
     }
     // Shift carries from lane i+1 to lane i; lane 3 gets zero.
     e.movi(VReg(1).s4, 0);
-    e.ext(VReg(0).b16, VReg(0).b16, VReg(1).b16, 4);
-    e.orr(VReg(d).b16, VReg(d).b16, VReg(0).b16);
+    e.ext(VReg(3).b16, VReg(3).b16, VReg(1).b16, 4);
+    e.orr(VReg(d).b16, VReg(d).b16, VReg(3).b16);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_SHL, SHL_I8, SHL_I16, SHL_I32, SHL_I64, SHL_V128);
@@ -2257,7 +2259,9 @@ struct SHR_V128 : Sequence<SHR_V128, I<OPCODE_SHR, V128Op, V128Op, I8Op>> {
         return;
       }
       // Read carry before writing result (handles dest==src aliasing).
-      e.shl(VReg(0).s4, VReg(s).s4, 32 - sh);
+      // The carry goes in v3, not v0: SrcVReg parks a constant src1 in v0, and
+      // the result shift below still has to read it.
+      e.shl(VReg(3).s4, VReg(s).s4, 32 - sh);
       e.ushr(VReg(d).s4, VReg(s).s4, sh);
     } else {
       // Variable shift: mask to 0-7, splat, use ushl.
@@ -2265,14 +2269,14 @@ struct SHR_V128 : Sequence<SHR_V128, I<OPCODE_SHR, V128Op, V128Op, I8Op>> {
       e.dup(VReg(1).s4, e.w0);
       e.movi(VReg(2).s4, 32);
       e.sub(VReg(2).s4, VReg(2).s4, VReg(1).s4);   // 32-N
-      e.ushl(VReg(0).s4, VReg(s).s4, VReg(2).s4);  // carry: lane << (32-N)
+      e.ushl(VReg(3).s4, VReg(s).s4, VReg(2).s4);  // carry: lane << (32-N)
       e.neg(VReg(1).s4, VReg(1).s4);               // -N for right shift
       e.ushl(VReg(d).s4, VReg(s).s4, VReg(1).s4);  // result: lane >> N
     }
     // Shift carries from lane i-1 to lane i; lane 0 gets zero.
     e.movi(VReg(1).s4, 0);
-    e.ext(VReg(0).b16, VReg(1).b16, VReg(0).b16, 12);
-    e.orr(VReg(d).b16, VReg(d).b16, VReg(0).b16);
+    e.ext(VReg(3).b16, VReg(1).b16, VReg(3).b16, 12);
+    e.orr(VReg(d).b16, VReg(d).b16, VReg(3).b16);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_SHR, SHR_I8, SHR_I16, SHR_I32, SHR_I64, SHR_V128);
@@ -4464,14 +4468,15 @@ struct DOT_PRODUCT_3_V128
       int s1 = SrcVReg(e, i.src1, 0);
       int s2 = SrcVReg(e, i.src2, 1);
       int d = i.dest.reg().getIdx();
+      // Widen the high halves first. SrcVReg parks a constant operand in v0 or
+      // v1, so those must not be written until both halves have been read.
+      e.fcvtl2(VReg(2).d2, VReg(s1).s4);           // v2 = {s1[2], s1[3]} as f64
+      e.fcvtl2(VReg(3).d2, VReg(s2).s4);           // v3 = {s2[2], s2[3]} as f64
+      e.fmul(VReg(2).d2, VReg(2).d2, VReg(3).d2);  // v2 = {a2*b2, a3*b3}
       // Widen low 2 floats of each source to double.
       e.fcvtl(VReg(0).d2, VReg(s1).s2);            // v0 = {s1[0], s1[1]} as f64
       e.fcvtl(VReg(1).d2, VReg(s2).s2);            // v1 = {s2[0], s2[1]} as f64
       e.fmul(VReg(0).d2, VReg(0).d2, VReg(1).d2);  // v0 = {a0*b0, a1*b1}
-      // Widen high 2 floats (elements 2,3) to double.
-      e.fcvtl2(VReg(2).d2, VReg(s1).s4);           // v2 = {s1[2], s1[3]} as f64
-      e.fcvtl2(VReg(3).d2, VReg(s2).s4);           // v3 = {s2[2], s2[3]} as f64
-      e.fmul(VReg(2).d2, VReg(2).d2, VReg(3).d2);  // v2 = {a2*b2, a3*b3}
       // Sum: d0 = v0[0] + v0[1] + v2[0] (skip v2[1] = element 3).
       e.faddp(DReg(1), VReg(0).d2);
       e.fadd(DReg(1), DReg(1), DReg(2));
@@ -4495,14 +4500,15 @@ struct DOT_PRODUCT_4_V128
       int s1 = SrcVReg(e, i.src1, 0);
       int s2 = SrcVReg(e, i.src2, 1);
       int d = i.dest.reg().getIdx();
+      // Widen the high halves first. SrcVReg parks a constant operand in v0 or
+      // v1, so those must not be written until both halves have been read.
+      e.fcvtl2(VReg(2).d2, VReg(s1).s4);
+      e.fcvtl2(VReg(3).d2, VReg(s2).s4);
+      e.fmul(VReg(2).d2, VReg(2).d2, VReg(3).d2);
       // Widen low 2 floats to double, multiply.
       e.fcvtl(VReg(0).d2, VReg(s1).s2);
       e.fcvtl(VReg(1).d2, VReg(s2).s2);
       e.fmul(VReg(0).d2, VReg(0).d2, VReg(1).d2);
-      // Widen high 2 floats to double, multiply.
-      e.fcvtl2(VReg(2).d2, VReg(s1).s4);
-      e.fcvtl2(VReg(3).d2, VReg(s2).s4);
-      e.fmul(VReg(2).d2, VReg(2).d2, VReg(3).d2);
       // Sum all 4 products: v0 = {a0*b0+a2*b2, a1*b1+a3*b3}
       e.fadd(VReg(0).d2, VReg(0).d2, VReg(2).d2);
       e.faddp(DReg(1), VReg(0).d2);

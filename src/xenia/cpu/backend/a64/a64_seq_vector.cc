@@ -799,6 +799,9 @@ struct VECTOR_ROTATE_LEFT_V128
     int s2 = SrcVReg(e, i.src2, 1);
     int d = i.dest.reg().getIdx();
     // rotate = (src << amt) | (src >> (width - amt))
+    // The right-shift temporary is v1, not v0: SrcVReg parks a constant
+    // src1 in v0 and both shifts read it. v1 is free from the point the
+    // amount mask has consumed src2.
     switch (i.instr->flags) {
       case INT8_TYPE: {
         e.movi(VReg(2).b16, 0x07);
@@ -806,33 +809,33 @@ struct VECTOR_ROTATE_LEFT_V128
         // Left shift.
         e.ushl(VReg(3).b16, VReg(s1).b16, VReg(2).b16);
         // Right shift = negate amount.
-        e.movi(VReg(0).b16, 8);
-        e.sub(VReg(0).b16, VReg(0).b16, VReg(2).b16);
-        e.neg(VReg(0).b16, VReg(0).b16);
-        e.ushl(VReg(0).b16, VReg(s1).b16, VReg(0).b16);
-        e.orr(VReg(d).b16, VReg(3).b16, VReg(0).b16);
+        e.movi(VReg(1).b16, 8);
+        e.sub(VReg(1).b16, VReg(1).b16, VReg(2).b16);
+        e.neg(VReg(1).b16, VReg(1).b16);
+        e.ushl(VReg(1).b16, VReg(s1).b16, VReg(1).b16);
+        e.orr(VReg(d).b16, VReg(3).b16, VReg(1).b16);
         break;
       }
       case INT16_TYPE: {
         e.movi(VReg(2).h8, 0x0F);
         e.and_(VReg(2).b16, VReg(s2).b16, VReg(2).b16);
         e.ushl(VReg(3).h8, VReg(s1).h8, VReg(2).h8);
-        e.movi(VReg(0).h8, 16);
-        e.sub(VReg(0).h8, VReg(0).h8, VReg(2).h8);
-        e.neg(VReg(0).h8, VReg(0).h8);
-        e.ushl(VReg(0).h8, VReg(s1).h8, VReg(0).h8);
-        e.orr(VReg(d).b16, VReg(3).b16, VReg(0).b16);
+        e.movi(VReg(1).h8, 16);
+        e.sub(VReg(1).h8, VReg(1).h8, VReg(2).h8);
+        e.neg(VReg(1).h8, VReg(1).h8);
+        e.ushl(VReg(1).h8, VReg(s1).h8, VReg(1).h8);
+        e.orr(VReg(d).b16, VReg(3).b16, VReg(1).b16);
         break;
       }
       case INT32_TYPE: {
         e.movi(VReg(2).s4, 0x1F);
         e.and_(VReg(2).b16, VReg(s2).b16, VReg(2).b16);
         e.ushl(VReg(3).s4, VReg(s1).s4, VReg(2).s4);
-        e.movi(VReg(0).s4, 32);
-        e.sub(VReg(0).s4, VReg(0).s4, VReg(2).s4);
-        e.neg(VReg(0).s4, VReg(0).s4);
-        e.ushl(VReg(0).s4, VReg(s1).s4, VReg(0).s4);
-        e.orr(VReg(d).b16, VReg(3).b16, VReg(0).b16);
+        e.movi(VReg(1).s4, 32);
+        e.sub(VReg(1).s4, VReg(1).s4, VReg(2).s4);
+        e.neg(VReg(1).s4, VReg(1).s4);
+        e.ushl(VReg(1).s4, VReg(s1).s4, VReg(1).s4);
+        e.orr(VReg(d).b16, VReg(3).b16, VReg(1).b16);
         break;
       }
       default:
@@ -901,19 +904,21 @@ struct VECTOR_DENORMFLUSH
     // Mask: exponent = bits 30:23 of each float.
     // If (val & 0x7F800000) == 0 then it's zero or denormal.
     // For denormals (mantissa != 0 but exponent == 0), replace with sign | 0.
+    // The working value lives in v3, not v0: SrcVReg parks a constant src1 in
+    // v0 and every step below still reads it.
     LoadV128Const(e, 2, vec128i(0x7F800000u), 0);
-    e.and_(VReg(0).b16, VReg(s).b16, VReg(2).b16);
-    // v0 = exponent bits. Compare with zero.
-    e.cmeq(VReg(0).s4, VReg(0).s4, 0);
-    // v0 = all-ones where exponent is zero (denormal or zero).
+    e.and_(VReg(3).b16, VReg(s).b16, VReg(2).b16);
+    // v3 = exponent bits. Compare with zero.
+    e.cmeq(VReg(3).s4, VReg(3).s4, 0);
+    // v3 = all-ones where exponent is zero (denormal or zero).
     // Keep sign bits of denormals.
     e.movi(VReg(1).s4, 0x80, LSL, 24);
     e.and_(VReg(1).b16, VReg(s).b16, VReg(1).b16);
     // v1 = sign bits only.
     // Select: where exponent is zero -> sign bits, else -> original.
-    e.bsl(VReg(0).b16, VReg(1).b16, VReg(s).b16);
-    if (d != 0) {
-      e.orr(VReg(d).b16, VReg(0).b16, VReg(0).b16);
+    e.bsl(VReg(3).b16, VReg(1).b16, VReg(s).b16);
+    if (d != 3) {
+      e.orr(VReg(d).b16, VReg(3).b16, VReg(3).b16);
     }
   }
 };
