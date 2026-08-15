@@ -35,6 +35,14 @@ class CodeCache {
 
   // Finds platform-specific function unwind info for the given host PC.
   virtual void* LookupUnwindInfo(uint64_t host_pc) = 0;
+
+  // Overwrites bytes of already-placed code. `execute_address` is an address
+  // in the execute view, as handed out by GuestFunction::machine_code.
+  // Handles the separate write view, the macOS W^X gate, and I-cache
+  // invalidation, none of which a plain store does. Returns false if the
+  // range falls outside the cache.
+  virtual bool PatchCode(void* execute_address, const void* data,
+                         size_t size) = 0;
 };
 
 }  // namespace backend
