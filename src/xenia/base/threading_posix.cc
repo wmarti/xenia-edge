@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <array>
 #include <atomic>
@@ -33,6 +34,16 @@
 #endif
 
 #include "xenia/base/logging.h"
+
+// Darwin has no unnamed POSIX semaphores, so the suspend park is a self-pipe
+// there. Definable by a test build to exercise that path on Linux too.
+#if !defined(XE_THREADING_SUSPEND_PIPE)
+#if XE_PLATFORM_MAC
+#define XE_THREADING_SUSPEND_PIPE 1
+#else
+#define XE_THREADING_SUSPEND_PIPE 0
+#endif
+#endif
 
 #if XE_PLATFORM_MAC
 #include <mach/mach.h>
@@ -268,6 +279,91 @@ uintptr_t GetTlsValue(TlsHandle handle) {
 bool SetTlsValue(TlsHandle handle, uintptr_t value) {
   return pthread_setspecific(handle, reinterpret_cast<void*>(value)) == 0;
 }
+
+
+// A park that a signal handler can safely block on.
+//
+// It must not touch any lock the interrupted code might already hold. macOS
+// previously fell back to state_mutex_ plus a condition variable, so a suspend
+// signal delivered while the thread held state_mutex_ (set_priority, set_name,
+// and every other WaitStarted path do) deadlocked that thread against itself,
+// and Resume could not recover it.
+//
+// Linux keeps the unnamed semaphore. Darwin has no unnamed semaphores --
+// sem_init returns ENOSYS -- so it uses a self-pipe instead: read() and
+// write() are both async-signal-safe.
+class SuspendGate {
+ public:
+  SuspendGate() {
+#if XE_THREADING_SUSPEND_PIPE
+    if (pipe(fds_) == 0) {
+      fcntl(fds_[0], F_SETFD, FD_CLOEXEC);
+      fcntl(fds_[1], F_SETFD, FD_CLOEXEC);
+    }
+#else
+    sem_init(&sem_, 0, 0);
+#endif
+  }
+  ~SuspendGate() { Destroy(); }
+
+  SuspendGate(const SuspendGate&) = delete;
+  SuspendGate& operator=(const SuspendGate&) = delete;
+
+  // Async-signal-safe.
+  void Wait() {
+#if XE_THREADING_SUSPEND_PIPE
+    uint8_t token;
+    ssize_t n;
+    do {
+      n = read(fds_[0], &token, 1);
+    } while (n < 0 && errno == EINTR);
+#else
+    int ret;
+    do {
+      ret = sem_wait(&sem_);
+    } while (ret == -1 && errno == EINTR);
+#endif
+  }
+
+  // Async-signal-safe.
+  void Post() {
+#if XE_THREADING_SUSPEND_PIPE
+    const uint8_t token = 1;
+    ssize_t n;
+    do {
+      n = write(fds_[1], &token, 1);
+    } while (n < 0 && errno == EINTR);
+#else
+    sem_post(&sem_);
+#endif
+  }
+
+  void Destroy() {
+#if XE_THREADING_SUSPEND_PIPE
+    if (fds_[0] >= 0) {
+      close(fds_[0]);
+      fds_[0] = -1;
+    }
+    if (fds_[1] >= 0) {
+      close(fds_[1]);
+      fds_[1] = -1;
+    }
+#else
+    if (!destroyed_) {
+      destroyed_ = true;
+      sem_destroy(&sem_);
+    }
+#endif
+  }
+
+ private:
+#if XE_THREADING_SUSPEND_PIPE
+  int fds_[2] = {-1, -1};
+#else
+  sem_t sem_;
+  bool destroyed_ = false;
+#endif
+};
 
 class PosixConditionBase {
  public:
@@ -683,9 +779,6 @@ class PosixCondition<Thread> final : public PosixConditionBase {
         state_(State::kUninitialized),
         suspend_count_(0),
         joined_(false) {
-#if XE_PLATFORM_LINUX
-    sem_init(&suspend_sem_, 0, 0);
-#endif
 #if XE_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
 #endif
@@ -791,9 +884,6 @@ class PosixCondition<Thread> final : public PosixConditionBase {
         state_(State::kRunning),
         suspend_count_(0),
         joined_(false) {
-#if XE_PLATFORM_LINUX
-    sem_init(&suspend_sem_, 0, 0);
-#endif
 #if XE_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
 #endif
@@ -1069,11 +1159,9 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     --suspend_count_;
     if (suspend_count_ == 0) {
       state_ = State::kRunning;
-#if XE_PLATFORM_LINUX
-      // sem_post is async-signal-safe and wakes the thread from sem_wait
-      // inside the suspend signal handler without taking any locks.
-      sem_post(&suspend_sem_);
-#endif
+      // Async-signal-safe, and takes no lock the suspended thread could
+      // already be holding.
+      suspend_gate_.Post();
     }
     state_signal_.notify_all();
     return true;
@@ -1180,18 +1268,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   /// non-reentrant mutex/condvar operations. macOS has no unnamed
   /// semaphores (sem_init returns ENOSYS), so we fall back to the condvar
   /// path there.
-  void WaitSuspended() {
-#if XE_PLATFORM_LINUX
-    int ret;
-    do {
-      ret = sem_wait(&suspend_sem_);
-    } while (ret == -1 && errno == EINTR);
-#else
-    std::unique_lock lock(state_mutex_);
-    state_signal_.wait(lock, [this] { return suspend_count_ == 0; });
-    state_ = State::kRunning;
-#endif
-  }
+  void WaitSuspended() { suspend_gate_.Wait(); }
 
   void* native_handle() const override {
     return reinterpret_cast<void*>(thread_);
@@ -1211,10 +1288,8 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     bool expected = false;
     if (thread_ && joined_.compare_exchange_strong(expected, true)) {
       pthread_join(thread_, nullptr);
-#if XE_PLATFORM_LINUX
-      // Safe now: the thread is gone and cannot touch the semaphore again.
-      sem_destroy(&suspend_sem_);
-#endif
+      // Safe now: the thread is gone and cannot touch the gate again.
+      suspend_gate_.Destroy();
     }
   }
   pthread_t thread_;
@@ -1227,9 +1302,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   State state_;             // Protected by state_mutex_
   uint32_t suspend_count_;  // Protected by state_mutex_
   std::atomic<bool> joined_;  // Prevents double pthread_join
-#if XE_PLATFORM_LINUX
-  sem_t suspend_sem_;  // Async-signal-safe suspend/resume semaphore.
-#endif
+  SuspendGate suspend_gate_;  // Async-signal-safe suspend/resume park.
   mutable std::mutex state_mutex_;
   mutable std::mutex callback_mutex_;
   mutable std::condition_variable state_signal_;
