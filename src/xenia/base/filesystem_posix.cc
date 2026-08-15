@@ -157,8 +157,10 @@ bool CreateEmptyFile(const std::filesystem::path& path) {
 
 class PosixFileHandle : public FileHandle {
  public:
-  PosixFileHandle(std::filesystem::path path, int handle)
-      : FileHandle(std::move(path)), handle_(handle) {}
+  PosixFileHandle(std::filesystem::path path, int handle, bool append_only)
+      : FileHandle(std::move(path)),
+        handle_(handle),
+        append_only_(append_only) {}
   ~PosixFileHandle() override {
     close(handle_);
     handle_ = -1;
@@ -176,7 +178,13 @@ class PosixFileHandle : public FileHandle {
   }
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
-    ssize_t out = pwrite(handle_, buffer, buffer_length, file_offset);
+    // A handle whose only write right is append ignores the offset and goes to
+    // the end of the file. That is what Win32 does for a handle opened with
+    // FILE_APPEND_DATA and no FILE_WRITE_DATA, and the guest relies on it. The
+    // descriptor carries O_APPEND in that case, so write() appends atomically.
+    ssize_t out = append_only_
+                      ? write(handle_, buffer, buffer_length)
+                      : pwrite(handle_, buffer, buffer_length, file_offset);
     if (out >= 0) {
       *out_bytes_written = out;
       return true;
@@ -192,6 +200,7 @@ class PosixFileHandle : public FileHandle {
 
  private:
   int handle_ = -1;
+  bool append_only_ = false;
 };
 
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(
@@ -215,15 +224,25 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
   } else {
     open_access = O_RDONLY;
   }
-  // No O_APPEND. Every write goes through pwrite() with an explicit offset, and
-  // Linux documents that pwrite() ignores its offset on an O_APPEND handle, so
-  // setting it silently redirected positioned guest writes to the end of file.
+  // O_APPEND only when append is the ONLY write right the caller asked for.
+  // Win32 treats FILE_APPEND_DATA without FILE_WRITE_DATA that way: the offset
+  // is ignored and the write goes to the end of the file. Setting it for a
+  // normal write handle instead would silently redirect positioned guest writes
+  // to the end of file, because Linux documents that pwrite() ignores its
+  // offset on an O_APPEND descriptor.
+  const bool append_only = (desired_access & FileAccess::kFileAppendData) &&
+                           !(desired_access & (FileAccess::kGenericWrite |
+                                               FileAccess::kFileWriteData |
+                                               FileAccess::kGenericAll));
+  if (append_only) {
+    open_access |= O_APPEND;
+  }
   int handle = open(path.c_str(), open_access);
   if (handle == -1) {
     // TODO(benvanik): pick correct response.
     return nullptr;
   }
-  return std::make_unique<PosixFileHandle>(path, handle);
+  return std::make_unique<PosixFileHandle>(path, handle, append_only);
 }
 
 std::optional<FileInfo> GetInfo(const std::filesystem::path& path) {
