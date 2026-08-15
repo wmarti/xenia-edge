@@ -418,8 +418,6 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
           std::memcpy(&mcontext_fpsimd->vregs[modified_register_index],
                       &thread_context.v[modified_register_index],
                       sizeof(vec128_t));
-          mcontext.regs[modified_register_index] =
-              thread_context.x[modified_register_index];
         }
       }
 #endif  // XE_PLATFORM_MAC
