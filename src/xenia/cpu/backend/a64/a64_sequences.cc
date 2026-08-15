@@ -3282,7 +3282,16 @@ struct MAX_F32 : Sequence<MAX_F32, I<OPCODE_MAX, F32Op, F32Op, F32Op>> {
       c.f = i.src1.constant();
       e.mov(e.w0, static_cast<uint64_t>(c.u));
       e.fmov(e.s0, e.w0);
-      e.fmax(i.dest, e.s0, i.src2.is_constant ? e.s1 : i.src2);
+      if (i.src2.is_constant) {
+        // Both constant: the second one has to be materialised too, or the
+        // fmax reads whatever the previous sequence left in s1.
+        c.f = i.src2.constant();
+        e.mov(e.w0, static_cast<uint64_t>(c.u));
+        e.fmov(e.s1, e.w0);
+        e.fmax(i.dest, e.s0, e.s1);
+      } else {
+        e.fmax(i.dest, e.s0, i.src2);
+      }
     } else if (i.src2.is_constant) {
       union {
         float f;
@@ -3307,7 +3316,14 @@ struct MAX_F64 : Sequence<MAX_F64, I<OPCODE_MAX, F64Op, F64Op, F64Op>> {
       c.d = i.src1.constant();
       e.mov(e.x0, c.u);
       e.fmov(e.d0, e.x0);
-      e.fmax(i.dest, e.d0, i.src2.is_constant ? e.d1 : i.src2);
+      if (i.src2.is_constant) {
+        c.d = i.src2.constant();
+        e.mov(e.x0, c.u);
+        e.fmov(e.d1, e.x0);
+        e.fmax(i.dest, e.d0, e.d1);
+      } else {
+        e.fmax(i.dest, e.d0, i.src2);
+      }
     } else if (i.src2.is_constant) {
       union {
         double d;
@@ -3427,7 +3443,14 @@ struct MIN_F32 : Sequence<MIN_F32, I<OPCODE_MIN, F32Op, F32Op, F32Op>> {
       c.f = i.src1.constant();
       e.mov(e.w0, static_cast<uint64_t>(c.u));
       e.fmov(e.s0, e.w0);
-      e.fmin(i.dest, e.s0, i.src2.is_constant ? e.s1 : i.src2);
+      if (i.src2.is_constant) {
+        c.f = i.src2.constant();
+        e.mov(e.w0, static_cast<uint64_t>(c.u));
+        e.fmov(e.s1, e.w0);
+        e.fmin(i.dest, e.s0, e.s1);
+      } else {
+        e.fmin(i.dest, e.s0, i.src2);
+      }
     } else if (i.src2.is_constant) {
       union {
         float f;
@@ -3452,7 +3475,14 @@ struct MIN_F64 : Sequence<MIN_F64, I<OPCODE_MIN, F64Op, F64Op, F64Op>> {
       c.d = i.src1.constant();
       e.mov(e.x0, c.u);
       e.fmov(e.d0, e.x0);
-      e.fmin(i.dest, e.d0, i.src2.is_constant ? e.d1 : i.src2);
+      if (i.src2.is_constant) {
+        c.d = i.src2.constant();
+        e.mov(e.x0, c.u);
+        e.fmov(e.d1, e.x0);
+        e.fmin(i.dest, e.d0, e.d1);
+      } else {
+        e.fmin(i.dest, e.d0, i.src2);
+      }
     } else if (i.src2.is_constant) {
       union {
         double d;
