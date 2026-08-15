@@ -420,12 +420,13 @@ struct ScopedMultiWaiter {
       return true;
     }
 
-    // Async-signal-safe.
-    void Wait() {
+    // Async-signal-safe. Returns false if the gate is not armed, so the caller
+    // can park some other way instead of spinning on a call that never blocks.
+    bool Wait() {
 #if XE_THREADING_SUSPEND_PIPE
-      // Arm() ran before the signal was raised, so the descriptors exist.
+      // Arm() ran before the count could rise, so the descriptors exist.
       if (fds_[0] < 0) {
-        return;
+        return false;
       }
       uint8_t token;
       ssize_t n;
@@ -438,6 +439,7 @@ struct ScopedMultiWaiter {
         ret = sem_wait(&sem_);
       } while (ret == -1 && errno == EINTR);
 #endif
+      return true;
     }
 
     // Async-signal-safe.
@@ -1471,7 +1473,21 @@ struct ScopedMultiWaiter {
     /// non-reentrant mutex/condvar operations. macOS has no unnamed
     /// semaphores (sem_init returns ENOSYS), so we fall back to the condvar
     /// path there.
-    void WaitSuspended() { suspend_gate_.Wait(); }
+    void WaitSuspended() {
+      // Level-triggered on suspend_count_, not on gate tokens. macOS suspends
+      // with SIGUSR1, which does not queue: two pthread_kills can collapse into
+      // one handler entry while both matching Resume()s still Post(), leaving a
+      // spare token. Re-reading the count means a spare token costs one extra
+      // read and never releases a thread that is still suspended.
+      while (suspend_count_.load(std::memory_order_acquire) > 0) {
+        if (!suspend_gate_.Wait()) {
+          // Not armed. Suspend() and Thread::Create both arm before they raise
+          // the count, so this should be unreachable; park rather than spin.
+          struct timespec ts = {0, 1000 * 1000};
+          nanosleep(&ts, nullptr);
+        }
+      }
+    }
 
     void* native_handle() const override {
       return reinterpret_cast<void*>(thread_);
@@ -1502,8 +1518,10 @@ struct ScopedMultiWaiter {
 #endif
     bool signaled_;
     int exit_code_;
-    State state_;               // Protected by state_mutex_
-    uint32_t suspend_count_;    // Protected by state_mutex_
+    State state_;  // Protected by state_mutex_
+    // Written only under state_mutex_. Atomic so the suspend signal handler can
+    // read it without taking a lock, which would not be async-signal-safe.
+    std::atomic<uint32_t> suspend_count_;
     std::atomic<bool> joined_;  // Prevents double pthread_join
     SuspendGate suspend_gate_;  // Async-signal-safe suspend/resume park.
     mutable std::mutex state_mutex_;
