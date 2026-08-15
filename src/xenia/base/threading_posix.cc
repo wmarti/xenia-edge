@@ -403,6 +403,32 @@ class SuspendGate {
 #endif
 };
 
+// WaitMultiple cannot block on several condition variables at once, so it used
+// to poll every millisecond. Event::Pulse signals, sleeps 10 us and resets, so
+// a poll that coarse missed most pulses -- measured at 73%, against 4% for the
+// single-handle path, which does block on the handle's own condition variable.
+//
+// Every handle that becomes signalled also bumps this counter and wakes anyone
+// in a multiple-wait. The counter is what closes the lost-wakeup race: a waiter
+// reads it before it inspects the handles, so a signal that lands in between
+// leaves the values different and the waiter loops instead of sleeping.
+static std::mutex g_any_signal_mutex;
+static std::condition_variable g_any_signal_cond;
+static uint64_t g_any_signal_generation = 0;
+
+static void NotifyAnySignal() {
+  {
+    std::lock_guard guard(g_any_signal_mutex);
+    ++g_any_signal_generation;
+  }
+  g_any_signal_cond.notify_all();
+}
+
+static uint64_t ReadAnySignalGeneration() {
+  std::lock_guard guard(g_any_signal_mutex);
+  return g_any_signal_generation;
+}
+
 class PosixConditionBase {
  public:
   PosixConditionBase() {
@@ -483,6 +509,9 @@ class PosixConditionBase {
       // Cancellation point, clear of the alloc below.
       pthread_testcancel();
 #endif
+      // Sampled before the handles are inspected, so a signal that arrives
+      // during the inspection is not lost.
+      const uint64_t generation = ReadAnySignalGeneration();
 
       // Check all handles to see if any/all are signaled.
       // Use try_lock to avoid deadlocks from lock ordering issues.
@@ -582,11 +611,16 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      // Sleep for a short time before polling again.
+      // Wait for a handle to be signalled rather than sleeping blind. The
+      // timeout is still bounded: some state the predicate reads (a thread
+      // exiting, a timer expiring) does not route through NotifyAnySignal.
       auto remaining =
           std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
       auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-      std::this_thread::sleep_for(sleep_time);
+      std::unique_lock<std::mutex> any_lock(g_any_signal_mutex);
+      if (g_any_signal_generation == generation) {
+        g_any_signal_cond.wait_for(any_lock, sleep_time);
+      }
     }
   }
 
@@ -624,6 +658,7 @@ class PosixCondition<Event> : public PosixConditionBase {
     auto lock = std::unique_lock(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyAnySignal();
     return true;
   }
 
@@ -662,6 +697,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
     }
     count_ += release_count;
     cond_.notify_all();
+    NotifyAnySignal();
     return true;
   }
 
@@ -670,6 +706,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
   void post_execution() override {
     count_--;
     cond_.notify_all();
+    NotifyAnySignal();
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -694,6 +731,7 @@ class PosixCondition<Mutant> final : public PosixConditionBase {
       // Free to be acquired by another thread
       if (count_ == 0) {
         cond_.notify_all();
+        NotifyAnySignal();
       }
       return true;
     }
@@ -728,6 +766,7 @@ class PosixCondition<Timer> final : public PosixConditionBase {
     std::lock_guard lock(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyAnySignal();
     return true;
   }
 
@@ -1295,6 +1334,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
       exit_code_ = exit_code;
       signaled_ = true;
       cond_.notify_all();
+      NotifyAnySignal();
     }
     if (is_current_thread) {
 #if XE_PLATFORM_MAC && defined(__aarch64__)
@@ -1762,6 +1802,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   thread->handle_.exit_code_ = 0;
   thread->handle_.signaled_ = true;
   thread->handle_.cond_.notify_all();
+  NotifyAnySignal();
 
   current_thread_ = nullptr;
   return nullptr;
