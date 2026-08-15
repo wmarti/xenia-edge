@@ -4085,6 +4085,9 @@ struct COMPARE_NE_F64
   struct NAME##_F32                                                  \
       : Sequence<NAME##_F32, I<OPCODE_##NAME, I8Op, F32Op, F32Op>> { \
     static void Emit(A64Emitter& e, const EmitArgType& i) {          \
+      /* fcmp reads FPCR, and the last vector float op in the block */ \
+      /* left it in VMX mode. Free when the mode already matches.   */ \
+      e.ChangeFpcrMode(FPCRMode::Fpu);                             \
       if (i.src1.is_constant) {                                      \
         union {                                                      \
           float f;                                                   \
@@ -4123,6 +4126,9 @@ struct COMPARE_NE_F64
   struct NAME##_F64                                                  \
       : Sequence<NAME##_F64, I<OPCODE_##NAME, I8Op, F64Op, F64Op>> { \
     static void Emit(A64Emitter& e, const EmitArgType& i) {          \
+      /* fcmp reads FPCR, and the last vector float op in the block */ \
+      /* left it in VMX mode. Free when the mode already matches.   */ \
+      e.ChangeFpcrMode(FPCRMode::Fpu);                             \
       if (i.src1.is_constant) {                                      \
         union {                                                      \
           double d;                                                  \
