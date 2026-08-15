@@ -22,12 +22,18 @@ namespace xe {
 
 class PosixMappedMemory : public MappedMemory {
  public:
-  PosixMappedMemory(void* data, size_t size, int file_descriptor)
-      : MappedMemory(data, size), file_descriptor_(file_descriptor) {}
+  // data/size describe what the caller asked for; map_base/map_length describe
+  // the page-aligned mapping underneath, which is what munmap and msync need.
+  PosixMappedMemory(void* data, size_t size, int file_descriptor,
+                    void* map_base, size_t map_length)
+      : MappedMemory(data, size),
+        file_descriptor_(file_descriptor),
+        map_base_(map_base),
+        map_length_(map_length) {}
 
   ~PosixMappedMemory() override {
-    if (data_) {
-      munmap(data_, size());
+    if (map_base_) {
+      munmap(map_base_, map_length_);
     }
     if (file_descriptor_ >= 0) {
       close(file_descriptor_);
@@ -68,26 +74,38 @@ class PosixMappedMemory : public MappedMemory {
     // of it. mmap() past EOF succeeds but faults with SIGBUS on first touch, so
     // extend the file here to match.
     if (mode == Mode::kReadWrite && offset + map_length > file_size) {
-      if (ftruncate(file_descriptor, off_t(offset + map_length))) {
+      if (ftruncate(file_descriptor, off_t(offset + map_length))) {  // NOLINT
         close(file_descriptor);
         return nullptr;
       }
     }
 
-    void* data =
-        mmap(0, map_length, protection, MAP_SHARED, file_descriptor, offset);
-    if (data == MAP_FAILED) {
+    // mmap only accepts a page-aligned offset. Align down and lengthen the
+    // mapping to compensate, then hand the caller a pointer to the byte it
+    // actually asked for -- the same thing mapped_memory_win.cc does with the
+    // allocation granularity. Without this an unaligned offset failed outright
+    // and size() described a different range than the mapping.
+    const size_t page = size_t(getpagesize());
+    const size_t aligned_offset = offset & ~(page - 1);
+    const size_t delta = offset - aligned_offset;
+    const size_t map_span = map_length + delta;
+
+    void* map_base = mmap(0, map_span, protection, MAP_SHARED, file_descriptor,
+                          off_t(aligned_offset));
+    if (map_base == MAP_FAILED) {
       close(file_descriptor);
       return nullptr;
     }
 
-    return std::make_unique<PosixMappedMemory>(data, map_length,
-                                               file_descriptor);
+    void* data = static_cast<uint8_t*>(map_base) + delta;
+    return std::make_unique<PosixMappedMemory>(
+        data, map_length, file_descriptor, map_base, map_span);
   }
 
   void Close(uint64_t truncate_size) override {
-    if (data_) {
-      munmap(data_, size());
+    if (map_base_) {
+      munmap(map_base_, map_length_);
+      map_base_ = nullptr;
       data_ = nullptr;
     }
     if (file_descriptor_ >= 0) {
@@ -99,10 +117,13 @@ class PosixMappedMemory : public MappedMemory {
     }
   }
 
-  void Flush() override { msync(data(), size(), MS_ASYNC); }
+  // msync needs the page-aligned base, not the caller-visible pointer.
+  void Flush() override { msync(map_base_, map_length_, MS_ASYNC); }
 
  private:
   int file_descriptor_;
+  void* map_base_ = nullptr;
+  size_t map_length_ = 0;
 };
 
 std::unique_ptr<MappedMemory> MappedMemory::Open(
