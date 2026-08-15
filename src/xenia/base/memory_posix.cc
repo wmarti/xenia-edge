@@ -21,6 +21,7 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <unordered_map>
 #include <sstream>
 #include <string>
 
@@ -187,6 +188,27 @@ static void InstallCleanupHandlers() {
 }
 #endif  // !XE_PLATFORM_ANDROID
 
+// Reservations made through AllocFixed, so a release that follows the Win32
+// convention of passing length 0 can find its extent.
+static std::mutex g_reservations_mutex;
+static std::unordered_map<void*, size_t> g_reservations;
+
+static void RememberReservation(void* base_address, size_t length) {
+  std::lock_guard guard(g_reservations_mutex);
+  g_reservations[base_address] = length;
+}
+
+static size_t LookupReservationLength(void* base_address) {
+  std::lock_guard guard(g_reservations_mutex);
+  auto it = g_reservations.find(base_address);
+  return it == g_reservations.end() ? 0 : it->second;
+}
+
+static void ForgetReservation(void* base_address) {
+  std::lock_guard guard(g_reservations_mutex);
+  g_reservations.erase(base_address);
+}
+
 void* AllocFixed(void* base_address, size_t length,
                  AllocationType allocation_type, PageAccess access) {
   // mmap does not support reserve / commit, so ignore allocation_type.
@@ -236,6 +258,7 @@ void* AllocFixed(void* base_address, size_t length,
     return nullptr;
   }
 
+  RememberReservation(result, length);
   return result;
 }
 
@@ -263,8 +286,29 @@ bool DeallocFixed(void* base_address, size_t length,
   switch (deallocation_type) {
     case DeallocationType::kDecommit:
       return Protect(base_address, length, PageAccess::kNoAccess);
-    case DeallocationType::kRelease:
-      return munmap(base_address, length) == 0;
+    case DeallocationType::kRelease: {
+      // memory_win.cc forces length = 0 for MEM_RELEASE because that is what
+      // VirtualFree requires, so callers legitimately pass 0. munmap rejects a
+      // zero length, which silently leaked the mapping. Look the reservation up
+      // instead of guessing: QueryProtect would merge adjacent regions with the
+      // same protection and unmap memory this reservation never owned.
+      size_t release_length = length;
+      if (!release_length) {
+        release_length = LookupReservationLength(base_address);
+        if (!release_length) {
+          XELOGE(
+              "DeallocFixed: release of {} with length 0, but that address is "
+              "not a known reservation; refusing to guess",
+              base_address);
+          return false;
+        }
+      }
+      if (munmap(base_address, release_length) != 0) {
+        return false;
+      }
+      ForgetReservation(base_address);
+      return true;
+    }
     default:
       assert_unhandled_case(deallocation_type);
   }
