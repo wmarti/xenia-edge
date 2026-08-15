@@ -978,6 +978,15 @@ struct ScopedMultiWaiter {
                     ThreadStartData* start_data) {
       start_data->create_suspended = params.create_suspended;
 
+      // The start routine parks on the gate before running anything, so the
+      // gate has to be armed here, by the creating thread, which can still
+      // report a failure. Arming from the start routine would leave the caller
+      // believing the thread is suspended when it is not.
+      if (params.create_suspended && !suspend_gate_.Arm()) {
+        XELOGE("Thread::Create: could not arm the suspend gate");
+        return false;
+      }
+
       auto attempt_create = [&](size_t stack_size, bool use_custom_stack_size) {
         pthread_attr_t attr;
         int result = pthread_attr_init(&attr);
