@@ -41,15 +41,22 @@ bool IsDebuggerAttached() {
 }
 
 void Break() {
-  static std::once_flag flag;
-  std::call_once(flag, []() {
-    // Install handler for sigtrap only once
-    std::signal(SIGTRAP, [](int) {
-      // Forward signal to default handler after being caught
-      std::signal(SIGTRAP, SIG_DFL);
-    });
-  });
+  // Do not touch the SIGTRAP disposition here. ExceptionHandler::Install owns
+  // it, and the previous std::signal call replaced the exception handler and
+  // then left SIGTRAP at SIG_DFL for the rest of the run, so the next guest
+  // breakpoint or trap killed the process.
+  //
+  // Only trap when a debugger is actually listening. It intercepts SIGTRAP
+  // ahead of any handler, which is the point of the call; with nobody attached
+  // the trap would reach the exception handler, go unclaimed, and be fatal.
+  if (!IsDebuggerAttached()) {
+    return;
+  }
+#if defined(__clang__)
+  __builtin_debugtrap();
+#else
   std::raise(SIGTRAP);
+#endif
 }
 
 namespace internal {
