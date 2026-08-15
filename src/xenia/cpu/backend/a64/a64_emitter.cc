@@ -10,6 +10,7 @@
 #include "xenia/cpu/backend/a64/a64_emitter.h"
 
 #include <cstring>
+#include <string>
 
 #include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
@@ -26,6 +27,7 @@
 #include "xenia/cpu/hir/label.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/cpu/thread_state.h"
 
 DECLARE_int64(a64_max_stackpoints);
 DECLARE_bool(a64_enable_host_guest_stack_synchronization);
@@ -422,7 +424,51 @@ void A64Emitter::RecordSequenceSample(uint32_t key, uint32_t host_bytes) {
 
 void A64Emitter::DebugBreak() { brk(0xF000); }
 
-void A64Emitter::Trap(uint16_t trap_type) { brk(trap_type); }
+// The guest-to-host thunk passes the context in x0, so these take it directly.
+static uint64_t TrapDebugPrint(void* raw_context) {
+  auto thread_state =
+      reinterpret_cast<ppc::PPCContext_s*>(raw_context)->thread_state;
+  uint32_t str_ptr = uint32_t(thread_state->context()->r[3]);
+  uint32_t str_length = uint32_t(thread_state->context()->r[4]);
+  auto str = thread_state->memory()->TranslateVirtual<const char*>(str_ptr);
+  std::string message(str, str_length);
+  XELOGD("(DebugPrint) {}", message);
+  return 0;
+}
+
+static uint64_t TrapDebugBreak(void* raw_context) {
+  XELOGE("tw/td forced trap hit! This should be a crash!");
+  if (cvars::break_on_debugbreak) {
+    xe::debugging::Break();
+  }
+  return 0;
+}
+
+void A64Emitter::Trap(uint16_t trap_type) {
+  // Mirrors X64Emitter::Trap. Emitting a bare `brk trap_type` instead meant a
+  // debug-print trap killed the process where the x64 backend logs and
+  // continues, and trap type 0 encoded to exactly the BRK the debugger patches
+  // in for breakpoints, so the two were indistinguishable in the handler.
+  switch (trap_type) {
+    case 20:
+    case 26:
+      // 0x0FE00014 is a 'debug print' where r3 = buffer r4 = length
+      CallNative(reinterpret_cast<void*>(&TrapDebugPrint));
+      break;
+    case 0:
+    case 22:
+      CallNative(reinterpret_cast<void*>(&TrapDebugBreak));
+      break;
+    case 25:
+      break;
+    default:
+      XELOGW("Unknown trap type {}", trap_type);
+      // Never brk #0: that is the breakpoint encoding the debugger patches in,
+      // and the exception handler tells them apart by encoding.
+      brk(0xF002);
+      break;
+  }
+}
 
 void A64Emitter::b(const Xbyak_aarch64::Cond cond,
                    const Xbyak_aarch64::Label& label) {
