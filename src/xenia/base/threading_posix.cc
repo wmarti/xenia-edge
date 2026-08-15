@@ -409,6 +409,8 @@ class PosixConditionBase {
     }
     if (executed) {
       post_execution();
+      lock.unlock();
+      post_execution_unlocked();
       return WaitResult::kSuccess;
     }
     return WaitResult::kTimeout;
@@ -560,6 +562,15 @@ class PosixConditionBase {
         } else {
           handles[first_signaled]->post_execution();
         }
+        // Then the parts that must not run under any handle's lock.
+        locks.clear();
+        if (wait_all) {
+          for (size_t i = 0; i < handles.size(); ++i) {
+            handles[i]->post_execution_unlocked();
+          }
+        } else {
+          handles[first_signaled]->post_execution_unlocked();
+        }
         return std::make_pair(WaitResult::kSuccess, first_signaled);
       }
 
@@ -605,6 +616,12 @@ class PosixConditionBase {
     ~ScopedParked() { --c_.parked_waiters_; }
     PosixConditionBase& c_;
   };
+
+  // Runs after mutex_ has been released. Anything that can block on the
+  // signalling thread belongs here, not in post_execution(): that runs with
+  // mutex_ held, and a thread that is on its way out needs mutex_ to publish
+  // its exit code.
+  inline virtual void post_execution_unlocked() {}
   std::condition_variable cond_;
   std::mutex mutex_;
 };
@@ -1337,14 +1354,22 @@ class PosixCondition<Thread> final : public PosixConditionBase {
  private:
   static void* ThreadStartRoutine(void* parameter);
   bool signaled() const override { return signaled_; }
-  void post_execution() override {
-    if (thread_ && !joined_) {
-      joined_ = true;
+  void post_execution() override {}
+
+  void post_execution_unlocked() override {
+    // Terminate() publishes signaled_ while the thread is still running, so a
+    // waiter can reach here before the thread has left its start routine. That
+    // thread takes mutex_ in its own tail to publish the exit code, so joining
+    // it while holding mutex_ deadlocked the pair permanently. Join here, with
+    // the lock released, and only once.
+    bool expected = false;
+    if (thread_ && joined_.compare_exchange_strong(expected, true)) {
       pthread_join(thread_, nullptr);
-    }
 #if XE_PLATFORM_LINUX
-    sem_destroy(&suspend_sem_);
+      // Safe now: the thread is gone and cannot touch the semaphore again.
+      sem_destroy(&suspend_sem_);
 #endif
+    }
   }
   pthread_t thread_;
 #if XE_PLATFORM_LINUX
@@ -1355,7 +1380,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   int exit_code_;
   State state_;             // Protected by state_mutex_
   uint32_t suspend_count_;  // Protected by state_mutex_
-  bool joined_;             // Prevents double pthread_join
+  std::atomic<bool> joined_;  // Prevents double pthread_join
 #if XE_PLATFORM_LINUX
   sem_t suspend_sem_;  // Async-signal-safe suspend/resume semaphore.
 #endif
