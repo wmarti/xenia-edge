@@ -3274,6 +3274,10 @@ EMITTER_OPCODE_TABLE(OPCODE_DID_SATURATE, DID_SATURATE);
 // ============================================================================
 struct MAX_F32 : Sequence<MAX_F32, I<OPCODE_MAX, F32Op, F32Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         float f;
@@ -3308,6 +3312,10 @@ struct MAX_F32 : Sequence<MAX_F32, I<OPCODE_MAX, F32Op, F32Op, F32Op>> {
 };
 struct MAX_F64 : Sequence<MAX_F64, I<OPCODE_MAX, F64Op, F64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         double d;
@@ -3435,6 +3443,10 @@ struct MIN_I64 : Sequence<MIN_I64, I<OPCODE_MIN, I64Op, I64Op, I64Op>> {
 };
 struct MIN_F32 : Sequence<MIN_F32, I<OPCODE_MIN, F32Op, F32Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         float f;
@@ -3467,6 +3479,10 @@ struct MIN_F32 : Sequence<MIN_F32, I<OPCODE_MIN, F32Op, F32Op, F32Op>> {
 };
 struct MIN_F64 : Sequence<MIN_F64, I<OPCODE_MIN, F64Op, F64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         double d;
@@ -3521,6 +3537,10 @@ EMITTER_OPCODE_TABLE(OPCODE_MIN, MIN_I8, MIN_I16, MIN_I32, MIN_I64, MIN_F32,
 struct CONVERT_I32_F32
     : Sequence<CONVERT_I32_F32, I<OPCODE_CONVERT, I32Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         float f;
@@ -3542,6 +3562,10 @@ struct CONVERT_I32_F32
 struct CONVERT_I32_F64
     : Sequence<CONVERT_I32_F64, I<OPCODE_CONVERT, I32Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         double d;
@@ -3564,6 +3588,10 @@ struct CONVERT_I32_F64
 struct CONVERT_I64_F64
     : Sequence<CONVERT_I64_F64, I<OPCODE_CONVERT, I64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         double d;
@@ -3585,6 +3613,10 @@ struct CONVERT_I64_F64
 struct CONVERT_F32_I32
     : Sequence<CONVERT_F32_I32, I<OPCODE_CONVERT, F32Op, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       e.mov(e.w0,
             static_cast<uint64_t>(static_cast<uint32_t>(i.src1.constant())));
@@ -3597,6 +3629,10 @@ struct CONVERT_F32_I32
 struct CONVERT_F64_I64
     : Sequence<CONVERT_F64_I64, I<OPCODE_CONVERT, F64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       e.mov(e.x0, static_cast<uint64_t>(i.src1.constant()));
       e.scvtf(i.dest, e.x0);
@@ -3650,6 +3686,10 @@ EMITTER_OPCODE_TABLE(OPCODE_CONVERT, CONVERT_I32_F32, CONVERT_I32_F64,
 // ============================================================================
 struct ROUND_F32 : Sequence<ROUND_F32, I<OPCODE_ROUND, F32Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     // Round mode is in i.instr->flags.
     if (i.src1.is_constant) {
       union {
@@ -3683,6 +3723,10 @@ struct ROUND_F32 : Sequence<ROUND_F32, I<OPCODE_ROUND, F32Op, F32Op>> {
 };
 struct ROUND_F64 : Sequence<ROUND_F64, I<OPCODE_ROUND, F64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         double d;
@@ -3819,6 +3863,10 @@ EMITTER_OPCODE_TABLE(OPCODE_SQRT, SQRT_F32, SQRT_F64, SQRT_V128);
 // ============================================================================
 struct IS_NAN_F32 : Sequence<IS_NAN_F32, I<OPCODE_IS_NAN, I8Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         float f;
@@ -3837,6 +3885,10 @@ struct IS_NAN_F32 : Sequence<IS_NAN_F32, I<OPCODE_IS_NAN, I8Op, F32Op>> {
 };
 struct IS_NAN_F64 : Sequence<IS_NAN_F64, I<OPCODE_IS_NAN, I8Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         double d;
@@ -3860,6 +3912,10 @@ EMITTER_OPCODE_TABLE(OPCODE_IS_NAN, IS_NAN_F32, IS_NAN_F64);
 struct COMPARE_EQ_F32
     : Sequence<COMPARE_EQ_F32, I<OPCODE_COMPARE_EQ, I8Op, F32Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         float f;
@@ -3898,6 +3954,10 @@ struct COMPARE_EQ_F32
 struct COMPARE_EQ_F64
     : Sequence<COMPARE_EQ_F64, I<OPCODE_COMPARE_EQ, I8Op, F64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         double d;
@@ -3937,6 +3997,10 @@ struct COMPARE_EQ_F64
 struct COMPARE_NE_F32
     : Sequence<COMPARE_NE_F32, I<OPCODE_COMPARE_NE, I8Op, F32Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         float f;
@@ -3975,6 +4039,10 @@ struct COMPARE_NE_F32
 struct COMPARE_NE_F64
     : Sequence<COMPARE_NE_F64, I<OPCODE_COMPARE_NE, I8Op, F64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     if (i.src1.is_constant) {
       union {
         double d;
@@ -4655,6 +4723,10 @@ struct RSQRT_F32 : Sequence<RSQRT_F32, I<OPCODE_RSQRT, F32Op, F32Op>> {
 };
 struct RSQRT_F64 : Sequence<RSQRT_F64, I<OPCODE_RSQRT, F64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // FPCR is left in VMX mode by the last vector float op in the block, and
+    // this sequence's result depends on it (flush-to-zero, rounding, NaN
+    // default). The call is free when the mode already matches.
+    e.ChangeFpcrMode(FPCRMode::Fpu);
     // PPC frsqrte uses a specific lookup table, not a high-precision estimate.
     DReg src = i.src1.is_constant ? e.d0 : DReg(i.src1.reg().getIdx());
     if (i.src1.is_constant) {
