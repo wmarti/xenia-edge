@@ -298,14 +298,29 @@ inline int SrcVReg(A64Emitter& e, const T& op, int scratch_idx) {
   return op.reg().getIdx();
 }
 
+// True when the 4 KB physical-range offset has to be emulated in the address
+// calculation because the host cannot express it with a mapping.
+inline bool NeedsPhysicalRemap() {
+  return xe::memory::allocation_granularity() > 0x1000;
+}
+
+// Applies the 0xE0000000 +0x1000 remap to w0, branch-free.
+inline void ApplyPhysicalRemapW0(A64Emitter& e) {
+  using namespace Xbyak_aarch64;
+  // w17 = w0 + 0x1000, kept only when w0 >= 0xE0000000.
+  e.mov(e.w17, 0xE0000000u);
+  e.cmp(e.w0, e.w17);
+  e.add(e.w17, e.w0, 1, 12);  // w17 = w0 + 0x1000 via LSL #12
+  e.csel(e.w0, e.w0, e.w17, LO);
+}
+
 // Compute a guest memory address, returning the XReg for [x21, xN] addressing.
 // For constants, loads the address into x0 (scratch).
 inline XReg ComputeMemoryAddress(A64Emitter& e, const I64Op& guest) {
   using namespace Xbyak_aarch64;
   if (guest.is_constant) {
     uint32_t address = static_cast<uint32_t>(guest.constant());
-    if (address >= 0xE0000000 &&
-        xe::memory::allocation_granularity() > 0x1000) {
+    if (address >= 0xE0000000 && NeedsPhysicalRemap()) {
       address += 0x1000;
     }
     e.mov(e.x0, static_cast<uint64_t>(address));
@@ -315,12 +330,8 @@ inline XReg ComputeMemoryAddress(A64Emitter& e, const I64Op& guest) {
     // Guest addresses are always 32-bit. Clear any stale upper bits before
     // applying the host membase so guest pointers can't escape above 4 GB.
     e.mov(e.w0, WReg(src.getIdx()));
-    if (xe::memory::allocation_granularity() > 0x1000) {
-      // Branch-free: w17 = w0 + 0x1000, kept only when w0 >= 0xE0000000.
-      e.mov(e.w17, 0xE0000000u);
-      e.cmp(e.w0, e.w17);
-      e.add(e.w17, e.w0, 1, 12);  // w17 = w0 + 0x1000 via LSL #12
-      e.csel(e.w0, e.w0, e.w17, LO);
+    if (NeedsPhysicalRemap()) {
+      ApplyPhysicalRemapW0(e);
     }
     return e.x0;
   }
@@ -332,7 +343,9 @@ inline XReg AddGuestMemoryOffset(A64Emitter& e, const XReg& base,
   // Guest address arithmetic wraps at 32 bits before the host membase is
   // applied. Keep the add in W registers so stale high bits can't escape into
   // the final host pointer.
-  e.mov(e.w0, WReg(base.getIdx()));
+  if (base.getIdx() != 0) {
+    e.mov(e.w0, WReg(base.getIdx()));
+  }
   if (offset.is_constant) {
     const uint32_t imm = static_cast<uint32_t>(offset.constant());
     const uint32_t neg = 0u - imm;
@@ -353,6 +366,40 @@ inline XReg AddGuestMemoryOffset(A64Emitter& e, const XReg& base,
     }
   } else {
     e.add(e.w0, e.w0, WReg(offset.reg().getIdx()));
+  }
+  return e.x0;
+}
+
+// Compute a guest memory address that carries a displacement.
+//
+// The 0xE0000000 physical remap has to be decided on the effective address, not
+// on the base alone: a base below the boundary whose displacement carries it
+// above still needs the +0x1000, and a base above it with a negative
+// displacement must not get one. Deciding on the base makes the same guest
+// address resolve two different ways depending on how constant folding split
+// it. The x64 backend already decides on base+offset
+// (x64_seq_memory.cc ComputeMemoryAddressOffset).
+template <typename OffsetOp>
+inline XReg ComputeMemoryAddressOffset(A64Emitter& e, const I64Op& guest,
+                                       const OffsetOp& offset) {
+  using namespace Xbyak_aarch64;
+  if (guest.is_constant && offset.is_constant) {
+    uint32_t address = static_cast<uint32_t>(guest.constant()) +
+                       static_cast<uint32_t>(offset.constant());
+    if (address >= 0xE0000000 && NeedsPhysicalRemap()) {
+      address += 0x1000;
+    }
+    e.mov(e.x0, static_cast<uint64_t>(address));
+    return e.x0;
+  }
+  if (guest.is_constant) {
+    e.mov(e.w0, static_cast<uint64_t>(static_cast<uint32_t>(guest.constant())));
+  } else {
+    e.mov(e.w0, WReg(guest.reg().getIdx()));
+  }
+  AddGuestMemoryOffset(e, e.x0, offset);
+  if (NeedsPhysicalRemap()) {
+    ApplyPhysicalRemapW0(e);
   }
   return e.x0;
 }

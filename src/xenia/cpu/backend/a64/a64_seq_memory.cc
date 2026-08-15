@@ -672,10 +672,10 @@ EMITTER_OPCODE_TABLE(OPCODE_LOAD_CLOCK, LOAD_CLOCK);
 struct LOAD_OFFSET_I8
     : Sequence<LOAD_OFFSET_I8, I<OPCODE_LOAD_OFFSET, I8Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressOffset(e, i.src1, i.src2);
     e.ldrb(i.dest, ptr(e.GetMembaseReg(), e.x0));
     if (IsTracingData()) {
-      AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2);
       e.mov(e.w2, i.dest);
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI8));
@@ -685,13 +685,13 @@ struct LOAD_OFFSET_I8
 struct LOAD_OFFSET_I16
     : Sequence<LOAD_OFFSET_I16, I<OPCODE_LOAD_OFFSET, I16Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressOffset(e, i.src1, i.src2);
     e.ldrh(i.dest, ptr(e.GetMembaseReg(), e.x0));
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev16(i.dest, i.dest);
     }
     if (IsTracingData()) {
-      AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2);
       e.mov(e.w2, i.dest);
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI16));
@@ -759,7 +759,7 @@ struct LOAD_OFFSET_I32
       e.b(done);
       e.L(normal_access);
       {
-        AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+        ComputeMemoryAddressOffset(e, i.src1, i.src2);
         e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           e.rev(i.dest, i.dest);
@@ -767,13 +767,13 @@ struct LOAD_OFFSET_I32
       }
       e.L(done);
     } else {
-      AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2);
       e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.rev(i.dest, i.dest);
       }
       if (IsTracingData()) {
-        AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+        ComputeMemoryAddressOffset(e, i.src1, i.src2);
         e.mov(e.w2, i.dest);
         e.mov(e.w1, e.w0);
         e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI32));
@@ -784,13 +784,13 @@ struct LOAD_OFFSET_I32
 struct LOAD_OFFSET_I64
     : Sequence<LOAD_OFFSET_I64, I<OPCODE_LOAD_OFFSET, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressOffset(e, i.src1, i.src2);
     e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev(i.dest, i.dest);
     }
     if (IsTracingData()) {
-      AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2);
       e.mov(e.x2, i.dest);
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI64));
@@ -804,7 +804,7 @@ struct STORE_OFFSET_I8
     : Sequence<STORE_OFFSET_I8,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I8Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressOffset(e, i.src1, i.src2);
     if (i.src3.is_constant) {
       e.mov(e.w17, static_cast<uint64_t>(i.src3.constant() & 0xFF));
       e.strb(e.w17, ptr(e.GetMembaseReg(), e.x0));
@@ -812,7 +812,7 @@ struct STORE_OFFSET_I8
       e.strb(i.src3, ptr(e.GetMembaseReg(), e.x0));
     }
     if (IsTracingData()) {
-      AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2);
       e.ldrb(e.w2, ptr(e.GetMembaseReg(), e.x0));
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI8));
@@ -823,7 +823,7 @@ struct STORE_OFFSET_I16
     : Sequence<STORE_OFFSET_I16,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressOffset(e, i.src1, i.src2);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       if (i.src3.is_constant) {
         uint16_t val = xe::byte_swap(static_cast<uint16_t>(i.src3.constant()));
@@ -841,7 +841,7 @@ struct STORE_OFFSET_I16
       }
     }
     if (IsTracingData()) {
-      AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2);
       e.ldrh(e.w2, ptr(e.GetMembaseReg(), e.x0));
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI16));
@@ -920,7 +920,7 @@ struct STORE_OFFSET_I32
       e.b(done);
       e.L(normal_access);
       {
-        AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+        ComputeMemoryAddressOffset(e, i.src1, i.src2);
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           if (i.src3.is_constant) {
             uint32_t val =
@@ -942,7 +942,7 @@ struct STORE_OFFSET_I32
       }
       e.L(done);
     } else {
-      AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2);
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         if (i.src3.is_constant) {
           uint32_t val =
@@ -962,7 +962,7 @@ struct STORE_OFFSET_I32
         }
       }
       if (IsTracingData()) {
-        AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+        ComputeMemoryAddressOffset(e, i.src1, i.src2);
         e.ldr(e.w2, ptr(e.GetMembaseReg(), e.x0));
         e.mov(e.w1, e.w0);
         e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI32));
@@ -974,7 +974,7 @@ struct STORE_OFFSET_I64
     : Sequence<STORE_OFFSET_I64,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressOffset(e, i.src1, i.src2);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       if (i.src3.is_constant) {
         uint64_t val = xe::byte_swap(static_cast<uint64_t>(i.src3.constant()));
@@ -992,7 +992,7 @@ struct STORE_OFFSET_I64
       }
     }
     if (IsTracingData()) {
-      AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2);
       e.ldr(e.x2, ptr(e.GetMembaseReg(), e.x0));
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI64));
