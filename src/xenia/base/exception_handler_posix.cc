@@ -428,6 +428,17 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
     }
   }
 
+  if (signal_number == SIGTRAP) {
+    // A trap is not a fault. Returning from the handler resumes *after* the
+    // instruction on x86-64, so restoring the disposition and returning would
+    // continue straight past an unclaimed breakpoint -- and past every failed
+    // xenia_assert, which is raise(SIGTRAP) on POSIX. Hand it back to whoever
+    // owned it and make sure it actually lands.
+    sigaction(SIGTRAP, &original_sigtrap_handler_, nullptr);
+    raise(SIGTRAP);
+    return;
+  }
+
   // Unhandled: restore the original disposition so the kernel re-delivers
   // the signal to it on instruction retry, otherwise we loop forever.
   struct sigaction* original_handler = nullptr;
@@ -440,9 +451,6 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       break;
     case SIGILL:
       original_handler = &original_sigill_handler_;
-      break;
-    case SIGTRAP:
-      original_handler = &original_sigtrap_handler_;
       break;
   }
   if (original_handler) {
