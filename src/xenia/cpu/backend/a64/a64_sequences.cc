@@ -4087,82 +4087,88 @@ struct COMPARE_NE_F64
 };
 
 // Float compares for SLT/SLE/SGT/SGE (use MI/LS/GT/GE for ordered compares)
-#define DEFINE_FLOAT_COMPARE(NAME, COND_S, COND_D)                   \
-  struct NAME##_F32                                                  \
-      : Sequence<NAME##_F32, I<OPCODE_##NAME, I8Op, F32Op, F32Op>> { \
-    static void Emit(A64Emitter& e, const EmitArgType& i) {          \
-      if (i.src1.is_constant) {                                      \
-        union {                                                      \
-          float f;                                                   \
-          uint32_t u;                                                \
-        } c;                                                         \
-        c.f = i.src1.constant();                                     \
-        e.mov(e.w0, static_cast<uint64_t>(c.u));                     \
-        e.fmov(e.s0, e.w0);                                          \
-        if (i.src2.is_constant) {                                    \
-          union {                                                    \
-            float f;                                                 \
-            uint32_t u;                                              \
-          } c2;                                                      \
-          c2.f = i.src2.constant();                                  \
-          e.mov(e.w0, static_cast<uint64_t>(c2.u));                  \
-          e.fmov(e.s1, e.w0);                                        \
-          e.fcmp(e.s0, e.s1);                                        \
-        } else {                                                     \
-          e.fcmp(e.s0, i.src2);                                      \
-        }                                                            \
-      } else if (i.src2.is_constant) {                               \
-        union {                                                      \
-          float f;                                                   \
-          uint32_t u;                                                \
-        } c;                                                         \
-        c.f = i.src2.constant();                                     \
-        e.mov(e.w0, static_cast<uint64_t>(c.u));                     \
-        e.fmov(e.s0, e.w0);                                          \
-        e.fcmp(i.src1, e.s0);                                        \
-      } else {                                                       \
-        e.fcmp(i.src1, i.src2);                                      \
-      }                                                              \
-      e.cset(i.dest, Xbyak_aarch64::COND_S);                         \
-    }                                                                \
-  };                                                                 \
-  struct NAME##_F64                                                  \
-      : Sequence<NAME##_F64, I<OPCODE_##NAME, I8Op, F64Op, F64Op>> { \
-    static void Emit(A64Emitter& e, const EmitArgType& i) {          \
-      if (i.src1.is_constant) {                                      \
-        union {                                                      \
-          double d;                                                  \
-          uint64_t u;                                                \
-        } c;                                                         \
-        c.d = i.src1.constant();                                     \
-        e.mov(e.x0, c.u);                                            \
-        e.fmov(e.d0, e.x0);                                          \
-        if (i.src2.is_constant) {                                    \
-          union {                                                    \
-            double d;                                                \
-            uint64_t u;                                              \
-          } c2;                                                      \
-          c2.d = i.src2.constant();                                  \
-          e.mov(e.x0, c2.u);                                         \
-          e.fmov(e.d1, e.x0);                                        \
-          e.fcmp(e.d0, e.d1);                                        \
-        } else {                                                     \
-          e.fcmp(e.d0, i.src2);                                      \
-        }                                                            \
-      } else if (i.src2.is_constant) {                               \
-        union {                                                      \
-          double d;                                                  \
-          uint64_t u;                                                \
-        } c;                                                         \
-        c.d = i.src2.constant();                                     \
-        e.mov(e.x0, c.u);                                            \
-        e.fmov(e.d0, e.x0);                                          \
-        e.fcmp(i.src1, e.d0);                                        \
-      } else {                                                       \
-        e.fcmp(i.src1, i.src2);                                      \
-      }                                                              \
-      e.cset(i.dest, Xbyak_aarch64::COND_D);                         \
-    }                                                                \
+#define DEFINE_FLOAT_COMPARE(NAME, COND_S, COND_D)                     \
+  struct NAME##_F32                                                    \
+      : Sequence<NAME##_F32, I<OPCODE_##NAME, I8Op, F32Op, F32Op>> {   \
+    static void Emit(A64Emitter& e, const EmitArgType& i) {            \
+      /* fcmp reads FPCR, and the last vector float op in the block */ \
+      /* left it in VMX mode. Free when the mode already matches.   */ \
+      e.ChangeFpcrMode(FPCRMode::Fpu);                                 \
+      if (i.src1.is_constant) {                                        \
+        union {                                                        \
+          float f;                                                     \
+          uint32_t u;                                                  \
+        } c;                                                           \
+        c.f = i.src1.constant();                                       \
+        e.mov(e.w0, static_cast<uint64_t>(c.u));                       \
+        e.fmov(e.s0, e.w0);                                            \
+        if (i.src2.is_constant) {                                      \
+          union {                                                      \
+            float f;                                                   \
+            uint32_t u;                                                \
+          } c2;                                                        \
+          c2.f = i.src2.constant();                                    \
+          e.mov(e.w0, static_cast<uint64_t>(c2.u));                    \
+          e.fmov(e.s1, e.w0);                                          \
+          e.fcmp(e.s0, e.s1);                                          \
+        } else {                                                       \
+          e.fcmp(e.s0, i.src2);                                        \
+        }                                                              \
+      } else if (i.src2.is_constant) {                                 \
+        union {                                                        \
+          float f;                                                     \
+          uint32_t u;                                                  \
+        } c;                                                           \
+        c.f = i.src2.constant();                                       \
+        e.mov(e.w0, static_cast<uint64_t>(c.u));                       \
+        e.fmov(e.s0, e.w0);                                            \
+        e.fcmp(i.src1, e.s0);                                          \
+      } else {                                                         \
+        e.fcmp(i.src1, i.src2);                                        \
+      }                                                                \
+      e.cset(i.dest, Xbyak_aarch64::COND_S);                           \
+    }                                                                  \
+  };                                                                   \
+  struct NAME##_F64                                                    \
+      : Sequence<NAME##_F64, I<OPCODE_##NAME, I8Op, F64Op, F64Op>> {   \
+    static void Emit(A64Emitter& e, const EmitArgType& i) {            \
+      /* fcmp reads FPCR, and the last vector float op in the block */ \
+      /* left it in VMX mode. Free when the mode already matches.   */ \
+      e.ChangeFpcrMode(FPCRMode::Fpu);                                 \
+      if (i.src1.is_constant) {                                        \
+        union {                                                        \
+          double d;                                                    \
+          uint64_t u;                                                  \
+        } c;                                                           \
+        c.d = i.src1.constant();                                       \
+        e.mov(e.x0, c.u);                                              \
+        e.fmov(e.d0, e.x0);                                            \
+        if (i.src2.is_constant) {                                      \
+          union {                                                      \
+            double d;                                                  \
+            uint64_t u;                                                \
+          } c2;                                                        \
+          c2.d = i.src2.constant();                                    \
+          e.mov(e.x0, c2.u);                                           \
+          e.fmov(e.d1, e.x0);                                          \
+          e.fcmp(e.d0, e.d1);                                          \
+        } else {                                                       \
+          e.fcmp(e.d0, i.src2);                                        \
+        }                                                              \
+      } else if (i.src2.is_constant) {                                 \
+        union {                                                        \
+          double d;                                                    \
+          uint64_t u;                                                  \
+        } c;                                                           \
+        c.d = i.src2.constant();                                       \
+        e.mov(e.x0, c.u);                                              \
+        e.fmov(e.d0, e.x0);                                            \
+        e.fcmp(i.src1, e.d0);                                          \
+      } else {                                                         \
+        e.fcmp(i.src1, i.src2);                                        \
+      }                                                                \
+      e.cset(i.dest, Xbyak_aarch64::COND_D);                           \
+    }                                                                  \
   }
 
 DEFINE_FLOAT_COMPARE(COMPARE_SLT, MI, MI);
