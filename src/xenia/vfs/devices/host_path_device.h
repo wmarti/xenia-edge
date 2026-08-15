@@ -47,6 +47,10 @@ class HostPathDevice : public Device {
 
  private:
   void PopulateEntry(HostPathEntry* parent_entry);
+  // ancestors carries the canonical paths already on the recursion stack, so a
+  // directory symlink that points back at one of them is not followed forever.
+  void PopulateEntry(HostPathEntry* parent_entry,
+                     std::vector<std::filesystem::path>& ancestors);
 
   std::string name_;
   std::filesystem::path host_path_;

@@ -129,6 +129,28 @@ uint64_t StfsSingleFileContainerSize(uint64_t payload_size) {
 }  // namespace
 
 void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
+  std::vector<std::filesystem::path> ancestors;
+  PopulateEntry(parent_entry, ancestors);
+}
+
+void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry,
+                                   std::vector<std::filesystem::path>& ancestors) {
+  // A directory here can be a symlink (ListFiles classifies from stat, matching
+  // what Windows reports for a junction), so the walk has to be cycle-safe.
+  std::error_code ec;
+  auto canonical_self = std::filesystem::canonical(parent_entry->host_path(), ec);
+  if (!ec) {
+    for (const auto& seen : ancestors) {
+      if (seen == canonical_self) {
+        XELOGW("HostPathDevice: {} is already on the path being walked; not "
+               "following it again",
+               xe::path_to_utf8(parent_entry->host_path()));
+        return;
+      }
+    }
+    ancestors.push_back(canonical_self);
+  }
+
   auto child_infos = xe::filesystem::ListFiles(parent_entry->host_path());
   for (auto& child_info : child_infos) {
     // On the content partition, present a single-file package (a directory
@@ -164,8 +186,12 @@ void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
     parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
 
     if (child_info.type == xe::filesystem::FileInfo::Type::kDirectory) {
-      PopulateEntry(child);
+      PopulateEntry(child, ancestors);
     }
+  }
+
+  if (!ec) {
+    ancestors.pop_back();
   }
 }
 
