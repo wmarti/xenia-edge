@@ -51,6 +51,12 @@ struct EmitFunctionInfo {
   } code_size;
   size_t prolog_stack_alloc_offset;
   size_t stack_size;
+  // True only for the HostToGuest thunk, which is the one function that saves
+  // the full callee-saved set and therefore needs a full unwind description.
+  // Must be explicit: a guest function whose frame happens to match the thunk's
+  // is otherwise indistinguishable, and a guest function's frame holds locals
+  // at the offsets the thunk's unwind record claims for saved registers.
+  bool is_host_to_guest_thunk;
 #if XE_ARCH_ARM64
   // Offset from SP where x30 (LR) is saved.  ARM64 callees save LR
   // explicitly at varying offsets; the unwind info generator needs this
