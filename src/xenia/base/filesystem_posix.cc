@@ -8,6 +8,8 @@
  */
 
 #include "xenia/base/assert.h"
+#include <cstring>
+
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string.h"
@@ -91,10 +93,15 @@ std::filesystem::path GetUserFolder() {
   // if HOME not set, fall back to this
   if (home == NULL) {
     struct passwd pw1;
-    struct passwd* pw;
+    struct passwd* pw = nullptr;
     char buf[4096];  // could potentionally lower this
-    getpwuid_r(getuid(), &pw1, buf, sizeof(buf), &pw);
-    assert(&pw1 == pw);  // sanity check
+    // getpwuid_r reports "no entry" by returning 0 with a null result, so the
+    // pointer has to be checked before it is dereferenced.
+    if (getpwuid_r(getuid(), &pw1, buf, sizeof(buf), &pw) != 0 || !pw) {
+      XELOGW("GetUserFolder: no HOME and no passwd entry; using the current "
+             "directory");
+      return std::filesystem::current_path() / ".local" / "share";
+    }
     home = pw->pw_dir;
   }
 
@@ -259,12 +266,22 @@ std::vector<FileInfo> ListFilesUnsorted(const std::filesystem::path& path) {
 
     info.name = ent->d_name;
     struct stat st;
-    stat((path / info.name).c_str(), &st);
+    if (stat((path / info.name).c_str(), &st) != 0) {
+      // Dangling symlink, or the entry went away between readdir and stat.
+      // Fall back to the link itself so the entry is still listed, and zero the
+      // fields rather than reading an uninitialised struct.
+      if (lstat((path / info.name).c_str(), &st) != 0) {
+        std::memset(&st, 0, sizeof(st));
+      }
+    }
     info.create_timestamp = convertUnixtimeToWinFiletime(st.st_ctime);
     info.access_timestamp = convertUnixtimeToWinFiletime(st.st_atime);
     info.write_timestamp = convertUnixtimeToWinFiletime(st.st_mtime);
     info.path = path;
-    if (ent->d_type == DT_DIR) {
+    // Classify from the stat, not d_type: d_type reports DT_LNK for a symlink
+    // to a directory (and DT_UNKNOWN on filesystems that do not carry it), so
+    // symlinked directories were listed as files.
+    if (S_ISDIR(st.st_mode)) {
       info.type = FileInfo::Type::kDirectory;
       info.total_size = 0;
     } else {
