@@ -815,6 +815,14 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
 void A64Emitter::CallNative(void* fn) { CallNativeSafe(fn); }
 
 void A64Emitter::CallNativeSafe(void* fn) {
+  // The guest-to-host thunk unconditionally reinstalls fpcr_fpu on the way
+  // back, so whatever mode this emitter thinks is live is stale afterwards.
+  // Call, CallIndirect and CallExtern already do this; without it here a VMX
+  // float op after the call skips its msr and runs with FZ clear.
+  // Must be ForgetFpcrMode rather than "assume Fpu": with inline MMIO checks
+  // the call sits inside a taken branch, and the fall-through path never
+  // executes the thunk.
+  ForgetFpcrMode();
   // GuestToHostThunk: x0=target function, x1/x2=args (set by caller).
   // The thunk rearranges: saves x0 in x9, sets x0=context, calls x9.
   mov(x0, reinterpret_cast<uint64_t>(fn));
