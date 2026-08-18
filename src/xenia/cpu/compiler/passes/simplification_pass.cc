@@ -72,7 +72,29 @@ static bool SameValueOrEqualConstant(hir::Value* x, hir::Value* y) {
   }
 
   if (x->IsConstant() && y->IsConstant()) {
-    return x->AsUint64() == y->AsUint64();
+    if (x->type != y->type) {
+      return false;
+    }
+    // Compare raw bits, not AsUint64: scalar compares also come in float
+    // flavours (the FPSCR derivation for the fct* conversions compares
+    // against float bounds), and AsUint64 on a float constant asserts in
+    // debug and returns 0 in release -- which made every pair of float
+    // constants look equal and let the pass merge compares against
+    // different bounds.
+    switch (x->type) {
+      case hir::INT8_TYPE:
+        return x->constant.u8 == y->constant.u8;
+      case hir::INT16_TYPE:
+        return x->constant.u16 == y->constant.u16;
+      case hir::INT32_TYPE:
+      case hir::FLOAT32_TYPE:
+        return x->constant.u32 == y->constant.u32;
+      case hir::INT64_TYPE:
+      case hir::FLOAT64_TYPE:
+        return x->constant.u64 == y->constant.u64;
+      default:
+        return false;
+    }
   }
 
   return false;
