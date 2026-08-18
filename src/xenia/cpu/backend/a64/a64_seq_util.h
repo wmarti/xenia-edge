@@ -406,26 +406,35 @@ inline XReg ComputeMemoryAddressOffset(A64Emitter& e, const I64Op& guest,
 
 // Flush denormal float32 lanes to zero in a NEON register (in-place).
 // A float32 is denormal when 0 < abs(val) < 0x00800000.
-// vreg must not equal sa or sb.
 // This is needed because FPCR.FZ may not flush denormal inputs on all ARM64
 // implementations (the ARM spec says input flushing is implementation-defined).
+//
+// Loads the threshold the comparison below needs: 0x01000000, the smallest
+// normal magnitude with the sign shifted out.
+inline void LoadDenormalThreshold_V128(A64Emitter& e, int k) {
+  e.movi(VReg(k).s4, 0x1, LSL, 24);
+}
+
+// The K-preloaded body. val<<1 drops the sign and doubles the magnitude:
+// denormals land in [0x00000002, 0x00FFFFFE] and zeros at 0, both below
+// 0x01000000; the smallest normal lands exactly on it. Masking zero lanes too
+// is deliberate - bic of bits 30:0 is a no-op on a zero of either sign - so no
+// instruction is spent excluding them. ushr clears bit 31 of the mask, which
+// keeps the sign: -denormal flushes to -0, +denormal to +0.
+// vreg must equal neither k nor t.
+inline void FlushDenormalsWithK_V128(A64Emitter& e, int vreg, int k, int t) {
+  e.shl(VReg(t).s4, VReg(vreg).s4, 1);
+  e.cmhi(VReg(t).s4, VReg(k).s4,
+         VReg(t).s4);  // mask: all-1s for denormal-or-zero lanes
+  e.ushr(VReg(t).s4, VReg(t).s4, 1);  // clear bit 31: preserve the sign
+  e.bic(VReg(vreg).b16, VReg(vreg).b16, VReg(t).b16);
+}
+
+// One-shot form for single flushes; multi-flush sites load K once themselves.
 inline void FlushDenormals_V128(A64Emitter& e, int vreg, int sa = 2,
                                 int sb = 3) {
-  // val<<1 removes the sign bit and doubles the value.
-  // Denormals become [0x00000002, 0x00FFFFFE]; zeros become 0x00000000.
-  // (val<<1) - 1: wraps 0→0xFFFFFFFF (excluded),
-  // denorms→[0x00000001,0x00FFFFFD]. Denormal iff ((val<<1) - 1) < 0x00FFFFFF
-  // (unsigned).
-  e.shl(VReg(sa).s4, VReg(vreg).s4, 1);
-  e.movi(VReg(sb).s4, 1u);
-  e.sub(VReg(sa).s4, VReg(sa).s4, VReg(sb).s4);
-  e.mvni(VReg(sb).s4, 0xFFu, LSL, 24);  // 0x00FFFFFF
-  e.cmhi(VReg(sb).s4, VReg(sb).s4,
-         VReg(sa).s4);  // mask: all-1s for denormal lanes
-  // Clear only bits 30:0 (preserve sign bit 31) so -denormal → -0, +denormal →
-  // +0.
-  e.ushr(VReg(sa).s4, VReg(sb).s4, 1);  // sa = mask with bit 31 cleared
-  e.bic(VReg(vreg).b16, VReg(vreg).b16, VReg(sa).b16);
+  LoadDenormalThreshold_V128(e, sa);
+  FlushDenormalsWithK_V128(e, vreg, sa, sb);
 }
 
 // Fixup for vmaxfp/vminfp NaN lanes.
@@ -464,8 +473,9 @@ inline void PrepareVmxFpSources(A64Emitter& e, const T1& op1, const T2& op2,
   }
   // Flush denormal inputs in software only if FPCR.FZ doesn't handle it.
   if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-    FlushDenormals_V128(e, 0);
-    FlushDenormals_V128(e, 1);
+    LoadDenormalThreshold_V128(e, 2);
+    FlushDenormalsWithK_V128(e, 0, 2, 3);
+    FlushDenormalsWithK_V128(e, 1, 2, 3);
   }
   out_s1 = 0;
   out_s2 = 1;
@@ -514,9 +524,10 @@ inline void PrepareVmxFmaSources(A64Emitter& e, const T1& op1, const T2& op2,
     e.mov(VReg(3).b16, VReg(s3).b16);
   }
   if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-    FlushDenormals_V128(e, 0, 2, tmp);
-    FlushDenormals_V128(e, 1, 2, tmp);
-    FlushDenormals_V128(e, 3, 2, tmp);
+    LoadDenormalThreshold_V128(e, 2);
+    FlushDenormalsWithK_V128(e, 0, 2, tmp);
+    FlushDenormalsWithK_V128(e, 1, 2, tmp);
+    FlushDenormalsWithK_V128(e, 3, 2, tmp);
   }
 }
 
