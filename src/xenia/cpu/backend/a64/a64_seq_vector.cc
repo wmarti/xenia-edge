@@ -975,40 +975,50 @@ struct PERMUTE_V128
                I<OPCODE_PERMUTE, V128Op, V128Op, V128Op, V128Op>> {
   static void EmitByInt8(A64Emitter& e, const EmitArgType& i) {
     int d = i.dest.reg().getIdx();
-    // Copy src2 to v0, src3 to v1 (consecutive for 2-register TBL).
+    // The old sequence XORed every control byte with 3 to remap PPC byte
+    // order. Byte-reversing each 32-bit word of the *tables* instead achieves
+    // the same thing one level up: rev32_table[idx & 0x1F] equals
+    // raw_table[(idx ^ 3) & 0x1F], because ^3 stays inside the 5-bit mask and
+    // never crosses the 16-byte two-register TBL boundary (bit 4 unchanged).
+    // rev32 also replaces the plain copies into v0/v1, and constant tables
+    // get their bytes swapped on the host for free.
+    //
+    // Compute the masked control first: the control register is read before
+    // v0/v1 are written, so no conflict copy is needed either.
+    if (i.src1.is_constant) {
+      // Fold the mask on the host too; the adjusted constant is sometimes
+      // movi-encodable, shrinking the load.
+      vec128_t ctrl = i.src1.constant();
+      for (int k = 0; k < 16; k++) {
+        ctrl.u8[k] &= 0x1F;
+      }
+      LoadV128Const(e, 2, ctrl);
+    } else {
+      e.movi(VReg(2).b16, 0x1F);
+      e.and_(VReg(2).b16, VReg(i.src1.reg().getIdx()).b16, VReg(2).b16);
+    }
     if (i.src2.is_constant) {
-      LoadV128Const(e, 0, i.src2.constant());
-    } else if (i.src2.reg().getIdx() != 0) {
-      e.orr(VReg(0).b16, VReg(i.src2.reg().getIdx()).b16,
-            VReg(i.src2.reg().getIdx()).b16);
+      vec128_t t = i.src2.constant();
+      vec128_t swapped;
+      for (int k = 0; k < 16; k++) {
+        swapped.u8[k] = t.u8[k ^ 3];
+      }
+      LoadV128Const(e, 0, swapped);
+    } else {
+      e.rev32(VReg(0).b16, VReg(i.src2.reg().getIdx()).b16);
     }
     if (i.src3.is_constant) {
-      LoadV128Const(e, 1, i.src3.constant());
-    } else if (i.src3.reg().getIdx() != 1) {
-      e.orr(VReg(1).b16, VReg(i.src3.reg().getIdx()).b16,
-            VReg(i.src3.reg().getIdx()).b16);
-    }
-    // Load control vector into v2, XOR each byte with 3 for endian swap.
-    int ctrl;
-    if (i.src1.is_constant) {
-      LoadV128Const(e, 2, i.src1.constant());
-      ctrl = 2;
-    } else {
-      ctrl = i.src1.reg().getIdx();
-      if (ctrl == 0 || ctrl == 1) {
-        // Control conflicts with table registers, copy to v2.
-        e.orr(VReg(2).b16, VReg(ctrl).b16, VReg(ctrl).b16);
-        ctrl = 2;
+      vec128_t t = i.src3.constant();
+      vec128_t swapped;
+      for (int k = 0; k < 16; k++) {
+        swapped.u8[k] = t.u8[k ^ 3];
       }
+      LoadV128Const(e, 1, swapped);
+    } else {
+      e.rev32(VReg(1).b16, VReg(i.src3.reg().getIdx()).b16);
     }
-    // XOR control bytes with 0x03 to remap PPC byte indices to LE,
-    // then mask to 5 bits (0-31) so TBL indices stay in range.
-    e.movi(VReg(3).b16, 0x03);
-    e.eor(VReg(3).b16, VReg(ctrl).b16, VReg(3).b16);
-    e.movi(VReg(2).b16, 0x1F);
-    e.and_(VReg(3).b16, VReg(3).b16, VReg(2).b16);
     // TBL with 2-register table {v0, v1}.
-    e.tbl(VReg(d).b16, VReg(0).b16, 2, VReg(3).b16);
+    e.tbl(VReg(d).b16, VReg(0).b16, 2, VReg(2).b16);
   }
 
   static void EmitByInt16(A64Emitter& e, const EmitArgType& i) {
