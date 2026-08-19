@@ -202,10 +202,12 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   }
   code_offsets.prolog_stack_alloc = getSize();
 
-  // Store host return address (x30/LR) so the epilog can restore it.
-  str(x30, ptr(sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
-  // Store guest PPC return address (passed in x0 by convention).
-  str(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+  // Store the guest PPC return address (passed in x0 by convention) and the
+  // host return address (x30/LR) with one paired store; the layout keeps the
+  // two slots adjacent for exactly this.
+  static_assert(StackLayout::HOST_RET_ADDR ==
+                StackLayout::GUEST_RET_ADDR + 8);
+  stp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
   // Store zero for call return address (we haven't made a call yet).
   str(xzr, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
 
@@ -641,8 +643,8 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     } else {
       // Tail call: pass our return address to the callee.
       PopStackpoint();
-      ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
-      ldr(x30, ptr(sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
+      ldp(x0, x30,
+          ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
       if (stack_size() <= 4095) {
         add(sp, sp, static_cast<uint32_t>(stack_size()));
       } else {
@@ -697,8 +699,8 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
 
   if (instr->flags & hir::CALL_TAIL) {
     PopStackpoint();
-    ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
-    ldr(x30, ptr(sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
+    ldp(x0, x30,
+        ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
     if (stack_size() <= 4095) {
       add(sp, sp, static_cast<uint32_t>(stack_size()));
     } else {
@@ -844,8 +846,8 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
   if (instr->flags & hir::CALL_TAIL) {
     // Tail call: pass our return address to the callee.
     PopStackpoint();
-    ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
-    ldr(x30, ptr(sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
+    ldp(x0, x30,
+        ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
     if (stack_size() <= 4095) {
       add(sp, sp, static_cast<uint32_t>(stack_size()));
     } else {
