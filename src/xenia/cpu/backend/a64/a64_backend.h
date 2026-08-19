@@ -108,6 +108,12 @@ struct A64BackendContext {
   ReserveHelper* reserve_helper_;
   uint64_t cached_reserve_value_;
   uint64_t* guest_tick_count;
+  // Constants for CALL_INDIRECT's encoded indirection mode, loaded with one
+  // ldr from x19 instead of a 3-4 instruction immediate materialisation per
+  // call site. Stable after code-cache Initialize.
+  uint64_t indirection_table_bias;
+  uint64_t code_execute_base;
+  uint64_t external_indirection_table;
   A64BackendStackpoint* stackpoints;
   // address of the live reservation, and its granule generation when taken
   uint32_t reserve_address;

@@ -227,6 +227,11 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
                  const Xbyak_aarch64::Label& label) {
     CodeGenerator::cbnz(rt, label);
   }
+  // +/-32 KiB only; guard with near_tbz_branches_safe_.
+  void tbnz_near(const Xbyak_aarch64::WReg& rt, uint32_t bit,
+                 const Xbyak_aarch64::Label& label) {
+    CodeGenerator::tbnz(rt, bit, label);
+  }
 
   // Shadow of CodeGenerator::L that records the bind offset so later
   // branches to this label can be emitted in single-instruction form.
@@ -275,6 +280,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // True when every tail label of the current function provably sits within
   // the +/-1 MiB reach of cbnz/b.cond (set per function in Emit).
   bool near_tail_branches_safe_ = false;
+  // Same, for tbnz's +/-32 KiB reach.
+  bool near_tbz_branches_safe_ = false;
 
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t vec_reg_map_[VEC_COUNT];

@@ -153,6 +153,8 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
       }
     }
     near_tail_branches_safe_ = hir_instr_count * 256 < (768 * 1024);
+    // tbnz reaches only +/-32 KiB, so its tail form needs a tighter bound.
+    near_tbz_branches_safe_ = hir_instr_count * 256 < (24 * 1024);
   }
 
   // Calculate local variable stack offsets.
@@ -644,29 +646,64 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
       // 32-bit host target.
       ldr(w9, ptr(x16, static_cast<uint32_t>(0)));
     } else {
-      // Encoded path: see A64CodeCache for the entry format.
-      Label external_target;
-      Label indirection_ready;
-
-      mov(x14, code_cache_->indirection_table_base_bias());
+      // Encoded path: see A64CodeCache for the entry format. The three
+      // constants live in the backend context, so each costs one ldr instead
+      // of a 3-4 instruction immediate materialisation per call site.
+      static_assert(offsetof(A64BackendContext, indirection_table_bias) <
+                        4096 &&
+                    offsetof(A64BackendContext, external_indirection_table) <
+                        4096);
+      ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
+                            A64BackendContext, indirection_table_bias))));
       add(x14, x14, w16, UXTW);
       ldr(w9, ptr(x14, static_cast<uint32_t>(0)));
-      tbnz(w9, 31, external_target);
 
-      // Internal: rel32 from code cache base.
-      mov(x14, code_cache_->execute_base_address());
-      add(x9, x14, w9, UXTW);
-      b(indirection_ready);
+      if (near_tbz_branches_safe_) {
+        // External targets (host thunks and trampolines) number in the
+        // dozens per title, so that case is cold: emit it in the tail.
+        auto& indirection_ready = NewCachedLabel();
+        auto& external_target =
+            AddToTail([&indirection_ready](A64Emitter& e, Label&) {
+              e.and_(e.w15, e.w9,
+                     A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14,
+                    ptr(e.x19,
+                        static_cast<uint32_t>(offsetof(
+                            A64BackendContext, external_indirection_table))));
+              e.add(e.x14, e.x14, e.x15, LSL, 3);
+              e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.b(indirection_ready);
+            });
+        tbnz_near(w9, 31, external_target);
 
-      // External: tagged index into the side table.
-      L(external_target);
-      and_(w15, w9, A64CodeCache::kIndirectionExternalIndexMask);
-      mov(x14, code_cache_->external_indirection_table_base_address());
-      lsl(x15, x15, 3);
-      add(x14, x14, x15);
-      ldr(x9, ptr(x14, static_cast<uint32_t>(0)));
+        // Internal: rel32 from code cache base.
+        ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
+                              A64BackendContext, code_execute_base))));
+        add(x9, x14, w9, UXTW);
+        L(indirection_ready);
+      } else {
+        // Function too large to prove the +/-32 KiB tbnz reach: keep the
+        // external case inline.
+        Label external_target;
+        Label indirection_ready;
+        tbnz(w9, 31, external_target);
 
-      L(indirection_ready);
+        // Internal: rel32 from code cache base.
+        ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
+                              A64BackendContext, code_execute_base))));
+        add(x9, x14, w9, UXTW);
+        b(indirection_ready);
+
+        // External: tagged index into the side table.
+        L(external_target);
+        and_(w15, w9, A64CodeCache::kIndirectionExternalIndexMask);
+        ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
+                              A64BackendContext, external_indirection_table))));
+        add(x14, x14, x15, LSL, 3);
+        ldr(x9, ptr(x14, static_cast<uint32_t>(0)));
+
+        L(indirection_ready);
+      }
     }
   } else {
     // No indirection table: resolve at runtime.
@@ -789,29 +826,56 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
       // 32-bit host target.
       ldr(w9, ptr(x16, static_cast<uint32_t>(0)));
     } else {
-      // Encoded path: see A64CodeCache for the entry format.
-      Label external_target;
-      Label indirection_ready;
-
-      mov(x14, code_cache_->indirection_table_base_bias());
+      // Encoded path: see A64CodeCache for the entry format. Constants come
+      // from the backend context (one ldr each) and the cold external case
+      // sits in the tail when tbnz's +/-32 KiB reach is provable.
+      ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
+                            A64BackendContext, indirection_table_bias))));
       add(x14, x14, w16, UXTW);
       ldr(w9, ptr(x14, static_cast<uint32_t>(0)));
-      tbnz(w9, 31, external_target);
 
-      // Internal: rel32 from code cache base.
-      mov(x14, code_cache_->execute_base_address());
-      add(x9, x14, w9, UXTW);
-      b(indirection_ready);
+      if (near_tbz_branches_safe_) {
+        auto& indirection_ready = NewCachedLabel();
+        auto& external_target =
+            AddToTail([&indirection_ready](A64Emitter& e, Label&) {
+              e.and_(e.w15, e.w9,
+                     A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14,
+                    ptr(e.x19,
+                        static_cast<uint32_t>(offsetof(
+                            A64BackendContext, external_indirection_table))));
+              e.add(e.x14, e.x14, e.x15, LSL, 3);
+              e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.b(indirection_ready);
+            });
+        tbnz_near(w9, 31, external_target);
 
-      // External: tagged index into the side table.
-      L(external_target);
-      and_(w15, w9, A64CodeCache::kIndirectionExternalIndexMask);
-      mov(x14, code_cache_->external_indirection_table_base_address());
-      lsl(x15, x15, 3);
-      add(x14, x14, x15);
-      ldr(x9, ptr(x14, static_cast<uint32_t>(0)));
+        // Internal: rel32 from code cache base.
+        ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
+                              A64BackendContext, code_execute_base))));
+        add(x9, x14, w9, UXTW);
+        L(indirection_ready);
+      } else {
+        Label external_target;
+        Label indirection_ready;
+        tbnz(w9, 31, external_target);
 
-      L(indirection_ready);
+        // Internal: rel32 from code cache base.
+        ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
+                              A64BackendContext, code_execute_base))));
+        add(x9, x14, w9, UXTW);
+        b(indirection_ready);
+
+        // External: tagged index into the side table.
+        L(external_target);
+        and_(w15, w9, A64CodeCache::kIndirectionExternalIndexMask);
+        ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
+                              A64BackendContext, external_indirection_table))));
+        add(x14, x14, x15, LSL, 3);
+        ldr(x9, ptr(x14, static_cast<uint32_t>(0)));
+
+        L(indirection_ready);
+      }
     }
   } else {
     // No indirection table: resolve at runtime.
