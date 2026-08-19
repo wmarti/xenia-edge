@@ -4326,6 +4326,30 @@ struct MUL_ADD_F64
                           i.instr->flags & ARITHMETIC_NEGATE_RESULT);
   }
 };
+// Register plan for the V128 FMA sequences. `tmp` is live scratch across the
+// NaN fixup while the sources still matter: the dest register serves unless it
+// aliases a source (vmaddfp v3,v1,v2,v3), in which case a free scratch-bank
+// register does - one always exists, because an all-constant operand set
+// occupies the whole bank but then no source is allocated and dest cannot
+// alias. `qs` is written only after the sources are dead, so the first
+// scratch-bank register that is not tmp serves.
+static void PickFmaFixupScratch(int a, int c, int b, int d, int* out_tmp,
+                                int* out_qs) {
+  auto in_sources = [&](int r) { return r == a || r == c || r == b; };
+  int tmp;
+  if (!in_sources(d)) {
+    tmp = d;
+  } else if (!in_sources(0)) {
+    tmp = 0;
+  } else if (!in_sources(1)) {
+    tmp = 1;
+  } else {
+    tmp = 3;
+  }
+  *out_tmp = tmp;
+  *out_qs = tmp != 0 ? 0 : 1;
+}
+
 struct MUL_ADD_V128
     : Sequence<MUL_ADD_V128,
                I<OPCODE_MUL_ADD, V128Op, V128Op, V128Op, V128Op>> {
@@ -4334,17 +4358,21 @@ struct MUL_ADD_V128
     EmitWithVmxDenormalFlushFpcr(e, [&] {
       const int d = i.dest.reg().getIdx();
 
-      // dest is free until the result is stored, so it lends the fixup the
-      // scratch register v0-v3 cannot cover.
-      PrepareVmxFmaSources(e, i.src1, i.src2, i.src3, d);
+      // On software-flush hosts the sources are copied to v0/v1/v3 and dest
+      // lends the fixup its scratch; on FZ hosts allocated sources feed the
+      // FMA directly and the scratch plan below avoids them.
+      int a, c, b;
+      PrepareVmxFmaSources(e, i.src1, i.src2, i.src3, d, &a, &c, &b);
+      int tmp, qs;
+      PickFmaFixupScratch(a, c, b, d, &tmp, &qs);
 
-      e.mov(VReg(2).b16, VReg(3).b16);
-      e.fmla(VReg(2).s4, VReg(0).s4, VReg(1).s4);
+      e.mov(VReg(2).b16, VReg(b).b16);
+      e.fmla(VReg(2).s4, VReg(a).s4, VReg(c).s4);
 
       if (i.instr->flags & ARITHMETIC_NEGATE_RESULT) {
         e.fneg(VReg(2).s4, VReg(2).s4);
       }
-      FixupVmxNan_V128_Fma(e, d);
+      FixupVmxNan_V128_Fma(e, a, c, b, tmp, qs);
 
       // Flush output denormals.
       if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
@@ -4403,16 +4431,19 @@ struct MUL_SUB_V128
                I<OPCODE_MUL_SUB, V128Op, V128Op, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     // dest = s1*s2 - s3 with VMX denormal flushing and PPC NaN propagation.
-    // Same as MUL_ADD but negate s3 before the fmla. v3 keeps the un-negated
-    // s3, which is the operand the fixup propagates.
+    // Same as MUL_ADD but negate s3 before the fmla. The source register
+    // keeps the un-negated s3, which is the operand the fixup propagates.
     EmitWithVmxDenormalFlushFpcr(e, [&] {
       const int d = i.dest.reg().getIdx();
 
-      PrepareVmxFmaSources(e, i.src1, i.src2, i.src3, d);
+      int a, c, b;
+      PrepareVmxFmaSources(e, i.src1, i.src2, i.src3, d, &a, &c, &b);
+      int tmp, qs;
+      PickFmaFixupScratch(a, c, b, d, &tmp, &qs);
 
-      e.mov(VReg(2).b16, VReg(3).b16);
+      e.mov(VReg(2).b16, VReg(b).b16);
       e.fneg(VReg(2).s4, VReg(2).s4);
-      e.fmla(VReg(2).s4, VReg(0).s4, VReg(1).s4);
+      e.fmla(VReg(2).s4, VReg(a).s4, VReg(c).s4);
 
       // Negate before the fixup, never after: the fixup overwrites every NaN
       // lane, and hardware leaves a NaN result's sign alone.
@@ -4420,7 +4451,7 @@ struct MUL_SUB_V128
         e.fneg(VReg(2).s4, VReg(2).s4);
       }
 
-      FixupVmxNan_V128_Fma(e, d);
+      FixupVmxNan_V128_Fma(e, a, c, b, tmp, qs);
 
       // Flush output denormals.
       if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
