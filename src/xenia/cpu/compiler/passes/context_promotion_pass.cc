@@ -188,6 +188,13 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
       const uint32_t size = static_cast<uint32_t>(GetTypeSize(type));
       Value* previous_value = LookupTrackedValue(offset, size, type);
       if (previous_value) {
+
+      const size_t offset = i->src1.offset;
+      // Reuse only a value of the identical type. Slots are in practice
+      // accessed with one type each, but an explicit check costs nothing and
+      // an ASSIGN across types would be malformed HIR.
+      if (validity.test(static_cast<uint32_t>(offset)) &&
+          context_values_[offset]->type == i->dest->type) {
         // Legit previous value, reuse.
         i->opcode = &hir::OPCODE_ASSIGN_info;
         i->set_src1(previous_value);
@@ -196,6 +203,17 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
         // (Loads don't modify memory, but TrackValue evicts any tracked
         // value overlapping a range we now know with a different shape.)
         TrackValue(offset, size, i->dest);
+
+      } else {
+        // Store the loaded value into the table. VEC128 participates in the
+        // forwarding here; only dead-store elimination still excludes it
+        // (RemoveDeadStoresBlock), so every vector store keeps reaching
+        // context memory and any host-side reader of ctx->v stays correct.
+        // Accumulator chains (vmaddfp v, ..., v) reloaded the register from
+        // the context on every instruction because of the old exclusion --
+        // load_context v128 topped the execution profile at 330k.
+        context_values_[offset] = i->dest;
+        validity.set(static_cast<uint32_t>(offset));
       }
     } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
       const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
@@ -210,6 +228,10 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
         // still clobbers these bytes, so overlapping tracked values die.
         InvalidateTrackedRange(offset, size);
       }
+
+      // Store value into the table for later (all types, see above).
+      context_values_[offset] = value;
+      validity.set(static_cast<uint32_t>(offset));
     }
     i = next;
   }
