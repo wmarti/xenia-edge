@@ -825,7 +825,13 @@ bool A64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
   // indirection lookup and, for a tail call, the stack teardown and jump.
   ldr(w15, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
   cmp(w16, w15);
-  b(EQ, epilog_label());
+  if (near_tail_branches_safe_) {
+    // The epilog is bound at function end, inside the same +/-1 MiB bound
+    // that gates the other tail branches.
+    b_near(EQ, epilog_label());
+  } else {
+    b(EQ, epilog_label());
+  }
   CallIndirect(instr, 16);
   return true;
 }
@@ -839,7 +845,13 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
     // Compare target guest address with our function's return address.
     ldr(w0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
     cmp(target_w, w0);
+    if (near_tail_branches_safe_) {
+    // The epilog is bound at function end, inside the same +/-1 MiB bound
+    // that gates the other tail branches.
+    b_near(EQ, epilog_label());
+  } else {
     b(EQ, epilog_label());
+  }
   }
 
   // Load host code address from indirection table.
