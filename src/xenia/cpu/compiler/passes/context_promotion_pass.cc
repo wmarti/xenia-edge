@@ -188,82 +188,103 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
       const uint32_t size = static_cast<uint32_t>(GetTypeSize(type));
       Value* previous_value = LookupTrackedValue(offset, size, type);
       if (previous_value) {
-        // Legit previous value, reuse.
-        i->opcode = &hir::OPCODE_ASSIGN_info;
-        i->set_src1(previous_value);
-      } else if (promote_vec128 || type != TypeName::VEC128_TYPE) {
-        // Track the loaded value so later loads of this range reuse it.
-        // (Loads don't modify memory, but TrackValue evicts any tracked
-        // value overlapping a range we now know with a different shape.)
-        TrackValue(offset, size, i->dest);
+        const size_t offset = i->src1.offset;
+        // Reuse only a value of the identical type. Slots are in practice
+        // accessed with one type each, but an explicit check costs nothing and
+        // an ASSIGN across types would be malformed HIR.
+        if (validity.test(static_cast<uint32_t>(offset)) &&
+            context_values_[offset]->type == i->dest->type) {
+          // Legit previous value, reuse.
+          i->opcode = &hir::OPCODE_ASSIGN_info;
+          i->set_src1(previous_value);
+        } else if (promote_vec128 || type != TypeName::VEC128_TYPE) {
+          // Track the loaded value so later loads of this range reuse it.
+          // (Loads don't modify memory, but TrackValue evicts any tracked
+          // value overlapping a range we now know with a different shape.)
+          TrackValue(offset, size, i->dest);
+
+        } else {
+          // Store the loaded value into the table. VEC128 participates in the
+          // forwarding here; only dead-store elimination still excludes it
+          // (RemoveDeadStoresBlock), so every vector store keeps reaching
+          // context memory and any host-side reader of ctx->v stays correct.
+          // Accumulator chains (vmaddfp v, ..., v) reloaded the register from
+          // the context on every instruction because of the old exclusion --
+          // load_context v128 topped the execution profile at 330k.
+          context_values_[offset] = i->dest;
+          validity.set(static_cast<uint32_t>(offset));
+        }
+      } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
+        const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
+        Value* value = i->src2.value;
+        const uint32_t size = static_cast<uint32_t>(GetTypeSize(value->type));
+        if (promote_vec128 || value->type != TypeName::VEC128_TYPE) {
+          // Track the stored value for later loads. TrackValue first drops
+          // every tracked value overlapping the bytes this store clobbers.
+          TrackValue(offset, size, value);
+        } else {
+          // VEC128 promotion disabled: the value isn't tracked, but the store
+          // still clobbers these bytes, so overlapping tracked values die.
+          InvalidateTrackedRange(offset, size);
+        }
+
+        // Store value into the table for later (all types, see above).
+        context_values_[offset] = value;
+        validity.set(static_cast<uint32_t>(offset));
       }
-    } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
-      const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
-      Value* value = i->src2.value;
-      const uint32_t size = static_cast<uint32_t>(GetTypeSize(value->type));
-      if (promote_vec128 || value->type != TypeName::VEC128_TYPE) {
-        // Track the stored value for later loads. TrackValue first drops
-        // every tracked value overlapping the bytes this store clobbers.
-        TrackValue(offset, size, value);
-      } else {
-        // VEC128 promotion disabled: the value isn't tracked, but the store
-        // still clobbers these bytes, so overlapping tracked values die.
-        InvalidateTrackedRange(offset, size);
-      }
+      i = next;
     }
-    i = next;
   }
-}
 
-void ContextPromotionPass::RemoveDeadStoresBlock(Block* block) {
-  // In this walk a validity bit means "this byte is fully overwritten by a
-  // later store in this block, with no barrier or load in between".
-  auto& validity = context_validity_;
-  validity.reset();
-  const bool promote_vec128 =
-      cvars::context_promote_vec128 && !cvars::disable_context_promotion;
+  void ContextPromotionPass::RemoveDeadStoresBlock(Block * block) {
+    // In this walk a validity bit means "this byte is fully overwritten by a
+    // later store in this block, with no barrier or load in between".
+    auto& validity = context_validity_;
+    validity.reset();
+    const bool promote_vec128 =
+        cvars::context_promote_vec128 && !cvars::disable_context_promotion;
 
-  // Walk backwards and mark byte ranges that are written to.
-  // If a store's whole range was already written to later, it is dead.
-  Instr* i = block->instr_tail;
-  while (i) {
-    Instr* prev = i->prev;
-    if (i->opcode->flags & (OPCODE_FLAG_VOLATILE | OPCODE_FLAG_BRANCH)) {
-      // Volatile instruction - requires all context values be flushed.
-      validity.reset();
-    } else if (i->opcode == &OPCODE_LOAD_CONTEXT_info) {
-      // A load that survived PromoteBlock is a live use of these bytes:
-      // earlier stores overlapping it must be kept. (PromoteBlock folds
-      // exact-match loads to values, but a load whose range/type mismatches
-      // the tracked value - or that follows a volatile reset - survives.)
-      const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
-      const uint32_t size = static_cast<uint32_t>(GetTypeSize(i->dest->type));
-      validity.reset(offset, offset + size);
-    } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
-      const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
-      const Value* value = i->src2.value;
-      const uint32_t size = static_cast<uint32_t>(GetTypeSize(value->type));
-      if (promote_vec128 || value->type != TypeName::VEC128_TYPE) {
-        bool fully_overwritten = true;
-        for (uint32_t b = offset; b < offset + size; ++b) {
-          if (!validity.test(b)) {
-            fully_overwritten = false;
-            break;
+    // Walk backwards and mark byte ranges that are written to.
+    // If a store's whole range was already written to later, it is dead.
+    Instr* i = block->instr_tail;
+    while (i) {
+      Instr* prev = i->prev;
+      if (i->opcode->flags & (OPCODE_FLAG_VOLATILE | OPCODE_FLAG_BRANCH)) {
+        // Volatile instruction - requires all context values be flushed.
+        validity.reset();
+      } else if (i->opcode == &OPCODE_LOAD_CONTEXT_info) {
+        // A load that survived PromoteBlock is a live use of these bytes:
+        // earlier stores overlapping it must be kept. (PromoteBlock folds
+        // exact-match loads to values, but a load whose range/type mismatches
+        // the tracked value - or that follows a volatile reset - survives.)
+        const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
+        const uint32_t size = static_cast<uint32_t>(GetTypeSize(i->dest->type));
+        validity.reset(offset, offset + size);
+      } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
+        const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
+        const Value* value = i->src2.value;
+        const uint32_t size = static_cast<uint32_t>(GetTypeSize(value->type));
+        if (promote_vec128 || value->type != TypeName::VEC128_TYPE) {
+          bool fully_overwritten = true;
+          for (uint32_t b = offset; b < offset + size; ++b) {
+            if (!validity.test(b)) {
+              fully_overwritten = false;
+              break;
+            }
+          }
+          if (!fully_overwritten) {
+            // Some byte still escapes - keep the store; all bytes it writes
+            // are now dead for earlier stores.
+            validity.set(offset, offset + size);
+          } else {
+            // Every byte is overwritten later. Remove this store.
+            i->UnlinkAndNOP();
           }
         }
-        if (!fully_overwritten) {
-          // Some byte still escapes - keep the store; all bytes it writes
-          // are now dead for earlier stores.
-          validity.set(offset, offset + size);
-        } else {
-          // Every byte is overwritten later. Remove this store.
-          i->UnlinkAndNOP();
-        }
       }
+      i = prev;
     }
-    i = prev;
   }
-}
 
 }  // namespace passes
 }  // namespace compiler
