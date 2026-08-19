@@ -540,23 +540,39 @@ inline void PrepareVmxFmaSources(A64Emitter& e, const T1& op1, const T2& op2,
 // supply. Modifies v2 in place. Clobbers v1 and tmp.
 inline void FixupVmxNan_V128_Fma(A64Emitter& e, int tmp) {
   using namespace Xbyak_aarch64;
-  // Lowest priority first, so an earlier operand overwrites a later one: C,
-  // then B, then A. BIF inserts an operand wherever its self-compare is false,
-  // which is exactly where that operand is NaN.
-  e.fcmeq(VReg(tmp).s4, VReg(1).s4, VReg(1).s4);
-  e.bif(VReg(2).b16, VReg(1).b16, VReg(tmp).b16);
-  e.fcmeq(VReg(tmp).s4, VReg(3).s4, VReg(3).s4);
-  e.bif(VReg(2).b16, VReg(3).b16, VReg(tmp).b16);
-  e.fcmeq(VReg(tmp).s4, VReg(0).s4, VReg(0).s4);
-  e.bif(VReg(2).b16, VReg(0).b16, VReg(tmp).b16);
+  // Fast path: FMLA propagates any operand NaN into that result lane, and an
+  // invalid operation produces the default NaN, so a result with no NaN lane
+  // proves no lane needs fixing. Four inline instructions decide it; the
+  // ten-instruction fixup moves to the function tail. This mirrors the x64
+  // backend's vptest design and its stated invariant.
+  auto& done = e.NewCachedLabel();
+  auto& slow = e.AddToTail([tmp, &done](A64Emitter& e,
+                                        Xbyak_aarch64::Label&) {
+    // Lowest priority first, so an earlier operand overwrites a later one: C,
+    // then B, then A. BIF inserts an operand wherever its self-compare is
+    // false, which is exactly where that operand is NaN.
+    e.fcmeq(VReg(tmp).s4, VReg(1).s4, VReg(1).s4);
+    e.bif(VReg(2).b16, VReg(1).b16, VReg(tmp).b16);
+    e.fcmeq(VReg(tmp).s4, VReg(3).s4, VReg(3).s4);
+    e.bif(VReg(2).b16, VReg(3).b16, VReg(tmp).b16);
+    e.fcmeq(VReg(tmp).s4, VReg(0).s4, VReg(0).s4);
+    e.bif(VReg(2).b16, VReg(0).b16, VReg(tmp).b16);
 
-  // Quiet whatever NaN each lane ended up with. A lane still holding the
-  // arithmetic result is either not NaN or already the default NaN, so this
-  // only ever quiets an operand that was signalling.
-  e.fcmeq(VReg(tmp).s4, VReg(2).s4, VReg(2).s4);
-  e.movi(VReg(1).s4, 0x40, LSL, 16);
-  e.bic(VReg(1).b16, VReg(1).b16, VReg(tmp).b16);
-  e.orr(VReg(2).b16, VReg(2).b16, VReg(1).b16);
+    // Quiet whatever NaN each lane ended up with. A lane still holding the
+    // arithmetic result is either not NaN or already the default NaN, so this
+    // only ever quiets an operand that was signalling.
+    e.fcmeq(VReg(tmp).s4, VReg(2).s4, VReg(2).s4);
+    e.movi(VReg(1).s4, 0x40, LSL, 16);
+    e.bic(VReg(1).b16, VReg(1).b16, VReg(tmp).b16);
+    e.orr(VReg(2).b16, VReg(2).b16, VReg(1).b16);
+    e.b(done);
+  });
+
+  e.fcmeq(VReg(tmp).s4, VReg(2).s4, VReg(2).s4);  // all-ones where not NaN
+  e.uminv(SReg(tmp), VReg(tmp).s4);               // 0 iff any lane is NaN
+  e.fmov(WReg(0), SReg(tmp));
+  e.cbz_near(WReg(0), slow);
+  e.L(done);
 }
 
 // VMX float32x4 binary operations with full PPC semantics.
