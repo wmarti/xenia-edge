@@ -145,11 +145,27 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   // the fattest sequence this backend emits, so a function passing this test
   // cannot place any tail out of range. Functions failing it (which would
   // need ~3000+ HIR instructions) keep the expanded far form.
+  function_has_vmx_ = false;
   {
     size_t hir_instr_count = 0;
     for (auto* b = builder->first_block(); b; b = b->next) {
       for (auto* i = b->instr_head; i; i = i->next) {
         ++hir_instr_count;
+        if (i->dest && i->dest->type == hir::VEC128_TYPE) {
+          function_has_vmx_ = true;
+        } else if (!function_has_vmx_) {
+          uint32_t sig = i->opcode->signature;
+          const hir::Instr::Op* ops[3] = {&i->src1, &i->src2, &i->src3};
+          for (int k = 0; k < 3; ++k) {
+            auto t = static_cast<hir::OpcodeSignatureType>(
+                (sig >> (3 * (k + 1))) & 0x7);
+            if (t == hir::OPCODE_SIG_TYPE_V &&
+                ops[k]->value->type == hir::VEC128_TYPE) {
+              function_has_vmx_ = true;
+              break;
+            }
+          }
+        }
       }
     }
     near_tail_branches_safe_ = hir_instr_count * 256 < (768 * 1024);
@@ -614,7 +630,7 @@ void A64Emitter::UnimplementedInstr(const hir::Instr* i) {
 
 void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   assert_not_null(function);
-  ForgetFpcrMode();
+  EnsureFpuFpcrModeForTransition();
   if (TryInlinePPCGprLrSaveRestore(instr, function)) {
     return;
   }
@@ -817,7 +833,7 @@ bool A64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
 }
 
 void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
-  ForgetFpcrMode();
+  EnsureFpuFpcrModeForTransition();
   auto target_w = WReg(reg_index);
 
   // Check if this is a possible return (e.g., PPC blr).
@@ -927,7 +943,7 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
 }
 
 void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
-  ForgetFpcrMode();
+  EnsureFpuFpcrModeForTransition();
   bool undefined = true;
   if (function->behavior() == Function::Behavior::kBuiltin) {
     auto builtin_function = static_cast<const BuiltinFunction*>(function);
@@ -967,10 +983,11 @@ void A64Emitter::CallNativeSafe(void* fn) {
   // back, so whatever mode this emitter thinks is live is stale afterwards.
   // Call, CallIndirect and CallExtern already do this; without it here a VMX
   // float op after the call skips its msr and runs with FZ clear.
-  // Must be ForgetFpcrMode rather than "assume Fpu": with inline MMIO checks
-  // the call sits inside a taken branch, and the fall-through path never
-  // executes the thunk.
-  ForgetFpcrMode();
+  // The transition guard sits here, inside any inline-MMIO taken branch, so
+  // the switch executes exactly on the path that reaches the thunk; the
+  // fall-through path keeps its mode and the Unknown tracker afterwards makes
+  // later ops re-establish it.
+  EnsureFpuFpcrModeForTransition();
   // GuestToHostThunk: x0=target function, x1/x2=args (set by caller).
   // The thunk rearranges: saves x0 in x9, sets x0=context, calls x9.
   mov(x0, reinterpret_cast<uint64_t>(fn));
@@ -1076,7 +1093,17 @@ void A64Emitter::EmitPreemptCheck() {
   static_assert(offsetof(ppc::PPCContext, preempt_requested) < 4096);
   const uint32_t flag_offset =
       static_cast<uint32_t>(offsetof(ppc::PPCContext, preempt_requested));
-  Label& do_yield = AddToTail([&after, flag_offset](A64Emitter& e, Label&) {
+  const bool has_vmx = function_has_vmx_;
+  Label& do_yield = AddToTail([&after, flag_offset, has_vmx](A64Emitter& e,
+                                                             Label&) {
+    // The yield calls host code, which must run in FPU mode. The runtime mode
+    // here is whatever the interrupted block was in - unknowable at emission
+    // - so functions that touch VEC128 switch unconditionally (cold path).
+    if (has_vmx) {
+      e.ldr(e.w0, ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                 A64BackendContext, fpcr_fpu))));
+      e.msr(3, 3, 4, 4, 0, e.x0);  // msr FPCR, x0
+    }
     e.strb(e.wzr, ptr(e.x20, flag_offset));
     // Null until the scheduler starts, and a stale flag can reach here after
     // it shuts down, so check before calling.

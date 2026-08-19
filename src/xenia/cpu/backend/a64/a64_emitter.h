@@ -179,6 +179,20 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     }
     fpcr_mode_ = FPCRMode::Unknown;
   }
+  // Host and cross-function transitions must run in FPU mode. When the
+  // tracker holds Unknown the runtime mode can still be VMX - a VMX-exiting
+  // block can BRANCH into a block whose entry consulted only the linearly
+  // previous block - so inside functions that touch VEC128 at all, Unknown
+  // gets an explicit switch. ChangeFpcrMode from Unknown always emits; from
+  // a tracked Fpu it is a no-op; functions with no VEC128 can never be in a
+  // VMX mode and skip the guard entirely.
+  void EnsureFpuFpcrModeForTransition() {
+    if (IsVmxFpcrMode(fpcr_mode_) ||
+        (fpcr_mode_ == FPCRMode::Unknown && function_has_vmx_)) {
+      ChangeFpcrMode(FPCRMode::Fpu);
+    }
+    fpcr_mode_ = FPCRMode::Unknown;
+  }
   bool ChangeFpcrMode(FPCRMode new_mode, bool already_set = false);
   bool IsFeatureEnabled(uint64_t feature_flag) const {
     return (feature_flags_ & feature_flag) == feature_flag;
@@ -353,6 +367,9 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   static constexpr int64_t kTestBranchBackwardRange = (1ll << 15) - 8;
 
   FPCRMode fpcr_mode_ = FPCRMode::Unknown;
+  // Whether the current function contains any VEC128-typed instruction (set
+  // per function in Emit); gates the Unknown-mode transition guard.
+  bool function_has_vmx_ = false;
   bool synchronize_stack_on_next_instruction_ = false;
 };
 
