@@ -370,6 +370,25 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // Whether the current function contains any VEC128-typed instruction (set
   // per function in Emit); gates the Unknown-mode transition guard.
   bool function_has_vmx_ = false;
+  // FPCR seeding state, per function: how many predecessor edges each block
+  // expects (from the final-HIR pre-scan), the meet of the modes recorded so
+  // far on its incoming edges, and the authoritative label->block mapping.
+  struct IncomingFpcr {
+    FPCRMode meet = FPCRMode::Unknown;
+    uint32_t count = 0;
+  };
+  std::unordered_map<const hir::Block*, uint32_t> expected_preds_;
+  std::unordered_map<const hir::Block*, IncomingFpcr> incoming_fpcr_;
+  std::unordered_map<const hir::Label*, const hir::Block*> label_block_;
+  void RecordIncomingFpcr(const hir::Block* target, FPCRMode mode) {
+    auto& in = incoming_fpcr_[target];
+    if (in.count == 0) {
+      in.meet = mode;
+    } else if (in.meet != mode) {
+      in.meet = FPCRMode::Unknown;
+    }
+    ++in.count;
+  }
   bool synchronize_stack_on_next_instruction_ = false;
 };
 
