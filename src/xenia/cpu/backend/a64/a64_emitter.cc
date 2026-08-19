@@ -148,9 +148,49 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   // cannot place any tail out of range. Functions failing it (which would
   // need ~3000+ HIR instructions) keep the expanded far form.
   function_has_vmx_ = false;
+  expected_preds_.clear();
+  incoming_fpcr_.clear();
+  label_block_.clear();
   {
+    // Labels resolve to blocks through each block's own label chain - the
+    // same mapping the emitter binds branch targets from. A label's ->block
+    // back-pointer can be stale after the passes reshape blocks, exactly like
+    // the edges ControlFlowAnalysisPass recorded (which also never included
+    // fall-through), so neither is trusted here.
+    auto& label_block = label_block_;
+    for (auto* b = builder->first_block(); b; b = b->next) {
+      for (auto* label = b->label_head; label; label = label->next) {
+        label_block[label] = b;
+      }
+    }
     size_t hir_instr_count = 0;
     for (auto* b = builder->first_block(); b; b = b->next) {
+      // Expected predecessor count, recomputed from the final HIR. Branches
+      // can sit MID-block (the not-taken path continues inside the same
+      // block), so every instruction is scanned, not just the tail - the
+      // edges ControlFlowAnalysisPass recorded are both stale and
+      // tail-only.
+      for (auto* i = b->instr_head; i; i = i->next) {
+        const hir::Label* label = nullptr;
+        if (i->opcode == &hir::OPCODE_BRANCH_info) {
+          label = i->src1.label;
+        } else if (i->opcode == &hir::OPCODE_BRANCH_TRUE_info ||
+                   i->opcode == &hir::OPCODE_BRANCH_FALSE_info) {
+          label = i->src2.label;
+        }
+        if (label) {
+          auto it = label_block.find(label);
+          if (it != label_block.end()) {
+            ++expected_preds_[it->second];
+          }
+        }
+      }
+      // Fall-through exists unless the block's final instruction is an
+      // unconditional branch.
+      auto* last = b->instr_tail;
+      if (b->next && !(last && last->opcode == &hir::OPCODE_BRANCH_info)) {
+        ++expected_preds_[b->next];
+      }
       for (auto* i = b->instr_head; i; i = i->next) {
         ++hir_instr_count;
         if (i->dest && i->dest->type == hir::VEC128_TYPE) {
@@ -252,9 +292,28 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   auto block = builder->first_block();
   synchronize_stack_on_next_instruction_ = false;
   while (block) {
-    // Reset FPCR tracking on each block entry (we don't know which
-    // predecessor ran, so mode is unknown).
-    ForgetFpcrMode();
+    // FPCR tracking across blocks: msr fpcr is a serializing write on most
+    // cores, and resetting the mode at every block entry makes the first
+    // float op of every block re-emit it. Every branch emission records the
+    // tracker's mode at that exact point into the target block's meet (a
+    // branch can sit mid-block, so a per-block exit mode would be wrong), and
+    // block ends record the fall-through mode. The entry mode carries over
+    // only when every expected predecessor edge has contributed - which an
+    // unemitted loop back edge has not - and all contributions agree; a call
+    // on a predecessor path contributes Unknown, which blocks seeding. Host
+    // transitions are guarded independently by
+    // EnsureFpuFpcrModeForTransition, so no stale mode can escape into host
+    // code.
+    {
+      FPCRMode incoming = FPCRMode::Unknown;
+      auto exp_it = expected_preds_.find(block);
+      auto in_it = incoming_fpcr_.find(block);
+      if (exp_it != expected_preds_.end() && in_it != incoming_fpcr_.end() &&
+          in_it->second.count == exp_it->second) {
+        incoming = in_it->second.meet;
+      }
+      fpcr_mode_ = incoming;
+    }
     // Flags from a previous block cannot be trusted either.
     ResetFlagsZeroTest();
 
@@ -286,6 +345,23 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
         // One-shot handoff: whatever this sequence declared about NZCV is
         // visible to exactly the next sequence and nothing later.
         ShiftFlagsZeroTest();
+        // Record the FPCR mode this branch carries to its target (branches
+        // can sit mid-block; the mode here is the mode the jump takes).
+        {
+          const hir::Label* label = nullptr;
+          if (instr->opcode == &hir::OPCODE_BRANCH_info) {
+            label = instr->src1.label;
+          } else if (instr->opcode == &hir::OPCODE_BRANCH_TRUE_info ||
+                     instr->opcode == &hir::OPCODE_BRANCH_FALSE_info) {
+            label = instr->src2.label;
+          }
+          if (label) {
+            auto it = label_block_.find(label);
+            if (it != label_block_.end()) {
+              RecordIncomingFpcr(it->second, fpcr_mode_);
+            }
+          }
+        }
       } catch (const Xbyak_aarch64::Error& e) {
         // Uncaught this aborts the process with no context, so name the opcode
         // and the guest function and fail just this compile.
@@ -310,6 +386,14 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
       return false;
     }
 
+    // Fall-through edge to the next block, unless this block cannot fall
+    // through.
+    {
+      auto* last = block->instr_tail;
+      if (block->next && !(last && last->opcode == &hir::OPCODE_BRANCH_info)) {
+        RecordIncomingFpcr(block->next, fpcr_mode_);
+      }
+    }
     block = block->next;
   }
 
@@ -1099,6 +1183,11 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
   //
   // Tests the preempt flag other threads raise. The cold path clears it, a
   // deferred yield re-sets it.
+  // The yield path may clobber FPCR at runtime; under block-entry mode
+  // seeding the tracker can hold a pre-established mode here, so drop it and
+  // let the next float op re-establish. (The switch back to FPU for the
+  // yield's own host call happens in the tail.)
+  fpcr_mode_ = FPCRMode::Unknown;
   Label& after = NewCachedLabel();
   // ldrb/strb unsigned-offset encoding caps at 4095.
   static_assert(offsetof(ppc::PPCContext, preempt_requested) < 4096);
