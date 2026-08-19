@@ -1291,6 +1291,12 @@ void A64Backend::InitializeBackendContext(void* ctx) {
   a64_ctx->fpcr_vmx_daz = DEFAULT_VMX_FPCR;   // never follows NJM
   a64_ctx->flags = (1U << kA64BackendNJMOn);  // NJM on by default
   a64_ctx->guest_tick_count = Clock::GetGuestTickCountPointer();
+  // CALL_INDIRECT's encoded mode reads these from x19; see A64BackendContext.
+  auto* cache = static_cast<A64CodeCache*>(code_cache_.get());
+  a64_ctx->indirection_table_bias = cache->indirection_table_base_bias();
+  a64_ctx->code_execute_base = cache->execute_base_address();
+  a64_ctx->external_indirection_table =
+      cache->external_indirection_table_base_address();
 
   auto set_est = [&](int index, float value) {
     uint32_t bits;
