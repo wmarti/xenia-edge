@@ -115,6 +115,24 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   FunctionDebugInfo* debug_info() const { return debug_info_; }
   size_t stack_size() const { return stack_size_; }
 
+  // NZCV fusion between adjacent HIR instructions (ANDS + compare-vs-zero).
+  void DeclareFlagsZeroTest(int gpr_reg, bool is64) {
+    flags_zero_fresh_reg_ = gpr_reg;
+    flags_zero_fresh_is64_ = is64;
+  }
+  bool FlagsHoldZeroTest(int gpr_reg, bool is64) const {
+    return flags_zero_armed_reg_ == gpr_reg && flags_zero_armed_is64_ == is64 &&
+           gpr_reg >= 0;
+  }
+  void ResetFlagsZeroTest() {
+    flags_zero_fresh_reg_ = flags_zero_armed_reg_ = -1;
+  }
+  void ShiftFlagsZeroTest() {
+    flags_zero_armed_reg_ = flags_zero_fresh_reg_;
+    flags_zero_armed_is64_ = flags_zero_fresh_is64_;
+    flags_zero_fresh_reg_ = -1;
+  }
+
   void MarkSourceOffset(const hir::Instr* i);
 
   // Called from SelectSequence once a sequence has emitted. Cheap no-op unless
@@ -294,6 +312,15 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   bool near_tail_branches_safe_ = false;
   // Same, for tbnz's +/-32 KiB reach.
   bool near_tbz_branches_safe_ = false;
+  // NZCV fusion: the previous HIR instruction's sequence declared that the
+  // flags currently hold a zero-test of this GPR (ANDS). -1 = nothing.
+  // `fresh` is what the current sequence declares; the emit loop shifts it
+  // into `armed` between instructions, so `armed` can never leak past one
+  // instruction, a label bind, or a block boundary.
+  int flags_zero_fresh_reg_ = -1;
+  bool flags_zero_fresh_is64_ = false;
+  int flags_zero_armed_reg_ = -1;
+  bool flags_zero_armed_is64_ = false;
 
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t vec_reg_map_[VEC_COUNT];
