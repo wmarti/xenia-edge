@@ -138,6 +138,23 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
 }
 
 bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
+  // Decide up front whether single-instruction branches to tail labels are
+  // safe; the prolog's stackpoint check needs the answer too. cbnz/b.cond
+  // reach +/-1 MiB and the distance to a tail is bounded by the rest of the
+  // body plus every tail block. 256 bytes per HIR instruction is far above
+  // the fattest sequence this backend emits, so a function passing this test
+  // cannot place any tail out of range. Functions failing it (which would
+  // need ~3000+ HIR instructions) keep the expanded far form.
+  {
+    size_t hir_instr_count = 0;
+    for (auto* b = builder->first_block(); b; b = b->next) {
+      for (auto* i = b->instr_head; i; i = i->next) {
+        ++hir_instr_count;
+      }
+    }
+    near_tail_branches_safe_ = hir_instr_count * 256 < (768 * 1024);
+  }
+
   // Calculate local variable stack offsets.
   auto locals = builder->locals();
   size_t stack_offset = StackLayout::GUEST_STACK_SIZE;
@@ -987,7 +1004,13 @@ void A64Emitter::EmitPreemptCheck() {
     e.b(after);
   });
   ldrb(w8, ptr(x20, flag_offset));
-  cbnz(w8, do_yield);
+  if (near_tail_branches_safe_) {
+    // Not-taken fall-through: two instructions on the hot path instead of an
+    // inverted branch over an unconditional one.
+    cbnz_near(w8, do_yield);
+  } else {
+    cbnz(w8, do_yield);
+  }
   L(after);
 }
 
@@ -1044,13 +1067,27 @@ void A64Emitter::PushStackpoint() {
                        offsetof(A64BackendContext, current_stackpoint_depth))));
 
   // Check for overflow.
-  mov(w10, static_cast<uint32_t>(cvars::a64_max_stackpoints));
-  cmp(w9, w10);
+  const uint32_t max_stackpoints =
+      static_cast<uint32_t>(cvars::a64_max_stackpoints);
+  if (max_stackpoints <= 0xFFF) {
+    cmp(w9, max_stackpoints);
+  } else if ((max_stackpoints & 0xFFF) == 0 &&
+             (max_stackpoints >> 12) <= 0xFFF) {
+    // The default 65536 encodes as 16 << 12.
+    cmp(w9, max_stackpoints >> 12, 12);
+  } else {
+    mov(w10, max_stackpoints);
+    cmp(w9, w10);
+  }
   auto& overflow_label = AddToTail([](A64Emitter& e, Label& lbl) {
     e.CallNativeSafe(
         reinterpret_cast<void*>(A64Emitter::HandleStackpointOverflowError));
   });
-  b(GE, overflow_label);
+  if (near_tail_branches_safe_) {
+    b_near(GE, overflow_label);
+  } else {
+    b(GE, overflow_label);
+  }
 }
 
 void A64Emitter::PopStackpoint() {
