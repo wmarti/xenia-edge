@@ -284,6 +284,9 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   Arena source_map_arena_;
 
   size_t stack_size_ = 0;
+  // True when every tail label of the current function provably sits within
+  // the +/-1 MiB reach of cbnz/b.cond (set per function in Emit).
+  bool near_tail_branches_safe_ = false;
 
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t vec_reg_map_[VEC_COUNT];
