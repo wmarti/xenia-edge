@@ -575,20 +575,51 @@ struct ADD_I64 : Sequence<ADD_I64, I<OPCODE_ADD, I64Op, I64Op, I64Op>> {
 // operand needs nothing: ARM's default NaN is the one PPC produces.
 enum class FpBinOp { Add, Sub, Mul, Div };
 
+// Emits the hardware op with a NaN-input fast path. The positional-NaN slow
+// path sits in the function tail when the near-branch bound allows, inline
+// otherwise. NaN results never negate and never canonicalise: neither input
+// is NaN on the fast path, so a NaN result is an invalid operation, and
+// AArch64 with FPCR.DN=0 -- which DEFAULT_FPU_FPCR is, and which none of the
+// fpcr_table entries set -- already produces the PPC default QNaN.
 static void EmitFpBinOpWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1,
                                       SReg s2, FpBinOp op) {
-  // Ensure FPU FPCR (no flush-to-zero) for scalar operations.
   e.ChangeFpcrMode(FPCRMode::Fpu);
-  auto& nan_path = e.NewCachedLabel();
   auto& done = e.NewCachedLabel();
+
+  // Slow path: first NaN by position wins, quiet if SNaN.
+  auto emit_nan_walk = [dest, s1, s2, &done](A64Emitter& e) {
+    auto& s1_not_nan = e.NewCachedLabel();
+    e.fcmp(s1, s1);
+    e.b_near(VC, s1_not_nan);
+    e.fmov(e.w0, s1);
+    e.orr(e.w0, e.w0, static_cast<uint64_t>(1u << 22));
+    e.fmov(dest, e.w0);
+    e.b(done);
+    e.L(s1_not_nan);
+    e.fmov(e.w0, s2);
+    e.orr(e.w0, e.w0, static_cast<uint64_t>(1u << 22));
+    e.fmov(dest, e.w0);
+    e.b(done);
+  };
+
+  const bool tail_ok = e.near_tail_branches_safe();
+  Xbyak_aarch64::Label* nan_path;
+  if (tail_ok) {
+    nan_path = &e.AddToTail(
+        [emit_nan_walk](A64Emitter& e, Xbyak_aarch64::Label&) {
+          emit_nan_walk(e);
+        });
+  } else {
+    nan_path = &e.NewCachedLabel();
+  }
 
   // Check if either input is NaN. fccmp sets NZCV from immediate if the
   // condition is false (i.e. s1 was already NaN), preserving V=1.
   e.fcmp(s1, s1);
   e.fccmp(s2, s2, 0b0001, VC);
-  e.b_near(VS, nan_path);
+  e.b_near(VS, *nan_path);
 
-  // Fast path: no NaN input — hardware op.
+  // Fast path: no NaN input -- hardware op, falling through to done.
   switch (op) {
     case FpBinOp::Add:
       e.fadd(dest, s1, s2);
@@ -603,43 +634,54 @@ static void EmitFpBinOpWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1,
       e.fdiv(dest, s1, s2);
       break;
   }
-  // No canonicalisation needed. Neither input is a NaN on this path, so a NaN
-  // result can only come from an invalid operation, and AArch64 with FPCR.DN=0
-  // -- which DEFAULT_FPU_FPCR is, and which none of the fpcr_table entries set
-  // -- already produces 0x7FC00000, the PPC default QNaN. The code that used to
-  // sit here replaced that correct value with the NEGATIVE default QNaN.
-  e.b(done);
-
-  // Slow path: first NaN by position wins, quiet if SNaN.
-  e.L(nan_path);
-  auto& s1_not_nan = e.NewCachedLabel();
-  e.fcmp(s1, s1);
-  e.b_near(VC, s1_not_nan);
-  e.fmov(e.w0, s1);
-  e.orr(e.w0, e.w0, static_cast<uint64_t>(1u << 22));
-  e.fmov(dest, e.w0);
-  e.b(done);
-  e.L(s1_not_nan);
-  e.fmov(e.w0, s2);
-  e.orr(e.w0, e.w0, static_cast<uint64_t>(1u << 22));
-  e.fmov(dest, e.w0);
-
+  if (!tail_ok) {
+    e.b(done);
+    e.L(*nan_path);
+    emit_nan_walk(e);
+  }
   e.L(done);
 }
 
+// See the F32 twin for the layout and the no-canonicalisation rationale (the
+// F64 default QNaN 0x7FF8000000000000 is likewise what hardware produces).
 static void EmitFpBinOpWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1,
                                       DReg s2, FpBinOp op) {
   e.ChangeFpcrMode(FPCRMode::Fpu);
-  auto& nan_path = e.NewCachedLabel();
   auto& done = e.NewCachedLabel();
+
+  auto emit_nan_walk = [dest, s1, s2, &done](A64Emitter& e) {
+    auto& s1_not_nan = e.NewCachedLabel();
+    e.fcmp(s1, s1);
+    e.b_near(VC, s1_not_nan);
+    e.fmov(e.x0, s1);
+    e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
+    e.fmov(dest, e.x0);
+    e.b(done);
+    e.L(s1_not_nan);
+    e.fmov(e.x0, s2);
+    e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
+    e.fmov(dest, e.x0);
+    e.b(done);
+  };
+
+  const bool tail_ok = e.near_tail_branches_safe();
+  Xbyak_aarch64::Label* nan_path;
+  if (tail_ok) {
+    nan_path = &e.AddToTail(
+        [emit_nan_walk](A64Emitter& e, Xbyak_aarch64::Label&) {
+          emit_nan_walk(e);
+        });
+  } else {
+    nan_path = &e.NewCachedLabel();
+  }
 
   // Check if either input is NaN. fccmp sets NZCV from immediate if the
   // condition is false (i.e. s1 was already NaN), preserving V=1.
   e.fcmp(s1, s1);
   e.fccmp(s2, s2, 0b0001, VC);
-  e.b_near(VS, nan_path);
+  e.b_near(VS, *nan_path);
 
-  // Fast path: no NaN input — hardware op.
+  // Fast path: no NaN input -- hardware op, falling through to done.
   switch (op) {
     case FpBinOp::Add:
       e.fadd(dest, s1, s2);
@@ -654,26 +696,14 @@ static void EmitFpBinOpWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1,
       e.fdiv(dest, s1, s2);
       break;
   }
-  // See the F32 twin: the hardware result is already 0x7FF8000000000000, the
-  // PPC default QNaN. This used to overwrite it with the negative one.
-  e.b(done);
-
-  // Slow path: first NaN by position wins, quiet if SNaN.
-  e.L(nan_path);
-  auto& s1_not_nan = e.NewCachedLabel();
-  e.fcmp(s1, s1);
-  e.b_near(VC, s1_not_nan);
-  e.fmov(e.x0, s1);
-  e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
-  e.fmov(dest, e.x0);
-  e.b(done);
-  e.L(s1_not_nan);
-  e.fmov(e.x0, s2);
-  e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
-  e.fmov(dest, e.x0);
-
+  if (!tail_ok) {
+    e.b(done);
+    e.L(*nan_path);
+    emit_nan_walk(e);
+  }
   e.L(done);
 }
+
 // PPC FMA NaN selection (PowerISA 4.6.7.2):
 // The first NaN operand by position (frA=s1, frC=s2, frB=s3) wins,
 // regardless of QNaN vs SNaN.  If it's an SNaN, quiet it (set the
@@ -688,19 +718,64 @@ static void EmitFpBinOpWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1,
 static void EmitFmaWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1, DReg s2,
                                   DReg s3, bool is_sub, bool negate) {
   e.ChangeFpcrMode(FPCRMode::Fpu);
-  auto& nan_path = e.NewCachedLabel();
   auto& done = e.NewCachedLabel();
+
+  // Slow path: first NaN in A, B, C order wins (quiet if SNaN). The HIR
+  // operands are (A, C, B), so the walk is s1, s3, s2. Runs in the tail when
+  // the near-branch bound allows, inline otherwise. NaN results skip the
+  // negation, so both cold paths join after the fneg.
+  auto emit_nan_walk = [dest, s1, s2, s3, &done](A64Emitter& e) {
+    DReg order[3] = {s1, s3, s2};
+    for (int step = 0; step < 2; ++step) {
+      auto& not_nan = e.NewCachedLabel();
+      e.fcmp(order[step], order[step]);
+      e.b_near(VC, not_nan);
+      e.fmov(e.x0, order[step]);
+      e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));  // ensure quiet
+      e.fmov(dest, e.x0);
+      e.b(done);
+      e.L(not_nan);
+    }
+    // At least one operand is a NaN, so it must be this one.
+    e.fmov(e.x0, order[2]);
+    e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
+    e.fmov(dest, e.x0);
+    e.b(done);
+  };
+  // Invalid operation (0*inf, inf-inf) with no NaN input: canonicalize to the
+  // PPC default QNaN, un-negated.
+  auto emit_invalid = [dest, &done](A64Emitter& e) {
+    e.mov(e.x0, static_cast<uint64_t>(0x7FF8000000000000ull));
+    e.fmov(dest, e.x0);
+    e.b(done);
+  };
+
+  const bool tail_ok = e.near_tail_branches_safe();
+  Xbyak_aarch64::Label* nan_path;
+  Xbyak_aarch64::Label* invalid;
+  if (tail_ok) {
+    nan_path = &e.AddToTail(
+        [emit_nan_walk](A64Emitter& e, Xbyak_aarch64::Label&) {
+          emit_nan_walk(e);
+        });
+    invalid = &e.AddToTail(
+        [emit_invalid](A64Emitter& e, Xbyak_aarch64::Label&) {
+          emit_invalid(e);
+        });
+  } else {
+    nan_path = &e.NewCachedLabel();
+    invalid = &e.NewCachedLabel();
+  }
 
   // Quick check: any NaN among the three operands?
   e.fcmp(s1, s1);
   e.fccmp(s2, s2, 0b0001, VC);
   e.fccmp(s3, s3, 0b0001, VC);
-  e.b_near(VS, nan_path);
+  e.b_near(VS, *nan_path);
 
-  // Fast path: no NaN input → hardware FMA, then negate the result. Not
+  // Fast path: no NaN input -> hardware FMA, then negate the result. Not
   // fnmadd: that negates the operands (-Ra - Rn*Rm), which differs from
   // -(Ra + Rn*Rm) when the two addends are zeros of opposite sign.
-  auto& invalid = e.NewCachedLabel();
   if (is_sub) {
     e.fnmsub(dest, s1, s2, s3);
   } else {
@@ -708,81 +783,87 @@ static void EmitFmaWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1, DReg s2,
   }
   // If result is NaN (0*inf or inf-inf), canonicalize to PPC default.
   e.fcmp(dest, dest);
-  e.b_near(VS, invalid);
+  e.b_near(VS, *invalid);
   if (negate) {
     e.fneg(dest, dest);
   }
-  e.b(done);
-  e.L(invalid);
-  e.mov(e.x0, static_cast<uint64_t>(0x7FF8000000000000ull));
-  e.fmov(dest, e.x0);
-  e.b(done);
-
-  // Slow path: first NaN in A, B, C order wins (quiet if SNaN).
-  e.L(nan_path);
-  DReg order[3] = {s1, s3, s2};
-  for (int step = 0; step < 2; ++step) {
-    auto& not_nan = e.NewCachedLabel();
-    e.fcmp(order[step], order[step]);
-    e.b_near(VC, not_nan);
-    e.fmov(e.x0, order[step]);
-    e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));  // ensure quiet
-    e.fmov(dest, e.x0);
+  if (!tail_ok) {
     e.b(done);
-    e.L(not_nan);
+    e.L(*nan_path);
+    emit_nan_walk(e);
+    e.L(*invalid);
+    emit_invalid(e);
   }
-  // At least one operand is a NaN, so it must be this one.
-  e.fmov(e.x0, order[2]);
-  e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
-  e.fmov(dest, e.x0);
-
   e.L(done);
 }
 
 static void EmitFmaWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1, SReg s2,
                                   SReg s3, bool is_sub, bool negate) {
   e.ChangeFpcrMode(FPCRMode::Fpu);
-  auto& nan_path = e.NewCachedLabel();
   auto& done = e.NewCachedLabel();
+
+  auto emit_nan_walk = [dest, s1, s2, s3, &done](A64Emitter& e) {
+    SReg order[3] = {s1, s3, s2};
+    for (int step = 0; step < 2; ++step) {
+      auto& not_nan = e.NewCachedLabel();
+      e.fcmp(order[step], order[step]);
+      e.b_near(VC, not_nan);
+      e.fmov(e.w0, order[step]);
+      e.orr(e.w0, e.w0, static_cast<uint32_t>(1u << 22));
+      e.fmov(dest, e.w0);
+      e.b(done);
+      e.L(not_nan);
+    }
+    e.fmov(e.w0, order[2]);
+    e.orr(e.w0, e.w0, static_cast<uint32_t>(1u << 22));
+    e.fmov(dest, e.w0);
+    e.b(done);
+  };
+  auto emit_invalid = [dest, &done](A64Emitter& e) {
+    e.mov(e.w0, static_cast<uint64_t>(0x7FC00000u));
+    e.fmov(dest, e.w0);
+    e.b(done);
+  };
+
+  const bool tail_ok = e.near_tail_branches_safe();
+  Xbyak_aarch64::Label* nan_path;
+  Xbyak_aarch64::Label* invalid;
+  if (tail_ok) {
+    nan_path = &e.AddToTail(
+        [emit_nan_walk](A64Emitter& e, Xbyak_aarch64::Label&) {
+          emit_nan_walk(e);
+        });
+    invalid = &e.AddToTail(
+        [emit_invalid](A64Emitter& e, Xbyak_aarch64::Label&) {
+          emit_invalid(e);
+        });
+  } else {
+    nan_path = &e.NewCachedLabel();
+    invalid = &e.NewCachedLabel();
+  }
 
   e.fcmp(s1, s1);
   e.fccmp(s2, s2, 0b0001, VC);
   e.fccmp(s3, s3, 0b0001, VC);
-  e.b_near(VS, nan_path);
+  e.b_near(VS, *nan_path);
 
-  auto& invalid = e.NewCachedLabel();
   if (is_sub) {
     e.fnmsub(dest, s1, s2, s3);
   } else {
     e.fmadd(dest, s1, s2, s3);
   }
   e.fcmp(dest, dest);
-  e.b_near(VS, invalid);
+  e.b_near(VS, *invalid);
   if (negate) {
     e.fneg(dest, dest);
   }
-  e.b(done);
-  e.L(invalid);
-  e.mov(e.w0, static_cast<uint64_t>(0x7FC00000u));
-  e.fmov(dest, e.w0);
-  e.b(done);
-
-  e.L(nan_path);
-  SReg order[3] = {s1, s3, s2};
-  for (int step = 0; step < 2; ++step) {
-    auto& not_nan = e.NewCachedLabel();
-    e.fcmp(order[step], order[step]);
-    e.b_near(VC, not_nan);
-    e.fmov(e.w0, order[step]);
-    e.orr(e.w0, e.w0, static_cast<uint32_t>(1u << 22));
-    e.fmov(dest, e.w0);
+  if (!tail_ok) {
     e.b(done);
-    e.L(not_nan);
+    e.L(*nan_path);
+    emit_nan_walk(e);
+    e.L(*invalid);
+    emit_invalid(e);
   }
-  e.fmov(e.w0, order[2]);
-  e.orr(e.w0, e.w0, static_cast<uint32_t>(1u << 22));
-  e.fmov(dest, e.w0);
-
   e.L(done);
 }
 

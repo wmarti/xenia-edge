@@ -114,6 +114,10 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   FunctionDebugInfo* debug_info() const { return debug_info_; }
   size_t stack_size() const { return stack_size_; }
 
+  // True when branches to tail labels may use the single-instruction near
+  // forms (see Emit); sequences use this to place cold paths out of line.
+  bool near_tail_branches_safe() const { return near_tail_branches_safe_; }
+
   // NZCV fusion between adjacent HIR instructions (ANDS + compare-vs-zero).
   void DeclareFlagsZeroTest(int gpr_reg, bool is64) {
     flags_zero_fresh_reg_ = gpr_reg;
