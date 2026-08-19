@@ -58,9 +58,12 @@ class StackLayout {
    */
   static constexpr size_t GUEST_STACK_SIZE = 80;  // 16-byte aligned
   static constexpr size_t GUEST_SCRATCH = 0;      // 48 bytes (3 x Q)
+  // GUEST_RET_ADDR and HOST_RET_ADDR are adjacent on purpose: the prolog
+  // saves both with one stp and the call-return teardown reloads both with
+  // one ldp.
   static constexpr size_t GUEST_RET_ADDR = 48;
-  static constexpr size_t GUEST_CALL_RET_ADDR = 56;
-  static constexpr size_t HOST_RET_ADDR = 64;
+  static constexpr size_t HOST_RET_ADDR = 56;
+  static constexpr size_t GUEST_CALL_RET_ADDR = 64;
   // Reserved padding. Longjmp detection state lives in A64BackendContext so it
   // can be checked even when native SP still points at a skipped frame.
   static constexpr size_t GUEST_RESERVED = 72;
