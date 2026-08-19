@@ -505,40 +505,57 @@ inline void FixupVmxNan_V128(A64Emitter& e) {
   e.orr(VReg(2).b16, VReg(2).b16, VReg(1).b16);
 }
 
-// Load an FMA's three sources into the registers FixupVmxNan_V128_Fma reads:
-// v0 = src1 (A), v1 = src2 (C), v3 = src3 (B), flushing input denormals in
-// software where FPCR.FZ does not. Uses v2 and `tmp` as flush scratch.
+// Load an FMA's three sources for the FMA and its NaN fixup, flushing input
+// denormals in software where FPCR.FZ does not. Writes the register indices
+// holding A, C, B to out_a/out_c/out_b.
+//
+// Where software flushing runs, the sources are copied into scratch v0/v1/v3
+// so the flush can modify them in place (allocated registers may be live-out).
+// On kA64FZFlushesInputs hosts nothing modifies them, so allocated sources
+// feed the FMA and fixup directly and the three copies disappear; constants
+// still materialise into the scratch bank via SrcVReg.
 template <typename T1, typename T2, typename T3>
 inline void PrepareVmxFmaSources(A64Emitter& e, const T1& op1, const T2& op2,
-                                 const T3& op3, int tmp) {
+                                 const T3& op3, int tmp, int* out_a,
+                                 int* out_c, int* out_b) {
   const int s1 = SrcVReg(e, op1, 0);
+  const int s2 = SrcVReg(e, op2, 1);
+  const int s3 = SrcVReg(e, op3, 3);
+  if (e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
+    *out_a = s1;
+    *out_c = s2;
+    *out_b = s3;
+    return;
+  }
   if (s1 != 0) {
     e.mov(VReg(0).b16, VReg(s1).b16);
   }
-  const int s2 = SrcVReg(e, op2, 1);
   if (s2 != 1) {
     e.mov(VReg(1).b16, VReg(s2).b16);
   }
-  const int s3 = SrcVReg(e, op3, 3);
   if (s3 != 3) {
     e.mov(VReg(3).b16, VReg(s3).b16);
   }
-  if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-    LoadDenormalThreshold_V128(e, 2);
-    FlushDenormalsWithK_V128(e, 0, 2, tmp);
-    FlushDenormalsWithK_V128(e, 1, 2, tmp);
-    FlushDenormalsWithK_V128(e, 3, 2, tmp);
-  }
+  LoadDenormalThreshold_V128(e, 2);
+  FlushDenormalsWithK_V128(e, 0, 2, tmp);
+  FlushDenormalsWithK_V128(e, 1, 2, tmp);
+  FlushDenormalsWithK_V128(e, 3, 2, tmp);
+  *out_a = 0;
+  *out_c = 1;
+  *out_b = 3;
 }
 
 // Fix PPC NaN propagation for a V128 FMA result (3 source operands).
 // Hardware returns the first NaN in A, B, C order, quieted, and the HIR
 // operands are (A, C, B). An invalid operation with no NaN operand needs
 // nothing: ARM's default NaN is already the one PPC produces.
-// Expects: v0 = flushed A, v1 = flushed C, v3 = flushed B, v2 = the FMA result.
-// `tmp` must be a register free until the result is stored, which v0-v3 cannot
-// supply. Modifies v2 in place. Clobbers v1 and tmp.
-inline void FixupVmxNan_V128_Fma(A64Emitter& e, int tmp) {
+// a/c/b hold the (flushed) sources; v2 holds the FMA result, modified in
+// place. `tmp` is live scratch across the whole fixup: it must differ from
+// a, c, b and v2 and must not alias a live allocated register. `qs` is
+// clobbered only after the sources are dead, so any scratch-bank register
+// other than tmp and v2 serves, even one that held a source.
+inline void FixupVmxNan_V128_Fma(A64Emitter& e, int a, int c, int b, int tmp,
+                                 int qs) {
   using namespace Xbyak_aarch64;
   // Fast path: FMLA propagates any operand NaN into that result lane, and an
   // invalid operation produces the default NaN, so a result with no NaN lane
@@ -546,25 +563,25 @@ inline void FixupVmxNan_V128_Fma(A64Emitter& e, int tmp) {
   // ten-instruction fixup moves to the function tail. This mirrors the x64
   // backend's vptest design and its stated invariant.
   auto& done = e.NewCachedLabel();
-  auto& slow = e.AddToTail([tmp, &done](A64Emitter& e,
-                                        Xbyak_aarch64::Label&) {
+  auto& slow = e.AddToTail([a, c, b, tmp, qs, &done](A64Emitter& e,
+                                                     Xbyak_aarch64::Label&) {
     // Lowest priority first, so an earlier operand overwrites a later one: C,
     // then B, then A. BIF inserts an operand wherever its self-compare is
     // false, which is exactly where that operand is NaN.
-    e.fcmeq(VReg(tmp).s4, VReg(1).s4, VReg(1).s4);
-    e.bif(VReg(2).b16, VReg(1).b16, VReg(tmp).b16);
-    e.fcmeq(VReg(tmp).s4, VReg(3).s4, VReg(3).s4);
-    e.bif(VReg(2).b16, VReg(3).b16, VReg(tmp).b16);
-    e.fcmeq(VReg(tmp).s4, VReg(0).s4, VReg(0).s4);
-    e.bif(VReg(2).b16, VReg(0).b16, VReg(tmp).b16);
+    e.fcmeq(VReg(tmp).s4, VReg(c).s4, VReg(c).s4);
+    e.bif(VReg(2).b16, VReg(c).b16, VReg(tmp).b16);
+    e.fcmeq(VReg(tmp).s4, VReg(b).s4, VReg(b).s4);
+    e.bif(VReg(2).b16, VReg(b).b16, VReg(tmp).b16);
+    e.fcmeq(VReg(tmp).s4, VReg(a).s4, VReg(a).s4);
+    e.bif(VReg(2).b16, VReg(a).b16, VReg(tmp).b16);
 
     // Quiet whatever NaN each lane ended up with. A lane still holding the
     // arithmetic result is either not NaN or already the default NaN, so this
     // only ever quiets an operand that was signalling.
     e.fcmeq(VReg(tmp).s4, VReg(2).s4, VReg(2).s4);
-    e.movi(VReg(1).s4, 0x40, LSL, 16);
-    e.bic(VReg(1).b16, VReg(1).b16, VReg(tmp).b16);
-    e.orr(VReg(2).b16, VReg(2).b16, VReg(1).b16);
+    e.movi(VReg(qs).s4, 0x40, LSL, 16);
+    e.bic(VReg(qs).b16, VReg(qs).b16, VReg(tmp).b16);
+    e.orr(VReg(2).b16, VReg(2).b16, VReg(qs).b16);
     e.b(done);
   });
 
