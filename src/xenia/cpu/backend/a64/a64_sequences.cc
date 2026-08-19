@@ -1650,40 +1650,59 @@ struct AND_I16 : Sequence<AND_I16, I<OPCODE_AND, I16Op, I16Op, I16Op>> {
   }
 };
 struct AND_I32 : Sequence<AND_I32, I<OPCODE_AND, I32Op, I32Op, I32Op>> {
+  static void EmitAndsImm(A64Emitter& e, const WReg& dest, const WReg& src,
+                          uint32_t imm) {
+    if (IsValidLogicalImm(imm, 32)) {
+      e.ands(dest, src, imm);
+    } else {
+      e.mov(e.w0, static_cast<uint64_t>(imm));  // mov leaves NZCV alone
+      e.ands(dest, src, e.w0);
+    }
+  }
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // ANDS instead of AND costs nothing and lets an immediately following
+    // compare-vs-zero of this dest drop its cmp (the hot
+    // IsFalse(And(x, mask)) pattern in the FPSCR derivation).
     if (i.src1.is_constant && i.src2.is_constant) {
       e.mov(i.dest, static_cast<uint64_t>(static_cast<uint32_t>(
                         i.src1.constant() & i.src2.constant())));
-    } else if (i.src2.is_constant) {
-      e.and_imm(i.dest, i.src1, static_cast<uint32_t>(i.src2.constant()), e.w0);
-    } else if (i.src1.is_constant) {
-      e.and_imm(i.dest, i.src2, static_cast<uint32_t>(i.src1.constant()), e.w0);
-    } else {
-      e.and_(i.dest, i.src1, i.src2);
+      return;
     }
+    if (i.src2.is_constant) {
+      EmitAndsImm(e, i.dest, i.src1, static_cast<uint32_t>(i.src2.constant()));
+    } else if (i.src1.is_constant) {
+      EmitAndsImm(e, i.dest, i.src2, static_cast<uint32_t>(i.src1.constant()));
+    } else {
+      e.ands(i.dest, i.src1, i.src2);
+    }
+    e.DeclareFlagsZeroTest(i.dest.reg().getIdx(), false);
   }
 };
 struct AND_I64 : Sequence<AND_I64, I<OPCODE_AND, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // See AND_I32: ANDS is free and feeds the compare-vs-zero fusion.
     if (i.src1.is_constant && i.src2.is_constant) {
       e.mov(i.dest,
             static_cast<uint64_t>(i.src1.constant() & i.src2.constant()));
-    } else if (i.src2.is_constant) {
-      EmitAndImm(e, i.dest, i.src1, static_cast<uint64_t>(i.src2.constant()));
-    } else if (i.src1.is_constant) {
-      EmitAndImm(e, i.dest, i.src2, static_cast<uint64_t>(i.src1.constant()));
-    } else {
-      e.and_(i.dest, i.src1, i.src2);
+      return;
     }
+    if (i.src2.is_constant) {
+      EmitAndsImm(e, i.dest, i.src1, static_cast<uint64_t>(i.src2.constant()));
+    } else if (i.src1.is_constant) {
+      EmitAndsImm(e, i.dest, i.src2, static_cast<uint64_t>(i.src1.constant()));
+    } else {
+      e.ands(i.dest, i.src1, i.src2);
+    }
+    e.DeclareFlagsZeroTest(i.dest.reg().getIdx(), true);
   }
 
-  static void EmitAndImm(A64Emitter& e, const XReg& dest, const XReg& src,
-                         uint64_t imm) {
+  static void EmitAndsImm(A64Emitter& e, const XReg& dest, const XReg& src,
+                          uint64_t imm) {
     if (IsValidLogicalImm(imm, 64)) {
-      e.and_(dest, src, imm);
+      e.ands(dest, src, imm);
     } else {
-      e.mov(e.x0, imm);
-      e.and_(dest, src, e.x0);
+      e.mov(e.x0, imm);  // mov leaves NZCV alone
+      e.ands(dest, src, e.x0);
     }
   }
 };
@@ -2666,6 +2685,16 @@ EMITTER_OPCODE_TABLE(OPCODE_CNTLZ, CNTLZ_I8, CNTLZ_I16, CNTLZ_I32, CNTLZ_I64);
   struct NAME##_I32                                                            \
       : Sequence<NAME##_I32, I<OPCODE_##NAME, I8Op, I32Op, I32Op>> {           \
     static void Emit(A64Emitter& e, const EmitArgType& i) {                    \
+      /* If the previous sequence was an ANDS of this register, Z already   */ \
+      /* answers a compare against zero for EQ/NE (ANDS clears C and V).    */ \
+      if ((Xbyak_aarch64::COND == Xbyak_aarch64::EQ ||                         \
+           Xbyak_aarch64::COND == Xbyak_aarch64::NE) &&                        \
+          !i.src1.is_constant && i.src2.is_constant &&                         \
+          i.src2.constant() == 0 &&                                            \
+          e.FlagsHoldZeroTest(i.src1.reg().getIdx(), false)) {                 \
+        e.cset(i.dest, Xbyak_aarch64::COND);                                   \
+        return;                                                                \
+      }                                                                        \
       if (i.src1.is_constant) {                                                \
         e.mov(e.w0, static_cast<uint64_t>(                                     \
                         static_cast<uint32_t>(i.src1.constant())));            \
@@ -2687,6 +2716,14 @@ EMITTER_OPCODE_TABLE(OPCODE_CNTLZ, CNTLZ_I8, CNTLZ_I16, CNTLZ_I32, CNTLZ_I64);
   struct NAME##_I64                                                            \
       : Sequence<NAME##_I64, I<OPCODE_##NAME, I8Op, I64Op, I64Op>> {           \
     static void Emit(A64Emitter& e, const EmitArgType& i) {                    \
+      if ((Xbyak_aarch64::COND == Xbyak_aarch64::EQ ||                         \
+           Xbyak_aarch64::COND == Xbyak_aarch64::NE) &&                        \
+          !i.src1.is_constant && i.src2.is_constant &&                         \
+          i.src2.constant() == 0 &&                                            \
+          e.FlagsHoldZeroTest(i.src1.reg().getIdx(), true)) {                  \
+        e.cset(i.dest, Xbyak_aarch64::COND);                                   \
+        return;                                                                \
+      }                                                                        \
       if (i.src1.is_constant) {                                                \
         e.mov(e.x0, static_cast<uint64_t>(i.src1.constant()));                 \
         if (i.src2.is_constant) {                                              \

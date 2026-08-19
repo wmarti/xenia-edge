@@ -240,6 +240,8 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
     // Reset FPCR tracking on each block entry (we don't know which
     // predecessor ran, so mode is unknown).
     ForgetFpcrMode();
+    // Flags from a previous block cannot be trusted either.
+    ResetFlagsZeroTest();
 
     // Bind all labels targeting this block.
     auto label = block->label_head;
@@ -258,12 +260,17 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
         if (instr->GetOpcodeNum() != hir::OPCODE_SOURCE_OFFSET) {
           synchronize_stack_on_next_instruction_ = false;
           EnsureSynchronizedGuestAndHostStack();
+          // The helper call clobbers NZCV.
+          ResetFlagsZeroTest();
         }
       }
       const hir::Instr* new_tail = instr;
       bool selected = false;
       try {
         selected = SelectSequence(this, instr, &new_tail);
+        // One-shot handoff: whatever this sequence declared about NZCV is
+        // visible to exactly the next sequence and nothing later.
+        ShiftFlagsZeroTest();
       } catch (const Xbyak_aarch64::Error& e) {
         // Uncaught this aborts the process with no context, so name the opcode
         // and the guest function and fail just this compile.
