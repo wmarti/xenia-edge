@@ -106,26 +106,32 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
       validity.reset();
     } else if (i->opcode == &OPCODE_LOAD_CONTEXT_info) {
       const size_t offset = i->src1.offset;
-      if (validity.test(static_cast<uint32_t>(offset))) {
+      // Reuse only a value of the identical type. Slots are in practice
+      // accessed with one type each, but an explicit check costs nothing and
+      // an ASSIGN across types would be malformed HIR.
+      if (validity.test(static_cast<uint32_t>(offset)) &&
+          context_values_[offset]->type == i->dest->type) {
         // Legit previous value, reuse.
         Value* previous_value = context_values_[offset];
         i->opcode = &hir::OPCODE_ASSIGN_info;
         i->set_src1(previous_value);
       } else {
-        // Store the loaded value into the table.
-        if (i->dest->type != TypeName::VEC128_TYPE) {
-          context_values_[offset] = i->dest;
-          validity.set(static_cast<uint32_t>(offset));
-        }
+        // Store the loaded value into the table. VEC128 participates in the
+        // forwarding here; only dead-store elimination still excludes it
+        // (RemoveDeadStoresBlock), so every vector store keeps reaching
+        // context memory and any host-side reader of ctx->v stays correct.
+        // Accumulator chains (vmaddfp v, ..., v) reloaded the register from
+        // the context on every instruction because of the old exclusion --
+        // load_context v128 topped the execution profile at 330k.
+        context_values_[offset] = i->dest;
+        validity.set(static_cast<uint32_t>(offset));
       }
     } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
       const size_t offset = i->src1.offset;
       Value* value = i->src2.value;
-      if (value->type != TypeName::VEC128_TYPE) {
-        // Store value into the table for later.
-        context_values_[offset] = value;
-        validity.set(static_cast<uint32_t>(offset));
-      }
+      // Store value into the table for later (all types, see above).
+      context_values_[offset] = value;
+      validity.set(static_cast<uint32_t>(offset));
     }
     i = next;
   }
