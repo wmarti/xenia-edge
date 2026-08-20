@@ -3527,7 +3527,24 @@ struct MAX_V128 : Sequence<MAX_V128, I<OPCODE_MAX, V128Op, V128Op, V128Op>> {
     });
   }
 };
-EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128);
+struct MAX_I64 : Sequence<MAX_I64, I<OPCODE_MAX, I64Op, I64Op, I64Op>> {
+  static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // Signed max; csel reads both sources before writing, so dest may alias
+    // either. Constants (only one side can be constant after simplification)
+    // materialise in scratch.
+    XReg s1 = i.src1.is_constant ? e.x0 : XReg(i.src1.reg().getIdx());
+    if (i.src1.is_constant) {
+      e.mov(e.x0, static_cast<uint64_t>(i.src1.constant()));
+    }
+    XReg s2 = i.src2.is_constant ? e.x1 : XReg(i.src2.reg().getIdx());
+    if (i.src2.is_constant) {
+      e.mov(e.x1, static_cast<uint64_t>(i.src2.constant()));
+    }
+    e.cmp(s1, s2);
+    e.csel(i.dest, s1, s2, Xbyak_aarch64::GT);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128, MAX_I64);
 
 // MIN has signed semantics (HIR builder constant-folds using CompareSLT).
 // I8/I16 need sign-extension; all need signed condition code (LT not LO).

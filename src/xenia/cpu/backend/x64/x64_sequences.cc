@@ -634,7 +634,30 @@ struct MAX_V128 : Sequence<MAX_V128, I<OPCODE_MAX, V128Op, V128Op, V128Op>> {
     e.vblendvps(i.dest, e.xmm2, e.xmm3, i.dest);
   }
 };
-EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128);
+struct MAX_I64 : Sequence<MAX_I64, I<OPCODE_MAX, I64Op, I64Op, I64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    // Signed max via cmovl. Materialise constants; dest may alias a source.
+    Xbyak::Reg64 s1 = i.src1.is_constant ? e.rax : i.src1.reg();
+    if (i.src1.is_constant) {
+      e.mov(e.rax, i.src1.constant());
+    }
+    Xbyak::Reg64 s2 = i.src2.is_constant ? e.rcx : i.src2.reg();
+    if (i.src2.is_constant) {
+      e.mov(e.rcx, i.src2.constant());
+    }
+    if (i.dest.reg() == s2) {
+      e.cmp(s2, s1);
+      e.cmovl(i.dest, s1);
+    } else {
+      if (i.dest.reg() != s1) {
+        e.mov(i.dest, s1);
+      }
+      e.cmp(i.dest, s2);
+      e.cmovl(i.dest, s2);
+    }
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128, MAX_I64);
 
 // ============================================================================
 // OPCODE_MIN
