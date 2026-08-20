@@ -346,6 +346,35 @@ inline XReg ComputeMemoryAddress(A64Emitter& e, const I64Op& guest) {
   }
 }
 
+// True when the guest address can index guest memory directly as
+// [membase, Wsrc, UXTW]: a non-constant register on a host without the
+// physical remap. Guest addresses are always 32-bit, and the addressing
+// mode's zero-extension is exactly the mov that ComputeMemoryAddress emits,
+// so the mov disappears. Remap hosts keep the mov path: the +0x1000 must be
+// applied to the effective address before the access.
+inline bool GuestMemDirectIndex(const I64Op& guest, int* out_w_idx) {
+  if (guest.is_constant || NeedsPhysicalRemap()) {
+    return false;
+  }
+  *out_w_idx = guest.reg().getIdx();
+  return true;
+}
+
+// Emit one guest memory access, passing the address operand to emit_access:
+// [membase, Wsrc, UXTW] when GuestMemDirectIndex allows it, otherwise
+// [membase, x0] via ComputeMemoryAddress. The fallback address lives in x0,
+// so emit_access must not clobber x0 before its load/store.
+template <typename Fn>
+inline void EmitGuestMemAccess(A64Emitter& e, const I64Op& guest,
+                               Fn&& emit_access) {
+  int w_idx;
+  if (GuestMemDirectIndex(guest, &w_idx)) {
+    emit_access(ptr(e.GetMembaseReg(), WReg(w_idx), Xbyak_aarch64::UXTW));
+  } else {
+    emit_access(ptr(e.GetMembaseReg(), ComputeMemoryAddress(e, guest)));
+  }
+}
+
 template <typename OffsetOp>
 inline XReg AddGuestMemoryOffset(A64Emitter& e, const XReg& base,
                                  const OffsetOp& offset) {
@@ -411,6 +440,27 @@ inline XReg ComputeMemoryAddressOffset(A64Emitter& e, const I64Op& guest,
     ApplyPhysicalRemapW0(e);
   }
   return e.x0;
+}
+
+// Offset form of EmitGuestMemAccess. Only a zero constant displacement can
+// take the direct [membase, Wsrc, UXTW] form. Guest effective addresses wrap
+// at 32 bits, so a nonzero displacement must be added in W registers first
+// (base + displacement can carry past bit 31) - folding it into the 64-bit
+// addressing mode would leak that carry into the host address. Everything
+// else goes through ComputeMemoryAddressOffset, whose W-register add is
+// load-bearing.
+template <typename OffsetOp, typename Fn>
+inline void EmitGuestMemAccessOffset(A64Emitter& e, const I64Op& guest,
+                                     const OffsetOp& offset,
+                                     Fn&& emit_access) {
+  int w_idx;
+  if (offset.is_constant && offset.constant() == 0 &&
+      GuestMemDirectIndex(guest, &w_idx)) {
+    emit_access(ptr(e.GetMembaseReg(), WReg(w_idx), Xbyak_aarch64::UXTW));
+  } else {
+    emit_access(
+        ptr(e.GetMembaseReg(), ComputeMemoryAddressOffset(e, guest, offset)));
+  }
 }
 
 // Flush denormal float32 lanes to zero in a NEON register (in-place).
