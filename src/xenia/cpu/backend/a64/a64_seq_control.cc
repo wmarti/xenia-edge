@@ -406,6 +406,9 @@ struct CALL_INDIRECT
         e.mov(e.w16, static_cast<uint32_t>(i.src1.constant()));
         e.CallIndirect(i.instr, 16);
       }
+    } else if (e.W16Holds(i.src1.value)) {
+      // The preceding LOAD_CONTEXT loaded the target straight into w16.
+      e.CallIndirect(i.instr, 16);
     } else {
       e.CallIndirect(i.instr, i.src1.reg().getIdx());
     }
@@ -426,6 +429,8 @@ struct CALL_INDIRECT_TRUE_I8
     if (i.src2.is_constant) {
       e.mov(e.w16, static_cast<uint32_t>(i.src2.constant()));
       e.CallIndirect(i.instr, 16);
+    } else if (e.W16Holds(i.src2.value)) {
+      e.CallIndirect(i.instr, 16);
     } else {
       e.CallIndirect(i.instr, i.src2.reg().getIdx());
     }
@@ -440,6 +445,8 @@ struct CALL_INDIRECT_TRUE_I16
     e.cbz_near(i.src1, skip);
     if (i.src2.is_constant) {
       e.mov(e.w16, static_cast<uint32_t>(i.src2.constant()));
+      e.CallIndirect(i.instr, 16);
+    } else if (e.W16Holds(i.src2.value)) {
       e.CallIndirect(i.instr, 16);
     } else {
       e.CallIndirect(i.instr, i.src2.reg().getIdx());
@@ -456,6 +463,8 @@ struct CALL_INDIRECT_TRUE_I32
     if (i.src2.is_constant) {
       e.mov(e.w16, static_cast<uint32_t>(i.src2.constant()));
       e.CallIndirect(i.instr, 16);
+    } else if (e.W16Holds(i.src2.value)) {
+      e.CallIndirect(i.instr, 16);
     } else {
       e.CallIndirect(i.instr, i.src2.reg().getIdx());
     }
@@ -470,6 +479,8 @@ struct CALL_INDIRECT_TRUE_I64
     e.cbz_near(i.src1, skip);
     if (i.src2.is_constant) {
       e.mov(e.w16, static_cast<uint32_t>(i.src2.constant()));
+      e.CallIndirect(i.instr, 16);
+    } else if (e.W16Holds(i.src2.value)) {
       e.CallIndirect(i.instr, 16);
     } else {
       e.CallIndirect(i.instr, i.src2.reg().getIdx());

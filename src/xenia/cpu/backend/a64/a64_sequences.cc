@@ -239,6 +239,24 @@ struct LOAD_CONTEXT_I64
     : Sequence<LOAD_CONTEXT_I64, I<OPCODE_LOAD_CONTEXT, I64Op, OffsetOp>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto offset = static_cast<uint32_t>(i.src1.value);
+    // Every blr/bctr is a single-use LOAD_CONTEXT of lr/ctr feeding the very
+    // next CALL_INDIRECT, whose thunk contract wants the target in w16 (the
+    // allocator can never satisfy that itself: w16 is outside the register
+    // map). Load w16 directly and skip the allocated dest entirely - the
+    // call reads only the low 32 bits, exactly what the mov it replaces
+    // truncated to.
+    const hir::Instr* next = i.instr->next;
+    const bool single_use =
+        i.instr->dest->use_head && !i.instr->dest->use_head->next;
+    if (single_use && next &&
+        ((next->GetOpcodeNum() == OPCODE_CALL_INDIRECT &&
+          next->src1.value == i.instr->dest) ||
+         (next->GetOpcodeNum() == OPCODE_CALL_INDIRECT_TRUE &&
+          next->src2.value == i.instr->dest))) {
+      e.ldr(e.w16, ptr(e.GetContextReg(), offset));
+      e.DeclareW16Holds(i.instr->dest);
+      return;
+    }
     e.ldr(i.dest, ptr(e.GetContextReg(), offset));
   }
 };

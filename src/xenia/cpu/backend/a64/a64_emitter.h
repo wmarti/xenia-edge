@@ -129,11 +129,23 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   }
   void ResetFlagsZeroTest() {
     flags_zero_fresh_reg_ = flags_zero_armed_reg_ = -1;
+    w16_holds_fresh_ = w16_holds_armed_ = nullptr;
   }
   void ShiftFlagsZeroTest() {
     flags_zero_armed_reg_ = flags_zero_fresh_reg_;
     flags_zero_armed_is64_ = flags_zero_fresh_is64_;
     flags_zero_fresh_reg_ = -1;
+    w16_holds_armed_ = w16_holds_fresh_;
+    w16_holds_fresh_ = nullptr;
+  }
+
+  // One-shot forwarding of an indirect-call target into w16: LOAD_CONTEXT
+  // declares that it loaded this HIR value directly into w16, and only the
+  // immediately following instruction may consume it (same shift/reset rules
+  // as the flags fusion; nothing between the two can touch w16).
+  void DeclareW16Holds(const hir::Value* value) { w16_holds_fresh_ = value; }
+  bool W16Holds(const hir::Value* value) const {
+    return value && w16_holds_armed_ == value;
   }
 
   void MarkSourceOffset(const hir::Instr* i);
@@ -327,6 +339,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   bool flags_zero_fresh_is64_ = false;
   int flags_zero_armed_reg_ = -1;
   bool flags_zero_armed_is64_ = false;
+  const hir::Value* w16_holds_fresh_ = nullptr;
+  const hir::Value* w16_holds_armed_ = nullptr;
 
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t vec_reg_map_[VEC_COUNT];
