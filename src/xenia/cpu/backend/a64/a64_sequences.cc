@@ -3142,12 +3142,15 @@ struct SELECT_F64
     if (i.src1.is_constant) {
       e.mov(e.w0, static_cast<uint64_t>(i.src1.constant() & 0xFF));
     }
-    // An adjacent ANDS that produced the condition already left the zero
-    // test in Z; csel/fcsel NE reads only Z. The constant loads below leave
-    // NZCV alone.
+    // An adjacent producer may have left a condition equivalent to the zero
+    // test in NZCV (ANDS -> NE, DENORMAL_QUIRK's bound compare -> LO); the
+    // fcsel picks on that condition directly. The constant loads below
+    // leave NZCV alone.
+    Xbyak_aarch64::Cond sel_cond = Xbyak_aarch64::NE;
     if (i.src1.is_constant ||
-        !e.FlagsHoldZeroTest(i.src1.reg().getIdx(), false)) {
+        !e.FlagsNonzeroCondHeld(i.src1.reg().getIdx(), false, &sel_cond)) {
       e.cmp(cond, 0);
+      sel_cond = Xbyak_aarch64::NE;
     }
     if (i.src2.is_constant) {
       union {
@@ -3169,7 +3172,7 @@ struct SELECT_F64
     }
     DReg s2 = i.src2.is_constant ? e.d0 : DReg(i.src2.reg().getIdx());
     DReg s3 = i.src3.is_constant ? e.d1 : DReg(i.src3.reg().getIdx());
-    e.fcsel(i.dest, s2, s3, Xbyak_aarch64::NE);
+    e.fcsel(i.dest, s2, s3, sel_cond);
   }
 };
 struct SELECT_V128_V128
@@ -3723,6 +3726,13 @@ struct DENORMAL_QUIRK
       emit_finite_check(e);
     }
     e.L(done);
+    // Both paths reach here with the bound compare still in NZCV: hot ran
+    // cmp(min-1, 2^52-1) and fell through on HS with dest = 0; cold ran
+    // cmp(max, inf-bound) and cset LO into dest. Either way LO is true
+    // exactly when dest != 0, and the mov/cset/b in between touch no flags,
+    // so the adjacent SELECT can pick on LO without re-testing.
+    e.DeclareFlagsNonzeroCond(i.dest.reg().getIdx(), false,
+                              Xbyak_aarch64::LO);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_DENORMAL_QUIRK, DENORMAL_QUIRK);
