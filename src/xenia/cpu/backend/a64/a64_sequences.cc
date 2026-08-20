@@ -779,9 +779,32 @@ static void EmitFmaWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1, DReg s2,
   // operands are (A, C, B), so the walk is s1, s3, s2. Runs in the tail when
   // the near-branch bound allows, inline otherwise. NaN results skip the
   // negation, so both cold paths join after the fneg.
-  auto emit_nan_walk = [dest, s1, s2, s3, &done](A64Emitter& e) {
-    DReg order[3] = {s1, s3, s2};
-    for (int step = 0; step < 2; ++step) {
+  // The FMA result is tested instead of the operands, so when dest aliases a
+  // source (reachable for non-Rc double forms via allocator eviction) the
+  // aliased value is preserved in v3 - the one vector scratch the call sites
+  // leave free - before the FMA overwrites it. The walk reads only the
+  // preserved operands, never dest: ARM FNMSUB negates the addend before the
+  // fused op, so a NaN addend can reach dest sign-flipped.
+  DReg t1 = s1;
+  DReg t2 = s2;
+  DReg t3 = s3;
+  if (dest.getIdx() == s1.getIdx() || dest.getIdx() == s2.getIdx() ||
+      dest.getIdx() == s3.getIdx()) {
+    const DReg preserved = DReg(3);
+    e.fmov(preserved, dest);
+    if (s1.getIdx() == dest.getIdx()) {
+      t1 = preserved;
+    }
+    if (s2.getIdx() == dest.getIdx()) {
+      t2 = preserved;
+    }
+    if (s3.getIdx() == dest.getIdx()) {
+      t3 = preserved;
+    }
+  }
+  auto emit_nan_walk = [dest, t1, t2, t3, &done](A64Emitter& e) {
+    DReg order[3] = {t1, t3, t2};
+    for (int step = 0; step < 3; ++step) {
       auto& not_nan = e.NewCachedLabel();
       e.fcmp(order[step], order[step]);
       e.b_near(VC, not_nan);
@@ -791,10 +814,9 @@ static void EmitFmaWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1, DReg s2,
       e.b(done);
       e.L(not_nan);
     }
-    // At least one operand is a NaN, so it must be this one.
-    e.fmov(e.x0, order[2]);
-    e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
-    e.fmov(dest, e.x0);
+    // No operand NaN: the result NaN was generated (0*inf, inf-inf) and
+    // dest already holds the hardware default QNaN, which under FPCR.DN=0
+    // is PPC's, un-negated. Leave it.
     e.b(done);
   };
   // Invalid operation (0*inf, inf-inf) with no NaN input: canonicalize to the
@@ -810,28 +832,21 @@ static void EmitFmaWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1, DReg s2,
     nan_path = &e.NewCachedLabel();
   }
 
-  // Quick check: any NaN among the three operands?
-  e.fcmp(s1, s1);
-  e.fccmp(s2, s2, 0b0001, VC);
-  e.fccmp(s3, s3, 0b0001, VC);
-  e.b_near(VS, *nan_path);
-
-  // Fast path: no NaN input -> hardware FMA, then negate the result. Not
-  // fnmadd: that negates the operands (-Ra - Rn*Rm), which differs from
-  // -(Ra + Rn*Rm) when the two addends are zeros of opposite sign.
+  // Hardware FMA first - any NaN input propagates to the result, so one
+  // result test replaces the three-operand screen. Not fnmadd: that negates
+  // the operands (-Ra - Rn*Rm), which differs from -(Ra + Rn*Rm) when the
+  // two addends are zeros of opposite sign.
   if (is_sub) {
     e.fnmsub(dest, s1, s2, s3);
   } else {
     e.fmadd(dest, s1, s2, s3);
   }
-  // A NaN result here can only be an invalid operation (0*inf, inf-inf), and
-  // with FPCR.DN=0 - DEFAULT_FPU_FPCR is 0 and fpcr_table only touches bits
-  // 22-24 - hardware already produces the PPC default QNaN, so nothing needs
-  // canonicalising. It must skip the negation though: PPC returns the
-  // invalid-operation NaN un-negated even for fnmadd/fnmsub.
+  e.fcmp(dest, dest);
+  e.b_near(VS, *nan_path);
+  // Every NaN (propagated or generated) took the branch, so the negation
+  // runs only on numeric results - PPC returns NaNs un-negated even for
+  // fnmadd/fnmsub, and the tail's exits all rejoin below the fneg.
   if (negate) {
-    e.fcmp(dest, dest);
-    e.b_near(VS, done);
     e.fneg(dest, dest);
   }
   if (!tail_ok) {
@@ -847,9 +862,32 @@ static void EmitFmaWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1, SReg s2,
   e.ChangeFpcrMode(FPCRMode::Fpu);
   auto& done = e.NewCachedLabel();
 
-  auto emit_nan_walk = [dest, s1, s2, s3, &done](A64Emitter& e) {
-    SReg order[3] = {s1, s3, s2};
-    for (int step = 0; step < 2; ++step) {
+  // The FMA result is tested instead of the operands, so when dest aliases a
+  // source (reachable for non-Rc double forms via allocator eviction) the
+  // aliased value is preserved in v3 - the one vector scratch the call sites
+  // leave free - before the FMA overwrites it. The walk reads only the
+  // preserved operands, never dest: ARM FNMSUB negates the addend before the
+  // fused op, so a NaN addend can reach dest sign-flipped.
+  SReg t1 = s1;
+  SReg t2 = s2;
+  SReg t3 = s3;
+  if (dest.getIdx() == s1.getIdx() || dest.getIdx() == s2.getIdx() ||
+      dest.getIdx() == s3.getIdx()) {
+    const SReg preserved = SReg(3);
+    e.fmov(preserved, dest);
+    if (s1.getIdx() == dest.getIdx()) {
+      t1 = preserved;
+    }
+    if (s2.getIdx() == dest.getIdx()) {
+      t2 = preserved;
+    }
+    if (s3.getIdx() == dest.getIdx()) {
+      t3 = preserved;
+    }
+  }
+  auto emit_nan_walk = [dest, t1, t2, t3, &done](A64Emitter& e) {
+    SReg order[3] = {t1, t3, t2};
+    for (int step = 0; step < 3; ++step) {
       auto& not_nan = e.NewCachedLabel();
       e.fcmp(order[step], order[step]);
       e.b_near(VC, not_nan);
@@ -859,9 +897,9 @@ static void EmitFmaWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1, SReg s2,
       e.b(done);
       e.L(not_nan);
     }
-    e.fmov(e.w0, order[2]);
-    e.orr(e.w0, e.w0, static_cast<uint32_t>(1u << 22));
-    e.fmov(dest, e.w0);
+    // No operand NaN: the result NaN was generated (0*inf, inf-inf) and
+    // dest already holds the hardware default QNaN, which under FPCR.DN=0
+    // is PPC's, un-negated. Leave it.
     e.b(done);
   };
   const bool tail_ok = e.near_tail_branches_safe();
@@ -875,21 +913,15 @@ static void EmitFmaWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1, SReg s2,
     nan_path = &e.NewCachedLabel();
   }
 
-  e.fcmp(s1, s1);
-  e.fccmp(s2, s2, 0b0001, VC);
-  e.fccmp(s3, s3, 0b0001, VC);
-  e.b_near(VS, *nan_path);
-
+  // See the F64 twin: result-gated, negation runs only on numeric results.
   if (is_sub) {
     e.fnmsub(dest, s1, s2, s3);
   } else {
     e.fmadd(dest, s1, s2, s3);
   }
-  // See the F64 twin: an invalid-operation result is already the PPC default
-  // QNaN under FPCR.DN=0 and only needs to skip the negation.
+  e.fcmp(dest, dest);
+  e.b_near(VS, *nan_path);
   if (negate) {
-    e.fcmp(dest, dest);
-    e.b_near(VS, done);
     e.fneg(dest, dest);
   }
   if (!tail_ok) {
