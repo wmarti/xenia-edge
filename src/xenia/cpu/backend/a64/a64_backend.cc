@@ -374,6 +374,13 @@ ResolveFunctionThunk A64HelperEmitter::EmitResolveFunctionThunk() {
   // x0 now holds the resolved host machine code address.
   mov(x9, x0);
 
+  // Host code may change FPCR; every guest entry point is emitted assuming
+  // the scalar FPU mode (see the emitter's entry-mode contract), so restore
+  // it before jumping in. Cold path - one resolve per call site, ever.
+  ldr(w11,
+      ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, fpcr_fpu))));
+  msr(3, 3, 4, 4, 0, x11);
+
   code_offsets.epilog = getSize();
 
   // Restore x0 (guest return address) and saved regs.
