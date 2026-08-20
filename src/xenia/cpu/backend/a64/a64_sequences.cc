@@ -744,27 +744,15 @@ static void EmitFmaWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1, DReg s2,
   };
   // Invalid operation (0*inf, inf-inf) with no NaN input: canonicalize to the
   // PPC default QNaN, un-negated.
-  auto emit_invalid = [dest, &done](A64Emitter& e) {
-    e.mov(e.x0, static_cast<uint64_t>(0x7FF8000000000000ull));
-    e.fmov(dest, e.x0);
-    e.b(done);
-  };
-
   const bool tail_ok = e.near_tail_branches_safe();
   Xbyak_aarch64::Label* nan_path;
-  Xbyak_aarch64::Label* invalid;
   if (tail_ok) {
     nan_path = &e.AddToTail(
         [emit_nan_walk](A64Emitter& e, Xbyak_aarch64::Label&) {
           emit_nan_walk(e);
         });
-    invalid = &e.AddToTail(
-        [emit_invalid](A64Emitter& e, Xbyak_aarch64::Label&) {
-          emit_invalid(e);
-        });
   } else {
     nan_path = &e.NewCachedLabel();
-    invalid = &e.NewCachedLabel();
   }
 
   // Quick check: any NaN among the three operands?
@@ -781,18 +769,20 @@ static void EmitFmaWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1, DReg s2,
   } else {
     e.fmadd(dest, s1, s2, s3);
   }
-  // If result is NaN (0*inf or inf-inf), canonicalize to PPC default.
-  e.fcmp(dest, dest);
-  e.b_near(VS, *invalid);
+  // A NaN result here can only be an invalid operation (0*inf, inf-inf), and
+  // with FPCR.DN=0 - DEFAULT_FPU_FPCR is 0 and fpcr_table only touches bits
+  // 22-24 - hardware already produces the PPC default QNaN, so nothing needs
+  // canonicalising. It must skip the negation though: PPC returns the
+  // invalid-operation NaN un-negated even for fnmadd/fnmsub.
   if (negate) {
+    e.fcmp(dest, dest);
+    e.b_near(VS, done);
     e.fneg(dest, dest);
   }
   if (!tail_ok) {
     e.b(done);
     e.L(*nan_path);
     emit_nan_walk(e);
-    e.L(*invalid);
-    emit_invalid(e);
   }
   e.L(done);
 }
@@ -819,27 +809,15 @@ static void EmitFmaWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1, SReg s2,
     e.fmov(dest, e.w0);
     e.b(done);
   };
-  auto emit_invalid = [dest, &done](A64Emitter& e) {
-    e.mov(e.w0, static_cast<uint64_t>(0x7FC00000u));
-    e.fmov(dest, e.w0);
-    e.b(done);
-  };
-
   const bool tail_ok = e.near_tail_branches_safe();
   Xbyak_aarch64::Label* nan_path;
-  Xbyak_aarch64::Label* invalid;
   if (tail_ok) {
     nan_path = &e.AddToTail(
         [emit_nan_walk](A64Emitter& e, Xbyak_aarch64::Label&) {
           emit_nan_walk(e);
         });
-    invalid = &e.AddToTail(
-        [emit_invalid](A64Emitter& e, Xbyak_aarch64::Label&) {
-          emit_invalid(e);
-        });
   } else {
     nan_path = &e.NewCachedLabel();
-    invalid = &e.NewCachedLabel();
   }
 
   e.fcmp(s1, s1);
@@ -852,17 +830,17 @@ static void EmitFmaWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1, SReg s2,
   } else {
     e.fmadd(dest, s1, s2, s3);
   }
-  e.fcmp(dest, dest);
-  e.b_near(VS, *invalid);
+  // See the F64 twin: an invalid-operation result is already the PPC default
+  // QNaN under FPCR.DN=0 and only needs to skip the negation.
   if (negate) {
+    e.fcmp(dest, dest);
+    e.b_near(VS, done);
     e.fneg(dest, dest);
   }
   if (!tail_ok) {
     e.b(done);
     e.L(*nan_path);
     emit_nan_walk(e);
-    e.L(*invalid);
-    emit_invalid(e);
   }
   e.L(done);
 }
