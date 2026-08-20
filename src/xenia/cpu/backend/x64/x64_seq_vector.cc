@@ -2077,6 +2077,21 @@ struct VECTOR_ROTATE_LEFT_V128
 };
 EMITTER_OPCODE_TABLE(OPCODE_VECTOR_ROTATE_LEFT, VECTOR_ROTATE_LEFT_V128);
 
+// Constant operands are materialized into the low scratch registers, so a
+// sequence that needs a temporary cannot just grab xmm0: it may be holding
+// one of its own sources. Pick a scratch that is none of the three
+// registers in play (at most three of xmm0-xmm3 can be taken).
+static Xbyak::Xmm PickFreeScratchXmm(const Xbyak::Xmm& a, const Xbyak::Xmm& b,
+                                     const Xbyak::Xmm& c) {
+  for (int idx = 0; idx < 4; ++idx) {
+    if (idx != a.getIdx() && idx != b.getIdx() && idx != c.getIdx()) {
+      return Xbyak::Xmm(idx);
+    }
+  }
+  assert_always();
+  return Xbyak::Xmm(0);
+}
+
 struct VECTOR_AVERAGE
     : Sequence<VECTOR_AVERAGE,
                I<OPCODE_VECTOR_AVERAGE, V128Op, V128Op, V128Op>> {
@@ -2096,99 +2111,49 @@ struct VECTOR_AVERAGE
               if (is_unsigned) {
                 e.vpavgb(dest, src1, src2);
               } else {
-                // todo: avx2 version or version that sign extends to two __m128
-
-                e.vmovdqa(e.ptr[e.rsp + stack_offset_src1], src1);
-                e.vmovdqa(e.ptr[e.rsp + stack_offset_src2], src2);
-
-                Xbyak::Label looper;
-
-                e.xor_(e.edx, e.edx);
-
-                e.L(looper);
-
-                e.movsx(e.ecx, e.byte[e.rsp + stack_offset_src2 + e.rdx]);
-                e.movsx(e.eax, e.byte[e.rsp + stack_offset_src1 + e.rdx]);
-
-                e.lea(e.ecx, e.ptr[e.ecx + e.eax + 1]);
-                e.sar(e.ecx, 1);
-                e.mov(e.byte[e.rsp + stack_offset_src1 + e.rdx], e.cl);
-
-                if (e.IsFeatureEnabled(kX64FlagsIndependentVars)) {
-                  e.inc(e.edx);
-                } else {
-                  e.add(e.edx, 1);
-                }
-
-                e.cmp(e.edx, 16);
-                e.jnz(looper);
-                e.vmovdqa(dest, e.ptr[e.rsp + stack_offset_src1]);
+                // vpavgb is unsigned, but flipping the sign bit of both
+                // inputs maps signed values onto unsigned ones
+                // order-preservingly (a ^ 0x80 == a + 128 as unsigned), so
+                // the unsigned average comes out biased by exactly +128 and
+                // one more flip removes it. Same rounding, no loop, no
+                // spill.
+                Xbyak::Xmm tmp = PickFreeScratchXmm(src1, src2, dest);
+                e.vpxor(tmp, src1, e.GetXmmConstPtr(XMMSignMaskI8));
+                e.vpxor(dest, src2, e.GetXmmConstPtr(XMMSignMaskI8));
+                e.vpavgb(dest, tmp, dest);
+                e.vpxor(dest, dest, e.GetXmmConstPtr(XMMSignMaskI8));
               }
               break;
             case INT16_TYPE:
               if (is_unsigned) {
                 e.vpavgw(dest, src1, src2);
               } else {
-                e.vmovdqa(e.ptr[e.rsp + stack_offset_src1], src1);
-                e.vmovdqa(e.ptr[e.rsp + stack_offset_src2], src2);
-
-                Xbyak::Label looper;
-
-                e.xor_(e.edx, e.edx);
-
-                e.L(looper);
-
-                e.movsx(e.ecx, e.word[e.rsp + stack_offset_src2 + e.rdx]);
-                e.movsx(e.eax, e.word[e.rsp + stack_offset_src1 + e.rdx]);
-
-                e.lea(e.ecx, e.ptr[e.ecx + e.eax + 1]);
-                e.sar(e.ecx, 1);
-                e.mov(e.word[e.rsp + stack_offset_src1 + e.rdx], e.cx);
-
-                e.add(e.edx, 2);
-
-                e.cmp(e.edx, 16);
-                e.jnz(looper);
-                e.vmovdqa(dest, e.ptr[e.rsp + stack_offset_src1]);
+                // See the i8 case: sign-bit flip turns the unsigned vpavgw
+                // into the signed average.
+                Xbyak::Xmm tmp = PickFreeScratchXmm(src1, src2, dest);
+                e.vpxor(tmp, src1, e.GetXmmConstPtr(XMMSignMaskI16));
+                e.vpxor(dest, src2, e.GetXmmConstPtr(XMMSignMaskI16));
+                e.vpavgw(dest, tmp, dest);
+                e.vpxor(dest, dest, e.GetXmmConstPtr(XMMSignMaskI16));
               }
               break;
             case INT32_TYPE: {
-              // No 32bit averages in AVX.
-              e.vmovdqa(e.ptr[e.rsp + stack_offset_src1], src1);
-              e.vmovdqa(e.ptr[e.rsp + stack_offset_src2], src2);
-
-              Xbyak::Label looper;
-
-              e.xor_(e.edx, e.edx);
-
-              e.L(looper);
-              auto src2_current_ptr =
-                  e.dword[e.rsp + stack_offset_src2 + e.rdx];
-              auto src1_current_ptr =
-                  e.dword[e.rsp + stack_offset_src1 + e.rdx];
-
+              // No 32-bit average instruction exists, but the rounding
+              // average is (a | b) - ((a ^ b) >> 1) - an identity that
+              // never forms the sum, so it cannot overflow the lane and
+              // needs no widening. The shift carries the signedness:
+              // arithmetic for signed lanes, logical for unsigned.
+              Xbyak::Xmm tmp = PickFreeScratchXmm(src1, src2, dest);
+              e.vpor(tmp, src1, src2);
+              // dest may alias either source; both are read before it is
+              // written, and tmp already holds everything still needed.
+              e.vpxor(dest, src1, src2);
               if (is_unsigned) {
-                // implicit zero-ext
-                e.mov(e.ecx, src2_current_ptr);
-                e.mov(e.eax, src1_current_ptr);
+                e.vpsrld(dest, dest, 1);
               } else {
-                e.movsxd(e.rcx, src2_current_ptr);
-                e.movsxd(e.rax, src1_current_ptr);
+                e.vpsrad(dest, dest, 1);
               }
-
-              e.lea(e.rcx, e.ptr[e.rcx + e.rax + 1]);
-              if (is_unsigned) {
-                e.shr(e.rcx, 1);
-              } else {
-                e.sar(e.rcx, 1);
-              }
-              e.mov(e.dword[e.rsp + stack_offset_src1 + e.rdx], e.ecx);
-
-              e.add(e.edx, 4);
-
-              e.cmp(e.edx, 16);
-              e.jnz(looper);
-              e.vmovdqa(dest, e.ptr[e.rsp + stack_offset_src1]);
+              e.vpsubd(dest, tmp, dest);
             } break;
 
             default:
@@ -3135,22 +3100,11 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
       if (IsPackOutUnsigned(flags)) {
         if (IsPackOutSaturate(flags)) {
           // unsigned -> unsigned + saturate
-#if XE_PLATFORM_WIN32
-          // Windows x64 ABI: __m128i is passed by implicit pointer
-          if (i.src1.is_constant) {
-            e.lea(e.GetNativeParam(0),
-                  e.StashConstantXmm(0, i.src1.constant()));
-          } else {
-            e.lea(e.GetNativeParam(0), e.StashXmm(0, i.src1));
-          }
-          if (i.src2.is_constant) {
-            e.lea(e.GetNativeParam(1),
-                  e.StashConstantXmm(1, i.src2.constant()));
-          } else {
-            e.lea(e.GetNativeParam(1), e.StashXmm(1, i.src2));
-          }
-#else
-          // Linux/Mac System V ABI: __m128i passed in xmm0/xmm1, return in xmm0
+          // vpackuswb saturates from SIGNED words, so an unsigned word above
+          // 0x7FFF would come out 0 instead of 255. Clamping to 255 first
+          // makes every word non-negative and in range, which turns that
+          // saturation into an exact copy - so the whole guest->host round
+          // trip this used to make becomes four instructions.
           auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
           auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
           e.vmovaps(e.xmm0, src1);
@@ -3159,9 +3113,19 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
           e.CallNativeSafe(
               reinterpret_cast<void*>(EmulatePack8_IN_16_UN_UN_SAT));
           e.vmovaps(i.dest, e.xmm0);
+
+          auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm4);
+          e.vpcmpeqb(e.xmm2, e.xmm2, e.xmm2);  // 0x00FF per word, no
+          e.vpsrlw(e.xmm2, e.xmm2, 8);         // constant load needed
+          e.vpminuw(e.xmm0, src1, e.xmm2);
+          e.vpminuw(e.xmm1, src2, e.xmm2);
+          e.vpackuswb(i.dest, e.xmm0, e.xmm1);
           e.vpshufb(i.dest, i.dest, e.GetXmmConstPtr(XMMByteOrderMask));
         } else {
-          // unsigned -> unsigned
+          // unsigned -> unsigned (modulo: keep each word's low byte)
+          // Masking to the low byte puts every word in vpackuswb's exact
+          // range, so the pack truncates instead of saturating - again
+          // replacing a guest->host call with four instructions.
           auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
           auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
 
@@ -3176,6 +3140,13 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
 #endif
           e.CallNativeSafe(reinterpret_cast<void*>(EmulatePack8_IN_16_UN_UN));
           e.vmovaps(i.dest, e.xmm0);
+
+          auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm4);
+          e.vpcmpeqb(e.xmm2, e.xmm2, e.xmm2);
+          e.vpsrlw(e.xmm2, e.xmm2, 8);
+          e.vpand(e.xmm0, src1, e.xmm2);
+          e.vpand(e.xmm1, src2, e.xmm2);
+          e.vpackuswb(i.dest, e.xmm0, e.xmm1);
           e.vpshufb(i.dest, i.dest, e.GetXmmConstPtr(XMMByteOrderMask));
         }
       } else {
