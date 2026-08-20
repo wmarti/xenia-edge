@@ -374,6 +374,12 @@ typedef struct alignas(64) PPCContext_s {
     } bits;
   } fpscr;  // Floating-point status and control register
 
+  // Nonzero asks the running fiber to yield at its next JIT safepoint. Other
+  // host threads write it as a single byte store, raced reads are benign. Not
+  // std::atomic because this struct lives in raw memory no constructor runs
+  // over.
+  uint8_t preempt_requested;
+
   // Most frequently used registers first.
 
   uint64_t r[32];  // 0x20 General purpose registers
@@ -434,12 +440,6 @@ typedef struct alignas(64) PPCContext_s {
   // Every thread gets one, shared with others only if a private arena could
   // not be reserved, so emitted counters never have to null check.
   uint8_t* trace_counts;
-
-  // Nonzero asks the running fiber to yield at its next JIT safepoint. Other
-  // host threads write it as a single byte store, raced reads are benign. Not
-  // std::atomic because this struct lives in raw memory no constructor runs
-  // over.
-  uint8_t preempt_requested;
 
   template <typename T = uint8_t*>
   inline T TranslateVirtual(uint32_t guest_address) XE_RESTRICT const {
