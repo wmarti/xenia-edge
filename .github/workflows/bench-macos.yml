@@ -1,0 +1,145 @@
+name: Bench macOS ARM64
+
+# Native Apple Silicon benchmark of the PPC JIT.
+#
+# Everything this project measured during the audit was either static code
+# size, instruction counts from emulating the emitted AArch64 under unicorn on
+# an x86 host, or x86 cycle timings. None of that is wall-clock time for the
+# a64 backend on real hardware. This workflow runs xenia's own 169k-case PPC
+# corpus natively on an arm64 runner, once per ref, so the two branches can be
+# compared directly.
+#
+# The corpus .s sources need a PowerPC assembler to become the .bin/.map pairs
+# the runner loads, and macOS has none. tools/bench/ppcbin.tar.zst carries them
+# prebuilt (288 KB) so no toolchain is required here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: 'Ref to compare against'
+        default: 'edge'
+      suites:
+        description: 'Space-separated suites to time (empty = a default hot set)'
+        default: ''
+
+jobs:
+  bench:
+    name: Bench ${{ matrix.ref }}
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ['${{ github.event.inputs.baseline_ref }}', 'a64-fixes-on-edge']
+    steps:
+      - name: Checkout ref under test
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+
+      - name: Fetch prebuilt PPC corpus
+        uses: actions/checkout@v6
+        with:
+          ref: bench-macos-arm64
+          path: benchdata
+          sparse-checkout: tools/bench
+          sparse-checkout-cone-mode: false
+
+      - name: Setup
+        run: |
+          git submodule update --init --depth=1 -j$(sysctl -n hw.ncpu) \
+            $(grep -oE 'path = .+' .gitmodules | sed 's/path = //' \
+              | grep -v 'DirectXShaderCompiler')
+
+      - name: Build xenia-cpu-ppc-tests
+        run: |
+          # The corpus runner is not part of the normal build; XENIA_BUILD_TESTS
+          # gates it, and its CMake target already links the a64 backend when
+          # the target architecture is AArch64.
+          ./xenia-build.py build --config=Release --tests \
+            --target=xenia-cpu-ppc-tests
+
+      - name: Unpack corpus
+        run: |
+          mkdir -p ppcbin
+          tar -x --zstd -f benchdata/tools/bench/ppcbin.tar.zst -C /tmp
+          cp /tmp/ppcbin/*.bin /tmp/ppcbin/*.map ppcbin/
+          echo "suites: $(ls ppcbin/*.map | wc -l)"
+
+      - name: Locate binary
+        id: bin
+        run: |
+          exe=$(find build -name xenia-cpu-ppc-tests -type f -perm +111 | head -1)
+          echo "exe=$exe" >> "$GITHUB_OUTPUT"
+          file "$exe"
+
+      - name: Benchmark
+        run: |
+          exe='${{ steps.bin.outputs.exe }}'
+          suites='${{ github.event.inputs.suites }}'
+          if [ -z "$suites" ]; then
+            # Hot set: the sequences this branch changed most, plus call-heavy
+            # ones for the stackpoint redesign.
+            suites="instr__gen_vsel instr__gen_vaddfp instr__gen_vnmsubfp \
+                    instr__gen_vmaddfp instr__gen_vperm instr__gen_fmadds \
+                    instr__gen_vavgsb instr__gen_vavgsw instr__gen_vpkuhus \
+                    instr__gen_fadd instr__gen_fmuls instr_mcrf"
+          fi
+          echo "ref,suite,run,seconds" > bench-${{ matrix.ref }}.csv
+          for s in $suites; do
+            [ -f "ppcbin/$s.map" ] || { echo "skip missing $s"; continue; }
+            # Three runs; the comparison uses the minimum, which rejects
+            # scheduler and thermal noise better than a mean.
+            for run in 1 2 3; do
+              start=$(python3 -c 'import time; print(time.perf_counter())')
+              "$exe" --test_bin_path=ppcbin/ "$s" > /dev/null 2>&1 || true
+              end=$(python3 -c 'import time; print(time.perf_counter())')
+              python3 -c "print('${{ matrix.ref }},$s,$run,%.4f' % ($end - $start))" \
+                >> bench-${{ matrix.ref }}.csv
+            done
+            echo "  timed $s"
+          done
+          echo '--- results ---'
+          cat bench-${{ matrix.ref }}.csv
+
+      - name: Upload results
+        uses: actions/upload-artifact@v5
+        with:
+          name: bench-${{ matrix.ref }}
+          path: bench-${{ matrix.ref }}.csv
+          if-no-files-found: error
+
+  compare:
+    name: Compare
+    needs: bench
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: results
+      - name: Summarize
+        run: |
+          python3 - <<'PY'
+          import csv, glob, collections
+          best = collections.defaultdict(dict)
+          for f in glob.glob('results/**/*.csv', recursive=True):
+              for row in csv.DictReader(open(f)):
+                  k = (row['ref'], row['suite'])
+                  t = float(row['seconds'])
+                  if k not in best or t < best[k[0]].get(k[1], 9e9):
+                      best[k[0]][k[1]] = min(t, best[k[0]].get(k[1], 9e9))
+          refs = sorted(best)
+          if len(refs) != 2:
+              print('refs found:', refs); raise SystemExit(0)
+          base, new = refs[0], refs[1]
+          if new == 'edge': base, new = new, base
+          print(f"{'suite':32s} {base:>12s} {new:>12s} {'delta':>9s}")
+          tb = tn = 0.0
+          for s in sorted(set(best[base]) & set(best[new])):
+              b, n = best[base][s], best[new][s]
+              tb += b; tn += n
+              print(f"{s:32s} {b:12.4f} {n:12.4f} {100*(n-b)/b:+8.1f}%")
+          if tb:
+              print(f"{'TOTAL':32s} {tb:12.4f} {tn:12.4f} {100*(tn-tb)/tb:+8.1f}%")
+          PY
