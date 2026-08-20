@@ -64,8 +64,10 @@ class StackLayout {
   static constexpr size_t GUEST_RET_ADDR = 48;
   static constexpr size_t HOST_RET_ADDR = 56;
   static constexpr size_t GUEST_CALL_RET_ADDR = 64;
-  // Reserved padding. Longjmp detection state lives in A64BackendContext so it
-  // can be checked even when native SP still points at a skipped frame.
+  // This frame's stackpoint entry depth, spilled by PushStackpoint so
+  // PopStackpoint restores it without a read-modify-write of the context
+  // field. (Longjmp detection state itself lives in A64BackendContext so it
+  // can be checked even when native SP still points at a skipped frame.)
   static constexpr size_t GUEST_RESERVED = 72;
 };
 
