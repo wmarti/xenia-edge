@@ -1535,9 +1535,17 @@ EMITTER_OPCODE_TABLE(OPCODE_DID_SATURATE, DID_SATURATE);
 template <typename ARGS, typename FN>
 static void EmitBinaryFpWithPpcDefaultNan_F64(X64Emitter& e, const ARGS& i,
                                               FN&& emit_op) {
+  // When dest shares a register with a source the arithmetic stages through
+  // xmm2, because the tail must read the original operands to tell a
+  // propagated NaN from a generated one. A non-aliased dest (the common Rc
+  // shape) takes the result directly and drops the copy.
+  const bool aliased =
+      (!i.src1.is_constant && i.dest.reg() == i.src1.reg()) ||
+      (!i.src2.is_constant && i.dest.reg() == i.src2.reg());
+  const Xmm target = aliased ? e.xmm2 : i.dest.reg();
   Xbyak::Label& done = e.NewCachedLabel();
   Xbyak::Label& invalid =
-      e.AddToTail([i, &done](X64Emitter& e, Xbyak::Label& tail) {
+      e.AddToTail([i, aliased, &done](X64Emitter& e, Xbyak::Label& tail) {
         e.L(tail);
         Xbyak::Label propagate;
         // Re-derive rather than capture: a constant operand lives in xmm0 or
@@ -1552,15 +1560,19 @@ static void EmitBinaryFpWithPpcDefaultNan_F64(X64Emitter& e, const ARGS& i,
         e.vmovq(i.dest, e.rax);
         e.jmp(done, X64Emitter::T_NEAR);
         e.L(propagate);
-        e.vmovapd(i.dest, e.xmm2);
+        if (aliased) {
+          e.vmovapd(i.dest, e.xmm2);
+        }
         e.jmp(done, X64Emitter::T_NEAR);
       });
   Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
   Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
-  emit_op(e, e.xmm2, src1, src2);
-  e.vucomisd(e.xmm2, e.xmm2);
+  emit_op(e, target, src1, src2);
+  e.vucomisd(target, target);
   e.jp(invalid, X64Emitter::T_NEAR);
-  e.vmovapd(i.dest, e.xmm2);
+  if (aliased) {
+    e.vmovapd(i.dest, e.xmm2);
+  }
   e.L(done);
 }
 
