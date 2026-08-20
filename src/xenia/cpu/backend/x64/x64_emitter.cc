@@ -277,7 +277,12 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
     const Instr* instr = block->instr_head;
     while (instr) {
       if (synchronize_stack_on_next_instruction_) {
-        if (instr->GetOpcodeNum() != hir::OPCODE_SOURCE_OFFSET) {
+        // Skip annotations as well as SOURCE_OFFSET: under full debug info
+        // the frontend emits COMMENT first, and a check emitted there sits
+        // before the recorded source-map offset, so a longjmp repair would
+        // land past it and it would never run.
+        if (instr->GetOpcodeNum() != hir::OPCODE_SOURCE_OFFSET &&
+            instr->GetOpcodeNum() != hir::OPCODE_COMMENT) {
           synchronize_stack_on_next_instruction_ = false;
           EnsureSynchronizedGuestAndHostStack();
         }
@@ -522,10 +527,10 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
         processor->LookupModule(static_cast<uint32_t>(target_address));
 
     if (module_for_address) {
-      XexModule* xexmod = dynamic_cast<XexModule*>(module_for_address);
-      if (xexmod) {
-        InfoCacheFlags* flags = xexmod->GetInstructionAddressFlags(
-            static_cast<uint32_t>(target_address));
+      {
+        InfoCacheFlags* flags =
+            module_for_address->GetInstructionAddressFlags(
+                static_cast<uint32_t>(target_address));
         if (flags) {
           if (flags->is_return_site) {
             auto ones_with_address = processor->FindFunctionsWithAddress(

@@ -330,7 +330,12 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
       // Skip SOURCE_OFFSET because the return address from the call would
       // point past the check, so it would never execute.
       if (synchronize_stack_on_next_instruction_) {
-        if (instr->GetOpcodeNum() != hir::OPCODE_SOURCE_OFFSET) {
+        // Skip annotations as well as SOURCE_OFFSET: under full debug info
+        // the frontend emits COMMENT first, and a check emitted there sits
+        // before the recorded source-map offset, so a longjmp repair would
+        // land past it and it would never run.
+        if (instr->GetOpcodeNum() != hir::OPCODE_SOURCE_OFFSET &&
+            instr->GetOpcodeNum() != hir::OPCODE_COMMENT) {
           synchronize_stack_on_next_instruction_ = false;
           EnsureSynchronizedGuestAndHostStack();
           // The helper call clobbers NZCV.
