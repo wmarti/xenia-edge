@@ -374,6 +374,12 @@ typedef struct alignas(64) PPCContext_s {
     } bits;
   } fpscr;  // Floating-point status and control register
 
+  // Nonzero asks the running fiber to yield at its next JIT safepoint. Other
+  // host threads write it as a single byte store, raced reads are benign. Not
+  // std::atomic because this struct lives in raw memory no constructor runs
+  // over.
+  uint8_t preempt_requested;
+
   // Most frequently used registers first.
 
   uint64_t r[32];  // 0x20 General purpose registers
