@@ -141,9 +141,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     return false;
   }
   bool FlagsHoldZeroTest(int gpr_reg, bool is64) const {
-    return flags_zero_armed_reg_ == gpr_reg &&
-           flags_zero_armed_is64_ == is64 && gpr_reg >= 0 &&
-           flags_zero_armed_cond_ == Xbyak_aarch64::NE;
+    return flags_zero_armed_reg_ == gpr_reg && flags_zero_armed_is64_ == is64 &&
+           gpr_reg >= 0 && flags_zero_armed_cond_ == Xbyak_aarch64::NE;
   }
   void ResetFlagsZeroTest() {
     flags_zero_fresh_reg_ = flags_zero_armed_reg_ = -1;
@@ -201,7 +200,6 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   void PushStackpoint();
   void PopStackpoint();
   void EnsureSynchronizedGuestAndHostStack();
-
 
   // After a conditional region (TRAP_TRUE / CALL_*_TRUE), the taken path's
   // tracker state must meet the skip path's entry state: keep it only when

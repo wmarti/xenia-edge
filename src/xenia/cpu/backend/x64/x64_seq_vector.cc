@@ -2557,7 +2557,7 @@ struct PERMUTE_V128
         vec128_t mrghb_folded, mrglb_folded;
         static const uint8_t kMrghb[16] = {18, 2, 19, 3, 16, 0, 17, 1,
                                            22, 6, 23, 7, 20, 4, 21, 5};
-        static const uint8_t kMrglb[16] = {26, 10, 27, 11, 24, 8, 25, 9,
+        static const uint8_t kMrglb[16] = {26, 10, 27, 11, 24, 8,  25, 9,
                                            30, 14, 31, 15, 28, 12, 29, 13};
         std::memcpy(&mrghb_folded, kMrghb, 16);
         std::memcpy(&mrglb_folded, kMrglb, 16);

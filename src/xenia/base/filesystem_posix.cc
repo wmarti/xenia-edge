@@ -7,8 +7,8 @@
  ******************************************************************************
  */
 
-#include "xenia/base/assert.h"
 #include <cstring>
+#include "xenia/base/assert.h"
 
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
@@ -98,8 +98,9 @@ std::filesystem::path GetUserFolder() {
     // getpwuid_r reports "no entry" by returning 0 with a null result, so the
     // pointer has to be checked before it is dereferenced.
     if (getpwuid_r(getuid(), &pw1, buf, sizeof(buf), &pw) != 0 || !pw) {
-      XELOGW("GetUserFolder: no HOME and no passwd entry; using the current "
-             "directory");
+      XELOGW(
+          "GetUserFolder: no HOME and no passwd entry; using the current "
+          "directory");
       return std::filesystem::current_path() / ".local" / "share";
     }
     home = pw->pw_dir;
@@ -181,9 +182,9 @@ class PosixFileHandle : public FileHandle {
     // the end of the file. That is what Win32 does for a handle opened with
     // FILE_APPEND_DATA and no FILE_WRITE_DATA, and the guest relies on it. The
     // descriptor carries O_APPEND in that case, so write() appends atomically.
-    ssize_t out = append_only_ ? write(handle_, buffer, buffer_length)
-                               : pwrite(handle_, buffer, buffer_length,
-                                        file_offset);
+    ssize_t out = append_only_
+                      ? write(handle_, buffer, buffer_length)
+                      : pwrite(handle_, buffer, buffer_length, file_offset);
     if (out >= 0) {
       *out_bytes_written = out;
       return true;
@@ -229,10 +230,10 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
   // normal write handle instead would silently redirect positioned guest writes
   // to the end of file, because Linux documents that pwrite() ignores its
   // offset on an O_APPEND descriptor.
-  const bool append_only =
-      (desired_access & FileAccess::kFileAppendData) &&
-      !(desired_access & (FileAccess::kGenericWrite |
-                          FileAccess::kFileWriteData | FileAccess::kGenericAll));
+  const bool append_only = (desired_access & FileAccess::kFileAppendData) &&
+                           !(desired_access & (FileAccess::kGenericWrite |
+                                               FileAccess::kFileWriteData |
+                                               FileAccess::kGenericAll));
   if (append_only) {
     open_access |= O_APPEND;
   }

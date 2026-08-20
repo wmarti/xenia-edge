@@ -528,9 +528,8 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
 
     if (module_for_address) {
       {
-        InfoCacheFlags* flags =
-            module_for_address->GetInstructionAddressFlags(
-                static_cast<uint32_t>(target_address));
+        InfoCacheFlags* flags = module_for_address->GetInstructionAddressFlags(
+            static_cast<uint32_t>(target_address));
         if (flags) {
           if (flags->is_return_site) {
             auto ones_with_address = processor->FindFunctionsWithAddress(

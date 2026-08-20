@@ -135,8 +135,7 @@ class CodeCacheBase : public CodeCache {
                  size_t size) override {
     auto* addr = reinterpret_cast<uint8_t*>(execute_address);
     if (!generated_code_execute_base_ || !generated_code_write_base_ ||
-        addr < generated_code_execute_base_ ||
-        size > kGeneratedCodeSize ||
+        addr < generated_code_execute_base_ || size > kGeneratedCodeSize ||
         addr > generated_code_execute_base_ + (kGeneratedCodeSize - size)) {
       return false;
     }

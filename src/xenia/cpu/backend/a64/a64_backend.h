@@ -63,9 +63,9 @@ struct ReserveHelper {
 // record's own address identifies the frame: address - STACKPOINT_PREV is
 // the frame's post-alloc SP.
 struct A64StackpointNode {
-  const A64StackpointNode* prev_;   // older frame's node, null at chain root
-  uint32_t guest_stack_;            // guest r1 at function entry
-  uint32_t guest_return_address_;   // guest lr at function entry
+  const A64StackpointNode* prev_;  // older frame's node, null at chain root
+  uint32_t guest_stack_;           // guest r1 at function entry
+  uint32_t guest_return_address_;  // guest lr at function entry
 };
 static_assert(sizeof(A64StackpointNode) == 16,
               "the push emission pairs prev_ with the ret-slot zeroing and "

@@ -451,8 +451,7 @@ inline XReg ComputeMemoryAddressOffset(A64Emitter& e, const I64Op& guest,
 // load-bearing.
 template <typename OffsetOp, typename Fn>
 inline void EmitGuestMemAccessOffset(A64Emitter& e, const I64Op& guest,
-                                     const OffsetOp& offset,
-                                     Fn&& emit_access) {
+                                     const OffsetOp& offset, Fn&& emit_access) {
   int w_idx;
   if (offset.is_constant && offset.constant() == 0 &&
       GuestMemDirectIndex(guest, &w_idx)) {
@@ -484,7 +483,7 @@ inline void LoadDenormalThreshold_V128(A64Emitter& e, int k) {
 inline void FlushDenormalsWithK_V128(A64Emitter& e, int vreg, int k, int t) {
   e.shl(VReg(t).s4, VReg(vreg).s4, 1);
   e.cmhi(VReg(t).s4, VReg(k).s4,
-         VReg(t).s4);  // mask: all-1s for denormal-or-zero lanes
+         VReg(t).s4);                 // mask: all-1s for denormal-or-zero lanes
   e.ushr(VReg(t).s4, VReg(t).s4, 1);  // clear bit 31: preserve the sign
   e.bic(VReg(vreg).b16, VReg(vreg).b16, VReg(t).b16);
 }
@@ -494,11 +493,9 @@ inline void FlushDenormalsWithK_V128(A64Emitter& e, int vreg, int k, int t) {
 // the software flushes must not run. One flags load + tbz brackets a flush
 // block; FZ-input hosts never emit these blocks at all. w17 is free in every
 // vector FP sequence (the emitter reserves it as scratch).
-inline void EmitSkipFlushUnlessNJM(A64Emitter& e,
-                                   Xbyak_aarch64::Label& skip) {
-  e.ldr(e.w17, Xbyak_aarch64::ptr(
-                   e.x19, static_cast<uint32_t>(offsetof(
-                              A64BackendContext, flags))));
+inline void EmitSkipFlushUnlessNJM(A64Emitter& e, Xbyak_aarch64::Label& skip) {
+  e.ldr(e.w17, Xbyak_aarch64::ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                             A64BackendContext, flags))));
   e.tbz(e.w17, kA64BackendNJMOn, skip);
 }
 
@@ -594,8 +591,8 @@ inline void FixupVmxNan_V128(A64Emitter& e) {
 // still materialise into the scratch bank via SrcVReg.
 template <typename T1, typename T2, typename T3>
 inline void PrepareVmxFmaSources(A64Emitter& e, const T1& op1, const T2& op2,
-                                 const T3& op3, int tmp, int* out_a,
-                                 int* out_c, int* out_b) {
+                                 const T3& op3, int tmp, int* out_a, int* out_c,
+                                 int* out_b) {
   const int s1 = SrcVReg(e, op1, 0);
   const int s2 = SrcVReg(e, op2, 1);
   const int s3 = SrcVReg(e, op3, 3);

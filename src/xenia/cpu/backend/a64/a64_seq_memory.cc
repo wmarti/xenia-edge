@@ -267,8 +267,7 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
 };
 struct LOAD_I64 : Sequence<LOAD_I64, I<OPCODE_LOAD, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    EmitGuestMemAccess(e, i.src1,
-                       [&](const auto& adr) { e.ldr(i.dest, adr); });
+    EmitGuestMemAccess(e, i.src1, [&](const auto& adr) { e.ldr(i.dest, adr); });
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev(i.dest, i.dest);
     }
@@ -320,8 +319,7 @@ struct LOAD_F64 : Sequence<LOAD_F64, I<OPCODE_LOAD, F64Op, I64Op>> {
 };
 struct LOAD_V128 : Sequence<LOAD_V128, I<OPCODE_LOAD, V128Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    EmitGuestMemAccess(e, i.src1,
-                       [&](const auto& adr) { e.ldr(i.dest, adr); });
+    EmitGuestMemAccess(e, i.src1, [&](const auto& adr) { e.ldr(i.dest, adr); });
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       // Reverse bytes within each 32-bit word (PPC BE -> ARM64 LE).
       auto idx = i.dest.reg().getIdx();
@@ -592,8 +590,8 @@ struct STORE_V128
       e.rev32(VReg16B(0), VReg16B(src_idx));
       src_idx = 0;
     }
-    EmitGuestMemAccess(
-        e, i.src1, [&](const auto& adr) { e.str(QReg(src_idx), adr); });
+    EmitGuestMemAccess(e, i.src1,
+                       [&](const auto& adr) { e.str(QReg(src_idx), adr); });
     if (IsTracingData()) {
       auto trace_addr = ComputeMemoryAddress(e, i.src1);
       e.add(e.x2, e.GetMembaseReg(), trace_addr);

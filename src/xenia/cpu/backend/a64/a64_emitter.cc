@@ -267,8 +267,7 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   // Store the guest PPC return address (passed in x0 by convention) and the
   // host return address (x30/LR) with one paired store; the layout keeps the
   // two slots adjacent for exactly this.
-  static_assert(StackLayout::HOST_RET_ADDR ==
-                StackLayout::GUEST_RET_ADDR + 8);
+  static_assert(StackLayout::HOST_RET_ADDR == StackLayout::GUEST_RET_ADDR + 8);
   stp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
 
   // Record stackpoint for longjmp recovery. Also zeroes the call-return slot
@@ -313,9 +312,8 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
       // The function's first block starts in the scalar FPU mode by the
       // entry contract (see the initialization above); every other block
       // starts Unknown unless all its predecessor edges agreed.
-      FPCRMode incoming = (block == builder->first_block())
-                              ? FPCRMode::Fpu
-                              : FPCRMode::Unknown;
+      FPCRMode incoming =
+          (block == builder->first_block()) ? FPCRMode::Fpu : FPCRMode::Unknown;
       auto exp_it = expected_preds_.find(block);
       auto in_it = incoming_fpcr_.find(block);
       if (exp_it != expected_preds_.end() && in_it != incoming_fpcr_.end() &&
@@ -401,8 +399,7 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
     // through.
     {
       auto* last = block->instr_tail;
-      if (block->next &&
-          !(last && last->opcode == &hir::OPCODE_BRANCH_info)) {
+      if (block->next && !(last && last->opcode == &hir::OPCODE_BRANCH_info)) {
         RecordIncomingFpcr(block->next, fpcr_mode_);
       }
     }
@@ -749,8 +746,7 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     } else {
       // Tail call: pass our return address to the callee.
       PopStackpoint();
-      ldp(x0, x30,
-          ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
+      ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
       if (stack_size() <= 4095) {
         add(sp, sp, static_cast<uint32_t>(stack_size()));
       } else {
@@ -773,10 +769,9 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
       // Encoded path: see A64CodeCache for the entry format. The three
       // constants live in the backend context, so each costs one ldr instead
       // of a 3-4 instruction immediate materialisation per call site.
-      static_assert(offsetof(A64BackendContext, indirection_table_bias) <
-                        4096 &&
-                    offsetof(A64BackendContext, external_indirection_table) <
-                        4096);
+      static_assert(
+          offsetof(A64BackendContext, indirection_table_bias) < 4096 &&
+          offsetof(A64BackendContext, external_indirection_table) < 4096);
       ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
                             A64BackendContext, indirection_table_bias))));
       add(x14, x14, w16, UXTW);
@@ -788,12 +783,10 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
         auto& indirection_ready = NewCachedLabel();
         auto& external_target =
             AddToTail([&indirection_ready](A64Emitter& e, Label&) {
-              e.and_(e.w15, e.w9,
-                     A64CodeCache::kIndirectionExternalIndexMask);
-              e.ldr(e.x14,
-                    ptr(e.x19,
-                        static_cast<uint32_t>(offsetof(
-                            A64BackendContext, external_indirection_table))));
+              e.and_(e.w15, e.w9, A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14, ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                          A64BackendContext,
+                                          external_indirection_table))));
               e.add(e.x14, e.x14, e.x15, LSL, 3);
               e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
               e.b(indirection_ready);
@@ -801,8 +794,8 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
         tbnz_near(w9, 31, external_target);
 
         // Internal: rel32 from code cache base.
-        ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
-                              A64BackendContext, code_execute_base))));
+        ldr(x14, ptr(x19, static_cast<uint32_t>(
+                              offsetof(A64BackendContext, code_execute_base))));
         add(x9, x14, w9, UXTW);
         L(indirection_ready);
       } else {
@@ -813,8 +806,8 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
         tbnz(w9, 31, external_target);
 
         // Internal: rel32 from code cache base.
-        ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
-                              A64BackendContext, code_execute_base))));
+        ldr(x14, ptr(x19, static_cast<uint32_t>(
+                              offsetof(A64BackendContext, code_execute_base))));
         add(x9, x14, w9, UXTW);
         b(indirection_ready);
 
@@ -840,8 +833,7 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
 
   if (instr->flags & hir::CALL_TAIL) {
     PopStackpoint();
-    ldp(x0, x30,
-        ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
+    ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
     if (stack_size() <= 4095) {
       add(sp, sp, static_cast<uint32_t>(stack_size()));
     } else {
@@ -943,8 +935,8 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
   // itself and ignores x0), and the indirection loads touch neither. The
   // no-table fallback keeps the late reload because its resolve blr clobbers
   // x0/x30.
-  const bool hoist_ret_slots = (instr->flags & hir::CALL_TAIL) &&
-                               code_cache_->has_indirection_table();
+  const bool hoist_ret_slots =
+      (instr->flags & hir::CALL_TAIL) && code_cache_->has_indirection_table();
   if (hoist_ret_slots) {
     ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
   }
@@ -988,12 +980,10 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
         auto& indirection_ready = NewCachedLabel();
         auto& external_target =
             AddToTail([&indirection_ready](A64Emitter& e, Label&) {
-              e.and_(e.w15, e.w9,
-                     A64CodeCache::kIndirectionExternalIndexMask);
-              e.ldr(e.x14,
-                    ptr(e.x19,
-                        static_cast<uint32_t>(offsetof(
-                            A64BackendContext, external_indirection_table))));
+              e.and_(e.w15, e.w9, A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14, ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                          A64BackendContext,
+                                          external_indirection_table))));
               e.add(e.x14, e.x14, e.x15, LSL, 3);
               e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
               e.b(indirection_ready);
@@ -1001,8 +991,8 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
         tbnz_near(w9, 31, external_target);
 
         // Internal: rel32 from code cache base.
-        ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
-                              A64BackendContext, code_execute_base))));
+        ldr(x14, ptr(x19, static_cast<uint32_t>(
+                              offsetof(A64BackendContext, code_execute_base))));
         add(x9, x14, w9, UXTW);
         L(indirection_ready);
       } else {
@@ -1011,8 +1001,8 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
         tbnz(w9, 31, external_target);
 
         // Internal: rel32 from code cache base.
-        ldr(x14, ptr(x19, static_cast<uint32_t>(offsetof(
-                              A64BackendContext, code_execute_base))));
+        ldr(x14, ptr(x19, static_cast<uint32_t>(
+                              offsetof(A64BackendContext, code_execute_base))));
         add(x9, x14, w9, UXTW);
         b(indirection_ready);
 
@@ -1041,8 +1031,7 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
     // Tail call: pass our return address to the callee.
     PopStackpoint();
     if (!hoist_ret_slots) {
-      ldp(x0, x30,
-          ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
+      ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
     }
     if (stack_size() <= 4095) {
       add(sp, sp, static_cast<uint32_t>(stack_size()));
@@ -1217,14 +1206,14 @@ void A64Emitter::EmitPreemptCheck() {
       static_cast<uint32_t>(offsetof(ppc::PPCContext, preempt_requested));
   const bool has_vmx = function_has_vmx_;
   const FPCRMode held_mode = fpcr_mode_;
-  Label& do_yield = AddToTail([&after, flag_offset, has_vmx,
-                               held_mode](A64Emitter& e, Label&) {
+  Label& do_yield = AddToTail([&after, flag_offset, has_vmx, held_mode](
+                                  A64Emitter& e, Label&) {
     // The yield calls host code, which must run in FPU mode. The runtime mode
     // here is whatever the interrupted block was in - unknowable at emission
     // - so functions that touch VEC128 switch unconditionally (cold path).
     if (has_vmx) {
-      e.ldr(e.w0, ptr(e.x19, static_cast<uint32_t>(offsetof(
-                                 A64BackendContext, fpcr_fpu))));
+      e.ldr(e.w0, ptr(e.x19, static_cast<uint32_t>(
+                                 offsetof(A64BackendContext, fpcr_fpu))));
       e.msr(3, 3, 4, 4, 0, e.x0);  // msr FPCR, x0
     }
     e.strb(e.wzr, ptr(e.x20, flag_offset));
@@ -1276,12 +1265,10 @@ Label& A64Emitter::GetLabel(uint32_t label_id) {
   return *label;
 }
 
-
 void A64Emitter::PushStackpoint() {
   if (!cvars::a64_enable_host_guest_stack_synchronization) {
     // Still owns zeroing the call-return slot (see the prolog).
-    str(xzr,
-        ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
+    str(xzr, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
     return;
   }
   // Link this frame's node into the chain. All node fields are written
@@ -1302,10 +1289,8 @@ void A64Emitter::PushStackpoint() {
   ldr(w9, ptr(x20, static_cast<int32_t>(offsetof(ppc::PPCContext, r[1]))));
   ldr(w10, ptr(x20, static_cast<int32_t>(offsetof(ppc::PPCContext, lr))));
   // Zero the call-return slot and store prev_ with one pair.
-  stp(xzr, x8,
-      ptr(sp, static_cast<int32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
-  stp(w9, w10,
-      ptr(sp, static_cast<int32_t>(StackLayout::STACKPOINT_GUEST_SP)));
+  stp(xzr, x8, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
+  stp(w9, w10, ptr(sp, static_cast<int32_t>(StackLayout::STACKPOINT_GUEST_SP)));
   add(x11, sp, static_cast<uint32_t>(StackLayout::STACKPOINT_PREV));
   str(x11, ptr(x19, static_cast<uint32_t>(
                         offsetof(A64BackendContext, stackpoint_head))));
