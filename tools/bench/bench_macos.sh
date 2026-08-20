@@ -51,7 +51,12 @@ if [ ! -d "$CORPUS" ]; then
 fi
 
 build_ref() {           # build_ref <ref> -> echoes path to the binary
-  local ref="$1" wt="$WORK/wt-$ref" exe
+  # Each name gets its own statement: `local a=1 b=$a` declares both names
+  # before assigning either, so $a is unset while b is evaluated and `set -u`
+  # aborts.
+  local ref="$1"
+  local wt="$WORK/wt-$ref"
+  local exe=""
   if [ "$REUSE" = "1" ] && [ -d "$wt" ]; then
     exe=$(find "$wt/build" -name xenia-cpu-ppc-tests -type f -perm +111 2>/dev/null | head -1)
     [ -n "$exe" ] && { echo "$exe"; return; }
@@ -69,7 +74,7 @@ build_ref() {           # build_ref <ref> -> echoes path to the binary
     # xenia-cpu-ppc-tests is gated behind XENIA_BUILD_TESTS and is not part of
     # the normal app build; its CMake target already links the a64 backend on
     # AArch64.
-    ./xenia-build.py build --config=Release --tests \
+    ./xenia-build.py build --config=Release --build-tests \
       --target=xenia-cpu-ppc-tests >"$WORK/build-$ref.log" 2>&1 \
       || { tail -30 "$WORK/build-$ref.log"; die "build failed for $ref (see $WORK/build-$ref.log)"; }
   )
@@ -79,14 +84,29 @@ build_ref() {           # build_ref <ref> -> echoes path to the binary
 }
 
 bench_exe() {           # bench_exe <exe> <label> -> writes $WORK/<label>.csv
-  local exe="$1" label="$2" s run t best
+  local exe="$1"
+  local label="$2"
+  local s=""
+  local run=""
+  local t=""
+  local best=""
   : > "$WORK/$label.csv"
   for s in $SUITES; do
     [ -f "$CORPUS/$s.map" ] || { echo "    skip $s (not in corpus)"; continue; }
     best=""
     for run in $(seq 1 "$RUNS"); do
-      t=$( { /usr/bin/time -p "$exe" --test_bin_path="$CORPUS/" "$s" >/dev/null 2>/dev/null; } 2>&1 \
-             | awk '/^real/{print $2}' )
+      # Timed in python rather than /usr/bin/time: the BSD time on macOS
+      # writes to stderr with no -o option, so silencing the program's own
+      # stderr would swallow the measurement with it.
+      t=$(python3 - "$exe" "$CORPUS/" "$s" <<'PY'
+import subprocess, sys, time
+exe, corpus, suite = sys.argv[1:4]
+t0 = time.perf_counter()
+subprocess.run([exe, "--test_bin_path=" + corpus, suite],
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print("%.4f" % (time.perf_counter() - t0))
+PY
+)
       [ -n "$t" ] || t=9999
       best=$(python3 -c "print(min($t, ${best:-9999}))")
     done
