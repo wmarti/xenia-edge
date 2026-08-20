@@ -506,6 +506,19 @@ void Value::Div(Value* other, bool is_unsigned) {
 void Value::Max(Value* other) {
   assert_true(type == other->type);
   switch (type) {
+    // Integer Max is signed, matching the backends' csel/cmov GT sequences.
+    case INT8_TYPE:
+      constant.i8 = std::max(constant.i8, other->constant.i8);
+      break;
+    case INT16_TYPE:
+      constant.i16 = std::max(constant.i16, other->constant.i16);
+      break;
+    case INT32_TYPE:
+      constant.i32 = std::max(constant.i32, other->constant.i32);
+      break;
+    case INT64_TYPE:
+      constant.i64 = std::max(constant.i64, other->constant.i64);
+      break;
     case FLOAT32_TYPE:
       constant.f32 = std::max(constant.f32, other->constant.f32);
       break;

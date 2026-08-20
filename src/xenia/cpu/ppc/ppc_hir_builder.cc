@@ -551,20 +551,23 @@ void PPCHIRBuilder::UpdateFPSCR(std::initializer_list<Value*> operands,
 Value* PPCHIRBuilder::SingleDenormalOperand(
     std::initializer_list<Value*> operands) {
   Value* any_denormal = nullptr;
-  Value* any_nonfinite = nullptr;
+  Value* max_magnitude = nullptr;
   for (Value* operand : operands) {
     Value* magnitude = FpMagnitude(*this, operand);
     // Subtracting one wraps a zero operand up to the top, which is what keeps
     // zero from reading as denormal.
     Value* is_denormal = CompareULT(Sub(magnitude, LoadConstantUint64(1)),
                                     LoadConstantUint64(0x000FFFFFFFFFFFFFull));
-    Value* is_nonfinite =
-        CompareUGE(magnitude, LoadConstantUint64(0x7FF0000000000000ull));
     any_denormal = any_denormal ? Or(any_denormal, is_denormal) : is_denormal;
-    any_nonfinite =
-        any_nonfinite ? Or(any_nonfinite, is_nonfinite) : is_nonfinite;
+    // Nonfiniteness ORs across operands, and OR of (mag >= K) over the
+    // operands equals (max of mags >= K), so track one running maximum and
+    // compare once. Magnitudes have bit 63 clear, so the signed integer Max
+    // matches the unsigned comparison.
+    max_magnitude = max_magnitude ? Max(max_magnitude, magnitude) : magnitude;
   }
-  return And(any_denormal, IsFalse(any_nonfinite));
+  Value* all_finite =
+      CompareULT(max_magnitude, LoadConstantUint64(0x7FF0000000000000ull));
+  return And(any_denormal, all_finite);
 }
 
 Value* PPCHIRBuilder::ApplySingleDenormalOperand(Value* quirk, Value* result) {
