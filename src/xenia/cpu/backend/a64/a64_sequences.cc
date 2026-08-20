@@ -1699,17 +1699,32 @@ EMITTER_OPCODE_TABLE(OPCODE_ABS, ABS_F32, ABS_F64, ABS_V128);
 // OPCODE_AND
 // ============================================================================
 struct AND_I8 : Sequence<AND_I8, I<OPCODE_AND, I8Op, I8Op, I8Op>> {
+  static void EmitAndsImm(A64Emitter& e, const WReg& dest, const WReg& src,
+                          uint32_t imm) {
+    if (IsValidLogicalImm(imm, 32)) {
+      e.ands(dest, src, imm);
+    } else {
+      e.mov(e.w0, static_cast<uint64_t>(imm));  // mov leaves NZCV alone
+      e.ands(dest, src, e.w0);
+    }
+  }
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // ANDS instead of AND: I8 values are zero-extended in their W registers,
+    // so the 32-bit Z flag equals the I8 zero test, and a following
+    // compare-vs-zero or select can skip its cmp. Same pattern as AND_I32/64.
     if (i.src1.is_constant && i.src2.is_constant) {
       e.mov(i.dest, static_cast<uint64_t>(
                         (i.src1.constant() & i.src2.constant()) & 0xFF));
-    } else if (i.src2.is_constant) {
-      e.and_imm(i.dest, i.src1, i.src2.constant() & 0xFF, e.w0);
-    } else if (i.src1.is_constant) {
-      e.and_imm(i.dest, i.src2, i.src1.constant() & 0xFF, e.w0);
-    } else {
-      e.and_(i.dest, i.src1, i.src2);
+      return;
     }
+    if (i.src2.is_constant) {
+      EmitAndsImm(e, i.dest, i.src1, i.src2.constant() & 0xFF);
+    } else if (i.src1.is_constant) {
+      EmitAndsImm(e, i.dest, i.src2, i.src1.constant() & 0xFF);
+    } else {
+      e.ands(i.dest, i.src1, i.src2);
+    }
+    e.DeclareFlagsZeroTest(i.dest.reg().getIdx(), false);
   }
 };
 struct AND_I16 : Sequence<AND_I16, I<OPCODE_AND, I16Op, I16Op, I16Op>> {
@@ -2931,7 +2946,13 @@ struct SELECT_I8
     if (i.src1.is_constant) {
       e.mov(e.w0, static_cast<uint64_t>(i.src1.constant() & 0xFF));
     }
-    e.cmp(cond, 0);
+    // An adjacent ANDS that produced the condition already left the zero
+    // test in Z; csel/fcsel NE reads only Z. The constant loads below leave
+    // NZCV alone.
+    if (i.src1.is_constant ||
+        !e.FlagsHoldZeroTest(i.src1.reg().getIdx(), false)) {
+      e.cmp(cond, 0);
+    }
     if (i.src2.is_constant) {
       e.mov(e.w1, static_cast<uint64_t>(i.src2.constant() & 0xFF));
     }
@@ -2950,7 +2971,13 @@ struct SELECT_I16
     if (i.src1.is_constant) {
       e.mov(e.w0, static_cast<uint64_t>(i.src1.constant() & 0xFF));
     }
-    e.cmp(cond, 0);
+    // An adjacent ANDS that produced the condition already left the zero
+    // test in Z; csel/fcsel NE reads only Z. The constant loads below leave
+    // NZCV alone.
+    if (i.src1.is_constant ||
+        !e.FlagsHoldZeroTest(i.src1.reg().getIdx(), false)) {
+      e.cmp(cond, 0);
+    }
     if (i.src2.is_constant) {
       e.mov(e.w1, static_cast<uint64_t>(i.src2.constant() & 0xFFFF));
     }
@@ -2969,7 +2996,13 @@ struct SELECT_I32
     if (i.src1.is_constant) {
       e.mov(e.w0, static_cast<uint64_t>(i.src1.constant() & 0xFF));
     }
-    e.cmp(cond, 0);
+    // An adjacent ANDS that produced the condition already left the zero
+    // test in Z; csel/fcsel NE reads only Z. The constant loads below leave
+    // NZCV alone.
+    if (i.src1.is_constant ||
+        !e.FlagsHoldZeroTest(i.src1.reg().getIdx(), false)) {
+      e.cmp(cond, 0);
+    }
     if (i.src2.is_constant) {
       e.mov(e.w1,
             static_cast<uint64_t>(static_cast<uint32_t>(i.src2.constant())));
@@ -2990,7 +3023,13 @@ struct SELECT_I64
     if (i.src1.is_constant) {
       e.mov(e.w0, static_cast<uint64_t>(i.src1.constant() & 0xFF));
     }
-    e.cmp(cond, 0);
+    // An adjacent ANDS that produced the condition already left the zero
+    // test in Z; csel/fcsel NE reads only Z. The constant loads below leave
+    // NZCV alone.
+    if (i.src1.is_constant ||
+        !e.FlagsHoldZeroTest(i.src1.reg().getIdx(), false)) {
+      e.cmp(cond, 0);
+    }
     if (i.src2.is_constant) {
       e.mov(e.x1, static_cast<uint64_t>(i.src2.constant()));
     }
@@ -3009,7 +3048,13 @@ struct SELECT_F32
     if (i.src1.is_constant) {
       e.mov(e.w0, static_cast<uint64_t>(i.src1.constant() & 0xFF));
     }
-    e.cmp(cond, 0);
+    // An adjacent ANDS that produced the condition already left the zero
+    // test in Z; csel/fcsel NE reads only Z. The constant loads below leave
+    // NZCV alone.
+    if (i.src1.is_constant ||
+        !e.FlagsHoldZeroTest(i.src1.reg().getIdx(), false)) {
+      e.cmp(cond, 0);
+    }
     if (i.src2.is_constant) {
       union {
         float f;
@@ -3040,7 +3085,13 @@ struct SELECT_F64
     if (i.src1.is_constant) {
       e.mov(e.w0, static_cast<uint64_t>(i.src1.constant() & 0xFF));
     }
-    e.cmp(cond, 0);
+    // An adjacent ANDS that produced the condition already left the zero
+    // test in Z; csel/fcsel NE reads only Z. The constant loads below leave
+    // NZCV alone.
+    if (i.src1.is_constant ||
+        !e.FlagsHoldZeroTest(i.src1.reg().getIdx(), false)) {
+      e.cmp(cond, 0);
+    }
     if (i.src2.is_constant) {
       union {
         double d;
