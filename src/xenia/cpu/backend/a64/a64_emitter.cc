@@ -29,7 +29,6 @@
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
 
-DECLARE_int64(a64_max_stackpoints);
 DECLARE_bool(a64_enable_host_guest_stack_synchronization);
 
 namespace xe {
@@ -1247,14 +1246,6 @@ Label& A64Emitter::GetLabel(uint32_t label_id) {
   return *label;
 }
 
-void A64Emitter::HandleStackpointOverflowError(ppc::PPCContext* context) {
-  if (debugging::IsDebuggerAttached()) {
-    debugging::Break();
-  }
-  xe::FatalError(
-      "Overflowed stackpoints! Please report this error for this title to "
-      "Xenia developers.");
-}
 
 void A64Emitter::PushStackpoint() {
   if (!cvars::a64_enable_host_guest_stack_synchronization) {
@@ -1263,80 +1254,41 @@ void A64Emitter::PushStackpoint() {
         ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
     return;
   }
-  // x8 = stackpoints array, w9 = current depth
-  ldr(x8, ptr(x19,
-              static_cast<uint32_t>(offsetof(A64BackendContext, stackpoints))));
-  ldr(w9, ptr(x19, static_cast<uint32_t>(
-                       offsetof(A64BackendContext, current_stackpoint_depth))));
-
-  // Zero the call-return slot and spill this frame's entry depth beside it in
-  // one paired store: at every pop site the live depth equals entry + 1
-  // (calls balance, and the longjmp repair restores exactly entry + 1 for
-  // this frame), so PopStackpoint can restore the entry value from the frame
-  // with no read-modify-write of the context field. ldr w9 zero-extends, so
-  // the spilled x9 is the depth itself.
-  static_assert(StackLayout::GUEST_RESERVED ==
+  // Link this frame's node into the chain. All node fields are written
+  // before the head store, so an async signal never observes a head
+  // pointing at an uninitialized node, and the node sits above live SP so
+  // signal frames cannot smash it. No array, no depth, no bounds check:
+  // runaway recursion now dies on the host stack guard page (with the
+  // fiber-overflow diagnostic from the exception handler) instead of the
+  // old counted FatalError.
+  static_assert(StackLayout::STACKPOINT_PREV ==
                 StackLayout::GUEST_CALL_RET_ADDR + 8);
-  stp(xzr, x9,
-      ptr(sp, static_cast<int32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
-
-  // x8 += w9 * sizeof(A64BackendStackpoint) via scaled extended-register add.
-  static_assert(sizeof(A64BackendStackpoint) == 16,
-                "stackpoint indexing relies on a 16-byte element size");
-  add(x8, x8, w9, UXTW, 4);
-
-  // Store host SP.
-  mov(x10, sp);
-  str(x10, ptr(x8, static_cast<uint32_t>(
-                       offsetof(A64BackendStackpoint, host_stack_))));
-  // Store guest r1 (32-bit).
-  ldr(w10, ptr(x20, static_cast<int32_t>(offsetof(ppc::PPCContext, r[1]))));
-  str(w10, ptr(x8, static_cast<uint32_t>(
-                       offsetof(A64BackendStackpoint, guest_stack_))));
-  // Store guest LR (32-bit).
+  static_assert(StackLayout::STACKPOINT_GUEST_SP ==
+                StackLayout::STACKPOINT_PREV + 8);
+  static_assert(StackLayout::STACKPOINT_GUEST_RET ==
+                StackLayout::STACKPOINT_GUEST_SP + 4);
+  ldr(x8, ptr(x19, static_cast<uint32_t>(
+                       offsetof(A64BackendContext, stackpoint_head))));
+  ldr(w9, ptr(x20, static_cast<int32_t>(offsetof(ppc::PPCContext, r[1]))));
   ldr(w10, ptr(x20, static_cast<int32_t>(offsetof(ppc::PPCContext, lr))));
-  str(w10, ptr(x8, static_cast<uint32_t>(
-                       offsetof(A64BackendStackpoint, guest_return_address_))));
-
-  // Increment depth.
-  add(w9, w9, 1);
-  str(w9, ptr(x19, static_cast<uint32_t>(
-                       offsetof(A64BackendContext, current_stackpoint_depth))));
-
-  // Check for overflow.
-  const uint32_t max_stackpoints =
-      static_cast<uint32_t>(cvars::a64_max_stackpoints);
-  if (max_stackpoints <= 0xFFF) {
-    cmp(w9, max_stackpoints);
-  } else if ((max_stackpoints & 0xFFF) == 0 &&
-             (max_stackpoints >> 12) <= 0xFFF) {
-    // The default 65536 encodes as 16 << 12.
-    cmp(w9, max_stackpoints >> 12, 12);
-  } else {
-    mov(w10, max_stackpoints);
-    cmp(w9, w10);
-  }
-  auto& overflow_label = AddToTail([](A64Emitter& e, Label& lbl) {
-    e.CallNativeSafe(
-        reinterpret_cast<void*>(A64Emitter::HandleStackpointOverflowError));
-  });
-  if (near_tail_branches_safe_) {
-    b_near(GE, overflow_label);
-  } else {
-    b(GE, overflow_label);
-  }
+  // Zero the call-return slot and store prev_ with one pair.
+  stp(xzr, x8,
+      ptr(sp, static_cast<int32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
+  stp(w9, w10,
+      ptr(sp, static_cast<int32_t>(StackLayout::STACKPOINT_GUEST_SP)));
+  add(x11, sp, static_cast<uint32_t>(StackLayout::STACKPOINT_PREV));
+  str(x11, ptr(x19, static_cast<uint32_t>(
+                        offsetof(A64BackendContext, stackpoint_head))));
 }
-
 void A64Emitter::PopStackpoint() {
   if (!cvars::a64_enable_host_guest_stack_synchronization) {
     return;
   }
-  // The live depth here is always this frame's entry depth + 1 (see
-  // PushStackpoint), so restoring the spilled entry value is the decrement,
-  // without the read-modify-write.
-  ldr(w8, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RESERVED)));
-  str(w8, ptr(x19, static_cast<uint32_t>(
-                       offsetof(A64BackendContext, current_stackpoint_depth))));
+  // head = this frame's prev_. Runs before the frame teardown at every pop
+  // site, so there is no window where head points below live SP.
+  ldr(x8, ptr(sp, static_cast<uint32_t>(StackLayout::STACKPOINT_PREV)));
+  str(x8, ptr(x19, static_cast<uint32_t>(
+                       offsetof(A64BackendContext, stackpoint_head))));
 }
 
 void A64Emitter::EnsureSynchronizedGuestAndHostStack() {
@@ -1348,10 +1300,10 @@ void A64Emitter::EnsureSynchronizedGuestAndHostStack() {
   // still point at a skipped frame here.
   auto& return_from_sync = NewCachedLabel();
 
-  ldr(w16, ptr(x19, static_cast<uint32_t>(offsetof(
-                        A64BackendContext, pending_stackpoint_sync_depth))));
+  ldr(x16, ptr(x19, static_cast<uint32_t>(offsetof(
+                        A64BackendContext, pending_stackpoint_sync_node))));
   // Bound forward target (adr + b below) — short form is safe.
-  cbz_near(w16, return_from_sync);
+  cbz_near(x16, return_from_sync);
 
   auto& sync_label = AddToTail([](A64Emitter& e, Label& lbl) {
     // x8 was set up in the body to point at return_from_sync; do that there
