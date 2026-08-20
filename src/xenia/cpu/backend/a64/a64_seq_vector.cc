@@ -694,20 +694,30 @@ static bool TryEmitConstantVectorShift(A64Emitter& e, const V128Op& dest,
   uint32_t lane_bits, mask, lanes;
   switch (part_type) {
     case INT8_TYPE:
-      lane_bits = 8; mask = 0x07; lanes = 16;
+      lane_bits = 8;
+      mask = 0x07;
+      lanes = 16;
       break;
     case INT16_TYPE:
-      lane_bits = 16; mask = 0x0F; lanes = 8;
+      lane_bits = 16;
+      mask = 0x0F;
+      lanes = 8;
       break;
     case INT32_TYPE:
-      lane_bits = 32; mask = 0x1F; lanes = 4;
+      lane_bits = 32;
+      mask = 0x1F;
+      lanes = 4;
       break;
     default:
       return false;
   }
   auto lane_at = [&](uint32_t k) -> uint32_t {
-    if (lane_bits == 8) return amounts.u8[k];
-    if (lane_bits == 16) return amounts.u16[k];
+    if (lane_bits == 8) {
+      return amounts.u8[k];
+    }
+    if (lane_bits == 16) {
+      return amounts.u16[k];
+    }
     return amounts.u32[k];
   };
 
@@ -730,19 +740,31 @@ static bool TryEmitConstantVectorShift(A64Emitter& e, const V128Op& dest,
     }
     switch (part_type) {
       case INT8_TYPE:
-        if (kind == 0) e.shl(VReg(d).b16, VReg(s1).b16, amt0);
-        else if (kind == 1) e.ushr(VReg(d).b16, VReg(s1).b16, amt0);
-        else e.sshr(VReg(d).b16, VReg(s1).b16, amt0);
+        if (kind == 0) {
+          e.shl(VReg(d).b16, VReg(s1).b16, amt0);
+        } else if (kind == 1) {
+          e.ushr(VReg(d).b16, VReg(s1).b16, amt0);
+        } else {
+          e.sshr(VReg(d).b16, VReg(s1).b16, amt0);
+        }
         break;
       case INT16_TYPE:
-        if (kind == 0) e.shl(VReg(d).h8, VReg(s1).h8, amt0);
-        else if (kind == 1) e.ushr(VReg(d).h8, VReg(s1).h8, amt0);
-        else e.sshr(VReg(d).h8, VReg(s1).h8, amt0);
+        if (kind == 0) {
+          e.shl(VReg(d).h8, VReg(s1).h8, amt0);
+        } else if (kind == 1) {
+          e.ushr(VReg(d).h8, VReg(s1).h8, amt0);
+        } else {
+          e.sshr(VReg(d).h8, VReg(s1).h8, amt0);
+        }
         break;
       default:
-        if (kind == 0) e.shl(VReg(d).s4, VReg(s1).s4, amt0);
-        else if (kind == 1) e.ushr(VReg(d).s4, VReg(s1).s4, amt0);
-        else e.sshr(VReg(d).s4, VReg(s1).s4, amt0);
+        if (kind == 0) {
+          e.shl(VReg(d).s4, VReg(s1).s4, amt0);
+        } else if (kind == 1) {
+          e.ushr(VReg(d).s4, VReg(s1).s4, amt0);
+        } else {
+          e.sshr(VReg(d).s4, VReg(s1).s4, amt0);
+        }
         break;
     }
     return true;
@@ -753,24 +775,39 @@ static bool TryEmitConstantVectorShift(A64Emitter& e, const V128Op& dest,
   vec128_t folded = {};
   for (uint32_t k = 0; k < lanes; ++k) {
     int32_t v = static_cast<int32_t>(lane_at(k) & mask);
-    if (kind != 0) v = -v;
-    if (lane_bits == 8) folded.i8[k] = static_cast<int8_t>(v);
-    else if (lane_bits == 16) folded.i16[k] = static_cast<int16_t>(v);
-    else folded.i32[k] = v;
+    if (kind != 0) {
+      v = -v;
+    }
+    if (lane_bits == 8) {
+      folded.i8[k] = static_cast<int8_t>(v);
+    } else if (lane_bits == 16) {
+      folded.i16[k] = static_cast<int16_t>(v);
+    } else {
+      folded.i32[k] = v;
+    }
   }
   LoadV128Const(e, 2, folded);
   switch (part_type) {
     case INT8_TYPE:
-      if (kind == 2) e.sshl(VReg(d).b16, VReg(s1).b16, VReg(2).b16);
-      else e.ushl(VReg(d).b16, VReg(s1).b16, VReg(2).b16);
+      if (kind == 2) {
+        e.sshl(VReg(d).b16, VReg(s1).b16, VReg(2).b16);
+      } else {
+        e.ushl(VReg(d).b16, VReg(s1).b16, VReg(2).b16);
+      }
       break;
     case INT16_TYPE:
-      if (kind == 2) e.sshl(VReg(d).h8, VReg(s1).h8, VReg(2).h8);
-      else e.ushl(VReg(d).h8, VReg(s1).h8, VReg(2).h8);
+      if (kind == 2) {
+        e.sshl(VReg(d).h8, VReg(s1).h8, VReg(2).h8);
+      } else {
+        e.ushl(VReg(d).h8, VReg(s1).h8, VReg(2).h8);
+      }
       break;
     default:
-      if (kind == 2) e.sshl(VReg(d).s4, VReg(s1).s4, VReg(2).s4);
-      else e.ushl(VReg(d).s4, VReg(s1).s4, VReg(2).s4);
+      if (kind == 2) {
+        e.sshl(VReg(d).s4, VReg(s1).s4, VReg(2).s4);
+      } else {
+        e.ushl(VReg(d).s4, VReg(s1).s4, VReg(2).s4);
+      }
       break;
   }
   return true;
@@ -1118,10 +1155,10 @@ struct PERMUTE_V128
       // rev32'd tables followed by a rev32 of the result, so those controls
       // skip the control load and the tbl below. Identity checked against
       // the TBL emission over random vectors.
-      static const vec128_t kMrghbCtrl = vec128b(
-          0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
-      static const vec128_t kMrglbCtrl = vec128b(
-          8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+      static const vec128_t kMrghbCtrl =
+          vec128b(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+      static const vec128_t kMrglbCtrl =
+          vec128b(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
       zip_form = (ctrl == kMrghbCtrl) ? 1 : (ctrl == kMrglbCtrl) ? 2 : 0;
       if (!zip_form) {
         LoadV128Const(e, 2, ctrl);

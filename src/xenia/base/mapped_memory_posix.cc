@@ -24,8 +24,8 @@ class PosixMappedMemory : public MappedMemory {
  public:
   // data/size describe what the caller asked for; map_base/map_length describe
   // the page-aligned mapping underneath, which is what munmap and msync need.
-  PosixMappedMemory(void* data, size_t size, int file_descriptor, void* map_base,
-                    size_t map_length)
+  PosixMappedMemory(void* data, size_t size, int file_descriptor,
+                    void* map_base, size_t map_length)
       : MappedMemory(data, size),
         file_descriptor_(file_descriptor),
         map_base_(map_base),
@@ -98,9 +98,8 @@ class PosixMappedMemory : public MappedMemory {
     }
 
     void* data = static_cast<uint8_t*>(map_base) + delta;
-    return std::make_unique<PosixMappedMemory>(data, map_length,
-                                               file_descriptor, map_base,
-                                               map_span);
+    return std::make_unique<PosixMappedMemory>(
+        data, map_length, file_descriptor, map_base, map_span);
   }
 
   void Close(uint64_t truncate_size) override {

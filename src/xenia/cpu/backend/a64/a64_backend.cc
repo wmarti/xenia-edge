@@ -455,8 +455,8 @@ void* A64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
   // Publish head first, then move SP: between the two, head points above
   // live SP, which an async signal can tolerate; the reverse order would
   // leave head referencing memory below SP.
-  str(x10, ptr(x19, static_cast<uint32_t>(offsetof(
-                        A64BackendContext, stackpoint_head))));
+  str(x10, ptr(x19, static_cast<uint32_t>(
+                        offsetof(A64BackendContext, stackpoint_head))));
   str(xzr, ptr(x19, static_cast<uint32_t>(offsetof(
                         A64BackendContext, pending_stackpoint_sync_node))));
 
@@ -1139,14 +1139,30 @@ bool TestCondition(uint64_t pstate, uint32_t cond) {
   const bool v = (pstate >> 28) & 1;
   bool result;
   switch (cond >> 1) {
-    case 0b000: result = z; break;
-    case 0b001: result = c; break;
-    case 0b010: result = n; break;
-    case 0b011: result = v; break;
-    case 0b100: result = c && !z; break;
-    case 0b101: result = n == v; break;
-    case 0b110: result = (n == v) && !z; break;
-    default: result = true; break;  // AL/NV
+    case 0b000:
+      result = z;
+      break;
+    case 0b001:
+      result = c;
+      break;
+    case 0b010:
+      result = n;
+      break;
+    case 0b011:
+      result = v;
+      break;
+    case 0b100:
+      result = c && !z;
+      break;
+    case 0b101:
+      result = n == v;
+      break;
+    case 0b110:
+      result = (n == v) && !z;
+      break;
+    default:
+      result = true;
+      break;  // AL/NV
   }
   // Odd codes are the inverse, except 0b1111 (NV), which is still "always".
   if ((cond & 1) && cond != 0b1111) {
@@ -1177,8 +1193,7 @@ uint64_t A64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
     return current_pc + SignExtend(insn & 0x03FFFFFF, 26) * 4;
   }
   // B.cond / BC.cond imm19   0b01010100 imm19 x cond
-  if ((insn & 0xFF000010) == 0x54000000 ||
-      (insn & 0xFF000010) == 0x54000010) {
+  if ((insn & 0xFF000010) == 0x54000000 || (insn & 0xFF000010) == 0x54000010) {
     if (!TestCondition(ctx.pstate, insn & 0xF)) {
       return next_pc;
     }
@@ -1208,8 +1223,7 @@ uint64_t A64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
     return current_pc + SignExtend((insn >> 5) & 0x3FFF, 14) * 4;
   }
   // BR / BLR / RET  Rn
-  if ((insn & 0xFFFFFC1F) == 0xD61F0000 ||
-      (insn & 0xFFFFFC1F) == 0xD63F0000 ||
+  if ((insn & 0xFFFFFC1F) == 0xD61F0000 || (insn & 0xFFFFFC1F) == 0xD63F0000 ||
       (insn & 0xFFFFFC1F) == 0xD65F0000) {
     return ReadXReg(ctx, (insn >> 5) & 0x1F);
   }

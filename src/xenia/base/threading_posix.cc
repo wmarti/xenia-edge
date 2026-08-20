@@ -14,12 +14,12 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/threading_timer_queue.h"
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <array>
 #include <atomic>
@@ -1524,7 +1524,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
 #endif
   bool signaled_;
   int exit_code_;
-  State state_;             // Protected by state_mutex_
+  State state_;  // Protected by state_mutex_
   // Written only under state_mutex_. Atomic so the suspend signal handler can
   // read it without taking a lock, which would not be async-signal-safe.
   std::atomic<uint32_t> suspend_count_;

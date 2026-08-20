@@ -1559,9 +1559,8 @@ static void EmitBinaryFpWithPpcDefaultNan_F64(X64Emitter& e, const ARGS& i,
   // xmm2, because the tail must read the original operands to tell a
   // propagated NaN from a generated one. A non-aliased dest (the common Rc
   // shape) takes the result directly and drops the copy.
-  const bool aliased =
-      (!i.src1.is_constant && i.dest.reg() == i.src1.reg()) ||
-      (!i.src2.is_constant && i.dest.reg() == i.src2.reg());
+  const bool aliased = (!i.src1.is_constant && i.dest.reg() == i.src1.reg()) ||
+                       (!i.src2.is_constant && i.dest.reg() == i.src2.reg());
   const Xmm target = aliased ? e.xmm2 : i.dest.reg();
   Xbyak::Label& done = e.NewCachedLabel();
   Xbyak::Label& invalid =

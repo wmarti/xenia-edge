@@ -21,9 +21,9 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
-#include <unordered_map>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 #if XE_PLATFORM_MAC
 #include <mach/mach.h>
@@ -336,8 +336,10 @@ bool Protect(void* base_address, size_t length, PageAccess access,
       // means restoring whatever was on the caller's stack. Fail closed and say
       // so instead.
       *out_old_access = PageAccess::kNoAccess;
-      XELOGW("Protect: could not read the current protection of {}; reporting "
-             "kNoAccess", base_address);
+      XELOGW(
+          "Protect: could not read the current protection of {}; reporting "
+          "kNoAccess",
+          base_address);
     }
   }
 
