@@ -103,7 +103,14 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
   source_map_arena_.Reset();
   tail_code_.clear();
   label_bind_offsets_.clear();
-  fpcr_mode_ = FPCRMode::Unknown;
+  // Every path into a guest function runs in the scalar FPU mode: the
+  // host-to-guest thunk restores fpcr_fpu on entry, every call site emits
+  // EnsureFpuFpcrModeForTransition, every callee restores FPU before
+  // returning, the guest-to-host thunk restores fpcr_fpu after host
+  // callbacks, and the resolve thunk restores it after the host resolve.
+  // Starting Known-Fpu lets pure-integer functions skip both the first
+  // ChangeFpcrMode(Fpu) msr and the exit transition guard.
+  fpcr_mode_ = FPCRMode::Fpu;
 
   // The prolog, epilog and helpers emit outside the per-opcode guard below, so
   // an unencodable operand needs catching here too.
@@ -304,7 +311,11 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
     // EnsureFpuFpcrModeForTransition, so no stale mode can escape into host
     // code.
     {
-      FPCRMode incoming = FPCRMode::Unknown;
+      // The function's first block starts in the scalar FPU mode by the
+      // entry contract (see the initialization above); every other block
+      // starts Unknown unless all its predecessor edges agreed.
+      FPCRMode incoming =
+          (block == builder->first_block()) ? FPCRMode::Fpu : FPCRMode::Unknown;
       auto exp_it = expected_preds_.find(block);
       auto in_it = incoming_fpcr_.find(block);
       if (exp_it != expected_preds_.end() && in_it != incoming_fpcr_.end() &&
@@ -1203,19 +1214,20 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
   //
   // Tests the preempt flag other threads raise. The cold path clears it, a
   // deferred yield re-sets it.
-  // The yield path may clobber FPCR at runtime; under block-entry mode
-  // seeding the tracker can hold a pre-established mode here, so drop it and
-  // let the next float op re-establish. (The switch back to FPU for the
-  // yield's own host call happens in the tail.)
-  fpcr_mode_ = FPCRMode::Unknown;
+  // The yield path clobbers FPCR at runtime, but it is cold: when the
+  // tracker holds a known mode here (block-entry seeding often just
+  // established one), the yield tail restores that mode after the host
+  // call, so the hot path's static mode survives the check untouched. Only
+  // an already-unknown mode stays unknown.
   Label& after = NewCachedLabel();
   // ldrb/strb unsigned-offset encoding caps at 4095.
   static_assert(offsetof(ppc::PPCContext, preempt_requested) < 4096);
   const uint32_t flag_offset =
       static_cast<uint32_t>(offsetof(ppc::PPCContext, preempt_requested));
   const bool has_vmx = function_has_vmx_;
-  Label& do_yield = AddToTail([&after, flag_offset, has_vmx](A64Emitter& e,
-                                                             Label&) {
+  const FPCRMode held_mode = fpcr_mode_;
+  Label& do_yield = AddToTail([&after, flag_offset, has_vmx, held_mode](
+                                  A64Emitter& e, Label&) {
     // The yield calls host code, which must run in FPU mode. The runtime mode
     // here is whatever the interrupted block was in - unknowable at emission
     // - so functions that touch VEC128 switch unconditionally (cold path).
@@ -1233,6 +1245,15 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
     e.cbz(e.x0, after);
     e.mov(e.x9, reinterpret_cast<uint64_t>(e.backend()->guest_to_host_thunk()));
     e.blr(e.x9);
+    // Re-establish the mode the hot path still assumes (the host call left
+    // FPCR in the scalar FPU state via the guest-to-host thunk). The
+    // tracker still holds held_mode, which would make ChangeFpcrMode skip
+    // the emission - clear it first to force the reload.
+    if (held_mode != FPCRMode::Unknown && held_mode != FPCRMode::Fpu) {
+      e.fpcr_mode_ = FPCRMode::Unknown;
+      e.ChangeFpcrMode(held_mode);
+      e.fpcr_mode_ = held_mode;
+    }
     e.b(after);
   });
   if (cvars::log_safepoint_pc && guest_address) {
