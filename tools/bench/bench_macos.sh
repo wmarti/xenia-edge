@@ -22,7 +22,11 @@ set -euo pipefail
 
 REF_A="${1:-edge}"
 REF_B="${2:-a64-fixes-on-edge}"
-RUNS="${RUNS:-3}"
+RUNS="${RUNS:-5}"
+# A suite whose emitted code this branch does not change. Its measured delta
+# is pure measurement error, so it calibrates everything else in the table:
+# any result smaller than the control is indistinguishable from noise.
+CONTROL="${CONTROL:-instr__gen_vand}"
 REUSE="${REUSE:-0}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="${WORK:-/tmp/xenia-bench}"
@@ -32,7 +36,7 @@ CORPUS="$WORK/ppcbin"
 # PowerPC assembler, which macOS does not have.
 ARCHIVE="$ROOT/tools/bench/ppcbin.tar.zst"
 
-: "${SUITES:=instr__gen_vsel instr__gen_vaddfp instr__gen_vnmsubfp \
+: "${SUITES:=$CONTROL instr__gen_vsel instr__gen_vaddfp instr__gen_vnmsubfp \
 instr__gen_vmaddfp instr__gen_vperm instr__gen_fmadds instr__gen_vavgsb \
 instr__gen_vavgsw instr__gen_vpkuhus instr__gen_fadd instr__gen_fmuls \
 instr_mcrf}"
@@ -120,6 +124,7 @@ bench_exe() {           # bench_exe <exe> <label> -> writes $WORK/<label>.csv
   local run=""
   local t=""
   local best=""
+  local worst=""
   : > "$WORK/$label.csv"
   for s in $SUITES; do
     [ -f "$CORPUS/$s.map" ] || { echo "    skip $s (not in corpus)"; continue; }
@@ -139,9 +144,11 @@ PY
 )
       [ -n "$t" ] || t=9999
       best=$(python3 -c "print(min($t, ${best:-9999}))")
+      worst=$(python3 -c "print(max($t, ${worst:-0}))")
     done
-    echo "$s,$best" >> "$WORK/$label.csv"
-    printf '    %-28s %8.3fs\n' "$s" "$best"
+    echo "$s,$best,$worst" >> "$WORK/$label.csv"
+    printf '    %-28s %8.3fs  (spread %+.0f%%)\n' "$s" "$best" \
+      "$(python3 -c "print(100*($worst-$best)/$best if $best else 0)")"
   done
 }
 
@@ -162,6 +169,7 @@ python3 - "$WORK/a.csv" "$WORK/b.csv" "$REF_A" "$REF_B" <<'PY'
 import sys, csv
 a_path, b_path, ref_a, ref_b = sys.argv[1:5]
 rd = lambda p: {r[0]: float(r[1]) for r in csv.reader(open(p)) if r}
+control = "instr__gen_vand"
 A, B = rd(a_path), rd(b_path)
 common = [s for s in A if s in B]
 w = max([len(s) for s in common] + [16])
@@ -172,4 +180,10 @@ for s in sorted(common):
     print(f"{s:{w}} {A[s]:12.3f} {B[s]:12.3f} {100*(B[s]-A[s])/A[s]:+8.1f}%")
 if ta:
     print(f"{'TOTAL':{w}} {ta:12.3f} {tb:12.3f} {100*(tb-ta)/ta:+8.1f}%")
+if control in A and control in B:
+    noise = abs(100*(B[control]-A[control])/A[control])
+    print()
+    print(f"noise floor from the control suite ({control}, which this branch")
+    print(f"does not change): {noise:.1f}%. Treat any per-suite result smaller")
+    print("than that as indistinguishable from measurement error.")
 PY
