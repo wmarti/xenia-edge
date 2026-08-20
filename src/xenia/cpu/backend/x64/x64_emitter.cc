@@ -1027,6 +1027,11 @@ void X64Emitter::CallNative(uint64_t (*fn)(void* raw_context, uint64_t arg0),
 }
 
 void X64Emitter::CallNativeSafe(void* fn) {
+  // The guest-to-host thunk's tail restores mxcsr_fpu, so any tracked VMX
+  // mode is stale after this returns. (Tracker-only; when this runs inside
+  // a tail lambda the function's emission is already complete and the write
+  // is inert.)
+  ForgetMxcsrMode();
   // rcx = target function
   // rdx = arg0
   // r8  = arg1
@@ -2070,6 +2075,11 @@ bool X64Emitter::ChangeMxcsrMode(MXCSRMode new_mode, bool already_set) {
         SetMxcsrModeFlags(*this, new_mode);
       }
       return true;
+    } else {
+      // Even with the register already set, the backend flags word must
+      // describe the new mode, or a later dynamic check reads a stale flag
+      // (reachable through SET_ROUNDING_MODE).
+      SetMxcsrModeFlags(*this, new_mode);
     }
   }
   return false;
