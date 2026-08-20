@@ -674,9 +674,115 @@ EMITTER_OPCODE_TABLE(OPCODE_VECTOR_NONE_SET, VECTOR_NONE_SET);
 // ============================================================================
 // OPCODE_VECTOR_SHL
 // ============================================================================
+// Shift-by-constant fast paths for the VMX variable shifts. The frontend
+// only produces splatted shift amounts, but any constant folds: uniform
+// amounts use the immediate-form shift (one instruction), non-uniform ones
+// pre-mask (and pre-negate for right shifts) the constant on the host and
+// keep a single register-form shift. Returns true when it emitted.
+//
+// kind: 0 = shl (ushl), 1 = shr (ushr/-ushl), 2 = sha (sshr/-sshl).
+static bool TryEmitConstantVectorShift(A64Emitter& e, const V128Op& dest,
+                                       const V128Op& src1, const V128Op& src2,
+                                       uint32_t part_type, int kind) {
+  if (!src2.is_constant) {
+    return false;
+  }
+  const vec128_t amounts = src2.constant();
+  const int d = dest.reg().getIdx();
+  const int s1 = SrcVReg(e, src1, 0);
+
+  uint32_t lane_bits, mask, lanes;
+  switch (part_type) {
+    case INT8_TYPE:
+      lane_bits = 8; mask = 0x07; lanes = 16;
+      break;
+    case INT16_TYPE:
+      lane_bits = 16; mask = 0x0F; lanes = 8;
+      break;
+    case INT32_TYPE:
+      lane_bits = 32; mask = 0x1F; lanes = 4;
+      break;
+    default:
+      return false;
+  }
+  auto lane_at = [&](uint32_t k) -> uint32_t {
+    if (lane_bits == 8) return amounts.u8[k];
+    if (lane_bits == 16) return amounts.u16[k];
+    return amounts.u32[k];
+  };
+
+  bool uniform = true;
+  const uint32_t amt0 = lane_at(0) & mask;
+  for (uint32_t k = 1; k < lanes; ++k) {
+    if ((lane_at(k) & mask) != amt0) {
+      uniform = false;
+      break;
+    }
+  }
+
+  if (uniform) {
+    if (amt0 == 0) {
+      // ushr/sshr cannot encode #0; the shift is the identity.
+      if (d != s1) {
+        e.mov(VReg(d).b16, VReg(s1).b16);
+      }
+      return true;
+    }
+    switch (part_type) {
+      case INT8_TYPE:
+        if (kind == 0) e.shl(VReg(d).b16, VReg(s1).b16, amt0);
+        else if (kind == 1) e.ushr(VReg(d).b16, VReg(s1).b16, amt0);
+        else e.sshr(VReg(d).b16, VReg(s1).b16, amt0);
+        break;
+      case INT16_TYPE:
+        if (kind == 0) e.shl(VReg(d).h8, VReg(s1).h8, amt0);
+        else if (kind == 1) e.ushr(VReg(d).h8, VReg(s1).h8, amt0);
+        else e.sshr(VReg(d).h8, VReg(s1).h8, amt0);
+        break;
+      default:
+        if (kind == 0) e.shl(VReg(d).s4, VReg(s1).s4, amt0);
+        else if (kind == 1) e.ushr(VReg(d).s4, VReg(s1).s4, amt0);
+        else e.sshr(VReg(d).s4, VReg(s1).s4, amt0);
+        break;
+    }
+    return true;
+  }
+
+  // Non-uniform: fold the mask (and the negation for right shifts) on the
+  // host and load the finished per-lane shift vector.
+  vec128_t folded = {};
+  for (uint32_t k = 0; k < lanes; ++k) {
+    int32_t v = static_cast<int32_t>(lane_at(k) & mask);
+    if (kind != 0) v = -v;
+    if (lane_bits == 8) folded.i8[k] = static_cast<int8_t>(v);
+    else if (lane_bits == 16) folded.i16[k] = static_cast<int16_t>(v);
+    else folded.i32[k] = v;
+  }
+  LoadV128Const(e, 2, folded);
+  switch (part_type) {
+    case INT8_TYPE:
+      if (kind == 2) e.sshl(VReg(d).b16, VReg(s1).b16, VReg(2).b16);
+      else e.ushl(VReg(d).b16, VReg(s1).b16, VReg(2).b16);
+      break;
+    case INT16_TYPE:
+      if (kind == 2) e.sshl(VReg(d).h8, VReg(s1).h8, VReg(2).h8);
+      else e.ushl(VReg(d).h8, VReg(s1).h8, VReg(2).h8);
+      break;
+    default:
+      if (kind == 2) e.sshl(VReg(d).s4, VReg(s1).s4, VReg(2).s4);
+      else e.ushl(VReg(d).s4, VReg(s1).s4, VReg(2).s4);
+      break;
+  }
+  return true;
+}
+
 struct VECTOR_SHL_V128
     : Sequence<VECTOR_SHL_V128, I<OPCODE_VECTOR_SHL, V128Op, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    if (TryEmitConstantVectorShift(e, i.dest, i.src1, i.src2, i.instr->flags,
+                                   0)) {
+      return;
+    }
     int s1 = SrcVReg(e, i.src1, 0);
     int s2 = SrcVReg(e, i.src2, 1);
     int d = i.dest.reg().getIdx();
@@ -714,6 +820,10 @@ EMITTER_OPCODE_TABLE(OPCODE_VECTOR_SHL, VECTOR_SHL_V128);
 struct VECTOR_SHR_V128
     : Sequence<VECTOR_SHR_V128, I<OPCODE_VECTOR_SHR, V128Op, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    if (TryEmitConstantVectorShift(e, i.dest, i.src1, i.src2, i.instr->flags,
+                                   1)) {
+      return;
+    }
     int s1 = SrcVReg(e, i.src1, 0);
     int s2 = SrcVReg(e, i.src2, 1);
     int d = i.dest.reg().getIdx();
@@ -754,6 +864,10 @@ EMITTER_OPCODE_TABLE(OPCODE_VECTOR_SHR, VECTOR_SHR_V128);
 struct VECTOR_SHA_V128
     : Sequence<VECTOR_SHA_V128, I<OPCODE_VECTOR_SHA, V128Op, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    if (TryEmitConstantVectorShift(e, i.dest, i.src1, i.src2, i.instr->flags,
+                                   2)) {
+      return;
+    }
     int s1 = SrcVReg(e, i.src1, 0);
     int s2 = SrcVReg(e, i.src2, 1);
     int d = i.dest.reg().getIdx();
