@@ -1254,14 +1254,22 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
     e.mov(e.x0,
           reinterpret_cast<uint64_t>(&xe::cpu::backend::preempt_yield_handler));
     e.ldr(e.x0, ptr(e.x0));
-    e.cbz(e.x0, after);
+    const bool restore_held =
+        held_mode != FPCRMode::Unknown && held_mode != FPCRMode::Fpu;
+    Xbyak_aarch64::Label rejoin;
+    // A null handler (scheduler not yet started, or shut down with a stale
+    // flag) must still pass through the held-mode restore below: the FPU
+    // switch above already ran, and the hot path continues assuming
+    // held_mode.
+    e.cbz(e.x0, restore_held ? rejoin : after);
     e.mov(e.x9, reinterpret_cast<uint64_t>(e.backend()->guest_to_host_thunk()));
     e.blr(e.x9);
     // Re-establish the mode the hot path still assumes (the host call left
     // FPCR in the scalar FPU state via the guest-to-host thunk). The
     // tracker still holds held_mode, which would make ChangeFpcrMode skip
     // the emission - clear it first to force the reload.
-    if (held_mode != FPCRMode::Unknown && held_mode != FPCRMode::Fpu) {
+    if (restore_held) {
+      e.L(rejoin);
       e.fpcr_mode_ = FPCRMode::Unknown;
       e.ChangeFpcrMode(held_mode);
       e.fpcr_mode_ = held_mode;
