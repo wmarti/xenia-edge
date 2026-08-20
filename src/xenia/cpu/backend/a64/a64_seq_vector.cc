@@ -1097,6 +1097,16 @@ struct PERMUTE_I32
       e.ext(VReg(d).b16, VReg(s2).b16, VReg(s3).b16, words[0] * 4);
       return;
     }
+    // vmrghw/vmrglw word interleaves are a single zip: PPC word i is NEON
+    // s[i] directly, so [A0 B0 A1 B1] = zip1 and [A2 B2 A3 B3] = zip2.
+    if (words[0] == 0 && words[1] == 4 && words[2] == 1 && words[3] == 5) {
+      e.zip1(VReg(d).s4, VReg(s2).s4, VReg(s3).s4);
+      return;
+    }
+    if (words[0] == 2 && words[1] == 6 && words[2] == 3 && words[3] == 7) {
+      e.zip2(VReg(d).s4, VReg(s2).s4, VReg(s3).s4);
+      return;
+    }
     // Build TBL control from the I32 permute control word.
     uint8_t tbl_ctrl[16];
     for (int idx = 0; idx < 4; idx++) {
@@ -1133,6 +1143,7 @@ struct PERMUTE_V128
     //
     // Compute the masked control first: the control register is read before
     // v0/v1 are written, so no conflict copy is needed either.
+    int zip_form = 0;
     if (i.src1.is_constant) {
       // Fold the mask on the host too; the adjusted constant is sometimes
       // movi-encodable, shrinking the load.
@@ -1140,7 +1151,18 @@ struct PERMUTE_V128
       for (int k = 0; k < 16; k++) {
         ctrl.u8[k] &= 0x1F;
       }
-      LoadV128Const(e, 2, ctrl);
+      // The vmrghb/vmrglb byte interleaves collapse to zip1/zip2 on the
+      // rev32'd tables followed by a rev32 of the result, so those controls
+      // skip the control load and the tbl below. Identity checked against
+      // the TBL emission over random vectors.
+      static const vec128_t kMrghbCtrl =
+          vec128b(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+      static const vec128_t kMrglbCtrl =
+          vec128b(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+      zip_form = (ctrl == kMrghbCtrl) ? 1 : (ctrl == kMrglbCtrl) ? 2 : 0;
+      if (!zip_form) {
+        LoadV128Const(e, 2, ctrl);
+      }
     } else {
       e.movi(VReg(2).b16, 0x1F);
       e.and_(VReg(2).b16, VReg(i.src1.reg().getIdx()).b16, VReg(2).b16);
@@ -1165,6 +1187,15 @@ struct PERMUTE_V128
     } else {
       e.rev32(VReg(1).b16, VReg(i.src3.reg().getIdx()).b16);
     }
+    if (zip_form) {
+      if (zip_form == 1) {
+        e.zip1(VReg(d).b16, VReg(0).b16, VReg(1).b16);
+      } else {
+        e.zip2(VReg(d).b16, VReg(0).b16, VReg(1).b16);
+      }
+      e.rev32(VReg(d).b16, VReg(d).b16);
+      return;
+    }
     // TBL with 2-register table {v0, v1}.
     e.tbl(VReg(d).b16, VReg(0).b16, 2, VReg(2).b16);
   }
@@ -1176,6 +1207,30 @@ struct PERMUTE_V128
     // PPC halfword index H maps to NEON u16 index (H&7)^1 (halfword swap
     // within 32-bit words). For src3 (indices >= 8), add 16 byte offset.
     vec128_t ctrl = i.src1.constant();
+    // The vmrghh/vmrglh halfword interleaves - the only INT16 permutes the
+    // frontend emits - are one zip plus a word swap: zip1/zip2 on the
+    // halfword-swapped layout interleaves the wrong pair order within each
+    // word, and rev64.4s swaps the adjacent words back. Identity checked
+    // against the TBL emission over random vectors.
+    {
+      static const vec128_t kMrghhCtrl = vec128s(0, 8, 1, 9, 2, 10, 3, 11);
+      static const vec128_t kMrglhCtrl = vec128s(4, 12, 5, 13, 6, 14, 7, 15);
+      vec128_t masked = ctrl;
+      for (int k = 0; k < 8; k++) {
+        masked.u16[k] &= 0xF;
+      }
+      if (masked == kMrghhCtrl || masked == kMrglhCtrl) {
+        int a = SrcVReg(e, i.src2, 0);
+        int b = SrcVReg(e, i.src3, 1);
+        if (masked == kMrghhCtrl) {
+          e.zip1(VReg(d).h8, VReg(b).h8, VReg(a).h8);
+        } else {
+          e.zip2(VReg(d).h8, VReg(b).h8, VReg(a).h8);
+        }
+        e.rev64(VReg(d).s4, VReg(d).s4);
+        return;
+      }
+    }
     vec128_t tbl_ctrl = {};
     for (int k = 0; k < 8; k++) {
       uint16_t h = ctrl.u16[k] & 0xF;
