@@ -46,6 +46,16 @@ jobs:
           sparse-checkout: tools/bench
           sparse-checkout-cone-mode: false
 
+      # The steps below mirror the macOS job in build.yml. The CMake
+      # configure covers the whole project even when only one target is
+      # asked for, so the graphics-side prerequisites are required even
+      # for a CPU-only test binary.
+      - name: Download Slang
+        run: ./xenia-build.py slang
+
+      - name: Download Metal Shader Converter
+        run: ./xenia-build.py msc
+
       - name: Setup
         run: |
           git submodule update --init --depth=1 -j$(sysctl -n hw.ncpu) \
@@ -56,6 +66,27 @@ jobs:
           # this its CMake stops at "wxregex file does not exist".
           git submodule update --init --recursive --depth=1 \
             -j$(sysctl -n hw.ncpu) third_party/wxWidgets
+
+          ./xenia-build.py fetchdata
+
+      - name: Set up Python for Meson
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install Meson for spirv_to_dxil
+        # Without these, configure fails with
+        # "spirv_to_dxil needs meson>=1.4 and ninja on PATH".
+        run: python3 -m pip install --upgrade meson mako pyyaml packaging
+
+      - name: Install Metal Toolchain
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if sudo xcodebuild -downloadComponent MetalToolchain; then
+              exit 0
+            fi
+            [ $attempt -lt 5 ] && sleep $((attempt * 30))
+          done
 
       - name: Build xenia-cpu-ppc-tests
         run: |
