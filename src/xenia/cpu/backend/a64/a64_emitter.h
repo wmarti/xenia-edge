@@ -221,7 +221,11 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
         (fpcr_mode_ == FPCRMode::Unknown && function_has_vmx_)) {
       ChangeFpcrMode(FPCRMode::Fpu);
     }
-    fpcr_mode_ = FPCRMode::Unknown;
+    // The transition this guards returns with FPCR back in the scalar FPU
+    // state: a guest callee restores it before returning, and host calls
+    // come back through the guest-to-host or resolve thunk, both of which
+    // reload fpcr_fpu. The post-call code may rely on that.
+    fpcr_mode_ = FPCRMode::Fpu;
   }
   bool ChangeFpcrMode(FPCRMode new_mode, bool already_set = false);
   bool IsFeatureEnabled(uint64_t feature_flag) const {
