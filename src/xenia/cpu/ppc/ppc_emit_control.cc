@@ -422,11 +422,20 @@ int InstrEmit_crxor(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_mcrf(PPCHIRBuilder& f, const InstrData& i) {
-  uint32_t crfd = i.XL.BO >> 2;
-  Value* bi = f.LoadCR(i.XL.BI >> 2);
-
-  f.StoreCR(crfd, bi);
-  f.UpdateCR(crfd, bi);
+  // CR[4*BF:4*BF+3] <- CR[4*BFA:4*BFA+3]
+  // A plain four-bit field copy, SO included. The old lowering went through
+  // LoadCR/StoreCR, which place and extract the field at the SOURCE and
+  // DESTINATION bit positions respectively - so it stored zeros whenever the
+  // fields differed - and then ran UpdateCR, which overwrote lt/gt/eq with
+  // signed compares of the whole bit-word against zero. That turned a copied
+  // eq into gt (the word is a small positive) and dropped so entirely; it
+  // only looked right when the source bit pattern happened to compare the
+  // same way, which is why lt-from-cr0 and gt-from-anywhere passed.
+  const uint32_t crfd = i.XL.BO >> 2;
+  const uint32_t crfs = i.XL.BI >> 2;
+  for (uint32_t bit = 0; bit < 4; ++bit) {
+    f.StoreCRField(crfd, bit, f.LoadCRField(crfs, bit));
+  }
   return 0;
 }
 
