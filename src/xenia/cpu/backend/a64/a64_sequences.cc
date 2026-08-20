@@ -604,17 +604,40 @@ static void EmitFpBinOpWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1,
   e.ChangeFpcrMode(FPCRMode::Fpu);
   auto& done = e.NewCachedLabel();
 
-  // Slow path: first NaN by position wins, quiet if SNaN.
-  auto emit_nan_walk = [dest, s1, s2, &done](A64Emitter& e) {
+  // Result-gated: the hardware op runs first and only its result is tested -
+  // any NaN input propagates to a NaN result. When dest aliases a source the
+  // slow path still needs the original value, preserved in scratch up front
+  // (a constant source already lives in scratch and cannot alias).
+  SReg t1 = s1;
+  SReg t2 = s2;
+  if (dest.getIdx() == s1.getIdx()) {
+    e.fmov(e.s2, s1);
+    t1 = e.s2;
+  }
+  if (dest.getIdx() == s2.getIdx()) {
+    if (s2.getIdx() == s1.getIdx()) {
+      t2 = t1;
+    } else {
+      e.fmov(e.s3, s2);
+      t2 = e.s3;
+    }
+  }
+
+  // Slow path: first NaN by position wins, quiet if SNaN. If neither operand
+  // is NaN, the result's NaN came from an invalid operation and dest already
+  // holds the hardware default QNaN, which is PPC's - leave it.
+  auto emit_nan_walk = [dest, t1, t2, &done](A64Emitter& e) {
     auto& s1_not_nan = e.NewCachedLabel();
-    e.fcmp(s1, s1);
+    e.fcmp(t1, t1);
     e.b_near(VC, s1_not_nan);
-    e.fmov(e.w0, s1);
+    e.fmov(e.w0, t1);
     e.orr(e.w0, e.w0, static_cast<uint64_t>(1u << 22));
     e.fmov(dest, e.w0);
     e.b(done);
     e.L(s1_not_nan);
-    e.fmov(e.w0, s2);
+    e.fcmp(t2, t2);
+    e.b_near(VC, done);
+    e.fmov(e.w0, t2);
     e.orr(e.w0, e.w0, static_cast<uint64_t>(1u << 22));
     e.fmov(dest, e.w0);
     e.b(done);
@@ -631,13 +654,6 @@ static void EmitFpBinOpWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1,
     nan_path = &e.NewCachedLabel();
   }
 
-  // Check if either input is NaN. fccmp sets NZCV from immediate if the
-  // condition is false (i.e. s1 was already NaN), preserving V=1.
-  e.fcmp(s1, s1);
-  e.fccmp(s2, s2, 0b0001, VC);
-  e.b_near(VS, *nan_path);
-
-  // Fast path: no NaN input -- hardware op, falling through to done.
   switch (op) {
     case FpBinOp::Add:
       e.fadd(dest, s1, s2);
@@ -652,6 +668,8 @@ static void EmitFpBinOpWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1,
       e.fdiv(dest, s1, s2);
       break;
   }
+  e.fcmp(dest, dest);
+  e.b_near(VS, *nan_path);
   if (!tail_ok) {
     e.b(done);
     e.L(*nan_path);
@@ -667,16 +685,40 @@ static void EmitFpBinOpWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1,
   e.ChangeFpcrMode(FPCRMode::Fpu);
   auto& done = e.NewCachedLabel();
 
-  auto emit_nan_walk = [dest, s1, s2, &done](A64Emitter& e) {
+  // Result-gated: the hardware op runs first and only its result is tested -
+  // any NaN input propagates to a NaN result. When dest aliases a source the
+  // slow path still needs the original value, preserved in scratch up front
+  // (a constant source already lives in scratch and cannot alias).
+  DReg t1 = s1;
+  DReg t2 = s2;
+  if (dest.getIdx() == s1.getIdx()) {
+    e.fmov(e.d2, s1);
+    t1 = e.d2;
+  }
+  if (dest.getIdx() == s2.getIdx()) {
+    if (s2.getIdx() == s1.getIdx()) {
+      t2 = t1;
+    } else {
+      e.fmov(e.d3, s2);
+      t2 = e.d3;
+    }
+  }
+
+  // Slow path: first NaN by position wins, quiet if SNaN. If neither operand
+  // is NaN, the result's NaN came from an invalid operation and dest already
+  // holds the hardware default QNaN, which is PPC's - leave it.
+  auto emit_nan_walk = [dest, t1, t2, &done](A64Emitter& e) {
     auto& s1_not_nan = e.NewCachedLabel();
-    e.fcmp(s1, s1);
+    e.fcmp(t1, t1);
     e.b_near(VC, s1_not_nan);
-    e.fmov(e.x0, s1);
+    e.fmov(e.x0, t1);
     e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
     e.fmov(dest, e.x0);
     e.b(done);
     e.L(s1_not_nan);
-    e.fmov(e.x0, s2);
+    e.fcmp(t2, t2);
+    e.b_near(VC, done);
+    e.fmov(e.x0, t2);
     e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
     e.fmov(dest, e.x0);
     e.b(done);
@@ -693,13 +735,6 @@ static void EmitFpBinOpWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1,
     nan_path = &e.NewCachedLabel();
   }
 
-  // Check if either input is NaN. fccmp sets NZCV from immediate if the
-  // condition is false (i.e. s1 was already NaN), preserving V=1.
-  e.fcmp(s1, s1);
-  e.fccmp(s2, s2, 0b0001, VC);
-  e.b_near(VS, *nan_path);
-
-  // Fast path: no NaN input -- hardware op, falling through to done.
   switch (op) {
     case FpBinOp::Add:
       e.fadd(dest, s1, s2);
@@ -714,6 +749,8 @@ static void EmitFpBinOpWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1,
       e.fdiv(dest, s1, s2);
       break;
   }
+  e.fcmp(dest, dest);
+  e.b_near(VS, *nan_path);
   if (!tail_ok) {
     e.b(done);
     e.L(*nan_path);
