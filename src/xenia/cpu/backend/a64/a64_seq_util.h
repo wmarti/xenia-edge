@@ -481,10 +481,25 @@ inline void FlushDenormalsWithK_V128(A64Emitter& e, int vreg, int k, int t) {
 }
 
 // One-shot form for single flushes; multi-flush sites load K once themselves.
+// Runtime NJ gate: with VSCR.NJ clear, denormals pass through untouched, so
+// the software flushes must not run. One flags load + tbz brackets a flush
+// block; FZ-input hosts never emit these blocks at all. w17 is free in every
+// vector FP sequence (the emitter reserves it as scratch).
+inline void EmitSkipFlushUnlessNJM(A64Emitter& e,
+                                   Xbyak_aarch64::Label& skip) {
+  e.ldr(e.w17, Xbyak_aarch64::ptr(
+                   e.x19, static_cast<uint32_t>(offsetof(
+                              A64BackendContext, flags))));
+  e.tbz(e.w17, kA64BackendNJMOn, skip);
+}
+
 inline void FlushDenormals_V128(A64Emitter& e, int vreg, int sa = 2,
                                 int sb = 3) {
+  Xbyak_aarch64::Label no_flush;
+  EmitSkipFlushUnlessNJM(e, no_flush);
   LoadDenormalThreshold_V128(e, sa);
   FlushDenormalsWithK_V128(e, vreg, sa, sb);
+  e.L(no_flush);
 }
 
 // Fixup for vmaxfp/vminfp NaN lanes.
@@ -521,11 +536,15 @@ inline void PrepareVmxFpSources(A64Emitter& e, const T1& op1, const T2& op2,
   if (s2 != 1) {
     e.mov(VReg(1).b16, VReg(s2).b16);
   }
-  // Flush denormal inputs in software only if FPCR.FZ doesn't handle it.
+  // Flush denormal inputs in software only if FPCR.FZ doesn't handle it,
+  // and only while the guest actually has NJ on.
   if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
+    Xbyak_aarch64::Label no_flush;
+    EmitSkipFlushUnlessNJM(e, no_flush);
     LoadDenormalThreshold_V128(e, 2);
     FlushDenormalsWithK_V128(e, 0, 2, 3);
     FlushDenormalsWithK_V128(e, 1, 2, 3);
+    e.L(no_flush);
   }
   out_s1 = 0;
   out_s2 = 1;
@@ -586,10 +605,20 @@ inline void PrepareVmxFmaSources(A64Emitter& e, const T1& op1, const T2& op2,
   if (s3 != 3) {
     e.mov(VReg(3).b16, VReg(s3).b16);
   }
+  // The FMA family follows NJ like every other VMX op unless the
+  // accurate-flush mode pins it always-on (see VmxDenormalFlushFpcrMode).
+  Xbyak_aarch64::Label no_flush;
+  const bool gate_on_njm = !cvars::accurate_vmx_denormal_flush;
+  if (gate_on_njm) {
+    EmitSkipFlushUnlessNJM(e, no_flush);
+  }
   LoadDenormalThreshold_V128(e, 2);
   FlushDenormalsWithK_V128(e, 0, 2, tmp);
   FlushDenormalsWithK_V128(e, 1, 2, tmp);
   FlushDenormalsWithK_V128(e, 3, 2, tmp);
+  if (gate_on_njm) {
+    e.L(no_flush);
+  }
   *out_a = 0;
   *out_c = 1;
   *out_b = 3;
