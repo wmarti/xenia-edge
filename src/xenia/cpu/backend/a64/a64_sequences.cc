@@ -2192,16 +2192,23 @@ struct SHL_I8 : Sequence<SHL_I8, I<OPCODE_SHL, I8Op, I8Op, I8Op>> {
         e.uxtb(i.dest, i.dest);
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.w0, i.src2);
-      if (i.src1.is_constant) {
-        e.mov(i.dest, static_cast<uint64_t>(i.src1.constant() & 0xFF));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.lsl(i.dest, i.src1, WReg(i.src2.reg().getIdx()));
+        e.uxtb(i.dest, i.dest);
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.w0, i.src2);
+        if (i.src1.is_constant) {
+          e.mov(i.dest, static_cast<uint64_t>(i.src1.constant() & 0xFF));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        e.lsl(i.dest, i.dest, e.w0);
+        // Bits can shift past the type width; keep the I8 value zero-extended.
+        e.uxtb(i.dest, i.dest);
       }
-      e.lsl(i.dest, i.dest, e.w0);
-      // Bits can shift past the type width; keep the I8 value zero-extended.
-      e.uxtb(i.dest, i.dest);
     }
   }
 };
@@ -2223,16 +2230,23 @@ struct SHL_I16 : Sequence<SHL_I16, I<OPCODE_SHL, I16Op, I16Op, I8Op>> {
         e.uxth(i.dest, i.dest);
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.w0, i.src2);
-      if (i.src1.is_constant) {
-        e.mov(i.dest, static_cast<uint64_t>(i.src1.constant() & 0xFFFF));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.lsl(i.dest, i.src1, WReg(i.src2.reg().getIdx()));
+        e.uxth(i.dest, i.dest);
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.w0, i.src2);
+        if (i.src1.is_constant) {
+          e.mov(i.dest, static_cast<uint64_t>(i.src1.constant() & 0xFFFF));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        e.lsl(i.dest, i.dest, e.w0);
+        // Bits can shift past the type width; keep the I16 value zero-extended.
+        e.uxth(i.dest, i.dest);
       }
-      e.lsl(i.dest, i.dest, e.w0);
-      // Bits can shift past the type width; keep the I16 value zero-extended.
-      e.uxth(i.dest, i.dest);
     }
   }
 };
@@ -2246,15 +2260,21 @@ struct SHL_I32 : Sequence<SHL_I32, I<OPCODE_SHL, I32Op, I32Op, I8Op>> {
         e.lsl(i.dest, i.src1, static_cast<uint32_t>(i.src2.constant() & 0x1F));
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.w0, i.src2);
-      if (i.src1.is_constant) {
-        e.mov(i.dest,
-              static_cast<uint64_t>(static_cast<uint32_t>(i.src1.constant())));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.lsl(i.dest, i.src1, WReg(i.src2.reg().getIdx()));
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.w0, i.src2);
+        if (i.src1.is_constant) {
+          e.mov(i.dest,
+                static_cast<uint64_t>(static_cast<uint32_t>(i.src1.constant())));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        e.lsl(i.dest, i.dest, e.w0);
       }
-      e.lsl(i.dest, i.dest, e.w0);
     }
   }
 };
@@ -2268,14 +2288,20 @@ struct SHL_I64 : Sequence<SHL_I64, I<OPCODE_SHL, I64Op, I64Op, I8Op>> {
         e.lsl(i.dest, i.src1, static_cast<uint32_t>(i.src2.constant() & 0x3F));
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.x0, XReg(i.src2.reg().getIdx()));
-      if (i.src1.is_constant) {
-        e.mov(i.dest, static_cast<uint64_t>(i.src1.constant()));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.lsl(i.dest, i.src1, XReg(i.src2.reg().getIdx()));
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.x0, XReg(i.src2.reg().getIdx()));
+        if (i.src1.is_constant) {
+          e.mov(i.dest, static_cast<uint64_t>(i.src1.constant()));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        e.lsl(i.dest, i.dest, e.x0);
       }
-      e.lsl(i.dest, i.dest, e.x0);
     }
   }
 };
@@ -2339,14 +2365,20 @@ struct SHR_I8 : Sequence<SHR_I8, I<OPCODE_SHR, I8Op, I8Op, I8Op>> {
         e.lsr(i.dest, i.src1, static_cast<uint32_t>(i.src2.constant() & 0x1F));
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.w0, i.src2);
-      if (i.src1.is_constant) {
-        e.mov(i.dest, static_cast<uint64_t>(i.src1.constant() & 0xFF));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.lsr(i.dest, i.src1, WReg(i.src2.reg().getIdx()));
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.w0, i.src2);
+        if (i.src1.is_constant) {
+          e.mov(i.dest, static_cast<uint64_t>(i.src1.constant() & 0xFF));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        e.lsr(i.dest, i.dest, e.w0);
       }
-      e.lsr(i.dest, i.dest, e.w0);
     }
   }
 };
@@ -2366,14 +2398,20 @@ struct SHR_I16 : Sequence<SHR_I16, I<OPCODE_SHR, I16Op, I16Op, I8Op>> {
         e.lsr(i.dest, i.src1, static_cast<uint32_t>(i.src2.constant() & 0x1F));
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.w0, i.src2);
-      if (i.src1.is_constant) {
-        e.mov(i.dest, static_cast<uint64_t>(i.src1.constant() & 0xFFFF));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.lsr(i.dest, i.src1, WReg(i.src2.reg().getIdx()));
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.w0, i.src2);
+        if (i.src1.is_constant) {
+          e.mov(i.dest, static_cast<uint64_t>(i.src1.constant() & 0xFFFF));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        e.lsr(i.dest, i.dest, e.w0);
       }
-      e.lsr(i.dest, i.dest, e.w0);
     }
   }
 };
@@ -2388,15 +2426,21 @@ struct SHR_I32 : Sequence<SHR_I32, I<OPCODE_SHR, I32Op, I32Op, I8Op>> {
         e.lsr(i.dest, i.src1, static_cast<uint32_t>(i.src2.constant() & 0x1F));
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.w0, i.src2);
-      if (i.src1.is_constant) {
-        e.mov(i.dest,
-              static_cast<uint64_t>(static_cast<uint32_t>(i.src1.constant())));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.lsr(i.dest, i.src1, WReg(i.src2.reg().getIdx()));
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.w0, i.src2);
+        if (i.src1.is_constant) {
+          e.mov(i.dest,
+                static_cast<uint64_t>(static_cast<uint32_t>(i.src1.constant())));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        e.lsr(i.dest, i.dest, e.w0);
       }
-      e.lsr(i.dest, i.dest, e.w0);
     }
   }
 };
@@ -2410,14 +2454,20 @@ struct SHR_I64 : Sequence<SHR_I64, I<OPCODE_SHR, I64Op, I64Op, I8Op>> {
         e.lsr(i.dest, i.src1, static_cast<uint32_t>(i.src2.constant() & 0x3F));
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.x0, XReg(i.src2.reg().getIdx()));
-      if (i.src1.is_constant) {
-        e.mov(i.dest, static_cast<uint64_t>(i.src1.constant()));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.lsr(i.dest, i.src1, XReg(i.src2.reg().getIdx()));
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.x0, XReg(i.src2.reg().getIdx()));
+        if (i.src1.is_constant) {
+          e.mov(i.dest, static_cast<uint64_t>(i.src1.constant()));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        e.lsr(i.dest, i.dest, e.x0);
       }
-      e.lsr(i.dest, i.dest, e.x0);
     }
   }
 };
@@ -2512,15 +2562,21 @@ struct SHA_I32 : Sequence<SHA_I32, I<OPCODE_SHA, I32Op, I32Op, I8Op>> {
         e.asr(i.dest, i.src1, static_cast<uint32_t>(i.src2.constant() & 0x1F));
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.w0, i.src2);
-      if (i.src1.is_constant) {
-        e.mov(i.dest,
-              static_cast<uint64_t>(static_cast<uint32_t>(i.src1.constant())));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.asr(i.dest, i.src1, WReg(i.src2.reg().getIdx()));
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.w0, i.src2);
+        if (i.src1.is_constant) {
+          e.mov(i.dest,
+                static_cast<uint64_t>(static_cast<uint32_t>(i.src1.constant())));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        e.asr(i.dest, i.dest, e.w0);
       }
-      e.asr(i.dest, i.dest, e.w0);
     }
   }
 };
@@ -2534,14 +2590,20 @@ struct SHA_I64 : Sequence<SHA_I64, I<OPCODE_SHA, I64Op, I64Op, I8Op>> {
         e.asr(i.dest, i.src1, static_cast<uint32_t>(i.src2.constant() & 0x3F));
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.x0, XReg(i.src2.reg().getIdx()));
-      if (i.src1.is_constant) {
-        e.mov(i.dest, static_cast<uint64_t>(i.src1.constant()));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.asr(i.dest, i.src1, XReg(i.src2.reg().getIdx()));
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.x0, XReg(i.src2.reg().getIdx()));
+        if (i.src1.is_constant) {
+          e.mov(i.dest, static_cast<uint64_t>(i.src1.constant()));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        e.asr(i.dest, i.dest, e.x0);
       }
-      e.asr(i.dest, i.dest, e.x0);
     }
   }
 };
@@ -2623,17 +2685,24 @@ struct ROTATE_LEFT_I32
         }
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.w0, i.src2);
-      if (i.src1.is_constant) {
-        e.mov(i.dest,
-              static_cast<uint64_t>(static_cast<uint32_t>(i.src1.constant())));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV/RORV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.neg(e.w0, WReg(i.src2.reg().getIdx()));
+        e.ror(i.dest, i.src1, e.w0);
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.w0, i.src2);
+        if (i.src1.is_constant) {
+          e.mov(i.dest,
+                static_cast<uint64_t>(static_cast<uint32_t>(i.src1.constant())));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        // ROL(x, n) = ROR(x, -n) since ROR uses amount mod 32
+        e.neg(e.w0, e.w0);
+        e.ror(i.dest, i.dest, e.w0);
       }
-      // ROL(x, n) = ROR(x, -n) since ROR uses amount mod 32
-      e.neg(e.w0, e.w0);
-      e.ror(i.dest, i.dest, e.w0);
     }
   }
 };
@@ -2657,16 +2726,23 @@ struct ROTATE_LEFT_I64
         }
       }
     } else {
-      // Read shift amount first — dest may alias src2.
-      e.mov(e.x0, XReg(i.src2.reg().getIdx()));
-      if (i.src1.is_constant) {
-        e.mov(i.dest, static_cast<uint64_t>(i.src1.constant()));
-      } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
-        e.mov(i.dest, i.src1);
+      // LSLV/LSRV/ASRV/RORV read both sources before writing dest, so a
+      // register amount needs no staging copy even when dest aliases it.
+      if (!i.src1.is_constant) {
+        e.neg(e.x0, XReg(i.src2.reg().getIdx()));
+        e.ror(i.dest, i.src1, e.x0);
+      } else {
+        // Read shift amount first — dest may alias src2.
+        e.mov(e.x0, XReg(i.src2.reg().getIdx()));
+        if (i.src1.is_constant) {
+          e.mov(i.dest, static_cast<uint64_t>(i.src1.constant()));
+        } else if (i.dest.reg().getIdx() != i.src1.reg().getIdx()) {
+          e.mov(i.dest, i.src1);
+        }
+        // ROL(x, n) = ROR(x, -n) since ROR uses amount mod 64
+        e.neg(e.x0, e.x0);
+        e.ror(i.dest, i.dest, e.x0);
       }
-      // ROL(x, n) = ROR(x, -n) since ROR uses amount mod 64
-      e.neg(e.x0, e.x0);
-      e.ror(i.dest, i.dest, e.x0);
     }
   }
 };
@@ -3191,20 +3267,13 @@ struct SELECT_V128_V128
       // dest already holds the mask. BSL is safe here.
       e.bsl(VReg(d).b16, VReg(s3).b16, VReg(s2).b16);
     } else if (d == s3) {
-      // dest holds the mask=1 value. BIT inserts mask=1 bits from s3, keeps
-      // dest (=s2-candidate) where mask=0... no, dest=s3 not s2.
-      // Use: copy s2 to scratch, then BIT(scratch, s3, mask), move to dest.
-      // Or: copy mask to scratch v0, copy s2 to dest, BIT(dest, s3_orig, v0).
-      // Simplest: use scratch v0 for mask, then BSL.
-      e.orr(VReg(0).b16, VReg(s1).b16, VReg(s1).b16);  // v0 = mask
-      e.bsl(VReg(0).b16, VReg(s3).b16, VReg(s2).b16);  // v0 = result
-      e.orr(VReg(d).b16, VReg(0).b16, VReg(0).b16);    // dest = result
+      // dest already holds the mask=1 value: keep it where the mask is set
+      // and take s2 elsewhere, which is BIF exactly.
+      e.bif(VReg(d).b16, VReg(s2).b16, VReg(s1).b16);
     } else if (d == s2) {
-      // dest holds the mask=0 value. BIF inserts ~mask bits from s2,
-      // but dest=s2... Use scratch for mask.
-      e.orr(VReg(0).b16, VReg(s1).b16, VReg(s1).b16);  // v0 = mask
-      e.bsl(VReg(0).b16, VReg(s3).b16, VReg(s2).b16);  // v0 = result
-      e.orr(VReg(d).b16, VReg(0).b16, VReg(0).b16);    // dest = result
+      // dest already holds the mask=0 value: insert s3 where the mask is set
+      // and keep dest elsewhere, which is BIT exactly.
+      e.bit(VReg(d).b16, VReg(s3).b16, VReg(s1).b16);
     } else {
       // No aliasing — copy mask to dest, then BSL.
       e.orr(VReg(d).b16, VReg(s1).b16, VReg(s1).b16);
