@@ -782,14 +782,11 @@ void PPCHIRBuilder::SetReturnAddress(Value* value) {
   Module* mod = this->function_->module();
   if (value && value->IsConstant()) {
     if (mod) {
-      XexModule* xexmod = dynamic_cast<XexModule*>(mod);
-      if (xexmod) {
-        auto flags = xexmod->GetInstructionAddressFlags(value->AsUint32());
-        if (flags) {
-          InfoCacheFlags bits{};
-          bits.is_return_site = true;
-          AtomicSetInfoCacheFlags(flags, bits);
-        }
+      auto flags = mod->GetInstructionAddressFlags(value->AsUint32());
+      if (flags) {
+        InfoCacheFlags bits{};
+        bits.is_return_site = true;
+        AtomicSetInfoCacheFlags(flags, bits);
       }
     }
   }
