@@ -934,10 +934,24 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
   EnsureFpuFpcrModeForTransition();
   auto target_w = WReg(reg_index);
 
+  // A tail call through the indirection table reloads x0/x30 from the same
+  // slot pair the ret-check reads, so one ldp up front serves both: the
+  // b.eq-to-epilog path may clobber x0/x30 freely (the epilog reloads x30
+  // itself and ignores x0), and the indirection loads touch neither. The
+  // no-table fallback keeps the late reload because its resolve blr clobbers
+  // x0/x30.
+  const bool hoist_ret_slots =
+      (instr->flags & hir::CALL_TAIL) && code_cache_->has_indirection_table();
+  if (hoist_ret_slots) {
+    ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
+  }
+
   // Check if this is a possible return (e.g., PPC blr).
   if (instr->flags & hir::CALL_POSSIBLE_RETURN) {
     // Compare target guest address with our function's return address.
-    ldr(w0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+    if (!hoist_ret_slots) {
+      ldr(w0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+    }
     cmp(target_w, w0);
     if (near_tail_branches_safe_) {
       // The epilog is bound at function end, inside the same +/-1 MiB bound
@@ -1021,7 +1035,9 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
   if (instr->flags & hir::CALL_TAIL) {
     // Tail call: pass our return address to the callee.
     PopStackpoint();
-    ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
+    if (!hoist_ret_slots) {
+      ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
+    }
     if (stack_size() <= 4095) {
       add(sp, sp, static_cast<uint32_t>(stack_size()));
     } else {
