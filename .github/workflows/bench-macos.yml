@@ -117,17 +117,20 @@ jobs:
           if [ -z "$suites" ]; then
             # Hot set: the sequences this branch changed most, plus call-heavy
             # ones for the stackpoint redesign.
-            suites="instr__gen_vsel instr__gen_vaddfp instr__gen_vnmsubfp \
-                    instr__gen_vmaddfp instr__gen_vperm instr__gen_fmadds \
-                    instr__gen_vavgsb instr__gen_vavgsw instr__gen_vpkuhus \
-                    instr__gen_fadd instr__gen_fmuls instr_mcrf"
+            # instr__gen_vand leads as a control: this branch does not change
+            # its emitted code, so whatever delta it shows is pure
+            # measurement error and calibrates the rest of the table.
+            suites="instr__gen_vand instr__gen_vsel instr__gen_vaddfp \
+                    instr__gen_vnmsubfp instr__gen_vmaddfp instr__gen_vperm \
+                    instr__gen_fmadds instr__gen_vpkuhus instr__gen_fadd \
+                    instr__gen_fmuls instr_mcrf"
           fi
           echo "ref,suite,run,seconds" > bench-${{ matrix.ref }}.csv
           for s in $suites; do
             [ -f "ppcbin/$s.map" ] || { echo "skip missing $s"; continue; }
             # Three runs; the comparison uses the minimum, which rejects
             # scheduler and thermal noise better than a mean.
-            for run in 1 2 3; do
+            for run in 1 2 3 4 5; do
               start=$(python3 -c 'import time; print(time.perf_counter())')
               "$exe" --test_bin_path=ppcbin/ "$s" > /dev/null 2>&1 || true
               end=$(python3 -c 'import time; print(time.perf_counter())')
@@ -178,4 +181,13 @@ jobs:
               print(f"{s:32s} {b:12.4f} {n:12.4f} {100*(n-b)/b:+8.1f}%")
           if tb:
               print(f"{'TOTAL':32s} {tb:12.4f} {tn:12.4f} {100*(tn-tb)/tb:+8.1f}%")
+          c = 'instr__gen_vand'
+          if c in best[base] and c in best[new]:
+              n = abs(100*(best[new][c]-best[base][c])/best[base][c])
+              print()
+              print(f"NOISE FLOOR (control suite {c}, unchanged by this branch):"
+                    f" {n:.1f}%")
+              print("Shared CI runners are noisy; anything below this is not a")
+              print("measurement. Use tools/bench/bench_macos.sh on a quiet")
+              print("machine for numbers you can act on.")
           PY
