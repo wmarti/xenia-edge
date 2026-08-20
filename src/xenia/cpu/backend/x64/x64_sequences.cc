@@ -2906,10 +2906,35 @@ struct AND_I32 : Sequence<AND_I32, I<OPCODE_AND, I32Op, I32Op, I32Op>> {
   }
 };
 struct AND_I64 : Sequence<AND_I64, I<OPCODE_AND, I64Op, I64Op, I64Op>> {
+  // Masks with a single cleared bit miss the imm32 form and cost a 10-byte
+  // movabs plus an and; btr does the same clear in 5 bytes. The corpus hits
+  // this constantly: the fabs-magnitude mask ~(1<<63) guards every scalar
+  // float classification. Nothing consumes flags from AND emission, so the
+  // different flag behavior of btr is unobservable.
+  static bool TryEmitSingleBitClear(X64Emitter& e, const EmitArgType& i,
+                                    const I64Op& reg_src, uint64_t constant) {
+    const uint64_t cleared = ~constant;
+    if (!cleared || (cleared & (cleared - 1))) {
+      return false;
+    }
+    if (static_cast<int64_t>(constant) ==
+        static_cast<int64_t>(static_cast<int32_t>(constant))) {
+      return false;  // fits the and imm32 form, which is smaller
+    }
+    if (i.dest != reg_src.reg()) {
+      e.mov(i.dest, reg_src);
+    }
+    e.btr(i.dest, xe::tzcnt(cleared));
+    return true;
+  }
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     if (i.src2.is_constant && i.src2.constant() == 0xFFFFFFFF) {
       // special case for rlwinm codegen
       e.mov(((Reg64)i.dest).cvt32(), ((Reg64)i.src1).cvt32());
+    } else if (i.src2.is_constant && !i.src1.is_constant &&
+               TryEmitSingleBitClear(e, i, i.src1, i.src2.constant())) {
+    } else if (i.src1.is_constant && !i.src2.is_constant &&
+               TryEmitSingleBitClear(e, i, i.src2, i.src1.constant())) {
     } else {
       EmitAndXX<AND_I64, Reg64>(e, i);
     }
@@ -3059,7 +3084,33 @@ struct OR_I32 : Sequence<OR_I32, I<OPCODE_OR, I32Op, I32Op, I32Op>> {
   }
 };
 struct OR_I64 : Sequence<OR_I64, I<OPCODE_OR, I64Op, I64Op, I64Op>> {
+  // The bts twin of AND_I64's btr: a single set bit above the imm32 range
+  // (the NaN quiet bit 1<<51 in the float walks) in 5 bytes instead of a
+  // movabs pair.
+  static bool TryEmitSingleBitSet(X64Emitter& e, const EmitArgType& i,
+                                  const I64Op& reg_src, uint64_t constant) {
+    if (!constant || (constant & (constant - 1))) {
+      return false;
+    }
+    if (static_cast<int64_t>(constant) ==
+        static_cast<int64_t>(static_cast<int32_t>(constant))) {
+      return false;
+    }
+    if (i.dest != reg_src.reg()) {
+      e.mov(i.dest, reg_src);
+    }
+    e.bts(i.dest, xe::tzcnt(constant));
+    return true;
+  }
   static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (i.src2.is_constant && !i.src1.is_constant &&
+        TryEmitSingleBitSet(e, i, i.src1, i.src2.constant())) {
+      return;
+    }
+    if (i.src1.is_constant && !i.src2.is_constant &&
+        TryEmitSingleBitSet(e, i, i.src2, i.src1.constant())) {
+      return;
+    }
     EmitOrXX<OR_I64, Reg64>(e, i);
   }
 };
