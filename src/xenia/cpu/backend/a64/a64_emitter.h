@@ -203,8 +203,6 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   void PopStackpoint();
   void EnsureSynchronizedGuestAndHostStack();
 
-  static void HandleStackpointOverflowError(ppc::PPCContext* context);
-
   void ForgetFpcrMode() {
     if (IsVmxFpcrMode(fpcr_mode_)) {
       ChangeFpcrMode(FPCRMode::Fpu);

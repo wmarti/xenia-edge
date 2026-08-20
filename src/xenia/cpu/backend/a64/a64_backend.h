@@ -58,14 +58,23 @@ struct ReserveHelper {
   }
 };
 
-struct A64BackendStackpoint {
-  uint64_t host_stack_;
-  unsigned guest_stack_;
-  unsigned guest_return_address_;
+// One record per live guest frame, embedded in that frame's host stack at
+// StackLayout::STACKPOINT_PREV and linked through stackpoint_head. The
+// record's own address identifies the frame: address - STACKPOINT_PREV is
+// the frame's post-alloc SP.
+struct A64StackpointNode {
+  const A64StackpointNode* prev_;  // older frame's node, null at chain root
+  uint32_t guest_stack_;           // guest r1 at function entry
+  uint32_t guest_return_address_;  // guest lr at function entry
 };
+static_assert(sizeof(A64StackpointNode) == 16,
+              "the push emission pairs prev_ with the ret-slot zeroing and "
+              "the two guest words with one stp");
 
-uint32_t FindStackpointSyncDepth(const A64BackendStackpoint* stackpoints,
-                                 uint32_t current_depth, uint32_t guest_sp);
+// Walks the chain looking for a longjmp: more than one live frame skipped
+// by |guest_sp|. Returns the node to restore, or null (no repair).
+const A64StackpointNode* FindStackpointSyncNode(const A64StackpointNode* head,
+                                                uint32_t guest_sp);
 
 enum : uint32_t {
   kA64BackendFPCRModeBit = 0,
@@ -114,12 +123,11 @@ struct A64BackendContext {
   uint64_t indirection_table_bias;
   uint64_t code_execute_base;
   uint64_t external_indirection_table;
-  A64BackendStackpoint* stackpoints;
+  const A64StackpointNode* stackpoint_head;
   // address of the live reservation, and its granule generation when taken
   uint32_t reserve_address;
   uint32_t reserve_generation;
-  unsigned int current_stackpoint_depth;
-  unsigned int pending_stackpoint_sync_depth;
+  const A64StackpointNode* pending_stackpoint_sync_node;
   unsigned int fpcr_fpu;
   unsigned int fpcr_vmx;
   // bit 0 = 0 if fpcr is fpu, else it is vmx

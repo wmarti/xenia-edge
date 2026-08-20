@@ -45,9 +45,6 @@
 #include "xenia/cpu/thread_state.h"
 #include "xenia/cpu/xex_module.h"
 
-DEFINE_int64(a64_max_stackpoints, 65536,
-             "Max number of host->guest stack mappings we can record.", "a64");
-
 DEFINE_bool(a64_enable_host_guest_stack_synchronization, true,
             "Records entries for guest/host stack mappings at function starts "
             "and checks for reentry at return sites. Has slight performance "
@@ -63,24 +60,25 @@ namespace a64 {
 // a guest address has not yet been compiled.
 uint64_t ResolveFunction(void* raw_context, uint64_t target_address);
 
-uint32_t FindStackpointSyncDepth(const A64BackendStackpoint* stackpoints,
-                                 uint32_t current_depth, uint32_t guest_sp) {
-  if (!stackpoints || current_depth == 0) {
-    return 0;
+const A64StackpointNode* FindStackpointSyncNode(const A64StackpointNode* head,
+                                                uint32_t guest_sp) {
+  if (!head) {
+    return nullptr;
   }
-
-  uint32_t idx = current_depth - 1;
+  const A64StackpointNode* node = head;
   uint32_t frames_skipped = 0;
-  while (idx != 0xFFFFFFFFu && guest_sp > stackpoints[idx].guest_stack_) {
-    --idx;
+  // Walking from head visits newest first, so a run of equal guest_stack_
+  // values breaks at its newest node - the same choice the array walk made.
+  while (node && guest_sp > node->guest_stack_) {
+    node = node->prev_;
     ++frames_skipped;
   }
-
-  // >1 frames skipped = real longjmp, not an early SP restore.
-  if (idx == 0xFFFFFFFFu || frames_skipped <= 1) {
-    return 0;
+  // >1 frames skipped = real longjmp, not an early SP restore. Walking off
+  // the chain end matches the array walk's index underflow: no repair.
+  if (!node || frames_skipped <= 1) {
+    return nullptr;
   }
-  return idx + 1;
+  return node;
 }
 
 // ==========================================================================
@@ -429,53 +427,42 @@ void* A64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
 
   // x19 = backend context pointer (already set up by HostToGuestThunk)
 
-  // x10 = stackpoints array pointer
-  ldr(x10, ptr(x19, static_cast<uint32_t>(
-                        offsetof(A64BackendContext, stackpoints))));
-  // w11 = current_stackpoint_depth
-  ldr(w11, ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext,
-                                                   current_stackpoint_depth))));
+  // x10 = target node computed by ResolveFunction.
+  ldr(x10, ptr(x19, static_cast<uint32_t>(offsetof(
+                        A64BackendContext, pending_stackpoint_sync_node))));
+  auto& bad = NewCachedLabel();
 
-  // w13 = target depth computed by ResolveFunction.
-  ldr(w13, ptr(x19, static_cast<uint32_t>(offsetof(
-                        A64BackendContext, pending_stackpoint_sync_depth))));
-  auto& underflow = NewCachedLabel();
+  // A null target means this helper was called without a pending repair.
+  cbz(x10, bad);
+  // Nodes live at frame_base + STACKPOINT_PREV of a 16-aligned frame, so a
+  // valid pointer is always 8 mod 16.
+  and_(x11, x10, 0xF);
+  cmp(x11, 8);
+  b(NE, bad);
+  // A repair target is always an older (higher-addressed) frame; a node at
+  // or below live SP is corrupt. Analog of the old deeper-than-live trap.
+  mov(x11, sp);
+  cmp(x10, x11);
+  b(LS, bad);
 
-  cbz(x10, underflow);
-  // A zero target means this helper was called without a pending repair.
-  cbz(w13, underflow);
-  // The pending target must not be deeper than the current live depth.
-  cmp(w13, w11);
-  b(HI, underflow);
+  // Publish head first, then move SP: between the two, head points above
+  // live SP, which an async signal can tolerate; the reverse order would
+  // leave head referencing memory below SP.
+  str(x10, ptr(x19, static_cast<uint32_t>(
+                        offsetof(A64BackendContext, stackpoint_head))));
+  str(xzr, ptr(x19, static_cast<uint32_t>(offsetof(
+                        A64BackendContext, pending_stackpoint_sync_node))));
 
-  // x14 = &stackpoints[target_depth - 1]
-  sub(w13, w13, 1);
-
-  mov(w14, static_cast<uint32_t>(sizeof(A64BackendStackpoint)));
-  umull(x14, w13, w14);
-  add(x14, x10, x14);
-
-  // Restore host SP from stackpoints[index].host_stack_. A64 stackpoints are
-  // recorded after the function frame allocation, so this is already the SP
-  // expected by the return-site code.
-  ldr(x16, ptr(x14, static_cast<uint32_t>(
-                        offsetof(A64BackendStackpoint, host_stack_))));
-  mov(sp, x16);
-
-  // Update current_stackpoint_depth = index + 1
-  // (the entry we restored to has been consumed)
-  add(w13, w13, 1);
-  str(w13, ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext,
-                                                   current_stackpoint_depth))));
-  mov(w15, 0);
-  str(w15, ptr(x19, static_cast<uint32_t>(offsetof(
-                        A64BackendContext, pending_stackpoint_sync_depth))));
+  // The node sits inside its frame at STACKPOINT_PREV, so the frame's
+  // post-alloc SP - which is what the return-site code expects - is the
+  // node address minus that offset.
+  sub(x12, x10, static_cast<uint32_t>(StackLayout::STACKPOINT_PREV));
+  mov(sp, x12);
 
   // Jump back to the caller.
   br(x8);
 
-  L(underflow);
-  // Should be impossible — stackpoint array underflowed.
+  L(bad);
   brk(0xF001);  // assertion failure
 
   code_offsets.epilog = getSize();
@@ -917,12 +904,11 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
             auto* backend = static_cast<A64Backend*>(processor->backend());
             auto* backend_context =
                 backend->BackendContextForGuestContext(guest_context);
-            const uint32_t sync_depth = FindStackpointSyncDepth(
-                backend_context->stackpoints,
-                backend_context->current_stackpoint_depth,
+            const A64StackpointNode* sync_node = FindStackpointSyncNode(
+                backend_context->stackpoint_head,
                 static_cast<uint32_t>(guest_context->r[1]));
-            if (sync_depth != 0) {
-              backend_context->pending_stackpoint_sync_depth = sync_depth;
+            if (sync_node) {
+              backend_context->pending_stackpoint_sync_node = sync_node;
               return host_address;
             }
             break;
@@ -1350,31 +1336,23 @@ void A64Backend::InitializeBackendContext(void* ctx) {
   set_est_bits(kEstMantissaMask, 0x007FFFFFu);
   set_est_bits(kEstQuietBit, 0x00400000u);
 
-  // Allocate stackpoints for longjmp detection.
-  if (cvars::a64_enable_host_guest_stack_synchronization) {
-    uint64_t max_stackpoints = cvars::a64_max_stackpoints;
-    if (max_stackpoints > 0) {
-      a64_ctx->stackpoints = new A64BackendStackpoint[max_stackpoints]();
-    }
-  }
+  // Longjmp detection state: nodes live in the guest frames themselves, so
+  // the context only carries the chain head and the pending repair marker.
+  a64_ctx->stackpoint_head = nullptr;
+  a64_ctx->pending_stackpoint_sync_node = nullptr;
 
   // Reset the live host FPCR for a fresh PPC context so one test's rounding
   // state does not leak into the next on the shared PPC test runner thread.
   SetGuestRoundingMode(ctx, 0);
 }
 
-void A64Backend::DeinitializeBackendContext(void* ctx) {
-  auto* a64_ctx = BackendContextForGuestContext(ctx);
-  if (a64_ctx->stackpoints) {
-    delete[] a64_ctx->stackpoints;
-    a64_ctx->stackpoints = nullptr;
-  }
-}
+void A64Backend::DeinitializeBackendContext(void* ctx) {}
 
 void A64Backend::PrepareForReentry(void* ctx) {
   auto* a64_ctx = BackendContextForGuestContext(ctx);
-  a64_ctx->current_stackpoint_depth = 0;
-  a64_ctx->pending_stackpoint_sync_depth = 0;
+  // The old frames' nodes die with the host stack unwind; drop the chain.
+  a64_ctx->stackpoint_head = nullptr;
+  a64_ctx->pending_stackpoint_sync_node = nullptr;
 }
 
 uint32_t A64Backend::CreateGuestTrampoline(GuestTrampolineProc proc,
@@ -1494,24 +1472,21 @@ bool A64Backend::PopulatePseudoStacktrace(GuestPseudoStackTrace* st) {
   ppc::PPCContext* ctx = thrd_state->context();
   A64BackendContext* backend_ctx = BackendContextForGuestContext(ctx);
 
-  if (!backend_ctx->stackpoints || backend_ctx->current_stackpoint_depth < 2) {
+  // Walk the frame-embedded chain newest-first. The prev_-guarded loop
+  // reproduces the array version's exclusion of the oldest record, and the
+  // entry cap bounds the walk. Same-thread only: these are the calling
+  // thread's own live host frames.
+  const A64StackpointNode* node = backend_ctx->stackpoint_head;
+  if (!node || !node->prev_) {
     return false;
   }
-  uint32_t depth = backend_ctx->current_stackpoint_depth - 1;
-  uint32_t num_entries_to_populate =
-      std::min(MAX_GUEST_PSEUDO_STACKTRACE_ENTRIES, depth);
-
-  st->count = num_entries_to_populate;
-  st->truncated_flag = num_entries_to_populate < depth ? 1 : 0;
-
-  A64BackendStackpoint* current_stackpoint =
-      &backend_ctx->stackpoints[backend_ctx->current_stackpoint_depth - 1];
-
-  for (uint32_t stp_index = 0; stp_index < num_entries_to_populate;
-       ++stp_index) {
-    st->return_addrs[stp_index] = current_stackpoint->guest_return_address_;
-    current_stackpoint--;
+  uint32_t n = 0;
+  while (node && node->prev_ && n < MAX_GUEST_PSEUDO_STACKTRACE_ENTRIES) {
+    st->return_addrs[n++] = node->guest_return_address_;
+    node = node->prev_;
   }
+  st->count = n;
+  st->truncated_flag = (node && node->prev_) ? 1 : 0;
   return true;
 }
 
