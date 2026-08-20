@@ -71,6 +71,10 @@ build_ref() {           # build_ref <ref> -> echoes path to the binary
     git submodule update --init --depth=1 -j"$(sysctl -n hw.ncpu)" \
       $(grep -oE 'path = .+' .gitmodules | sed 's/path = //' \
         | grep -v 'DirectXShaderCompiler') >/dev/null 2>&1 || true
+    # wxWidgets vendors pcre and libpng as nested submodules; without this
+    # its CMake stops at "wxregex file does not exist".
+    git submodule update --init --recursive --depth=1 \
+      -j"$(sysctl -n hw.ncpu)" third_party/wxWidgets >/dev/null 2>&1 || true
     # xenia-cpu-ppc-tests is gated behind XENIA_BUILD_TESTS and is not part of
     # the normal app build; its CMake target already links the a64 backend on
     # AArch64.
