@@ -52,6 +52,11 @@ jobs:
             $(grep -oE 'path = .+' .gitmodules | sed 's/path = //' \
               | grep -v 'DirectXShaderCompiler')
 
+          # wxWidgets vendors pcre and libpng as nested submodules; without
+          # this its CMake stops at "wxregex file does not exist".
+          git submodule update --init --recursive --depth=1 \
+            -j$(sysctl -n hw.ncpu) third_party/wxWidgets
+
       - name: Build xenia-cpu-ppc-tests
         run: |
           # The corpus runner is not part of the normal build; XENIA_BUILD_TESTS
