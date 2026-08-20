@@ -56,7 +56,7 @@ class StackLayout {
    * address. The prolog stores it to GUEST_RET_ADDR and saves x30 (host
    * LR) to HOST_RET_ADDR.
    */
-  static constexpr size_t GUEST_STACK_SIZE = 80;  // 16-byte aligned
+  static constexpr size_t GUEST_STACK_SIZE = 96;  // 16-byte aligned
   static constexpr size_t GUEST_SCRATCH = 0;      // 48 bytes (3 x Q)
   // GUEST_RET_ADDR and HOST_RET_ADDR are adjacent on purpose: the prolog
   // saves both with one stp and the call-return teardown reloads both with
@@ -64,11 +64,16 @@ class StackLayout {
   static constexpr size_t GUEST_RET_ADDR = 48;
   static constexpr size_t HOST_RET_ADDR = 56;
   static constexpr size_t GUEST_CALL_RET_ADDR = 64;
-  // This frame's stackpoint entry depth, spilled by PushStackpoint so
-  // PopStackpoint restores it without a read-modify-write of the context
-  // field. (Longjmp detection state itself lives in A64BackendContext so it
-  // can be checked even when native SP still points at a skipped frame.)
-  static constexpr size_t GUEST_RESERVED = 72;
+  // This frame's stackpoint node (A64StackpointNode), linked through
+  // stackpoint_head in A64BackendContext. Living inside the frame, it needs
+  // no array, no depth counter and no bounds check; the node address minus
+  // STACKPOINT_PREV is the frame's post-alloc SP, which is what the longjmp
+  // repair restores. (The pending-repair marker itself stays in
+  // A64BackendContext so it can be checked even when native SP still points
+  // at a skipped frame.)
+  static constexpr size_t STACKPOINT_PREV = 72;
+  static constexpr size_t STACKPOINT_GUEST_SP = 80;
+  static constexpr size_t STACKPOINT_GUEST_RET = 84;
 };
 
 }  // namespace a64
