@@ -51,7 +51,10 @@ test_mcrf_3:
   blr
   #_ REGISTER_OUT r3 5
   #_ REGISTER_OUT r4 5
-  #_ REGISTER_OUT r12 0x40020000
+  # cmpw cr3 on equal operands sets eq; mcrf copies eq, so cr0 reads
+  # 0x2 (eq), not 0x4 (gt). The old expectation encoded xenia's
+  # compare-against-zero lowering.
+  #_ REGISTER_OUT r12 0x20020000
 
 test_mcrf_3_constant:
   li r3, 5
@@ -62,7 +65,10 @@ test_mcrf_3_constant:
   blr
   #_ REGISTER_OUT r3 5
   #_ REGISTER_OUT r4 5
-  #_ REGISTER_OUT r12 0x40020000
+  # cmpw cr3 on equal operands sets eq; mcrf copies eq, so cr0 reads
+  # 0x2 (eq), not 0x4 (gt). The old expectation encoded xenia's
+  # compare-against-zero lowering.
+  #_ REGISTER_OUT r12 0x20020000
 
 test_mcrf_4:
   #_ REGISTER_IN r3 100
@@ -100,7 +106,9 @@ test_mcrf_5:
   #_ REGISTER_OUT r4 20
   #_ REGISTER_OUT r5 30
   #_ REGISTER_OUT r6 30
-  #_ REGISTER_OUT r12 0x00802040
+  # cr2 holds lt (10 < 20); mcrf cr6,cr2 copies lt, so cr6 reads 0x8,
+  # not 0x4 (gt).
+  #_ REGISTER_OUT r12 0x00802080
 
 test_mcrf_5_constant:
   li r3, 10
@@ -116,4 +124,6 @@ test_mcrf_5_constant:
   #_ REGISTER_OUT r4 20
   #_ REGISTER_OUT r5 30
   #_ REGISTER_OUT r6 30
-  #_ REGISTER_OUT r12 0x00802040
+  # cr2 holds lt (10 < 20); mcrf cr6,cr2 copies lt, so cr6 reads 0x8,
+  # not 0x4 (gt).
+  #_ REGISTER_OUT r12 0x00802080
