@@ -203,6 +203,15 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   void EnsureSynchronizedGuestAndHostStack();
 
 
+  // After a conditional region (TRAP_TRUE / CALL_*_TRUE), the taken path's
+  // tracker state must meet the skip path's entry state: keep it only when
+  // both agree.
+  void MergeFpcrModeAfterConditional(FPCRMode skip_path_mode) {
+    if (fpcr_mode_ != skip_path_mode) {
+      fpcr_mode_ = FPCRMode::Unknown;
+    }
+  }
+  FPCRMode fpcr_mode() const { return fpcr_mode_; }
   void ForgetFpcrMode() {
     if (IsVmxFpcrMode(fpcr_mode_)) {
       ChangeFpcrMode(FPCRMode::Fpu);
