@@ -516,9 +516,11 @@ static Value* FpIsSignalingNan(PPCHIRBuilder& f, Value* value) {
                                f.LoadConstantUint64(0x0008000000000000ull))));
 }
 
-// VXSNAN is unconditional on PPC, and the host cannot be relied on for it: the
-// a64 sequences branch around the arithmetic when an operand is a NaN, so a
-// signalling operand may never reach an instruction that would signal.
+// VXSNAN is unconditional on PPC, and the host cannot be relied on for it:
+// several sequences still branch around the arithmetic when an operand is a
+// NaN (and result-gated ones clear host status per Rc instruction anyway),
+// so a signalling operand may never reach an instruction that would signal.
+// This software term is load-bearing even where the hardware op now runs.
 Value* PPCHIRBuilder::FpInvalidFromOperands(
     std::initializer_list<Value*> operands) {
   Value* any_snan = nullptr;
