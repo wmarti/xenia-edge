@@ -804,8 +804,9 @@ struct SELECT_F32
 struct SELECT_F64
     : Sequence<SELECT_F64, I<OPCODE_SELECT, F64Op, I8Op, F64Op, F64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
-    e.ChangeMxcsrMode(MXCSRMode::Fpu);
-    // dest = src1 != 0 ? src2 : src3
+    // dest = src1 != 0 ? src2 : src3. Every instruction here is
+    // MXCSR-insensitive (integer flag math and a blend), so no mode
+    // declaration - the a64 twin's fcsel path declares none either.
 
     if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
       e.movzx(e.rax, i.src1);
@@ -826,23 +827,21 @@ struct SELECT_F64
       return;
     }
 
-    e.movzx(e.eax, i.src1);
-    e.vmovd(e.xmm1, e.eax);
-    e.vpxor(e.xmm0, e.xmm0);
-    e.vpcmpeqq(e.xmm0, e.xmm1);
+    // cond == 0 borrows, making rax all-ones; vblendvpd picks src3 on the
+    // set sign bit and src2 otherwise.
+    e.cmp(i.src1, 1);
+    e.sbb(e.rax, e.rax);
+    e.vmovq(e.xmm0, e.rax);
 
-    Xmm src2 = i.src2.is_constant ? e.xmm2 : i.src2;
+    Xmm src2 = i.src2.is_constant ? e.xmm1 : i.src2;
     if (i.src2.is_constant) {
       e.LoadConstantXmm(src2, i.src2.constant());
     }
-    e.vpandn(e.xmm1, e.xmm0, src2);
-
     Xmm src3 = i.src3.is_constant ? e.xmm2 : i.src3;
     if (i.src3.is_constant) {
       e.LoadConstantXmm(src3, i.src3.constant());
     }
-    e.vpand(i.dest, e.xmm0, src3);
-    e.vpor(i.dest, e.xmm1);
+    e.vblendvpd(i.dest, src2, src3, e.xmm0);
   }
 };
 struct SELECT_V128_I8
