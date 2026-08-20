@@ -43,6 +43,28 @@ die() { echo "error: $*" >&2; exit 1; }
 [ -f "$ARCHIVE" ] || die "missing $ARCHIVE (are you on the bench-macos-arm64 branch?)"
 command -v zstd >/dev/null || tar --help 2>&1 | grep -q zstd || die "need zstd or a tar with --zstd"
 
+# CMake configures the whole project even when only one target is requested,
+# so the graphics-side prerequisites are needed even for this CPU-only test
+# binary. Checked up front because otherwise the failure surfaces deep inside
+# a wall of CMake output ("spirv_to_dxil needs meson>=1.4 and ninja on PATH").
+missing=""
+command -v meson >/dev/null || missing="$missing meson"
+command -v ninja >/dev/null || missing="$missing ninja"
+command -v cmake >/dev/null || missing="$missing cmake"
+python3 -c 'import mako' 2>/dev/null || missing="$missing python-mako"
+if [ -n "$missing" ]; then
+  cat >&2 <<MSG
+error: missing build prerequisites:$missing
+
+  brew install meson ninja cmake
+  python3 -m pip install --user mako pyyaml packaging
+
+Also make sure the Metal toolchain is present (once per machine):
+  sudo xcodebuild -downloadComponent MetalToolchain
+MSG
+  exit 1
+fi
+
 mkdir -p "$WORK"
 if [ ! -d "$CORPUS" ]; then
   echo "==> unpacking corpus"
@@ -67,6 +89,10 @@ build_ref() {           # build_ref <ref> -> echoes path to the binary
   fi
   (
     cd "$wt"
+    # Slang and the Metal Shader Converter are fetched by the build script
+    # itself; both are needed at configure time.
+    ./xenia-build.py slang >/dev/null 2>&1 || true
+    ./xenia-build.py msc >/dev/null 2>&1 || true
     # Submodules are per-worktree; only what the CPU tests link is needed.
     git submodule update --init --depth=1 -j"$(sysctl -n hw.ncpu)" \
       $(grep -oE 'path = .+' .gitmodules | sed 's/path = //' \
