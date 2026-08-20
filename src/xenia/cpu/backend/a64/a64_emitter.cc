@@ -266,10 +266,10 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   static_assert(StackLayout::HOST_RET_ADDR ==
                 StackLayout::GUEST_RET_ADDR + 8);
   stp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
-  // Store zero for call return address (we haven't made a call yet).
-  str(xzr, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
 
-  // Record stackpoint for longjmp recovery.
+  // Record stackpoint for longjmp recovery. Also zeroes the call-return slot
+  // (no call made yet), paired with the entry-depth spill when the
+  // synchronizer is on.
   PushStackpoint();
 
   // ========================================================================
@@ -1344,6 +1344,9 @@ void A64Emitter::HandleStackpointOverflowError(ppc::PPCContext* context) {
 
 void A64Emitter::PushStackpoint() {
   if (!cvars::a64_enable_host_guest_stack_synchronization) {
+    // Still owns zeroing the call-return slot (see the prolog).
+    str(xzr,
+        ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
     return;
   }
   // x8 = stackpoints array, w9 = current depth
@@ -1351,6 +1354,17 @@ void A64Emitter::PushStackpoint() {
               static_cast<uint32_t>(offsetof(A64BackendContext, stackpoints))));
   ldr(w9, ptr(x19, static_cast<uint32_t>(
                        offsetof(A64BackendContext, current_stackpoint_depth))));
+
+  // Zero the call-return slot and spill this frame's entry depth beside it in
+  // one paired store: at every pop site the live depth equals entry + 1
+  // (calls balance, and the longjmp repair restores exactly entry + 1 for
+  // this frame), so PopStackpoint can restore the entry value from the frame
+  // with no read-modify-write of the context field. ldr w9 zero-extends, so
+  // the spilled x9 is the depth itself.
+  static_assert(StackLayout::GUEST_RESERVED ==
+                StackLayout::GUEST_CALL_RET_ADDR + 8);
+  stp(xzr, x9,
+      ptr(sp, static_cast<int32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
 
   // x8 += w9 * sizeof(A64BackendStackpoint) via scaled extended-register add.
   static_assert(sizeof(A64BackendStackpoint) == 16,
@@ -1403,10 +1417,10 @@ void A64Emitter::PopStackpoint() {
   if (!cvars::a64_enable_host_guest_stack_synchronization) {
     return;
   }
-  // Decrement current_stackpoint_depth.
-  ldr(w8, ptr(x19, static_cast<uint32_t>(
-                       offsetof(A64BackendContext, current_stackpoint_depth))));
-  sub(w8, w8, 1);
+  // The live depth here is always this frame's entry depth + 1 (see
+  // PushStackpoint), so restoring the spilled entry value is the decrement,
+  // without the read-modify-write.
+  ldr(w8, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RESERVED)));
   str(w8, ptr(x19, static_cast<uint32_t>(
                        offsetof(A64BackendContext, current_stackpoint_depth))));
 }
