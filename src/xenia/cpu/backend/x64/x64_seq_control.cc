@@ -203,6 +203,10 @@ struct TRAP_TRUE_I8
     e.test(i.src1, i.src1);
     e.jnz(dotrap, X64Emitter::T_NEAR);
     e.L(after);
+    // The trap path came back through the guest-to-host thunk with the FPU
+    // image live; the fall-through kept the entry mode. Meet to Unknown so
+    // the next float op re-checks.
+    e.ForgetMxcsrMode();
   }
 };
 struct TRAP_TRUE_I16
