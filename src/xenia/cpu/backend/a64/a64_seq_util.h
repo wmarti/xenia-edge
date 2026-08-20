@@ -563,8 +563,7 @@ inline void FixupVmxNan_V128_Fma(A64Emitter& e, int a, int c, int b, int tmp,
   // ten-instruction fixup moves to the function tail. This mirrors the x64
   // backend's vptest design and its stated invariant.
   auto& done = e.NewCachedLabel();
-  auto& slow = e.AddToTail([a, c, b, tmp, qs, &done](A64Emitter& e,
-                                                     Xbyak_aarch64::Label&) {
+  auto emit_fixup = [a, c, b, tmp, qs, &done](A64Emitter& e) {
     // Lowest priority first, so an earlier operand overwrites a later one: C,
     // then B, then A. BIF inserts an operand wherever its self-compare is
     // false, which is exactly where that operand is NaN.
@@ -583,12 +582,24 @@ inline void FixupVmxNan_V128_Fma(A64Emitter& e, int a, int c, int b, int tmp,
     e.bic(VReg(qs).b16, VReg(qs).b16, VReg(tmp).b16);
     e.orr(VReg(2).b16, VReg(2).b16, VReg(qs).b16);
     e.b(done);
-  });
+  };
 
   e.fcmeq(VReg(tmp).s4, VReg(2).s4, VReg(2).s4);  // all-ones where not NaN
   e.uminv(SReg(tmp), VReg(tmp).s4);               // 0 iff any lane is NaN
   e.fmov(WReg(0), SReg(tmp));
-  e.cbz_near(WReg(0), slow);
+  if (e.near_tail_branches_safe()) {
+    auto& slow = e.AddToTail(
+        [emit_fixup](A64Emitter& e, Xbyak_aarch64::Label&) { emit_fixup(e); });
+    e.cbz_near(WReg(0), slow);
+  } else {
+    // Function too large to prove the +/-1 MiB reach of a near branch to the
+    // tail: keep the fixup inline, jumped over on the fast path.
+    auto& slow = e.NewCachedLabel();
+    e.cbz(WReg(0), slow);
+    e.b(done);
+    e.L(slow);
+    emit_fixup(e);
+  }
   e.L(done);
 }
 
