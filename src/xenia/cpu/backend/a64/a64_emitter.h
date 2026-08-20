@@ -118,14 +118,32 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // forms (see Emit); sequences use this to place cold paths out of line.
   bool near_tail_branches_safe() const { return near_tail_branches_safe_; }
 
-  // NZCV fusion between adjacent HIR instructions (ANDS + compare-vs-zero).
+  // NZCV fusion between adjacent HIR instructions. The classic producer is
+  // ANDS (condition NE); a producer may instead declare any condition code
+  // that is true at runtime exactly when the register is nonzero, on every
+  // path reaching the next instruction.
   void DeclareFlagsZeroTest(int gpr_reg, bool is64) {
+    DeclareFlagsNonzeroCond(gpr_reg, is64, Xbyak_aarch64::NE);
+  }
+  void DeclareFlagsNonzeroCond(int gpr_reg, bool is64,
+                               Xbyak_aarch64::Cond cond) {
     flags_zero_fresh_reg_ = gpr_reg;
     flags_zero_fresh_is64_ = is64;
+    flags_zero_fresh_cond_ = cond;
+  }
+  bool FlagsNonzeroCondHeld(int gpr_reg, bool is64,
+                            Xbyak_aarch64::Cond* out_cond) const {
+    if (flags_zero_armed_reg_ == gpr_reg && flags_zero_armed_is64_ == is64 &&
+        gpr_reg >= 0) {
+      *out_cond = flags_zero_armed_cond_;
+      return true;
+    }
+    return false;
   }
   bool FlagsHoldZeroTest(int gpr_reg, bool is64) const {
     return flags_zero_armed_reg_ == gpr_reg &&
-           flags_zero_armed_is64_ == is64 && gpr_reg >= 0;
+           flags_zero_armed_is64_ == is64 && gpr_reg >= 0 &&
+           flags_zero_armed_cond_ == Xbyak_aarch64::NE;
   }
   void ResetFlagsZeroTest() {
     flags_zero_fresh_reg_ = flags_zero_armed_reg_ = -1;
@@ -134,6 +152,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   void ShiftFlagsZeroTest() {
     flags_zero_armed_reg_ = flags_zero_fresh_reg_;
     flags_zero_armed_is64_ = flags_zero_fresh_is64_;
+    flags_zero_armed_cond_ = flags_zero_fresh_cond_;
     flags_zero_fresh_reg_ = -1;
     w16_holds_armed_ = w16_holds_fresh_;
     w16_holds_fresh_ = nullptr;
@@ -336,6 +355,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // into `armed` between instructions, so `armed` can never leak past one
   // instruction, a label bind, or a block boundary.
   int flags_zero_fresh_reg_ = -1;
+  Xbyak_aarch64::Cond flags_zero_fresh_cond_ = Xbyak_aarch64::NE;
+  Xbyak_aarch64::Cond flags_zero_armed_cond_ = Xbyak_aarch64::NE;
   bool flags_zero_fresh_is64_ = false;
   int flags_zero_armed_reg_ = -1;
   bool flags_zero_armed_is64_ = false;
