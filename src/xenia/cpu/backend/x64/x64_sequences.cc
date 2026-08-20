@@ -661,6 +661,101 @@ struct MAX_I64 : Sequence<MAX_I64, I<OPCODE_MAX, I64Op, I64Op, I64Op>> {
 EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128, MAX_I64);
 
 // ============================================================================
+// OPCODE_DENORMAL_QUIRK
+// ============================================================================
+// See the a64 twin: quirk = (any operand denormal) && (all finite). The
+// biased-minimum screen runs hot; the finiteness verdict is jumped over on
+// the (overwhelmingly common) clean path. Integer-only, MXCSR-insensitive.
+struct DENORMAL_QUIRK
+    : Sequence<DENORMAL_QUIRK,
+               I<OPCODE_DENORMAL_QUIRK, I8Op, F64Op, F64Op, F64Op>> {
+  template <typename SRC>
+  static int CollectOperands(X64Emitter& e, const SRC& s1, const SRC& s2,
+                             const SRC& s3, Xmm* out) {
+    const SRC* srcs[3] = {&s1, &s2, &s3};
+    uint64_t const_bits[3];
+    int reg_idx[3];
+    int n = 0;
+    int next_scratch = 0;
+    for (int k = 0; k < 3; ++k) {
+      uint64_t bits = 0;
+      int idx = -1;
+      if (srcs[k]->is_constant) {
+        double d = srcs[k]->constant();
+        std::memcpy(&bits, &d, sizeof(bits));
+      } else {
+        idx = srcs[k]->reg().getIdx();
+      }
+      bool dup = false;
+      for (int m = 0; m < n; ++m) {
+        if (idx >= 0 ? reg_idx[m] == idx
+                     : (reg_idx[m] < 0 && const_bits[m] == bits)) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) {
+        continue;
+      }
+      reg_idx[n] = idx;
+      const_bits[n] = bits;
+      if (idx >= 0) {
+        out[n] = Xmm(idx);
+      } else {
+        const Xmm scratch = (next_scratch == 0)   ? e.xmm0
+                            : (next_scratch == 1) ? e.xmm1
+                                                  : e.xmm2;
+        ++next_scratch;
+        vec128_t v = vec128q(bits, 0);
+        e.LoadConstantXmm(scratch, v);
+        out[n] = scratch;
+      }
+      ++n;
+    }
+    return n;
+  }
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    Xmm ops[3] = {e.xmm0, e.xmm0, e.xmm0};
+    const int n = CollectOperands(e, i.src1, i.src2, i.src3, ops);
+
+    // Hot: running minimum of (magnitude - 1) in rcx.
+    for (int k = 0; k < 3 && k < n; ++k) {
+      const auto& gp = (k == 0) ? e.rcx : e.rax;
+      e.vmovq(gp, ops[k]);
+      e.btr(gp, 63);
+      e.sub(gp, 1);
+      if (k != 0) {
+        e.cmp(e.rax, e.rcx);
+        e.cmovb(e.rcx, e.rax);
+      }
+    }
+    e.mov(e.rax, 0x000FFFFFFFFFFFFFull);
+    e.cmp(e.rcx, e.rax);
+    Xbyak::Label slow, done;
+    e.jb(slow);
+    e.xor_(i.dest.reg().cvt32(), i.dest.reg().cvt32());
+    e.jmp(done);
+
+    e.L(slow);
+    // Cold: all-finite verdict over the magnitudes.
+    for (int k = 0; k < 3 && k < n; ++k) {
+      const auto& gp = (k == 0) ? e.rcx : e.rax;
+      e.vmovq(gp, ops[k]);
+      e.btr(gp, 63);
+      if (k != 0) {
+        e.cmp(e.rax, e.rcx);
+        e.cmova(e.rcx, e.rax);
+      }
+    }
+    e.mov(e.rax, 0x7FF0000000000000ull);
+    e.cmp(e.rcx, e.rax);
+    e.setb(i.dest);
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_DENORMAL_QUIRK, DENORMAL_QUIRK);
+
+// ============================================================================
 // OPCODE_MIN
 // ============================================================================
 struct MIN_I8 : Sequence<MIN_I8, I<OPCODE_MIN, I8Op, I8Op, I8Op>> {
