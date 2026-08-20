@@ -901,9 +901,8 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
       target_address <= 0xFFFFFFFFu) {
     auto* module_for_address =
         processor->LookupModule(static_cast<uint32_t>(target_address));
-    auto* xexmod = dynamic_cast<XexModule*>(module_for_address);
-    if (xexmod) {
-      InfoCacheFlags* flags = xexmod->GetInstructionAddressFlags(
+    if (module_for_address) {
+      InfoCacheFlags* flags = module_for_address->GetInstructionAddressFlags(
           static_cast<uint32_t>(target_address));
       if (flags && flags->is_return_site) {
         uintptr_t host_address = 0;
