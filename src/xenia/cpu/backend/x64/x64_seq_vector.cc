@@ -2461,6 +2461,17 @@ struct PERMUTE_I32
       } else {
         src3 = i.src3;
       }
+      // vmrghw/vmrglw interleaves are single unpacks: PPC word i is host
+      // dword i, so [A0 B0 A1 B1] = vpunpckldq and [A2 B2 A3 B3] =
+      // vpunpckhdq.
+      if (control == MakePermuteMask(0, 0, 1, 0, 0, 1, 1, 1)) {
+        e.vpunpckldq(i.dest, src2, src3);
+        return;
+      }
+      if (control == MakePermuteMask(0, 2, 1, 2, 0, 3, 1, 3)) {
+        e.vpunpckhdq(i.dest, src2, src3);
+        return;
+      }
       // Words 0-1 from src2 and 2-3 from src3 is exactly vshufps, one
       // instruction instead of two shuffles and a blend.
       constexpr uint32_t kSelectBits = MakePermuteMask(1, 0, 1, 0, 1, 0, 1, 0);
@@ -2584,12 +2595,44 @@ struct PERMUTE_V128
       }
 
       if (i.src1.is_constant) {
-        e.LoadConstantXmm(e.xmm2, i.src1.constant());
-        e.vxorps(e.xmm2, e.xmm2, e.GetXmmConstPtr(XMMSwapWordMask));
+        const vec128_t folded = FixupConstantShuf8(i.src1.constant());
+        // vmrghb/vmrglb byte interleaves: unpack (src3, src2) then swap the
+        // dword pairs back - two instructions replacing the whole table
+        // path. Patterns are the folded (^3, &0x1F) index vectors, verified
+        // against the generic emission over random vectors; they mirror the
+        // a64 zip forms.
+        vec128_t mrghb_folded, mrglb_folded;
+        static const uint8_t kMrghb[16] = {18, 2, 19, 3, 16, 0, 17, 1,
+                                           22, 6, 23, 7, 20, 4, 21, 5};
+        static const uint8_t kMrglb[16] = {26, 10, 27, 11, 24, 8,  25, 9,
+                                           30, 14, 31, 15, 28, 12, 29, 13};
+        std::memcpy(&mrghb_folded, kMrghb, 16);
+        std::memcpy(&mrglb_folded, kMrglb, 16);
+        const bool mrgh = folded == mrghb_folded;
+        if (mrgh || folded == mrglb_folded) {
+          Xmm m_src2 = i.src2.is_constant ? e.xmm0 : Xmm(i.src2);
+          if (i.src2.is_constant) {
+            e.LoadConstantXmm(e.xmm0, i.src2.constant());
+          }
+          Xmm m_src3 = i.src3.is_constant ? e.xmm1 : Xmm(i.src3);
+          if (i.src3.is_constant) {
+            e.LoadConstantXmm(e.xmm1, i.src3.constant());
+          }
+          if (mrgh) {
+            e.vpunpcklbw(i.dest, m_src3, m_src2);
+          } else {
+            e.vpunpckhbw(i.dest, m_src3, m_src2);
+          }
+          e.vpshufd(i.dest, i.dest, 0xB1);
+          return;
+        }
+        // Fold the swap and the wrap into the constant itself - the runtime
+        // vxorps + vpand pair is pure waste on a known control.
+        e.LoadConstantXmm(e.xmm2, folded);
       } else {
         e.vxorps(e.xmm2, i.src1, e.GetXmmConstPtr(XMMSwapWordMask));
+        e.vpand(e.xmm2, e.GetXmmConstPtr(XMMPermuteByteMask));
       }
-      e.vpand(e.xmm2, e.GetXmmConstPtr(XMMPermuteByteMask));
 
       Xmm src2_shuf = e.xmm0;
       if (i.src2.value->IsConstantZero()) {
@@ -2651,6 +2694,29 @@ struct PERMUTE_V128
 
     assert_true(i.src1.is_constant);
 
+    // vmrghh/vmrglh halfword interleaves: unpack (src3, src2) then swap
+    // the dword pairs back, mirroring the a64 zip + rev64 forms.
+    {
+      const vec128_t masked = i.src1.constant() & vec128s(0xF);
+      const bool mrgh = masked == vec128s(0, 8, 1, 9, 2, 10, 3, 11);
+      if (mrgh || masked == vec128s(4, 12, 5, 13, 6, 14, 7, 15)) {
+        Xmm m_src2 = i.src2.is_constant ? e.xmm0 : Xmm(i.src2);
+        if (i.src2.is_constant) {
+          e.LoadConstantXmm(e.xmm0, i.src2.constant());
+        }
+        Xmm m_src3 = i.src3.is_constant ? e.xmm1 : Xmm(i.src3);
+        if (i.src3.is_constant) {
+          e.LoadConstantXmm(e.xmm1, i.src3.constant());
+        }
+        if (mrgh) {
+          e.vpunpcklwd(i.dest, m_src3, m_src2);
+        } else {
+          e.vpunpckhwd(i.dest, m_src3, m_src2);
+        }
+        e.vpshufd(i.dest, i.dest, 0xB1);
+        return;
+      }
+    }
     vec128_t perm = (i.src1.constant() & vec128s(0xF)) ^ vec128s(0x1);
     vec128_t perm_ctrl = vec128b(0);
     for (int i = 0; i < 8; i++) {
@@ -2662,19 +2728,20 @@ struct PERMUTE_V128
     }
     e.LoadConstantXmm(e.xmm0, perm);
 
+    // vpshufb is three-operand under AVX; shuffling straight from the
+    // sources kills both staging copies.
     if (i.src2.is_constant) {
       e.LoadConstantXmm(e.xmm1, i.src2.constant());
+      e.vpshufb(e.xmm1, e.xmm1, e.xmm0);
     } else {
-      e.vmovdqa(e.xmm1, i.src2);
+      e.vpshufb(e.xmm1, i.src2, e.xmm0);
     }
     if (i.src3.is_constant) {
       e.LoadConstantXmm(e.xmm2, i.src3.constant());
+      e.vpshufb(e.xmm2, e.xmm2, e.xmm0);
     } else {
-      e.vmovdqa(e.xmm2, i.src3);
+      e.vpshufb(e.xmm2, i.src3, e.xmm0);
     }
-
-    e.vpshufb(e.xmm1, e.xmm1, e.xmm0);
-    e.vpshufb(e.xmm2, e.xmm2, e.xmm0);
 
     uint8_t mask = 0;
     for (int i = 0; i < 8; i++) {
