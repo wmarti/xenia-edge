@@ -552,24 +552,21 @@ void PPCHIRBuilder::UpdateFPSCR(std::initializer_list<Value*> operands,
 // operand finite and at least one of them denormal.
 Value* PPCHIRBuilder::SingleDenormalOperand(
     std::initializer_list<Value*> operands) {
-  Value* any_denormal = nullptr;
-  Value* max_magnitude = nullptr;
+  // One opcode instead of a per-operand compare chain: the backends keep the
+  // denormal screen hot (a biased running minimum - subtracting one wraps a
+  // zero magnitude to the top so zero never reads as denormal) and evaluate
+  // the all-finite verdict out of line, where only denormal-bearing inputs
+  // ever go. Unused operand slots repeat an operand; duplicates are free.
+  Value* ops[3] = {nullptr, nullptr, nullptr};
+  int count = 0;
   for (Value* operand : operands) {
-    Value* magnitude = FpMagnitude(*this, operand);
-    // Subtracting one wraps a zero operand up to the top, which is what keeps
-    // zero from reading as denormal.
-    Value* is_denormal = CompareULT(Sub(magnitude, LoadConstantUint64(1)),
-                                    LoadConstantUint64(0x000FFFFFFFFFFFFFull));
-    any_denormal = any_denormal ? Or(any_denormal, is_denormal) : is_denormal;
-    // Nonfiniteness ORs across operands, and OR of (mag >= K) over the
-    // operands equals (max of mags >= K), so track one running maximum and
-    // compare once. Magnitudes have bit 63 clear, so the signed integer Max
-    // matches the unsigned comparison.
-    max_magnitude = max_magnitude ? Max(max_magnitude, magnitude) : magnitude;
+    ops[count++] = operand;
   }
-  Value* all_finite =
-      CompareULT(max_magnitude, LoadConstantUint64(0x7FF0000000000000ull));
-  return And(any_denormal, all_finite);
+  assert_true(count >= 1 && count <= 3);
+  for (; count < 3; ++count) {
+    ops[count] = ops[count - 1];
+  }
+  return DenormalQuirk(ops[0], ops[1], ops[2]);
 }
 
 Value* PPCHIRBuilder::ApplySingleDenormalOperand(Value* quirk, Value* result) {
