@@ -57,7 +57,7 @@ jobs:
           # The corpus runner is not part of the normal build; XENIA_BUILD_TESTS
           # gates it, and its CMake target already links the a64 backend when
           # the target architecture is AArch64.
-          ./xenia-build.py build --config=Release --tests \
+          ./xenia-build.py build --config=Release --build-tests \
             --target=xenia-cpu-ppc-tests
 
       - name: Unpack corpus
