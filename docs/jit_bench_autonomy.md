@@ -131,13 +131,19 @@ believed not to touch (`instr__gen_vand`) on the theory that its delta is pure
 measurement error. Measured, that control moved **-9.3%**, which on its face
 would mean the branch's -8.8% total is entirely noise.
 
-It is not. The premise is simply wrong for this branch. Several commits change
-code that every suite executes regardless of which instruction it is testing:
-guest-address zero-extend folding touches every load and store, stackpoints as
-linked records touch every guest frame, and moving `preempt_requested` into the
-`PPCContext` padding hole changes the layout every test shares. There is no
-suite whose emitted code this branch leaves alone, so a suite-based control
-measures the branch's general improvement and reports it as noise.
+That reading was too confident, and later measurement undercut it. `vand` is a
+0.15s suite, and sub-second suites on this machine do not resolve at all: at
+N=25 the same suite came out **+0.84%** with 15.5% spread, and a second tool
+put it at +0.65%. The -9.2% was not a measurement of anything. On x64,
+callgrind — which is deterministic — puts `vand` at **+0.02%**.
+
+So the honest position is that **the control moved by an unknown amount**,
+which is worse for a control than moving by a known one. The argument for
+distrusting a suite-based control does not depend on the number, though: this
+branch changes guest-address zero-extend folding, stackpoint records, and the
+`PPCContext` layout, all of which are on the path every suite executes, so
+there is no suite it demonstrably leaves alone. A control has to be something
+the change provably cannot reach.
 
 **The control must be the same binary against itself.** Running ref A as both
 sides of the comparison isolates measurement error, because the two sides are
@@ -289,10 +295,23 @@ published, so this is the number of record. `instr_mcrf` getting marginally slow
 consistent with the fix: it now copies the CR field instead of comparing it
 against zero.
 
-The gains are close to uniform across suites that test unrelated instructions,
-which is what the diff predicts — `hir_builder`, `ppc_hir_builder`, and
-`ppc_context.h` are on the path every suite executes. `ppc_testing_main.cc` is
-byte-identical between the refs, so the harness is not contributing.
+**Only the suites above about a second are actually measured.** Everything
+under roughly 0.4s — `vand`, `vaddfp`, `vavgsb`, `vavgsw`, `vpkuhus`, `fadd`,
+`fmuls`, `mcrf` — runs a sample spread of 7-92%, and the delta between refs is
+smaller than that spread. Raising the repetition count from 5 to 25 does not
+converge them: at N=25 `vand` came out +0.84% with 15.5% spread and `fadd`
+came out -31.6% with 72.5% spread. The variation is process startup, which no
+amount of repetition removes, because it is not the thing being timed.
+
+Two different tools disagree by more than ten points on the same sub-second
+suite while agreeing to a fraction of a point on the large ones. Treat the
+small-suite figures as **not measured**, which is a different statement from
+"no change".
+
+What survives that: the five suites over a second move -7.8% to -9.8% on a64,
+with spreads of 1.7-4.9%, reproduced across two independent tools and four
+runs. `ppc_testing_main.cc` is byte-identical between the refs, so the harness
+is not contributing to it.
 
 ### ylab
 
@@ -398,11 +417,20 @@ to argue about — a repeat run reproduces these exactly.
 
 Two things are worth reading carefully here.
 
-**The x64 gain is -1.04%, against -8.8% wall clock on a64.** That is not a
-contradiction and not a disappointment: the stack is thirty `[A64]` commits and
-six `[x64]` ones. Most of this work does not touch the x64 backend at all, and
-the measurement says so. Anyone quoting "-8.8%" as the branch's improvement
-should be quoting it as the *a64* improvement.
+**This table is not comparable to the wall-clock numbers, because it covers
+the wrong suites.** Seven of the eight are sub-second, chosen because they are
+what the six `[x64]` commits name — and those are exactly the suites where
+nothing resolves. The one large suite in the set, `fmadds`, moves -1.71%. Read
+this table as "the small suites do not move much on x64", not as the branch's
+x64 improvement.
+
+The wall-clock measurement on an exclusively allocated `ad-01` covers the large
+suites and puts x64 at **-7.8%** overall: `vsel` -9.8%, `vperm` -8.2%,
+`vnmsubfp` -7.7%, `vmaddfp` -7.5%, `fmadds` -5.4%, with spreads of 11-20%.
+That is close to the a64 figure on the same suites, which points at the shared
+frontend and HIR work rather than at the backend-specific commits — but the
+x64 spreads are high enough that the two should not be compared to a decimal
+place.
 
 **On x64 the control behaves like a control**, moving +0.02%. On a64 the same
 suite moved -9.2%, because the a64 commits change addressing, guest frames and
