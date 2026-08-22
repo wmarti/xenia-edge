@@ -280,6 +280,16 @@ byte-identical between the refs, so the harness is not contributing.
      visible from the login node afterwards, and reading them means another
      `srun` onto the same node. Copy anything worth keeping back to NFS home
      before the job exits.
+  3. *Run the tests inside the image they were built in.* The binary links
+     `libSDL3` out of its own build tree, so on the bare node it dies at
+     `error while loading shared libraries` before printing anything.
+  4. *`--shm-size=2g` is required.* The JIT code cache is a 256 MB `shm_open`
+     mapping, mapped twice — an execute view and a write view — and podman
+     defaults `/dev/shm` to 64 MB. Without it the cache fails to allocate and
+     every suite segfaults, which is easy to misread as a backend bug.
+
+  The third and fourth of those produced the same symptom from opposite causes,
+  and both initially read as a clean gate — see below.
 - Building both refs in that image is in flight.
 - Still open: `pip install` on the bare node is refused under PEP 668 and needs
   `--break-system-packages` or a venv — only relevant if we ever go back to a
@@ -318,6 +328,21 @@ Mac-only and stays a coarse gate rather than a per-commit one.
 
 Worth building deliberately rather than by adapting the larger harness, and
 worth building before the autonomy boundary moves past measure-and-report.
+
+### A gate that passed on nothing
+
+Worth recording, because it is the failure mode an unattended loop is least
+able to notice. When the x64 binary could not find `libSDL3`, every suite
+exited before printing a count. Both refs failed identically, so the set
+difference was empty, and the gate reported **"no regressions, gate: pass"** on
+two runs that had executed zero test cases.
+
+The verdict logic was right and the inputs were garbage. Two changes now make
+that impossible: suite verdicts are counted directly rather than inferred from
+the parsed `Failed:` totals, which are `0` when nothing ran at all, and a run
+that executed no cases fails outright on whichever side it happened on. The
+same shape of check belongs on anything else the loop learns to compare —
+agreement between two broken measurements is not evidence.
 
 ### Immediate next steps
 
