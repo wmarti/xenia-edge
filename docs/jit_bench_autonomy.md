@@ -191,6 +191,37 @@ to be stood up.
   is to *submit* `sbatch` work and collect it afterwards, never to compute on
   the login node.
 
+### Running a pass
+
+One command per machine, and both are idempotent — anything already done is
+reused, anything missing is rebuilt:
+
+    ./tools/bench/run_lane.sh                        # Mac, a64
+    sbatch tools/bench/slurm/x64-pipeline.sbatch     # ylab, x64
+
+Neither depends on state prepared by hand. That matters more on the cluster
+than it sounds: podman's graph root is `/var/user/$UID/containers/storage` and
+the build trees live in `/tmp`, both node-local, so an hour of setup on
+`epyc-7502` buys nothing on `ad-01` and a cleanup erases it. The pipeline
+archives the built image to NFS after building it, which turns a first run on
+a new node from a ten-minute apt job into a one-second load.
+
+### Sharing the repository with other sessions
+
+Several Claude sessions edit this tree, and one pushed to the bench branch
+mid-session while there were uncommitted changes in the same file — the merge
+was real and had to be resolved by hand. The rules that keep that survivable:
+
+- Fetch before editing anything shared, and rebase rather than merge.
+- Never force-push the bench branch.
+- Results stay local to the machine that produced them. Publishing them to a
+  shared branch would add a second thing to collide over for no benefit, since
+  whoever is coordinating can read both machines directly.
+- Every result bundle records the tooling commit it came from and whether that
+  tree was dirty, so a number can always be traced back to code.
+- `run_lane.sh` warns when the branch has moved underneath it or when
+  `tools/bench` has uncommitted changes.
+
 ## 5. Guardrails
 
 These are what make unattended operation defensible rather than merely possible.

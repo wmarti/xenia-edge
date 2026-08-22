@@ -37,6 +37,19 @@ fi
 
 git -C "$ROOT" fetch --quiet origin 2>/dev/null || say "fetch failed, using local refs"
 
+# Several sessions push to this branch. A pass that measures a tree which has
+# since moved is not wrong, but its result has to be read against the commit it
+# actually came from, so say so loudly rather than silently producing a number
+# that looks current.
+BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+if [ -n "$BRANCH" ] && [ "$BRANCH" != "HEAD" ]; then
+  BEHIND="$(git -C "$ROOT" rev-list --count "HEAD..origin/$BRANCH" 2>/dev/null || echo 0)"
+  [ "${BEHIND:-0}" -gt 0 ] \
+    && say "WARNING: $BEHIND commit(s) behind origin/$BRANCH — another session has pushed"
+fi
+[ -n "$(git -C "$ROOT" status --porcelain -- "$ROOT/tools/bench" 2>/dev/null)" ] \
+  && say "WARNING: tools/bench has uncommitted changes; this result is not reproducible from a commit"
+
 say "building (reusing anything already built)"
 if ! BUILD_ONLY=1 REUSE=1 "$ROOT/tools/bench/bench_macos.sh" "$REF_A" "$REF_B" \
      >"$OUT/build.log" 2>&1; then
