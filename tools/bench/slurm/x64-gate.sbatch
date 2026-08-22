@@ -3,9 +3,10 @@
 #
 #   sbatch tools/bench/slurm/x64-gate.sbatch
 #
-# Expects the worktrees and the unpacked corpus under $W (see x64-build.sbatch)
-# and the bench python next to it. Read tools/bench/slurm/README.md first — the
-# podman flags below are not decoration.
+# Fast path for re-running the gate when the builds are already present on this
+# node. If they are not, use x64-pipeline.sbatch, which creates everything it
+# needs. Read tools/bench/slurm/README.md first — the podman flags are not
+# decoration.
 #SBATCH --job-name=xenia-x64-gate
 #SBATCH --partition=epyc-7502
 #SBATCH --nodes=1
@@ -22,7 +23,7 @@ export TMPDIR=/tmp
 PM="podman --cgroup-manager=cgroupfs --events-backend=file"
 
 W="${W:-/tmp/x64-$(id -u)}"
-TOOLS="${TOOLS:-$HOME/xenia-ci}"
+SRC="${SRC:-$HOME/xenia-ci/src}"   # the checkout, for the bench tooling
 LOGS="${LOGS:-$HOME/xenia-ci/logs}"
 IMAGE="${IMAGE:-localhost/xenia-build:noble}"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -42,7 +43,7 @@ export LD_LIBRARY_PATH="$(dirname "$EA"):$(dirname "$EB"):${LD_LIBRARY_PATH:-}"
 grep " /dev/shm " /proc/mounts
 # Both refs get the SAME test path, or the baseline is never asked about the
 # cases the candidate adds and silently looks clean.
-python3 /tools/gate.py \
+python3 -u /src/tools/bench/gate.py \
   --exe-a "$EA" --exe-b "$EB" \
   --ref-a edge --ref-b a64-fixes-on-edge \
   --backend x64 --corpus "$W/ppcbin" --test-path "$TP" \
@@ -54,7 +55,7 @@ chmod 777 "$O/run.sh"
 # --shm-size only changes the size; /dev/shm stays noexec and the JIT maps its
 # code cache PROT_EXEC out of it. Mounting the tmpfs exec is the actual fix.
 $PM run --rm --tmpfs /dev/shm:rw,exec,nosuid,nodev,size=2g \
-  -v "$W:/w" -v "$O:/out" -v "$TOOLS:/tools:ro" \
+  -v "$W:/w" -v "$O:/out" -v "$SRC:/src:ro" \
   "$IMAGE" bash /out/run.sh > "$LOGS/x64-gate-$STAMP.log" 2>&1
 echo "podman rc=$?"
 
