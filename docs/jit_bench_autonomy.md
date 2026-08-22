@@ -298,6 +298,31 @@ byte-identical between the refs, so the harness is not contributing.
   once the container works, because it removes the dependency on containers
   being available at all.
 
+### Measured on ylab (AMD EPYC 7502, x64, in-container)
+
+The same corpus, the same common test path, the same gate:
+
+| ref | suites | cases | failed | crashed |
+|---|---|---|---|---|
+| `edge` | 493 | 169,058 | 4 (`instr_mcrf`) | 1 (`instr_seq_stacksync`) |
+| `a64-fixes-on-edge` | 493 | 169,059 | 0 | 0 |
+
+**This is identical to the a64 result**, case count for case count: the same
+four `instr_mcrf` failures, the same `instr_seq_stacksync` crash, the same two
+fixes, on a completely different backend and instruction set.
+
+That agreement is the whole reason for running two machines. The eight `[CPU]`
+commits change PPC semantics — NaN propagation, FPSCR summary bits, denormal
+flush, CR6 reduction — for `a64` and `x64` at once, and a change that is right
+on one and wrong on the other is invisible to either machine alone. The two
+backends reaching byte-identical verdicts on 169,059 cases is the strongest
+statement available that those commits are semantically neutral.
+
+It is not proof. Both backends share the PPC frontend and the HIR, so a mistake
+made there is reproduced faithfully on both sides rather than exposed by the
+comparison. What the differential rules out is a *backend-specific* divergence,
+which is the failure mode the `[A64]` and `[x64]` commits actually risk.
+
 ### Real game code (Mac only)
 
 The corpus is the gate, but it is not the ceiling. The pieces for running real
