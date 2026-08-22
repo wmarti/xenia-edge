@@ -84,7 +84,12 @@ say "corpus: $(ls "$W"/ppcbin/*.map 2>/dev/null | wc -l) suites"
 
 # ---------------------------------------------------------------- builds
 build_ref() {
-  local ref="$1" wt="$W/wt-$ref" want=""
+  # One name per statement. `local a=1 b=$a` declares both names before
+  # assigning either, so $a is still unset while b is evaluated and `set -u`
+  # aborts the job — which is exactly how this failed the first time.
+  local ref="$1"
+  local wt="$W/wt-$ref"
+  local want=""
   want=$(git -C "$SRC" rev-parse "origin/$ref" 2>/dev/null \
          || git -C "$SRC" rev-parse "$ref")
   if [ -d "$wt" ] && [ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" = "$want" ] \
