@@ -756,9 +756,8 @@ bool X64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
                            static_cast<int32_t>((guest_reg - first_gpr) * 8);
       // offsetof needs a constant member designator; guest_reg is a loop
       // variable. Clang accepts this as an extension, GCC rejects it.
-      mov(rdx, qword[GetContextReg() +
-                     (offsetof(ppc::PPCContext, r[0]) +
-                      guest_reg * sizeof(uint64_t))]);
+      mov(rdx, qword[GetContextReg() + (offsetof(ppc::PPCContext, r[0]) +
+                                        guest_reg * sizeof(uint64_t))]);
       if (has_movbe) {
         movbe(qword[GetMembaseReg() + rax + disp], rdx);
       } else {
@@ -786,8 +785,8 @@ bool X64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
       mov(rdx, qword[GetMembaseReg() + rax + disp]);
       bswap(rdx);
     }
-    mov(qword[GetContextReg() + (offsetof(ppc::PPCContext, r[0]) +
-                                 guest_reg * sizeof(uint64_t))],
+    mov(qword[GetContextReg() +
+              (offsetof(ppc::PPCContext, r[0]) + guest_reg * sizeof(uint64_t))],
         rdx);
   }
 

@@ -93,8 +93,8 @@ template <class T>
 class ConfigVar : public CommandVar<T>, virtual public IConfigVar {
  public:
   ConfigVar(const char* name, T* default_value, const char* description,
-               const char* display_name, const char* category, bool is_advanced,
-               bool is_transient);
+            const char* display_name, const char* category, bool is_advanced,
+            bool is_transient);
   std::string config_value() const override;
   std::string default_value() const override;
   std::string commandline_value() const override;
