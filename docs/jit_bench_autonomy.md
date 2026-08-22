@@ -424,14 +424,6 @@ nothing resolves. The one large suite in the set, `fmadds`, moves -1.71%. Read
 this table as "the small suites do not move much on x64", not as the branch's
 x64 improvement.
 
-The wall-clock measurement on an exclusively allocated `ad-01` covers the large
-suites and puts x64 at **-7.8%** overall: `vsel` -9.8%, `vperm` -8.2%,
-`vnmsubfp` -7.7%, `vmaddfp` -7.5%, `fmadds` -5.4%, with spreads of 11-20%.
-That is close to the a64 figure on the same suites, which points at the shared
-frontend and HIR work rather than at the backend-specific commits — but the
-x64 spreads are high enough that the two should not be compared to a decimal
-place.
-
 **On x64 the control behaves like a control**, moving +0.02%. On a64 the same
 suite moved -9.2%, because the a64 commits change addressing, guest frames and
 `PPCContext` layout — code every suite runs. The same suite is a valid control
@@ -439,15 +431,122 @@ for one backend and a useless one for the other, which is a good argument for
 calibrating against an identical binary rather than against a suite believed to
 be untouched.
 
-The improvement concentrates where the `[x64]` commits actually are:
-`vavgsb`/`vavgsw` (vector average without scalar loops), and the scalar float
-suites that the MXCSR-tracker and F64-binop commits touch. `vpkuhus` shows
-nothing, despite the byte-pack commit naming it — worth a look.
-
 A caveat on the metric: these counts cover the whole process, including JIT
 compilation and the test harness, so a change confined to generated code is
 diluted by everything around it. The counts are exact but they are not a
 measurement of the emitted code alone.
+
+### The large x64 suites: no change at all (job 103439)
+
+Five hours of callgrind on `epyc-7502` over the two biggest suites in the
+corpus, which the table above does not reach:
+
+| suite | `edge` | `a64-fixes-on-edge` | delta |
+|---|---|---|---|
+| `instr__gen_vsel` | 171,712,643,046 | 171,717,222,596 | **+0.003%** |
+| `instr__gen_vperm` | 172,050,578,523 | 172,055,008,443 | **+0.003%** |
+
+Different binaries — the counts are close but not equal, so this is not the
+same-binary trap. They execute the same x64 instruction stream. `vmaddfp`
+completed its count (172,949,345,163) but exited non-zero and was dropped.
+
+### The -7.8% x64 wall-clock figure is withdrawn
+
+An exclusively allocated `ad-01` (Sapphire Rapids, AVX-512) reported -7.80%
+overall, with spreads of 11-20%. An exclusively allocated `epyc-7502` (Zen 2,
+AVX2), same tooling, same corpus, reports **+1.16%**, with `vmaddfp` at
+**+16.74%** against ad-01's -7.53%. A sign flip of that size between two
+measurements of the same two binaries is not a property of the binaries.
+
+The cause was in this repo, not in the cluster: `bench_pair.py` calibrated
+A-vs-A on `args.suites[0]`, which both jobs set to `instr__gen_vand` — 0.31s,
+essentially all of it process startup. Startup is extremely reproducible, so
+the calibration reported a 0.07% "measurement error" and the six-second suites
+were read against it. Fixed in `dd3d69b37`: calibration now runs on the
+longest non-startup-bound suite.
+
+Callgrind is the tiebreak and it has no noise floor: on the two largest suites
+the delta is +0.003%. **The branch does not change what the x64 backend
+emits for these suites.** The a64 -8% stands — spreads of 1.7-4.9% against a
+delta of 7.8-9.8%, and 30 of the 45 commits are `[A64]`.
+
+### Eight of thirteen suites cannot measure anything
+
+On ylab every one of `vand`, `vaddfp`, `vavgsb`, `vavgsw`, `vpkuhus`, `fadd`,
+`fmuls`, `mcrf` finishes at 0.314s, which is bare process startup in the
+container. Three of them showed a confident `+15.9%` with a 0.2% spread: that
+is 0.314s → 0.364s, a fixed ~50 ms difference in how long the two binaries
+take to load, and none of it is guest code.
+
+This also clears the open `vpkuhus` lead. `1c102190d` replaces a guest→host
+call per PACK 8_IN_16 unsigned execution with `vpminuw`/`vpackuswb`, and
+`vpkuhus` is exactly that opcode. It showed nothing because the suite runs
+almost no guest code, not because the commit does nothing. Validating it needs
+a workload that executes the pack path — real game code, or a synthetic loop.
+
+`bench_pair.py` now measures startup directly, marks these suites
+startup-bound, and leaves them out of the total.
+
+## Where the x64 headroom is
+
+The callgrind result says the x64 backend was left where it was, so the leads
+below are all against `edge` as it stands.
+
+**1. x64 forgets its MXCSR mode at every basic block.** `x64_emitter.cc:264`:
+
+```cpp
+while (block) {
+  ForgetMxcsrMode();  // at start of block, mxcsr mode is undefined
+```
+
+This is the pattern `90aefe81e` replaced on a64 with a per-edge meet, where it
+was measured at 1.3% of all emitted instructions on the float corpus suites.
+`vldmxcsr` is considerably more expensive than the ARM `msr fpcr` this
+replaced, and it is forced at the top of every block containing a float op.
+The a64 commit already paid for the design: it documents three attempts
+refuted by disassembled counterexamples — `ControlFlowAnalysisPass` edges are
+stale by emission time and never included fall-through, label `->block`
+back-pointers are equally stale, and branches sit *mid*-block in this HIR so a
+per-block exit mode miscompiles a scalar-then-vector diamond. The x64 emitter
+walks the same HIR through the same `block->label_head` chain. Three of the
+five suites that carry signal are float suites.
+
+**2. x64 `SELECT_V128` on AVX-512 emits three instructions where one would
+do.** `x64_sequences.cc:936`:
+
+```cpp
+if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
+  e.vmovdqa(e.xmm3, src1);
+  e.vpternlogd(e.xmm3, src2, src3, ...);
+  e.vmovdqa(i.dest, e.xmm3);
+```
+
+`vpternlogd` is destructive in its first operand, so when `dest` aliases any
+source both copies go away — permuting the immediate covers the `src2`/`src3`
+cases. The a64 audit behind `c4a4239d4` found 15,605 `SELECT_V128` sites in
+this corpus, *all* of which take an aliased path. Worse, the AVX-512 branch is
+tested first, so on AVX-512 hardware a select that `mayblend == Int8` would
+render as a single `vpblendvb` becomes three instructions instead — AVX-512
+hardware emitting more than AVX2 hardware for the same HIR. `instr__gen_vsel`
+is the largest suite in the corpus at 171.7 billion instructions.
+
+Caveat worth measuring rather than asserting: `vmovdqa` xmm→xmm is
+move-eliminated at rename on recent Intel cores, so the cost here is
+front-end and code-size rather than execution latency.
+
+**3. The same staging pattern at the other `vpternlogd` sites.**
+`x64_seq_vector.cc:740` and `:860` both do `vmovdqa32 xmm3, src1` before
+`vpternlogd xmm3, ...`. Of the four sites in the backend, only `NOT_V128`
+(`x64_sequences.cc:3123`) writes `i.dest` directly.
+
+**4. The float-mode theme is seven commits on a64 and one on x64.** a64 got
+the FPCR entry/return contract, conditional-region merges, the per-edge meet,
+host-transition guards, `VSCR.NJ`-gated denormal flushes, a four-instruction
+flush, and NaN handling gated on the result rather than the operands. x64 has
+`77a164cb7` alone.
+
+Nothing here is written yet — the autonomy boundary is measure-and-report, and
+these are proposals for a human to take or refuse.
 
 ### Real game code (Mac only)
 
