@@ -1,0 +1,36 @@
+# The toolchain the ylab compute nodes do not have and cannot be given without
+# root. Mirrors the ubuntu job in .github/workflows/build.yml so the x64
+# numbers come from the same compiler CI uses.
+FROM docker.io/library/ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get -y update && apt-get -y install --no-install-recommends \
+      ca-certificates curl wget git python3 python3-pip python3-venv \
+      ninja-build cmake pkg-config zstd valgrind \
+      build-essential make g++-14 gcc-14 \
+      libgtk-3-dev libx11-xcb-dev libfontconfig1-dev libxtst-dev \
+      libasound2-dev libpulse-dev libudev-dev libdbus-1-dev \
+      libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+      libxi-dev libxss-dev libxkbcommon-dev libxfixes-dev \
+      liblz4-dev zlib1g-dev libzstd-dev libssl-dev libsnappy-dev \
+      libcurl4-openssl-dev libsecret-1-dev libnotify-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# clang-21 is not in the noble archive.
+RUN wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+      > /etc/apt/trusted.gpg.d/llvm.asc \
+ && echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" \
+      > /etc/apt/sources.list.d/llvm.list \
+ && apt-get -y update \
+ && apt-get -y install --no-install-recommends clang-21 lld-21 \
+ && rm -rf /var/lib/apt/lists/*
+
+# xenia-build.py --cc clang writes CMAKE_C_COMPILER=clang, but apt.llvm.org
+# installs only the -21 suffixed binaries, so the unversioned names have to
+# resolve or cmake fails with "is not a full path and was not found in PATH".
+RUN update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100 \
+ && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100 \
+ && update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-21 100
+
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+      mako pyyaml packaging meson
