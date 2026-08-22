@@ -34,7 +34,8 @@ DECLARE_bool(a64_enable_host_guest_stack_synchronization);
 #if XE_A64_PROFILER_AVAILABLE == 1
 DEFINE_bool(instrument_call_times, false,
             "Accumulate time spent in each guest function, for profiling "
-            "guest code. Writes profile_times.txt on shutdown.",
+            "guest code. Rewrites profile_times.txt every 30 seconds, and "
+            "again when the backend is destroyed.",
             "a64");
 #endif
 

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <vector>
 
 #include "xenia/base/assert.h"
@@ -23,6 +24,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/platform.h"
+#include "xenia/base/threading.h"
 #if XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
 #endif
@@ -1065,6 +1067,7 @@ void A64Backend::WriteGuestProfilerData() {
 
   std::vector<std::pair<uint32_t, uint64_t>> sorted;
   uint64_t total = 0;
+  std::lock_guard<std::mutex> lock(profiler_mutex_);
   for (auto&& entry : profiler_data_) {
     if (entry.second) {
       sorted.emplace_back(entry.first, entry.second);
@@ -1076,6 +1079,10 @@ void A64Backend::WriteGuestProfilerData() {
 
   FILE* f = std::fopen("profile_times.txt", "w");
   if (!f) {
+    // Silence here is indistinguishable from the cvar being off, and the path
+    // is relative: launched from a bundle the working directory is "/".
+    XELOGE("instrument_call_times: could not open profile_times.txt in {}",
+           std::filesystem::current_path().string());
     return;
   }
   std::fprintf(f, "# guest function times, CNTVCT_EL0 at %llu Hz\n",
@@ -1091,9 +1098,33 @@ void A64Backend::WriteGuestProfilerData() {
 }
 #endif
 
+#if XE_A64_PROFILER_AVAILABLE == 1
+// EmulatorApp::OnDestroy ends in std::quick_exit, which runs no destructors,
+// so ~A64Backend is never reached in a normal session and everything the
+// profiler accumulated would be discarded. The x64 backend hit the same wall
+// ("nope, destructor is never called") and answered it with a periodic writer.
+static A64Backend* g_profiler_backend = nullptr;
+static std::unique_ptr<xe::threading::Thread> g_profiler_update_thread{};
+
+static void GuestProfilerUpdateThreadProc() {
+  do {
+    xe::threading::Sleep(std::chrono::seconds(30));
+    if (g_profiler_backend) {
+      g_profiler_backend->WriteGuestProfilerData();
+    }
+  } while (true);
+}
+#endif
+
 A64Backend::~A64Backend() {
 #if XE_A64_PROFILER_AVAILABLE == 1
   WriteGuestProfilerData();
+  // Only disown if this is still the backend the writer knows about: the PPC
+  // test runner builds a fresh backend per suite, and the new one has already
+  // claimed the pointer by the time an old one is torn down.
+  if (g_profiler_backend == this) {
+    g_profiler_backend = nullptr;
+  }
 #endif
   ExceptionHandler::Uninstall(&ExceptionCallbackThunk, this);
   if (guest_trampoline_memory_) {
@@ -1176,6 +1207,18 @@ bool A64Backend::Initialize(Processor* processor) {
 
   // Register exception handler for MMIO access from JIT code.
   ExceptionHandler::Install(ExceptionCallbackThunk, this);
+
+#if XE_A64_PROFILER_AVAILABLE == 1
+  if (cvars::instrument_call_times) {
+    g_profiler_backend = this;
+    xe::threading::Thread::CreationParameters slimparams;
+    slimparams.create_suspended = false;
+    slimparams.initial_priority = xe::threading::ThreadPriority::kLowest;
+    slimparams.stack_size = 65536 * 4;
+    g_profiler_update_thread = xe::threading::Thread::Create(
+        slimparams, GuestProfilerUpdateThreadProc);
+  }
+#endif
 
   return true;
 }
