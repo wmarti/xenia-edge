@@ -288,6 +288,37 @@ byte-identical between the refs, so the harness is not contributing.
   once the container works, because it removes the dependency on containers
   being available at all.
 
+### Real game code (Mac only)
+
+The corpus is the gate, but it is not the ceiling. The pieces for running real
+titles are already on this machine and are what would eventually justify a
+wider autonomy boundary:
+
+- `~/Documents/X360-Games` holds real dumps — Gears of War (`4D5307D5`),
+  `4D5307E6`, GTA IV, Halo Reach — and `~/Documents/xenia-bench` is a harness
+  (XeniaBench) that already knows how to launch them: a host daemon, per-run
+  copy-on-write checkouts, alias-based asset mapping in
+  `configs/assets.local.json` so raw paths never leak, and content-addressed
+  artifacts.
+
+The honest caveat is that XeniaBench is built for a different question. It
+evaluates whether *agent systems* can operationalize runtime failures, and it
+carries the machinery that goes with that — blinded review, frozen experiment
+manifests, reviewer quorums. It is also mid-edit: several files are modified in
+the working tree, `.venv` is not installed, and `data/runs` is empty. Adopting
+it wholesale to answer "does Gears of War still boot after this JIT change" is
+using a research instrument as a smoke alarm.
+
+What the JIT loop actually needs is much smaller: launch a title, drive it to a
+known state, run for a fixed interval, and compare something stable against a
+recorded baseline — that a frame was presented, that the guest reached a known
+address, that no unimplemented-instruction path was taken. The `headless` cvar
+suppresses UI prompts but does not remove the need for a window, so this stays
+Mac-only and stays a coarse gate rather than a per-commit one.
+
+Worth building deliberately rather than by adapting the larger harness, and
+worth building before the autonomy boundary moves past measure-and-report.
+
 ### Immediate next steps
 
 1. Finish the x64 build of both refs and run the same per-suite verification.
