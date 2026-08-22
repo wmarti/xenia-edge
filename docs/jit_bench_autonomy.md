@@ -147,17 +147,33 @@ than a per-instruction win, not a weaker one.
 ### L3 — Optimization
 
 Proposes changes, then has to pass L1 on both backends and show a win in L2
-beyond the noise floor before the change is worth anything. The honest boundary
-for unattended operation:
+beyond the noise floor before the change is worth anything.
 
-- **Safe to automate**: measurement, regression detection, bisection of a
-  regression to a commit, and reporting. These only ever produce information.
-- **Automate with a gate**: backend-local codegen changes (`[A64]`, `[x64]`)
-  that are correctness-neutral on the full corpus for *both* backends and show a
-  measured win. Land on a dated branch, never on `edge`.
-- **Keep a human**: anything under `[CPU]`. Those commits change PPC semantics
-  the corpus only partially covers, and the corpus is not a specification. A
-  clean run there means "no known case disagrees", not "correct".
+**The decided boundary for unattended operation is measure-and-report.** L1 and
+L2 run autonomously on both machines and report what they find, including
+bisecting a regression to the commit that introduced it. Code changes are not
+proposed or landed without a human.
+
+That boundary is not timidity about the tooling — the gate is strong and the
+floor is real. It is that **the corpus is not a specification**. 169,059 cases
+passing means no known case disagrees, not that the JIT is correct. A
+miscompile can clear the entire corpus and still break a real title, and the
+only place that can be checked is the Mac, by running actual game code. Until
+that check is part of the loop, an automated "this passed, so it landed" is
+writing cheques the corpus cannot cash.
+
+What the loop is therefore allowed to do on its own:
+
+- Run L1 on every ref pair and report regressions, with the exact set
+  difference behind each verdict.
+- Run L2 on anything that cleared L1 and report deltas against a measured
+  floor.
+- Bisect a regression to a commit and say which one.
+- Re-run a result that failed to reproduce, and discard it rather than publish
+  it.
+
+What always stops for a human: writing or landing a change, and any judgement
+about whether a semantic difference is acceptable.
 
 ## 4. Autonomy mechanism
 
