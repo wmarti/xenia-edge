@@ -113,18 +113,38 @@ def main():
         ta += a
         tb += b
         delta = 100.0 * (b - a) / a
+        # A delta smaller than the run's own sample-to-sample variation has not
+        # been separated from that variation. Sub-second suites are dominated
+        # by process startup and routinely show 50-90% spread, which is how the
+        # same suite came out +3.6% on one machine and -8.1% on another.
+        resolved = abs(delta) >= spread
+        mark = "" if resolved else "  unresolved"
         print(f"{suite:{width}} {a:12.3f} {b:12.3f} {delta:+8.2f}% "
-              f"{spread:7.1f}%", flush=True)
+              f"{spread:7.1f}%{mark}", flush=True)
         rows.append({"suite": suite, "a_seconds": round(a, 4),
                      "b_seconds": round(b, 4), "delta_pct": round(delta, 3),
-                     "spread_pct": round(spread, 2)})
+                     "spread_pct": round(spread, 2), "resolved": resolved})
     total_delta = 100.0 * (tb - ta) / ta if ta else None
     if ta:
         print(f"{'TOTAL':{width}} {ta:12.3f} {tb:12.3f} {total_delta:+8.2f}%")
+
+    good = [r for r in rows if r.get("resolved")]
+    weak = [r for r in rows if "delta_pct" in r and not r.get("resolved")]
+    if good:
+        ga = sum(r["a_seconds"] for r in good)
+        gb = sum(r["b_seconds"] for r in good)
+        print(f"{'resolved only':{width}} {ga:12.3f} {gb:12.3f} "
+              f"{100.0*(gb-ga)/ga:+8.2f}%  ({len(good)} of {len(rows)} suites)")
     if floor is not None:
         print(f"\nmeasurement error, from running {args.ref_a} against "
-              f"itself: {floor:.2f}%.\nAnything of that size or smaller has "
-              f"not been measured.")
+              f"itself on {cal_suite}: {floor:.2f}%.")
+    if weak:
+        print(f"{len(weak)} suite(s) unresolved — their delta is smaller than "
+              f"their own sample spread:")
+        print("  " + ", ".join(r["suite"] for r in weak))
+        print("Report those as 'not measured', not as 'no change'. Running a "
+              "sub-second\nsuite more times does not help much; the variation "
+              "is process startup,\nnot the work being timed.")
 
     if args.out:
         pathlib.Path(args.out).write_text(json.dumps({
@@ -138,6 +158,8 @@ def main():
             "floor_pct": round(floor, 3) if floor is not None else None,
             "total_a": round(ta, 4), "total_b": round(tb, 4),
             "total_delta_pct": round(total_delta, 3) if total_delta else None,
+            "resolved_suites": len(good),
+            "unresolved_suites": [r["suite"] for r in weak],
             "suites": rows,
         }, indent=2) + "\n")
     return 0
