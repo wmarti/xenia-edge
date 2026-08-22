@@ -3,6 +3,28 @@
 `login-01` is a submission host, not a compute host: eight cores shared with
 roughly sixty interactive users. Everything here goes through `sbatch`.
 
+## Start here
+
+    sbatch tools/bench/slurm/x64-pipeline.sbatch
+
+That one job creates everything it needs — checkout, container image, both
+worktrees, submodules, builds, corpus — and then runs the gate. It is
+idempotent: work already present on the node is reused, anything missing is
+rebuilt.
+
+**Nothing on this cluster persists where you would expect.** Podman's graph
+root is `/var/user/$UID/containers/storage` and the build trees live in `/tmp`,
+both of which are node-local. An hour of setup on `epyc-7502` buys nothing on
+`ad-01`, and a cleanup erases it. The pipeline therefore archives the built
+image to `~/xenia-ci/image/` on NFS, so a first run on a new node loads it in
+seconds instead of spending ten minutes in apt. Only the checkout, the image
+archive, logs and results live on NFS; everything else is expected to vanish.
+
+`x64-gate.sbatch` and `x64-callgrind.sbatch` are fast paths for when the builds
+are already on the node. All three take their bench tooling from the checkout
+rather than from a copied-in directory, so it cannot drift from what is
+committed.
+
 The job scripts below encode a handful of things that are not obvious and each
 cost a debugging cycle to find. They are in the repository so the next run
 starts from the working configuration rather than rediscovering them.
