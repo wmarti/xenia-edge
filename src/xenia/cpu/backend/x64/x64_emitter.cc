@@ -107,7 +107,12 @@ bool X64Emitter::Emit(GuestFunction* function, HIRBuilder* builder,
                       void** out_code_address, size_t* out_code_size,
                       std::vector<SourceMapEntry>* out_source_map) {
   SCOPE_profile_cpu_f("cpu");
+#if XE_BUILD_EMULATOR
   guest_module_ = dynamic_cast<XexModule*>(function->module());
+#else
+  // No emulator means no XEX: the test runner only ever loads a RawModule.
+  guest_module_ = nullptr;
+#endif
   current_guest_function_ = function->address();
   // Reset.
   debug_info_ = debug_info;
@@ -749,8 +754,11 @@ bool X64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
     for (unsigned guest_reg = first_gpr; guest_reg <= 31; ++guest_reg) {
       const int32_t disp = -first_slot_offset +
                            static_cast<int32_t>((guest_reg - first_gpr) * 8);
-      mov(rdx,
-          qword[GetContextReg() + offsetof(ppc::PPCContext, r[guest_reg])]);
+      // offsetof needs a constant member designator; guest_reg is a loop
+      // variable. Clang accepts this as an extension, GCC rejects it.
+      mov(rdx, qword[GetContextReg() +
+                     (offsetof(ppc::PPCContext, r[0]) +
+                      guest_reg * sizeof(uint64_t))]);
       if (has_movbe) {
         movbe(qword[GetMembaseReg() + rax + disp], rdx);
       } else {
@@ -778,7 +786,9 @@ bool X64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
       mov(rdx, qword[GetMembaseReg() + rax + disp]);
       bswap(rdx);
     }
-    mov(qword[GetContextReg() + offsetof(ppc::PPCContext, r[guest_reg])], rdx);
+    mov(qword[GetContextReg() + (offsetof(ppc::PPCContext, r[0]) +
+                                 guest_reg * sizeof(uint64_t))],
+        rdx);
   }
 
   // The reloaded LR lands in both r12 and lr; 32-bit ops zero the rest of rcx.

@@ -1159,7 +1159,11 @@ ffmpeg_common(libavformat)
 # ==============================================================================
 # wxWidgets
 # ==============================================================================
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+# Only xenia-ui links wxWidgets, and wxWidgets itself hard-requires GTK3 on
+# Linux (build/cmake/toolkit.cmake). Building it when the emulator subsystems
+# are off would reintroduce exactly the dependency XENIA_BUILD_EMULATOR=OFF
+# exists to remove.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android" AND XENIA_BUILD_EMULATOR)
     # Build from vendored source — matches what we ship on Windows/macOS, and
     # on Linux gives us a known-good 3.3 (system 3.2 has GTK3/Wayland issues).
     # Strip the directory-level /W0 (or -w) so wxWidgets's own /W3 doesn't

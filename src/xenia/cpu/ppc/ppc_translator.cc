@@ -24,7 +24,9 @@
 #include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/ppc/ppc_scanner.h"
 #include "xenia/cpu/processor.h"
+#if XE_BUILD_EMULATOR
 #include "xenia/cpu/xex_module.h"
+#endif
 
 DEFINE_bool(dump_translated_hir_functions, false, "dumps translated hir",
             "CPU");
@@ -154,15 +156,18 @@ void PPCTranslator::DumpHIR(GuestFunction* function, PPCHIRBuilder* builder) {
   StringBuffer buffer{};
   builder_->Dump(&buffer);
 
-  XexModule* mod = dynamic_cast<XexModule*>(function->module());
-
   std::string folder_name = "hirdump";
+#if XE_BUILD_EMULATOR
+  // Only a XEX carries a title id; without the emulator every module is a
+  // RawModule and the dump lands in the generic folder.
+  XexModule* mod = dynamic_cast<XexModule*>(function->module());
   if (mod) {
     xex2_opt_execution_info* opt_exec_info = nullptr;
     if (mod->GetOptHeader(XEX_HEADER_EXECUTION_INFO, &opt_exec_info)) {
       folder_name = "hirdump_title_" + std::to_string(opt_exec_info->title_id);
     }
   }
+#endif
 
   // Try the working directory first; if it isn't writable (e.g. launched from
   // a macOS .app bundle, where CWD is "/"), fall back to the system temp dir.

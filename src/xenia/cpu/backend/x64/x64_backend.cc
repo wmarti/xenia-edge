@@ -30,7 +30,9 @@
 #include "xenia/cpu/breakpoint.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/stack_walker.h"
+#if XE_BUILD_EMULATOR
 #include "xenia/cpu/xex_module.h"
+#endif
 
 DECLARE_bool(record_mmio_access_exceptions);
 
@@ -613,6 +615,8 @@ void X64Backend::RecordMMIOExceptionForGuestInstruction(void* host_address) {
     uint32_t guestaddr = fnfor->MapMachineCodeToGuestAddress(host_addr_u64);
 
     Module* guest_module = fnfor->module();
+#if XE_BUILD_EMULATOR
+    // The instruction info-cache lives on XexModule; RawModule has none.
     if (guest_module) {
       XexModule* xex_guest_module = dynamic_cast<XexModule*>(guest_module);
 
@@ -627,6 +631,7 @@ void X64Backend::RecordMMIOExceptionForGuestInstruction(void* host_address) {
         }
       }
     }
+#endif
   }
 }
 bool X64Backend::ExceptionCallback(Exception* ex) {

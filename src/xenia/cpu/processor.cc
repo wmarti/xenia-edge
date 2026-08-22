@@ -37,7 +37,9 @@
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/thread.h"
 #include "xenia/cpu/thread_state.h"
+#if XE_BUILD_EMULATOR
 #include "xenia/cpu/xex_module.h"
+#endif
 
 // TODO(benvanik): based on compiler support
 #if XE_ARCH_AMD64
@@ -453,6 +455,11 @@ Function* Processor::ResolveFunction(uint32_t address) {
       return nullptr;
     }
     // only add it to the list of resolved functions if resolving succeeded
+#if XE_BUILD_EMULATOR
+    // Only a XexModule carries per-instruction address flags. Without the
+    // emulator the processor only ever sees RawModule, so this whole path is
+    // dead and the dynamic_cast (which is what forces xex_module.o into the
+    // link) can go with it.
     auto module_for = function->module();
 
     auto xexmod = dynamic_cast<XexModule*>(module_for);
@@ -464,6 +471,7 @@ Function* Processor::ResolveFunction(uint32_t address) {
         AtomicSetInfoCacheFlags(addr_flags, bits);
       }
     }
+#endif
 
     entry->function = function;
     entry->end_address = function->end_address();

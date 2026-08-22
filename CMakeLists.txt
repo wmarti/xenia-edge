@@ -75,6 +75,14 @@ else()
 endif()
 message(STATUS "Target architecture: XE_TARGET_AARCH64=${XE_TARGET_AARCH64} XE_TARGET_X86_64=${XE_TARGET_X86_64} (${_xe_arch_source})")
 
+option(XENIA_BUILD_EMULATOR
+  "Build the emulator subsystems (apu, gpu, hid, kernel, ui, vfs, app).\n   Turn OFF to build only base+cpu, which is all xenia-cpu-ppc-tests needs\n   and which drops the GTK3/fontconfig/wxWidgets/SDL/Vulkan dependencies."
+  ON)
+if(XENIA_BUILD_EMULATOR)
+  add_compile_definitions(XE_BUILD_EMULATOR=1)
+else()
+  add_compile_definitions(XE_BUILD_EMULATOR=0)
+endif()
 option(XENIA_BUILD_TESTS "Build test suites" OFF)
 option(XENIA_BUILD_MISC "Build misc subprojects (trace viewers, shader compiler, vfs-dump, demos)" OFF)
 option(XENIA_ENABLE_LTO "Enable link-time optimization in Release (slow link)" ON)
@@ -356,13 +364,33 @@ else()
       pthread
     )
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(GTK3 REQUIRED gtk+-x11-3.0)
-    include_directories(${GTK3_INCLUDE_DIRS})
-    link_directories(${GTK3_LIBRARY_DIRS})
-    add_compile_options(${GTK3_CFLAGS_OTHER})
+    # GTK3 is used only by src/xenia/ui (window_wx.cc XCB handle extraction),
+    # so it is only required when the emulator subsystems are built. Requiring
+    # it unconditionally makes xenia-cpu-ppc-tests unbuildable on hosts with no
+    # desktop dev packages, which is every headless CI and HPC node.
+    if(XENIA_BUILD_EMULATOR)
+      find_package(PkgConfig REQUIRED)
+      pkg_check_modules(GTK3 REQUIRED gtk+-x11-3.0)
+      include_directories(${GTK3_INCLUDE_DIRS})
+      link_directories(${GTK3_LIBRARY_DIRS})
+      add_compile_options(${GTK3_CFLAGS_OTHER})
+    endif()
 
-    link_libraries(stdc++fs dl lz4 m pthread rt)
+    # GCC will not inline the always_inline _movdir64b intrinsic unless the
+    # target feature is enabled ("target specific option mismatch"). Clang is
+    # lenient here, which is why the clang-21 CI never needed this.
+    if(XE_TARGET_X86_64 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      add_compile_options(-mmovdir64b)
+    endif()
+
+    # lz4 is pulled in by zarchive (vfs), not by anything under src/xenia that
+    # base or cpu needs. Requiring it unconditionally means the PPC test runner
+    # cannot link on a host without liblz4-dev.
+    if(XENIA_BUILD_EMULATOR)
+      link_libraries(stdc++fs dl lz4 m pthread rt)
+    else()
+      link_libraries(stdc++fs dl m pthread rt)
+    endif()
 
     # Link group so executables resolve circular static-lib deps.
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--start-group")
