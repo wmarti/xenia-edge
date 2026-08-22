@@ -22,7 +22,7 @@ export TMPDIR=/tmp
 PM="podman --cgroup-manager=cgroupfs --events-backend=file"
 
 W="${W:-/tmp/x64-$(id -u)}"
-TOOLS="${TOOLS:-$HOME/xenia-ci}"
+SRC="${SRC:-$HOME/xenia-ci/src}"   # the checkout, for the bench tooling
 LOGS="${LOGS:-$HOME/xenia-ci/logs}"
 IMAGE="${IMAGE:-localhost/xenia-build:noble}"
 # instr__gen_vand is the control; the rest are the suites the [x64] commits
@@ -44,7 +44,7 @@ EB=\$(find \$W/wt-a64-fixes-on-edge/build -name xenia-cpu-ppc-tests -type f | he
 export LD_LIBRARY_PATH="\$(dirname "\$EA"):\$(dirname "\$EB"):\${LD_LIBRARY_PATH:-}"
 # -u so per-suite lines reach the log as they happen. Without it python block
 # buffers into a redirect and an eight-hour job shows nothing until it ends.
-python3 -u /tools/callgrind_bench.py \\
+python3 -u /src/tools/bench/callgrind_bench.py \\
   --exe-a "\$EA" --exe-b "\$EB" --ref-a edge --ref-b a64-fixes \\
   --corpus "\$W/ppcbin" --out /out/callgrind.json \\
   --suites $SUITES
@@ -53,7 +53,7 @@ INNER
 chmod 777 "$O/run.sh"
 
 $PM run --rm --tmpfs /dev/shm:rw,exec,nosuid,nodev,size=2g \
-  -v "$W:/w" -v "$O:/out" -v "$TOOLS:/tools:ro" \
+  -v "$W:/w" -v "$O:/out" -v "$SRC:/src:ro" \
   "$IMAGE" bash /out/run.sh > "$LOGS/x64-cg-$STAMP.log" 2>&1
 echo "podman rc=$?"
 grep -vE '^time=' "$LOGS/x64-cg-$STAMP.log" | tail -25
