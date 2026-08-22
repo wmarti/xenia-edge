@@ -15,7 +15,16 @@ methodology is the one that survived being wrong earlier:
     or context layout no such suite exists — on a64 the "control" moved -9.2%
     against a real total of -8.5%, which would have discarded the result.
     Two byte-identical binaries cannot differ by anything but measurement
-    error.
+    error. It has to run on the *longest* suite: calibrating on a short one
+    measures how reproducibly the process starts, which is very reproducible,
+    and says nothing about a six-second suite. Doing that reported a 0.07%
+    measurement error next to real spreads of 18-31%, and dressed up an
+    unresolved x64 result as a measured -7.8%.
+  - Suites that finish at the process-startup floor are excluded from the
+    total. Eight of the corpus's thirteen suites land within a few ms of
+    startup, so their "delta" is the difference between two binaries' load
+    time - a fixed ~50 ms that reads as +15.9% and is not about guest code
+    at all.
 """
 import argparse
 import json
@@ -25,6 +34,11 @@ import statistics
 import subprocess
 import sys
 import time
+
+# A suite finishing within this multiple of bare process startup has not run
+# enough guest code to measure. On the PPC corpus eight of thirteen suites sit
+# here, all at the same 0.314s, and their deltas are load-time differences.
+STARTUP_MARGIN = 1.25
 
 
 def time_once(exe, suite, corpus, timeout):
@@ -42,6 +56,27 @@ def time_once(exe, suite, corpus, timeout):
         # meaningless, so it is dropped rather than folded into the minimum.
         return None
     return time.perf_counter() - t0
+
+
+def time_startup(exe, corpus, runs, timeout):
+    """Seconds the process costs before any guest code runs.
+
+    Asking for a suite name that matches nothing loads the binary, brings up
+    the runtime and reports zero tests. Whatever a real suite costs, it costs
+    this much first.
+    """
+    samples = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        try:
+            subprocess.run(
+                [exe, f"--test_bin_path={corpus}/", "__no_such_suite__"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+        samples.append(time.perf_counter() - t0)
+    return min(samples) if samples else None
 
 
 def measure(exe_a, exe_b, suite, corpus, runs, timeout):
@@ -84,9 +119,30 @@ def main():
     ap.add_argument("--label", default="")
     args = ap.parse_args()
 
-    # Calibrate first, on the suite that will also be reported, so the floor
-    # comes from the same work the results come from.
-    cal_suite = args.suites[0]
+    # What the process costs before any guest code runs. Every suite pays it,
+    # and the suites that pay nothing else cannot measure anything.
+    startup = time_startup(args.exe_a, args.corpus, 3, args.timeout)
+    if startup is not None:
+        print(f"process startup: {startup:.3f}s", flush=True)
+
+    # One probe run per suite, to find the longest. Calibrating on a short
+    # suite measures startup reproducibility, not the noise that acts on the
+    # suites carrying the signal.
+    probes = {}
+    for suite in args.suites:
+        t = time_once(args.exe_a, suite, args.corpus, args.timeout)
+        if t is not None:
+            probes[suite] = t
+    def is_startup_bound(seconds):
+        return startup is not None and seconds < startup * STARTUP_MARGIN
+
+    startup_bound = set()
+
+    # Calibrate on the longest suite that is not startup-bound.
+    usable = {s: t for s, t in probes.items() if s not in startup_bound}
+    cal_suite = (max(usable, key=usable.get) if usable
+                 else (max(probes, key=probes.get) if probes
+                       else args.suites[0]))
     print(f"calibrating on {cal_suite}: {args.ref_a} against itself, "
           f"min of {args.runs}", flush=True)
     ca, cb, cspread = measure(args.exe_a, args.exe_a, cal_suite,
@@ -110,23 +166,35 @@ def main():
             print(f"{suite:{width}} skipped (did not complete)")
             rows.append({"suite": suite, "error": "did not complete"})
             continue
-        ta += a
-        tb += b
         delta = 100.0 * (b - a) / a
+        bound = is_startup_bound(min(a, b))
+        if bound:
+            startup_bound.add(suite)
         # A delta smaller than the run's own sample-to-sample variation has not
         # been separated from that variation. Sub-second suites are dominated
         # by process startup and routinely show 50-90% spread, which is how the
         # same suite came out +3.6% on one machine and -8.1% on another.
-        resolved = abs(delta) >= spread
-        mark = "" if resolved else "  unresolved"
+        # A startup-bound suite is never resolved whatever the arithmetic says:
+        # two binaries that differ by 50 ms of load time show a tidy 0.2%
+        # spread and a confident +15.9%, and none of it is guest code.
+        resolved = abs(delta) >= spread and not bound
+        mark = "  startup-bound" if bound else ("" if resolved
+                                                else "  unresolved")
+        if not bound:
+            ta += a
+            tb += b
         print(f"{suite:{width}} {a:12.3f} {b:12.3f} {delta:+8.2f}% "
               f"{spread:7.1f}%{mark}", flush=True)
         rows.append({"suite": suite, "a_seconds": round(a, 4),
                      "b_seconds": round(b, 4), "delta_pct": round(delta, 3),
-                     "spread_pct": round(spread, 2), "resolved": resolved})
+                     "spread_pct": round(spread, 2), "resolved": resolved,
+                     "startup_bound": bound})
     total_delta = 100.0 * (tb - ta) / ta if ta else None
     if ta:
-        print(f"{'TOTAL':{width}} {ta:12.3f} {tb:12.3f} {total_delta:+8.2f}%")
+        # The total covers only the suites that run guest code; folding in the
+        # startup-bound ones would average real work against load time.
+        print(f"{'TOTAL (measurable)':{width}} {ta:12.3f} {tb:12.3f} "
+              f"{total_delta:+8.2f}%")
 
     good = [r for r in rows if r.get("resolved")]
     weak = [r for r in rows if "delta_pct" in r and not r.get("resolved")]
@@ -135,6 +203,12 @@ def main():
         gb = sum(r["b_seconds"] for r in good)
         print(f"{'resolved only':{width}} {ga:12.3f} {gb:12.3f} "
               f"{100.0*(gb-ga)/ga:+8.2f}%  ({len(good)} of {len(rows)} suites)")
+    if startup_bound:
+        print(f"\n{len(startup_bound)} suite(s) finish within "
+              f"{STARTUP_MARGIN:g}x of bare process startup ({startup:.3f}s) "
+              f"and run\nalmost no guest code, so they are excluded from the "
+              f"total:")
+        print("  " + ", ".join(sorted(startup_bound)))
     if floor is not None:
         print(f"\nmeasurement error, from running {args.ref_a} against "
               f"itself on {cal_suite}: {floor:.2f}%.")
@@ -158,6 +232,9 @@ def main():
             "floor_pct": round(floor, 3) if floor is not None else None,
             "total_a": round(ta, 4), "total_b": round(tb, 4),
             "total_delta_pct": round(total_delta, 3) if total_delta else None,
+            "startup_seconds": round(startup, 4) if startup else None,
+            "calibration_suite": cal_suite,
+            "startup_bound_suites": sorted(startup_bound),
             "resolved_suites": len(good),
             "unresolved_suites": [r["suite"] for r in weak],
             "suites": rows,
