@@ -9,8 +9,11 @@
 
 #include "xenia/cpu/backend/a64/a64_backend.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/atomic.h"
@@ -50,6 +53,9 @@ DEFINE_bool(a64_enable_host_guest_stack_synchronization, true,
             "and checks for reentry at return sites. Has slight performance "
             "impact, but fixes crashes in games that use setjmp/longjmp.",
             "a64");
+#if XE_A64_PROFILER_AVAILABLE == 1
+DECLARE_bool(instrument_call_times);
+#endif
 
 namespace xe {
 namespace cpu {
@@ -1023,7 +1029,72 @@ A64Backend::A64Backend() {
   guest_trampoline_address_bitmap_.Resize(MAX_GUEST_TRAMPOLINES);
 }
 
+#if XE_A64_PROFILER_AVAILABLE == 1
+uint64_t* A64Backend::GetProfilerRecordForFunction(uint32_t guest_address) {
+  std::lock_guard<std::mutex> lock(profiler_mutex_);
+  auto entry = profiler_data_.find(guest_address);
+  if (entry != profiler_data_.end()) {
+    return &entry->second;
+  }
+  profiler_data_[guest_address] = 0;
+  return &profiler_data_[guest_address];
+}
+
+// Writes the accumulated per-function times, hottest last so the tail of the
+// file is what matters. Ticks come from CNTVCT_EL0, whose rate CNTFRQ_EL0
+// reports (24 MHz on Apple Silicon), so the conversion to milliseconds is
+// exact rather than assumed.
+void A64Backend::WriteGuestProfilerData() {
+  if (!cvars::instrument_call_times || profiler_data_.empty()) {
+    return;
+  }
+  uint64_t freq = 0;
+  // Guard on the compiler's real target, not XE_ARCH_ARM64: the test harness
+  // models an AArch64 guest while compiling for x86-64, so the arch macro is
+  // set on a host that cannot assemble this.
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if XE_COMPILER_MSVC
+  freq = _ReadStatusReg(ARM64_SYSREG(3, 3, 14, 0, 0));  // CNTFRQ_EL0
+#else
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+#endif
+#endif
+  if (!freq) {
+    freq = 24000000;  // Apple Silicon's rate, and a sane fallback elsewhere.
+  }
+
+  std::vector<std::pair<uint32_t, uint64_t>> sorted;
+  uint64_t total = 0;
+  for (auto&& entry : profiler_data_) {
+    if (entry.second) {
+      sorted.emplace_back(entry.first, entry.second);
+      total += entry.second;
+    }
+  }
+  std::sort(sorted.begin(), sorted.end(),
+            [](auto& x, auto& y) { return x.second < y.second; });
+
+  FILE* f = std::fopen("profile_times.txt", "w");
+  if (!f) {
+    return;
+  }
+  std::fprintf(f, "# guest function times, CNTVCT_EL0 at %llu Hz\n",
+               static_cast<unsigned long long>(freq));
+  std::fprintf(f, "# address ticks milliseconds share\n");
+  for (auto&& e : sorted) {
+    const double ms = (static_cast<double>(e.second) / freq) * 1000.0;
+    const double share = total ? static_cast<double>(e.second) / total : 0.0;
+    std::fprintf(f, "%08X %llu %.6f %.6f\n", e.first,
+                 static_cast<unsigned long long>(e.second), ms, share);
+  }
+  std::fclose(f);
+}
+#endif
+
 A64Backend::~A64Backend() {
+#if XE_A64_PROFILER_AVAILABLE == 1
+  WriteGuestProfilerData();
+#endif
   ExceptionHandler::Uninstall(&ExceptionCallbackThunk, this);
   if (guest_trampoline_memory_) {
     memory::DeallocFixed(guest_trampoline_memory_,

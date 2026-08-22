@@ -11,7 +11,9 @@
 #define XENIA_CPU_BACKEND_A64_A64_BACKEND_H_
 
 #include <atomic>
+#include <map>
 #include <memory>
+#include <mutex>
 
 #include "xenia/base/bit_map.h"
 #include "xenia/base/cvar.h"
@@ -57,6 +59,14 @@ struct ReserveHelper {
     }
   }
 };
+
+// AArch64 exposes a constant-rate counter to userspace via CNTVCT_EL0, one
+// instruction with no serialization, so the per-guest-function profiler is
+// available on every AArch64 platform - unlike the x64 backend's, which reads
+// a Windows-specific shared page.
+#define XE_A64_PROFILER_AVAILABLE 1
+
+using GuestProfilerData = std::map<uint32_t, uint64_t>;
 
 // One record per live guest frame, embedded in that frame's host stack at
 // StackLayout::STACKPOINT_PREV and linked through stackpoint_head. The
@@ -204,6 +214,12 @@ class A64Backend : public Backend {
   bool ReservedStore64(ppc::PPCContext* context, uint32_t address,
                        uint64_t value) override;
 
+#if XE_A64_PROFILER_AVAILABLE == 1
+  // Accumulator cell for one guest function's total time, in CNTVCT ticks.
+  uint64_t* GetProfilerRecordForFunction(uint32_t guest_address);
+  void WriteGuestProfilerData();
+#endif
+
   bool trace_instr_available() const override;
   bool trace_data_available() const override;
   bool trace_func_available() const override;
@@ -218,6 +234,14 @@ class A64Backend : public Backend {
   void RecordMMIOExceptionForGuestInstruction(void* host_address);
 
  private:
+#if XE_A64_PROFILER_AVAILABLE == 1
+  GuestProfilerData profiler_data_;
+  // Translation can run on more than one thread, and the records are handed
+  // out at emit time, so the map itself needs guarding. std::map keeps
+  // references valid across inserts, so the returned pointer stays good.
+  std::mutex profiler_mutex_;
+#endif
+
   static bool ExceptionCallbackThunk(Exception* ex, void* data);
   bool ExceptionCallback(Exception* ex);
 

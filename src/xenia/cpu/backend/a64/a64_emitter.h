@@ -199,6 +199,12 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
   void PushStackpoint();
   void PopStackpoint();
+  // Adds this frame's elapsed CNTVCT_EL0 ticks to the function's accumulator.
+  // Emitted at the epilog and at every tail-call site, because a tail call
+  // leaves without ever reaching the epilog. Declared unguarded, as the x64
+  // emitter does: XE_A64_PROFILER_AVAILABLE lives in a64_backend.h, which this
+  // header does not include.
+  void EmitProfilerEpilogue();
   void EnsureSynchronizedGuestAndHostStack();
 
   // After a conditional region (TRAP_TRUE / CALL_*_TRUE), the taken path's

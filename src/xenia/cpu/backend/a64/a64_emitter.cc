@@ -31,6 +31,13 @@
 
 DECLARE_bool(a64_enable_host_guest_stack_synchronization);
 
+#if XE_A64_PROFILER_AVAILABLE == 1
+DEFINE_bool(instrument_call_times, false,
+            "Accumulate time spent in each guest function, for profiling "
+            "guest code. Writes profile_times.txt on shutdown.",
+            "a64");
+#endif
+
 namespace xe {
 namespace cpu {
 namespace backend {
@@ -275,6 +282,17 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   // synchronizer is on.
   PushStackpoint();
 
+#if XE_A64_PROFILER_AVAILABLE == 1
+  if (cvars::instrument_call_times) {
+    // CNTVCT_EL0 is the userspace-readable virtual counter: one instruction,
+    // no serialization, so it perturbs the measurement far less than a
+    // timer syscall would. x8 is dead here (the prolog's other users of it
+    // have finished) and x0/x30 are already spilled.
+    mrs(x8, 3, 3, 14, 0, 2);  // mrs x8, CNTVCT_EL0
+    str(x8, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_PROFILER_START)));
+  }
+#endif
+
   // ========================================================================
   // BODY
   // ========================================================================
@@ -417,6 +435,10 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
     CallNative(reinterpret_cast<void*>(TraceFunctionReturn));
   }
   code_offsets.epilog = getSize();
+
+#if XE_A64_PROFILER_AVAILABLE == 1
+  EmitProfilerEpilogue();
+#endif
 
   // Pop stackpoint before leaving.
   PopStackpoint();
@@ -745,6 +767,9 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
       synchronize_stack_on_next_instruction_ = true;
     } else {
       // Tail call: pass our return address to the callee.
+#if XE_A64_PROFILER_AVAILABLE == 1
+      EmitProfilerEpilogue();
+#endif
       PopStackpoint();
       ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
       if (stack_size() <= 4095) {
@@ -832,6 +857,9 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   }
 
   if (instr->flags & hir::CALL_TAIL) {
+#if XE_A64_PROFILER_AVAILABLE == 1
+    EmitProfilerEpilogue();
+#endif
     PopStackpoint();
     ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
     if (stack_size() <= 4095) {
@@ -1029,6 +1057,9 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
 
   if (instr->flags & hir::CALL_TAIL) {
     // Tail call: pass our return address to the callee.
+#if XE_A64_PROFILER_AVAILABLE == 1
+    EmitProfilerEpilogue();
+#endif
     PopStackpoint();
     if (!hoist_ret_slots) {
       ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
@@ -1295,6 +1326,25 @@ void A64Emitter::PushStackpoint() {
   str(x11, ptr(x19, static_cast<uint32_t>(
                         offsetof(A64BackendContext, stackpoint_head))));
 }
+#if XE_A64_PROFILER_AVAILABLE == 1
+void A64Emitter::EmitProfilerEpilogue() {
+  if (!cvars::instrument_call_times) {
+    return;
+  }
+  // x9 is deliberately left alone: the tail-call sites keep the branch target
+  // there. x0 is left alone because it carries the guest return value.
+  uint64_t* profiler_entry =
+      backend()->GetProfilerRecordForFunction(current_guest_function_);
+  mrs(x8, 3, 3, 14, 0, 2);  // mrs x8, CNTVCT_EL0
+  ldr(x10, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_PROFILER_START)));
+  sub(x8, x8, x10);
+  mov(x10, reinterpret_cast<uint64_t>(profiler_entry));
+  ldr(x11, ptr(x10));
+  add(x11, x11, x8);
+  str(x11, ptr(x10));
+}
+#endif
+
 void A64Emitter::PopStackpoint() {
   if (!cvars::a64_enable_host_guest_stack_synchronization) {
     return;

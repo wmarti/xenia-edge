@@ -74,6 +74,10 @@ class StackLayout {
   static constexpr size_t STACKPOINT_PREV = 72;
   static constexpr size_t STACKPOINT_GUEST_SP = 80;
   static constexpr size_t STACKPOINT_GUEST_RET = 84;
+  // Start tick for the optional per-guest-function profiler. Lands in the
+  // eight bytes of padding that already existed between the stackpoint node
+  // and the 16-byte-aligned frame size, so enabling it costs no stack.
+  static constexpr size_t GUEST_PROFILER_START = 88;
 };
 
 }  // namespace a64
