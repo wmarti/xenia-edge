@@ -252,6 +252,18 @@ byte-identical between the refs, so the harness is not contributing.
   the storage root at its default, since overriding it collides with the
   existing user namespace. `--log-driver=none` silently discards container
   stdout under `sbatch`.
+- **Two SLURM/podman rules that cost real time to find, and that any job on
+  this cluster has to follow:**
+  1. *Container stdout does not reliably reach the sbatch log.* Redirecting
+     `podman run` output on the host produced empty or truncated logs, which
+     read as "the build printed nothing" rather than as a capture failure. Have
+     the container write to a bind-mounted file and read that file from the
+     host afterwards. `--log-driver=none` makes it worse by discarding output
+     outright.
+  2. *`/tmp` is node-local.* Logs written there by a job on `epyc-7502` are not
+     visible from the login node afterwards, and reading them means another
+     `srun` onto the same node. Copy anything worth keeping back to NFS home
+     before the job exits.
 - Building both refs in that image is in flight.
 - Still open: `pip install` on the bare node is refused under PEP 668 and needs
   `--break-system-packages` or a venv — only relevant if we ever go back to a
