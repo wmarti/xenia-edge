@@ -27,10 +27,18 @@ set -euo pipefail
 REF_A="${1:-edge}"
 REF_B="${2:-a64-fixes-on-edge}"
 RUNS="${RUNS:-5}"
-# A suite whose emitted code this branch does not change. Its measured delta
-# is pure measurement error, so it calibrates everything else in the table:
-# any result smaller than the control is indistinguishable from noise.
+# The suite used to calibrate measurement error. It is deliberately NOT
+# calibrated by comparing the two refs on it: a suite whose emitted code a
+# branch leaves completely alone mostly does not exist, because changes to
+# addressing, guest frames, or PPCContext layout reach the code every suite
+# runs whatever instruction it names. Measured that way, instr__gen_vand
+# reported -9.2% for a branch whose total was -8.5%, which would have thrown
+# the entire result away as noise. The floor is instead measured by running
+# ref A against itself on this suite, where the two sides are byte-identical
+# by construction and any delta is therefore pure measurement error.
 CONTROL="${CONTROL:-instr__gen_vand}"
+# Set to 0 to skip the calibration pass and save one suite's worth of runs.
+CALIBRATE="${CALIBRATE:-1}"
 REUSE="${REUSE:-0}"
 SETUP_ONLY="${SETUP_ONLY:-0}"
 BUILD_ONLY="${BUILD_ONLY:-0}"
@@ -464,6 +472,22 @@ bench_pair() {          # alternates A/B order and writes a.csv plus b.csv
   done
 }
 
+calibrate_floor() {     # echoes the |delta| ref A shows against itself
+  local run=""
+  local t1=""
+  local t2=""
+  local best1=""
+  local best2=""
+  [ -f "$CORPUS/$CONTROL.map" ] || { echo ""; return; }
+  for run in $(seq 1 "$RUNS"); do
+    t1="$(time_suite "$EXE_A" "$CONTROL")"
+    t2="$(time_suite "$EXE_A" "$CONTROL")"
+    best1="$(python3 -c "print(min($t1, ${best1:-9999}))")"
+    best2="$(python3 -c "print(min($t2, ${best2:-9999}))")"
+  done
+  python3 -c "print('%.2f' % abs(100*($best2-$best1)/$best1))"
+}
+
 if [ "$SETUP_ONLY" = "1" ]; then
   echo "==> preparing $REF_A"
   prepare_ref "$REF_A"
@@ -487,15 +511,22 @@ if [ "$BUILD_ONLY" = "1" ]; then
   exit 0
 fi
 
+FLOOR=""
+if [ "$CALIBRATE" = "1" ]; then
+  echo "==> calibrating: $REF_A against itself on $CONTROL (min of $RUNS)"
+  FLOOR="$(calibrate_floor)"
+  echo "    measurement error: ${FLOOR:-unknown}%"
+fi
+
 echo "==> benchmarking $REF_A vs $REF_B (interleaved, min of $RUNS)"
 bench_pair
 
 echo
-python3 - "$WORK/a.csv" "$WORK/b.csv" "$REF_A" "$REF_B" <<'PY'
+python3 - "$WORK/a.csv" "$WORK/b.csv" "$REF_A" "$REF_B" "${FLOOR:-}" <<'PY'
 import sys, csv
 a_path, b_path, ref_a, ref_b = sys.argv[1:5]
+floor = sys.argv[5] if len(sys.argv) > 5 else ""
 rd = lambda p: {r[0]: float(r[1]) for r in csv.reader(open(p)) if r}
-control = "instr__gen_vand"
 A, B = rd(a_path), rd(b_path)
 common = [s for s in A if s in B]
 w = max([len(s) for s in common] + [16])
@@ -506,10 +537,10 @@ for s in sorted(common):
     print(f"{s:{w}} {A[s]:12.3f} {B[s]:12.3f} {100*(B[s]-A[s])/A[s]:+8.1f}%")
 if ta:
     print(f"{'TOTAL':{w}} {ta:12.3f} {tb:12.3f} {100*(tb-ta)/ta:+8.1f}%")
-if control in A and control in B:
-    noise = abs(100*(B[control]-A[control])/A[control])
+if floor:
     print()
-    print(f"noise floor from the control suite ({control}, which this branch")
-    print(f"does not change): {noise:.1f}%. Treat any per-suite result smaller")
-    print("than that as indistinguishable from measurement error.")
+    print(f"measurement error, from running {ref_a} against itself: {floor}%.")
+    print("Treat any result of that size or smaller as unmeasured. This floor")
+    print("compares two byte-identical binaries, so it cannot absorb a real")
+    print("improvement the way a per-suite control can.")
 PY
