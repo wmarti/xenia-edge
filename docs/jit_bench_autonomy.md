@@ -239,9 +239,15 @@ that exist only on the branch (`njm_flip_and_back`,
 | `instr_mcrf` | 0.016 | 0.016 | +0.6% |
 | **TOTAL** | **16.661** | **15.239** | **-8.5%** |
 
-Measurement error, from running `edge` against itself: **0.07-0.1%**, worst
-substantial suite ±0.7%. The improvement is between ten and eighty times the
-floor, so it is not in question. `instr_mcrf` getting marginally slower is
+Measurement error, from running `edge` against itself: **0.07%** on a quiet
+machine, **1.06%** while the machine was also driving SLURM jobs over SSH;
+worst substantial suite ±0.7%. The improvement is between eight and eighty
+times the floor depending on conditions, so it is not in question.
+
+The total reproduced across two independent min-of-5 runs taken hours apart
+under different load — **-8.5%** and **-8.4%**, with every per-suite figure
+within about a point. A result that does not reproduce is discarded rather than
+published, so this is the number of record. `instr_mcrf` getting marginally slower is
 consistent with the fix: it now copies the CR field instead of comparing it
 against zero.
 
