@@ -78,5 +78,9 @@ should be treated as confirmation rather than as the primary number.
 ## Node choice
 
 `epyc-7502`, `am-*` and `a4500-*` are AVX2-only; `ad-01` and `rtx6000-bw` have
-full AVX-512. Run the gate on both classes when a change touches vector
-codegen — they take different paths through the x64 backend.
+full AVX-512. The backend gates code on `kX64EmitAVX512Ortho` in seventeen
+places, plus VBMI, DQ, BW and GFNI paths, none of which a Zen 2 node executes —
+so a gate run on `epyc-7502` alone leaves all of them unmeasured. Run both
+classes whenever a change touches vector codegen:
+
+    sbatch -p ad -w ad-01 tools/bench/slurm/x64-pipeline.sbatch
