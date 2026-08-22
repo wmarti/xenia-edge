@@ -37,6 +37,13 @@ It is a submission host only. Everything real goes through `sbatch`/`srun`.
 Build and time on node-local `/tmp` (~320 GB free). `/home` is NFS at 96%
 capacity and must not carry build trees or timing runs.
 
+Covering both classes is not optional. The x64 backend gates code on
+`kX64EmitAVX512Ortho` in seventeen places, plus `kX64EmitAVX512VBMI`,
+`kX64EmitAVX512DQ`, `kX64EmitAVX512BW` and `kX64EmitGFNI` — none of which a
+Zen 2 node ever executes. A gate that only ever runs on `epyc-7502` leaves
+every one of those paths unmeasured, and a fault in one stays invisible until
+the code reaches an Intel machine.
+
 ## 2. The measurement substrate
 
 `xenia-cpu-ppc-tests` is both the correctness suite and the benchmark workload,
