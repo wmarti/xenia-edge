@@ -351,9 +351,21 @@ The same corpus, the same common test path, the same gate:
 | `edge` | 493 | 169,058 | 4 (`instr_mcrf`) | 1 (`instr_seq_stacksync`) |
 | `a64-fixes-on-edge` | 493 | 169,059 | 0 | 0 |
 
-**This is identical to the a64 result**, case count for case count: the same
-four `instr_mcrf` failures, the same `instr_seq_stacksync` crash, the same two
-fixes, on a completely different backend and instruction set.
+Repeated on `ad-01` (Xeon Gold 5418Y, Sapphire Rapids), which exercises the
+seventeen `kX64EmitAVX512Ortho` sites and the VBMI/DQ/BW/GFNI paths that a Zen 2
+node never reaches: **the same numbers again**. That run also started from a
+bare node with nothing prepared and completed in eighteen minutes end to end,
+which is what makes the pipeline usable unattended.
+
+| backend | machine | `edge` | `a64-fixes-on-edge` | gate |
+|---|---|---|---|---|
+| `a64` | M4 Pro | 4 failed, 1 crashed | clean, 169,059 | pass, 2 fixes |
+| `x64` AVX2 | `epyc-7502`, Zen 2 | 4 failed, 1 crashed | clean, 169,059 | pass, 2 fixes |
+| `x64` AVX-512 | `ad-01`, Sapphire Rapids | 4 failed, 1 crashed | clean, 169,059 | pass, 2 fixes |
+
+**Three backends and microarchitectures, identical verdicts on 169,059 cases**,
+case count for case count: the same four `instr_mcrf` failures, the same
+`instr_seq_stacksync` crash, the same two fixes.
 
 That agreement is the whole reason for running two machines. The eight `[CPU]`
 commits change PPC semantics — NaN propagation, FPSCR summary bits, denormal
@@ -366,6 +378,48 @@ It is not proof. Both backends share the PPC frontend and the HIR, so a mistake
 made there is reproduced faithfully on both sides rather than exposed by the
 comparison. What the differential rules out is a *backend-specific* divergence,
 which is the failure mode the `[A64]` and `[x64]` commits actually risk.
+
+### x64 performance, by instruction count
+
+Deterministic counts from callgrind on `epyc-7502`, so there is no noise floor
+to argue about — a repeat run reproduces these exactly.
+
+| suite | `edge` | `a64-fixes-on-edge` | delta |
+|---|---|---|---|
+| `instr__gen_vand` (control) | 7,056,240,079 | 7,057,910,328 | **+0.02%** |
+| `instr__gen_fadd` | 3,282,870,661 | 3,282,928,413 | +0.00% |
+| `instr__gen_vpkuhus` | 7,126,542,664 | 7,128,889,457 | +0.03% |
+| `instr__gen_vavgsb` | 7,096,569,406 | 7,070,813,334 | -0.36% |
+| `instr__gen_vavgsw` | 7,097,459,022 | 7,068,726,035 | -0.40% |
+| `instr_mcrf` | 216,830,888 | 215,710,348 | -0.52% |
+| `instr__gen_fmuls` | 3,373,447,955 | 3,336,985,652 | -1.08% |
+| `instr__gen_fmadds` | 40,983,983,671 | 40,281,803,563 | -1.71% |
+| **TOTAL** | **76,233,944,346** | **75,443,767,130** | **-1.04%** |
+
+Two things are worth reading carefully here.
+
+**The x64 gain is -1.04%, against -8.8% wall clock on a64.** That is not a
+contradiction and not a disappointment: the stack is thirty `[A64]` commits and
+six `[x64]` ones. Most of this work does not touch the x64 backend at all, and
+the measurement says so. Anyone quoting "-8.8%" as the branch's improvement
+should be quoting it as the *a64* improvement.
+
+**On x64 the control behaves like a control**, moving +0.02%. On a64 the same
+suite moved -9.2%, because the a64 commits change addressing, guest frames and
+`PPCContext` layout — code every suite runs. The same suite is a valid control
+for one backend and a useless one for the other, which is a good argument for
+calibrating against an identical binary rather than against a suite believed to
+be untouched.
+
+The improvement concentrates where the `[x64]` commits actually are:
+`vavgsb`/`vavgsw` (vector average without scalar loops), and the scalar float
+suites that the MXCSR-tracker and F64-binop commits touch. `vpkuhus` shows
+nothing, despite the byte-pack commit naming it — worth a look.
+
+A caveat on the metric: these counts cover the whole process, including JIT
+compilation and the test harness, so a change confined to generated code is
+diluted by everything around it. The counts are exact but they are not a
+measurement of the emitted code alone.
 
 ### Real game code (Mac only)
 
