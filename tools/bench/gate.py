@@ -108,7 +108,12 @@ def main():
         capture_output=True, text=True)
     print(cmp_proc.stdout)
     gate = json.loads((out / "gate.json").read_text())
-    clean = not gate["regressions"]
+    # A comparison only means something if both sides actually ran. When they
+    # break the same way — the x64 binary failing to find libSDL3 outside the
+    # container it was built in — the diff is empty and the gate would
+    # otherwise report a pass on two piles of nothing.
+    broken = [name for name, doc in (("a", a), ("b", b)) if doc["cases"] == 0]
+    clean = not gate["regressions"] and not broken
 
     result = {
         "backend": args.backend,
@@ -122,8 +127,12 @@ def main():
         "regressions": gate["regressions"],
         "fixes": gate["fixes"],
         "gate": "pass" if clean else "fail",
+        "broken_sides": broken,
     }
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    if broken:
+        print(f"\nERROR: ran no test cases at all on side(s): "
+              f"{', '.join(broken)}. The comparison is meaningless.")
     print(f"\ngate: {result['gate']}  "
           f"({len(gate['regressions'])} regressions, {len(gate['fixes'])} fixes)")
     print(f"bundle: {out}")

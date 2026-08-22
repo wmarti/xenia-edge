@@ -125,15 +125,22 @@ def main():
         "failed": sum(r["failed"] for r in results),
         "crashed": sum(1 for r in results if r["verdict"] == "crash"),
         "timed_out": sum(1 for r in results if r["verdict"] == "timeout"),
+        # Counted from verdicts rather than from the parsed totals. A binary
+        # that dies before printing anything — a missing shared library, say —
+        # yields "0 failed" from the totals while every suite has in fact
+        # failed, which reads as a clean run.
+        "not_passed": sum(1 for r in results if r["verdict"] != "pass"),
         "results": results,
     }
     pathlib.Path(args.out).write_text(json.dumps(summary, indent=2) + "\n")
     print(f"{args.label or args.exe}: {summary['suites']} suites, "
           f"{summary['cases']} cases, {summary['failed']} failed, "
           f"{summary['crashed']} crashed, {summary['timed_out']} timed out")
+    if summary["cases"] == 0:
+        print("error: no test cases ran at all — treat this as a broken "
+              "harness, not as a clean corpus", file=sys.stderr)
     # A clean corpus is the only success. Anything else is a finding.
-    return 0 if summary["failed"] == 0 and summary["crashed"] == 0 \
-        and summary["timed_out"] == 0 else 1
+    return 0 if summary["not_passed"] == 0 and summary["cases"] > 0 else 1
 
 
 if __name__ == "__main__":
