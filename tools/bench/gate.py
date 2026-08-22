@@ -44,6 +44,13 @@ def conditions():
         "machine": platform.machine(),
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    # Which tooling produced this bundle. Several sessions edit this
+    # repository, so a result that cannot be traced to a commit — and to
+    # whether the tree was dirty at the time — is hard to trust later.
+    here = str(HERE)
+    c["tool_commit"] = sh(f"git -C {here} rev-parse --short HEAD")
+    c["tool_branch"] = sh(f"git -C {here} rev-parse --abbrev-ref HEAD")
+    c["tool_dirty"] = bool(sh(f"git -C {here} status --porcelain -- {here}"))
     if c["system"] == "Darwin":
         c["cpu"] = sh("sysctl -n machdep.cpu.brand_string")
         c["ncpu"] = sh("sysctl -n hw.ncpu")
