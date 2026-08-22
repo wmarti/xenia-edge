@@ -1305,7 +1305,13 @@ endif()
 # Built on WIN32 and APPLE. The Windows build runs release with /MD to match
 # xenia's CRT under an MSVC environment so meson detects cl. Verify the archive
 # paths below against the real build output if Mesa is restructured.
-if(WIN32 OR APPLE)
+#
+# Gated on XENIA_BUILD_EMULATOR because only xenia-gpu links spirv_to_dxil. A
+# CPU-only build (xenia-cpu-ppc-tests) has no shader backend, and without the
+# gate configuring it on macOS aborts with FATAL_ERROR unless a Mesa tree and
+# meson are present - which is the whole dependency XENIA_BUILD_EMULATOR=OFF
+# exists to drop.
+if((WIN32 OR APPLE) AND XENIA_BUILD_EMULATOR)
   # Mesa source tree built for spirv_to_dxil. Defaults to the third_party/mesa
   # submodule (our fork with the barycentric, linking, keep_io_vars and FSI->ROV
   # changes). Repoint this cache variable to build a different Mesa checkout.
