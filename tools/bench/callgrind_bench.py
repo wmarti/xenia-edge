@@ -24,6 +24,9 @@ import pathlib
 # file is easy enough to read directly.
 SUMMARY_RE = re.compile(r"^summary:\s+(\d+)", re.M)
 TOTALS_RE = re.compile(r"^totals:\s+(\d+)", re.M)
+# Starting the process and discovering the corpus alone costs ~86M
+# instructions, so anything near that never reached the guest code.
+MIN_PLAUSIBLE = 150_000_000
 
 
 def count(exe, suite, corpus, timeout):
@@ -46,11 +49,23 @@ def count(exe, suite, corpus, timeout):
             return None, "timeout"
         if not out.exists():
             return None, f"no output (rc={proc.returncode})"
+        if proc.returncode != 0:
+            # valgrind exits 0 even when the program under it dies, and it
+            # still writes an output file, so a process that failed at startup
+            # reports a small, perfectly stable, entirely meaningless count.
+            # A stale container image missing liblz4 produced ~100k
+            # instructions per suite and a tidy -0.5% table.
+            tail = (proc.stderr or "").strip().splitlines()[-1:] or ["?"]
+            return None, f"program failed (rc={proc.returncode}): {tail[0][:120]}"
         text = out.read_text()
         m = SUMMARY_RE.search(text) or TOTALS_RE.search(text)
         if not m:
             return None, "no summary line"
-        return int(m.group(1)), None
+        count = int(m.group(1))
+        if count < MIN_PLAUSIBLE:
+            return None, (f"only {count:,} instructions — the program cannot "
+                          f"have run the suite")
+        return count, None
 
 
 def main():
