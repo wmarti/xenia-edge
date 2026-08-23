@@ -61,6 +61,10 @@ struct TailEmitter {
   Xbyak_aarch64::Label label;
   uint32_t alignment;
   TailEmitCallback func;
+  // Index of the sequence sample being emitted when this tail was registered,
+  // so the bytes it emits later can be charged back to it as cold. UINT32_MAX
+  // when it was registered outside sequence emission.
+  uint32_t sample_index = UINT32_MAX;
 };
 
 class A64Emitter : public Xbyak_aarch64::CodeGenerator {

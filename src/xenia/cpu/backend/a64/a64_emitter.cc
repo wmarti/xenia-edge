@@ -445,12 +445,19 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
     // ARM64 instructions are always 4-byte aligned, so alignment is mostly
     // a no-op unless we want cache-line alignment for hot paths.
     L(tail_item.label);
+    const size_t tail_size_before = getSize();
     try {
       tail_item.func(*this, tail_item.label);
     } catch (const Xbyak_aarch64::Error& e) {
       XELOGE("A64: assembler rejected tail code in guest function {:08X}: {}",
              current_guest_function_, e.what());
       return false;
+    }
+    // Before the pool flush, so the pool's bytes are not charged to whichever
+    // sequence happened to register the last tail.
+    if (tail_item.sample_index < sequence_samples_.size()) {
+      sequence_samples_[tail_item.sample_index].tail_bytes +=
+          static_cast<uint32_t>(getSize() - tail_size_before);
     }
     if (!MaybeFlushV128ConstPool()) {
       return false;
@@ -576,13 +583,68 @@ void A64Emitter::MarkSourceOffset(const hir::Instr* i) {
   }
 }
 
+// Count the MOVZ/MOVK chains in a just-emitted range that build a value wider
+// than 32 bits. This is the emit-time counterpart of the replay's classifier in
+// ppc_testing_main.cc, and reaches the same answer by a cheaper route: a
+// move-wide with hw >= 2 places its immediate at bit 32 or 48, so the value it
+// is building cannot fit in 32 bits, and no reconstruction is needed. Counted
+// per sequence rather than per function so a chain sitting in one cold sequence
+// cannot be charged at a hot sequence's execution rate.
+static void CountWideMoveChains(const uint8_t* code, uint32_t bytes,
+                                uint16_t* out_chains,
+                                uint16_t* out_instructions) {
+  uint32_t chains = 0, instructions = 0;
+  uint32_t open_reg = 0xFF, open_count = 0;
+  bool open_wide = false;
+  auto close = [&]() {
+    if (open_count && open_wide) {
+      ++chains;
+      instructions += open_count;
+    }
+    open_count = 0;
+    open_wide = false;
+    open_reg = 0xFF;
+  };
+  for (uint32_t off = 0; off + 4 <= bytes; off += 4) {
+    uint32_t insn;
+    std::memcpy(&insn, code + off, sizeof(insn));
+    // Move-wide immediate group: MOVN/MOVZ/MOVK share bits 28:23 == 100101.
+    if ((insn & 0x1F800000u) != 0x12800000u) {
+      close();
+      continue;
+    }
+    const uint32_t opc = (insn >> 29) & 0x3u;
+    const uint32_t hw = (insn >> 21) & 0x3u;
+    const uint32_t rd = insn & 0x1Fu;
+    const bool wide = hw >= 2u;
+    if (opc == 0x3u && open_count && rd == open_reg) {  // MOVK continuing
+      ++open_count;
+      open_wide = open_wide || wide;
+      continue;
+    }
+    close();
+    open_reg = rd;
+    open_count = 1;
+    open_wide = wide;
+  }
+  close();
+  *out_chains = static_cast<uint16_t>(chains);
+  *out_instructions = static_cast<uint16_t>(instructions);
+}
+
 void A64Emitter::RecordSequenceSample(const hir::Instr* i, uint32_t backend_key,
                                       uint32_t host_bytes) {
   if (coverage_current_index_ == UINT32_MAX || !host_bytes) {
     return;
   }
-  sequence_samples_.push_back({hir::MakeSequenceSampleKey(i, backend_key),
-                               coverage_current_index_, host_bytes});
+  SequenceSample sample = {};
+  sample.key = hir::MakeSequenceSampleKey(i, backend_key);
+  sample.guest_index = coverage_current_index_;
+  sample.host_bytes = host_bytes;
+  CountWideMoveChains(
+      reinterpret_cast<const uint8_t*>(getCode()) + (getSize() - host_bytes),
+      host_bytes, &sample.chains, &sample.chain_instructions);
+  sequence_samples_.push_back(sample);
 }
 
 void A64Emitter::DebugBreak() { brk(0xF000); }
@@ -1185,6 +1247,11 @@ Label& A64Emitter::AddToTail(TailEmitCallback callback, uint32_t alignment) {
   TailEmitter tail;
   tail.alignment = alignment;
   tail.func = std::move(callback);
+  // AddToTail runs while the sequence is still emitting, so the sample this
+  // sequence is about to push is the one at the current end of the vector.
+  tail.sample_index = coverage_current_index_ == UINT32_MAX
+                          ? UINT32_MAX
+                          : static_cast<uint32_t>(sequence_samples_.size());
   tail_code_.push_back(std::move(tail));
   return tail_code_.back().label;
 }
