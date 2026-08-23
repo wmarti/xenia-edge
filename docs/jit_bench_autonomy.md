@@ -487,6 +487,100 @@ a workload that executes the pack path — real game code, or a synthetic loop.
 `bench_pair.py` now measures startup directly, marks these suites
 startup-bound, and leaves them out of the total.
 
+## What the corpus actually measures
+
+Every test case in the generated corpus is one guest instruction and a `blr`:
+
+```
+test_vsel_1_GEN:
+  #_ REGISTER_IN v1 [...]
+  vsel v4, v1, v2, v3
+  blr
+```
+
+Around that, `ppc_testing_main.cc` resets the guest memory heap
+(`memory_->Reset()`, line 291), tears down and rebuilds `ThreadState`, JITs the
+function, calls it once, and string-compares the registers. Measured cost per
+case on an M4 Pro:
+
+| suite | cases | µs/case |
+|---|---|---|
+| `instr__gen_vand` | 650 | 208.9 |
+| `instr__gen_vsel` | 15,600 | 221.3 |
+| `instr__gen_vperm` | 15,600 | 234.8 |
+| `instr__gen_vmaddfp` | 15,600 | 241.0 |
+| `instr__gen_fmadds` | 3,456 | 285.9 |
+
+Roughly 800,000 cycles to execute one guest `vand`. Sampling `instr__gen_vsel`
+(1,825 main-thread samples, `edge`) shows where they go:
+
+| | samples | share |
+|---|---|---|
+| `BaseHeap::RebuildFreeBlocks` | 859 | 47% |
+| `Memory::Reset` → `__bzero` | 233 | 13% |
+| `ThreadState` ctor (mmap/munmap) | 183 | 10% |
+| Capstone disassembly | 200 | 11% |
+| all JIT frames | 108 | 6% |
+| — of which code generation | 31 | 1.7% |
+| **executing guest code** | **0** | **0%** |
+
+`RebuildFreeBlocks` is a linear scan of the ~1M-entry page table, run once per
+test case. There are no samples in `HostToGuest`, none in `Function::Call`,
+none in JITted code.
+
+## Attributing the a64 gain
+
+`edge` rebuilt with one half of the branch applied at a time, five large suites,
+min of 5:
+
+| build | vs `edge` | detail |
+|---|---|---|
+| `base-only` — 26 `[Base/POSIX]` + `[VFS]` | **+0.11%** | all five unresolved |
+| `cpu-only` — the 55 JIT commits | **-9.47%** | all five resolved, spreads 1.6-6.7% |
+| full branch | **-8.70%** | matches `cpu-only` |
+| `cpu-only`, harness debug dumping off | **-4.32%** | four of five resolved |
+
+The gain is entirely in `src/xenia/cpu`; the POSIX layer contributes nothing.
+That refuted the reading the profile suggested, which is why the split was
+built rather than argued.
+
+**About half the gain is the harness disassembling less code.**
+`ppc_testing_main.cc:268` sets `DebugInfoFlags::kDebugInfoAll`, so every one of
+the 15,600 JITted functions is dumped four ways — PPC source, raw HIR,
+optimised HIR, and the emitted host code walked instruction-by-instruction
+through Capstone by `A64Assembler::DumpMachineCode`. That last cost is
+proportional to how much code the backend emits. Rebuilding both refs with the
+flag set to `kDebugInfoNone` (a measurement-only patch, never landed) takes the
+delta from -9.47% to **-4.32%**. The dumping portion itself falls from 3.60s to
+2.58s, **-28%** — a direct proxy for the branch emitting less host code.
+
+So the -8.7% decomposes as: roughly half a code-size effect visible only
+because the harness disassembles everything, and roughly half JIT throughput
+and per-function overhead. **None of it is the speed of the emitted code**,
+which each suite executes exactly once per test case.
+
+## What this means for the branch's performance commits
+
+Of the 87 commits, ~35 make an explicit performance claim. **None has
+individual runtime evidence** — the finest attribution that exists is the
+four-row table above, and the smallest unit in it is 55 commits at once.
+
+- **Cannot be tested by this corpus at all** — they change how fast an emitted
+  sequence runs, not how large it is: `c4a4239d4` (SELECT_V128 BIT/BIF),
+  `d73cfa239` (vperm REV32 tables), `e16e9995d` (merges as zip), `b07a4187d`,
+  `38e7c5687`, `b1b9aab4f`, and all six `[x64]` commits — the last independently
+  confirmed at +0.003% by callgrind.
+- **Partially evidenced, as code size** — they shrink emitted code, which is
+  what the -28% dumping drop measures: `6c66fa966` (denormal flush in four),
+  `9d5f12670` (FMA fixup in four), `5b15a057a` (NaN paths to the tail),
+  `818537738` (prologue safepoints), `caa641401` (stp/ldp pairing). Smaller is
+  not shown to be faster.
+- **Proven, but as correctness rather than performance**: `752ddf5f9` (mcrf)
+  and `97343ebff` (stacksync), both confirmed on a64, AVX2 and AVX-512.
+
+Closing this gap needs a workload that executes guest code in a loop — real
+game code, or a synthetic harness — not more runs of this corpus.
+
 ## Where the x64 headroom is
 
 The callgrind result says the x64 backend was left where it was, so the leads
