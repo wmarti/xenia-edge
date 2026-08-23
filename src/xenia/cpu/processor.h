@@ -230,6 +230,8 @@ class Processor {
   void RecordSequenceSamples(uint32_t start_address,
                              std::vector<backend::SequenceSample> samples);
   bool trace_counts_enabled() const { return trace_counts_enabled_; }
+  // Write the coverage tables to --trace_function_coverage_out, if set.
+  void DumpTraceCountsToFile();
 
  private:
   // Write the guestcoverage, guestcoveragethreads and guestsequences tables
@@ -313,6 +315,7 @@ class Processor {
   uint8_t* trace_counts_fallback_ = nullptr;
   bool trace_counts_failed_ = false;
   bool trace_counts_enabled_ = false;
+  bool trace_counts_periodic_started_ = false;
   size_t trace_counts_next_offset_ = 0;
   size_t trace_counts_committed_ = 0;
 
