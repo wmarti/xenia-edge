@@ -416,3 +416,93 @@ agreement between two broken measurements is not evidence.
    then confirm with exclusive-node wall clock on an AVX2 node and an AVX-512
    node.
 4. Stand up the results branch and the periodic driver on both machines.
+
+## Execution weighting, and the rankings it destroyed
+
+Everything above this line ranks emitted code. None of it knows whether the code
+runs. Closing that gap changed the answer by a factor of forty and retired two
+optimizations that had looked like the obvious next moves.
+
+### Getting the counters out
+
+`--trace_function_coverage` had counted per-guest-instruction executions for a
+while, but the only reader was `Profiler::Dump`, which needs
+`-DXENIA_ENABLE_PROFILER=ON`. That build cannot run a title: `profiling.cc` mints
+a MicroProfile token per guest function, `MICROPROFILE_MAX_TIMERS` is 1024, and
+past that `MicroProfileGetToken` returns `MICROPROFILE_INVALID_TOKEN` whose
+`0xFFFF` timer index is written past the end of the timer arrays. Halo 3 JITs
+8,524 functions and the process dies two frames in, with no crash dump and no
+exit marker. So the counters were unreachable on exactly the runs worth
+measuring. `--trace_function_coverage_out` writes the tables from an ordinary
+build; `--trace_function_coverage_period` rewrites them every N seconds so a
+scripted run does not depend on someone quitting the emulator by hand.
+
+### Three attribution errors, and what they cost
+
+| what it did | what it produced |
+| --- | --- |
+| weighted a function's whole body by its guest-instruction executions | `82103AD8` and `82080608` -- ordinary loads and a return, one chain each -- ranked for billions of chain executions. That chain is the `preempt_yield_handler` materialization in the preemption **tail**, the cold side of a branch. |
+| the same, on a function with a hot inner loop | `825A7EC8` spends its count in eight `db16cyc`. Its materializations sit at calls and in tails *outside* the loop. Smeared, it read as a 92.25B-execution hotspot. |
+| priced a sequence at executions x its **average** emitted size | `load_offset i32` came top at 14.3%, from 110.87B executions x 30.2 average bytes. The key covers the normal, MMIO, constant and register variants, whose sizes differ, so the product is only valid if size and heat are uncorrelated. |
+
+The fix is to charge each site its own bytes, keep tail bytes separate, and count
+wide-move chains per sample at emit time. Then the saving from a proposed change
+T is exactly
+
+    score(T) = sum over affected sites s of  E_s * (C_old,s - C_new,s)
+
+with `E_s` the site's own execution count, never a function or sequence average.
+
+### What that says about the wide-move chains
+
+| model | claimed saving from chain -> one ldr |
+| --- | --- |
+| gross chain instruction share, smeared per function | 4.02% |
+| corrected for the replacement not being free | 2.36% |
+| **exact, per site** | **0.10%** |
+
+The chains are almost entirely in code that does not execute. This retires the
+`a64-literal-pool` branch permanently, and Apple's optimization guide independently
+agrees: 2.8.2 recommends short MOV sequences *over* PC-relative literal loads,
+because a literal pool is an "island" of data in code space that the
+instruction-side prefetcher will not fetch and the data-side prefetcher cannot
+predict, costing "at least one or more data cache misses for each new island".
+
+The already-landed thunk fix (`d9f96ccf5`) is not affected: it loads from the
+backend context, a structure the emitted code touches constantly, not from an
+island in code space.
+
+### Two targets that look good and cannot pay
+
+**Cross-block context promotion.** Context traffic is the largest single family in
+the ranking -- `store_context` 12.16% and `load_context` 5.45% of executed host
+instructions -- and `ContextPromotionPass` is deliberately block-local. Making it
+CFG-aware cannot pay in this IR: `DataFlowAnalysisPass::AnalyzeFlow` forces any
+value used outside its defining block through a local slot, emitting a
+`StoreLocal` after the def and a `LoadLocal` at the top of each consumer, and
+`register_allocation_pass.cc:74` states plainly that registers do not move across
+blocks. Forwarding a context value across an edge therefore trades a context
+store/load pair for a stack store/load pair, while the context store usually
+still has to happen for correctness. The blocker is the block-local register
+allocator, not the promotion pass. What *is* available without creating
+cross-block values is dead-store elimination across a single-predecessor edge,
+which only deletes stores.
+
+**Mapping away the 0xE0000000 remap.** Every guest memory access whose address is
+not constant pays `ApplyPhysicalRemapW0`, and it was four of the seven
+instructions in `load i32` (measured at 6.99 executed host instructions per
+execution). It cannot be removed by fixing the mapping: the 0xE0000000 and
+0xC0000000 views alias the same physical memory 4 KiB apart, `MapViews` rounds a
+view's file offset down to the host allocation granularity, and on a 16 KiB-page
+host no pair of mmap offsets can place both aliases correctly. The 4 KiB
+displacement is smaller than a page and is structurally unrepresentable, so the
+CPU side has to make it up.
+
+### Note on what the ranking still cannot do
+
+It ranks emitted work by execution, not CPU time. A change that alters what
+executes without altering what is emitted -- the remap branch below is exactly
+that -- is invisible to both the corpus replay and the executed-bytes ranking,
+and can only be scored by a paired runtime A/B. And the ranking still owes an
+independent check against uninstrumented host-PC sampling; `--jit_perf_map`,
+which arrived with the db16cyc series, is what that would need.
