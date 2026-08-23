@@ -990,3 +990,64 @@ silent at the diff level and loud at the compiler:
 None of this is an argument against automating the mechanical case; it is an
 argument that anything auto-resolved is unverified until it compiles and the
 169,048-case suite passes. Both gates were run before the result was trusted.
+
+## The paired runtime A/B, on the rebased tree
+
+Halo 3 is locked at 30 fps, so frame rate cannot show an improvement on it and
+CPU percent is the figure of merit. Frame rate is still measured, as a guard.
+
+### The branch against upstream
+
+Five interleaved pairs, `has207/edge` (ed0e06112) against this branch:
+
+| pair | upstream | ours | delta |
+| --- | --- | --- | --- |
+| 1 | 99.06% | 89.73% | -9.42% |
+| 2 | 98.99% | 89.76% | -9.32% |
+| 3 | 99.13% | 89.41% | -9.80% |
+| 4 | 99.03% | 89.78% | -9.33% |
+| 5 | 98.97% | 90.40% | -8.67% |
+
+**-9.31% CPU, five pairs of five agreeing, differences spread over 1.14 points.**
+Resolved on both statistics: best-against-best is -9.66% against a 1.10%
+within-ref spread.
+
+### What the db16cyc core release contributes
+
+Isolated on ONE binary with ONE cvar, `db16cyc_yield_after` 0 against 2, so
+nothing else can differ: **-4.99% CPU, four pairs of four agreeing** (-6.73%,
+-4.11%, -4.38%, -4.75%). Roughly half the branch's total, with the rest coming
+from the codegen work.
+
+That is smaller than the -10.15% the same idea measured before the rebase, and
+the reason is real rather than noise: upstream's `DELAY_EXECUTION` now coalesces
+consecutive barriers, so Halo 3's sled of eight `db16cyc` is already one
+instruction and much of what the core release used to recover has been recovered
+more cheaply. The two overlap; this measures what is left.
+
+Tuning it further did not pay. `after=1, sleep=150us` against the default
+`after=2, sleep=60us` came out at a mean of -0.19% with two pairs each way --
+not a result, so the defaults stand on evidence rather than on assumption.
+
+### Reading an interleaved A/B correctly
+
+The summary originally compared each ref's best run and called anything smaller
+than that ref's own max-to-min spread unresolved. That is the wrong statistic
+for interleaved runs. CPU percent drifts down over a session on this machine, so
+both refs fall together and the within-ref spread measures the drift. The
+db16cyc isolation came out as -4.54% against a 6.29% "spread" and was reported
+as unresolved, when every one of its four pairs favoured the release path by
+between 4.1% and 6.7%. Pairing by iteration is what the interleaving is for, and
+the summary now does it.
+
+Three harness faults were found the same way, each of which silently produced no
+result rather than a wrong one:
+
+  - the measurement window was counted in frames, and the frame number is only
+    visible through the log prefix. A settled title stops logging while running
+    at 87% of a core, so the run hung instead of measuring.
+  - the teardown did not wait for the emulator to exit, so two of them competed
+    for the GPU and one storage directory.
+  - the warmup was 180 seconds because nobody had measured what reaching the
+    menu costs. It is 49.2 seconds, identical with a cold or a warm shader
+    cache. That alone turned a 14-minute experiment into 45.
