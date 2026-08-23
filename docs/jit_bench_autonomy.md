@@ -1051,3 +1051,163 @@ result rather than a wrong one:
   - the warmup was 180 seconds because nobody had measured what reaching the
     menu costs. It is 49.2 seconds, identical with a cold or a warm shader
     cache. That alone turned a 14-minute experiment into 45.
+
+## The spin loop, pinned
+
+The post-rebase capture said one guest thread was 47.37% of all guest
+instruction execution and that 79% of that thread sat in a single function.
+`--dump_translated_hir_functions` settles what it is. The flag dumps **after**
+`compiler_->Compile()`, so the text below is the optimized HIR the backend
+actually emits from, not the frontend's first draft.
+
+Function `0x821A8500`, 151 guest instructions, prologue executed exactly once,
+**37.49% of all guest instruction execution**. Three blocks form the hot cycle:
+
+| block | guest | body |
+| --- | --- | --- |
+| `label14` | `821A855C-8564` | `load_offset` a guest word, `cmpwi 1`, branch |
+| `label2` | `821A8730-8734` | reload what it just stored, `cmpwi 2`, branch |
+| `label13` | `821A873C-874C` | two chained guest loads, `cmpwi 1`, back edge |
+
+No stores to guest memory. No calls on the hot path — both `call sub_821A0278`
+sites are off it (`821A8568` runs 9,953 times, `821A8738` **zero**). Three
+loads, three compares, three branches, 6,911,168,410 times. It is a poll, and
+the inference from the counter shape was right.
+
+### What it costs, and how much of that is dead
+
+Per iteration, priced at the sequence table's measured instructions-per-
+execution:
+
+| | host I |
+| --- | --- |
+| `label14` | 25.16 |
+| `label2` | 12.69 |
+| `label13` | 37.91 |
+| **per iteration** | **~75.8** |
+| × 6,911,168,410 iterations | **523.9 billion = 19.5% of the capture** |
+
+Of that, **21 host instructions per iteration are dead**, and the reason is
+`PPCHIRBuilder::UpdateCR`. Every PPC `cmpwi` materializes all three CR0 bits
+and stores each to context:
+
+```
+v71 = compare_slt v65, 1     ; 2 host I
+store_context +24, v71       ; 1  -- never read
+v72 = compare_sgt v65, 1     ; 2
+store_context +25, v72       ; 1  -- never read
+v73 = compare_eq v65, 1      ; 2
+store_context +26, v73       ; 1  -- never read (the branch uses the SSA value)
+branch_false v73, label2
+```
+
+Seven of those nine instructions are dead per `cmpwi`, three `cmpwi` per
+iteration: **21 of ~76 host instructions, 27.7% of the loop, 145.1 billion
+instructions, 5.39% of the whole capture** — from this one loop.
+
+Existing passes cannot remove them. `OPCODE_CONTEXT_BARRIER` is `IsFake()` and
+carries no flags, so it is not the obstacle; the cross-block DSE is. Its kill
+set is intersected over all successors, and `label14`'s other successor is the
+`lwarx`/`stwcx.` retry block, which never rewrites CR0. The intersection is
+empty, so nothing is killed on the hot path.
+
+### The static picture, across the whole title
+
+8,508 optimized function dumps, counting `store_context` into the CR range
+`[24,56)` against the offsets any `load_context` in the same function reads
+back:
+
+| off | field | stores | dead at function scope | |
+| --- | --- | --- | --- | --- |
+| +24 | `cr0_lt` | 73,333 | 57,456 | 78.3% |
+| +25 | `cr0_gt` | 73,333 | 57,456 | 78.3% |
+| +26 | `cr0_eq` | 73,333 | 57,456 | 78.3% |
+| +27 | `cr0_so` | 4,450 | 3,190 | 71.7% |
+| +48 | `cr6_0` | 14,888 | 23 | 0.2% |
+| +32 | `cr2_0` | 9,526 | 0 | 0.0% |
+
+**176,356 of 249,722 CR stores — 70.6% — target a field the function never
+reads.** This count is static, not execution-weighted; the 5.39% figure above
+is the sound per-site one. `cr6` is the vector-compare path and is essentially
+all live, so it must be left alone.
+
+## TODO — the immediately optimizable parts
+
+Ordered by expected payoff against confidence. Every entry names how it will be
+measured, because the campaign has already had two rankings overturned by the
+measurement rather than by the code.
+
+### Tier 1 — implementable now, target already measured
+
+**1. CR-bit liveness in `UpdateCR`.** 70.6% of CR stores are dead at function
+scope; 21 of ~76 host instructions in a loop that is 19.5% of the capture.
+Compute a per-function read set for the CR fields before emission — the scanner
+already walks every instruction — and skip the `StoreContext` for fields nothing
+reads. The compares come off for free: `DeadCodeEliminationPass` drops any
+non-`VOLATILE` instruction whose `dest` has no uses, so once the store is gone
+`compare_slt` and `compare_sgt` go with it. The change is confined to
+`PPCHIRBuilder::UpdateCR` plus the analysis.
+*Risk:* a caller reading CR0 across a call. CR0 is caller-volatile under the PPC
+ABI, but that assumption has to be paid for, not assumed — gate on a cvar,
+require 169,048/169,048 PPC tests, then a paired A/B.
+*Do not touch `UpdateCR6`* — `cr6` is 0.2% dead.
+
+**2. Generalized spin-loop release.** `delay_execution` fires 937,637 times from
+12 sites — **0.001%**. The db16cyc detector sees none of these polls, because
+they carry no `db16cyc`; they are plain load/compare/branch. Detect a
+self-looping HIR block whose body has no stores, no calls, no `reserved_load`/
+`reserved_store`, and no `VOLATILE` op, and route it into the same
+`DELAY_EXECUTION` core-release path. The db16cyc release measured **-4.99% CPU**
+on its own; this reaches roughly a hundred times more execution.
+*Risk:* the highest of anything on this list — releasing a core inside a loop
+that is not actually waiting will cost frames. Needs the FPS guard as well as
+CPU percent, and a title that is not FPS-capped alongside Halo 3.
+
+**3. `storev_left` / `storev_right` arm selection.** 213 sites, 45.00
+instructions each. `EmitPartialVectorStore` emits all five size arms inline.
+Move the rare arms to `AddToTail`, or specialize when the address alignment is a
+constant. Corrected estimate ~2%, not the 4.46% the table shows — see the
+attribution caveat in item 6.
+
+**4. `denormal_quirk`.** 5.29% at 19.36 instructions per execution over 15,649
+sites. Already has a cold tail, so the inline number is honest. Unexamined.
+
+### Tier 2 — measurement repairs, needed before Tier 1 results can be trusted
+
+**5. Tail taken-counters.** Tails are separated from inline code but carry no
+execution counter, so executed tail cost (415.1 billion, 15.43%) is an upper
+bound charged at the enclosing site's rate. `check_preempt` alone contributes
+195.1 billion of it and is almost never taken.
+
+**6. Inline branch arms in the byte attribution.** `host_bytes` counts the whole
+emitted body, so any sequence that branches internally without `AddToTail` is
+over-counted — `storev_left` reads 45.00 when one arm of ~5 runs. Either record
+a minimum-path length per sample, or move the arms to tails so the existing
+counter means something.
+
+**7. Per-sample call/MMIO variant attributes.** Still outstanding from the
+original repair list.
+
+**8. Validate against uninstrumented host-PC sampling.** `--jit_perf_map` came
+in with the rebase and makes this possible for the first time. Nothing in the
+model has been checked against a profile that does not come from the model.
+
+### Structural — large, and blocked on one thing
+
+**9. Context traffic.** `load_context i64` 4.60%, `store_context i8` 4.14%,
+`store_context i64` 3.21%, `store_context ci64` 1.39% — **13.34% of executed
+host instructions at ~1 instruction each**, which is to say the cost is the
+count, and the count exists because `DataFlowAnalysisPass::AnalyzeFlow` forces
+cross-block values through local slots and the register allocator is
+block-local. Nothing peephole-shaped will move it. Item 1 attacks a slice of it
+from the frontend instead, which is why it is first.
+
+### Closed — recorded so they are not reopened
+
+| | verdict |
+| --- | --- |
+| wide-move chains → literal pool | 0.11% by exact accounting. Retired twice. Apple's guide §2.8.2 agrees. |
+| cross-block context promotion | Blocked by the block-local register allocator: trades a context access for a local one. |
+| eliminating the `0xE0000000` physical remap by mapping | Structurally impossible — the `0xE0000000` and `0xC0000000` views alias the same physical memory 4 KiB apart, unrepresentable on a 16 KiB-page host. |
+| db16cyc tuning (`after=1/150us` vs `after=2/60us`) | -0.19%, two pairs each way. Not a result; defaults stand on evidence. |
+| `call - symbol` as a major target | Was 17.02 instructions per execution pre-rebase, is 8.95 now. Upstream got there first. |
