@@ -76,7 +76,7 @@ def cpu_seconds(pid):
     return sec + days * 86400
 
 
-def run_once(app, work, warmup_s, window_s, timeout, extra=()):
+def run_once(app, work, warmup_s, window_s, timeout, extra=(), game=None):
     """(fps, cpu_percent) over `window_frames` after warmup, or (None, None).
 
     CPU percent is the metric the db16cyc core-release work moved: it releases
@@ -101,7 +101,8 @@ def run_once(app, work, warmup_s, window_s, timeout, extra=()):
     # No --apu=nop: it fails CreateDriver and the guest dies at boot.
     p = subprocess.Popen(
         [app, f"--storage_root={work}/storage", f"--log_file={log}",
-         "--log_level=2", "--hid=nop", "--discord=false", *extra, GAME],
+         "--log_level=2", "--hid=nop", "--discord=false", *extra,
+         game or GAME],
         cwd=work, stdin=subprocess.DEVNULL, stdout=out,
         stderr=subprocess.STDOUT, start_new_session=True)
     # Wall-clock windows, not frame-count windows. The frame number is only
@@ -168,6 +169,10 @@ def main():
     # rebuild and without any chance of an unrelated code difference leaking in.
     # Repeatable rather than nargs="*": the values are themselves flags, and
     # argparse hands a leading "--" to the option parser instead of the list.
+    ap.add_argument("--game", default=GAME,
+                    help="path to the title to launch; defaults to Halo 3. "
+                         "Halo 3 and Halo Reach are both locked at 30 fps, so "
+                         "CPU percent is the figure of merit on either")
     ap.add_argument("--extra-a", action="append", default=[])
     ap.add_argument("--extra-b", action="append", default=[])
     args = ap.parse_args()
@@ -180,7 +185,8 @@ def main():
             order.reverse()
         for tag, app, acc, extra in order:
             fps, cpu = run_once(app, f"{args.work}-{tag}", args.warmup,
-                                args.window, args.timeout, extra)
+                                args.window, args.timeout, extra,
+                                args.game)
             name = args.ref_a if tag == "a" else args.ref_b
             if cpu is None:
                 print(f"run {i+1} {name:28} did not reach the window",
