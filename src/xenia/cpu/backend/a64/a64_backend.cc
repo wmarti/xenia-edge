@@ -1303,6 +1303,9 @@ void A64Backend::InitializeBackendContext(void* ctx) {
   a64_ctx->code_execute_base = cache->execute_base_address();
   a64_ctx->external_indirection_table =
       cache->external_indirection_table_base_address();
+  assert_not_null(guest_to_host_thunk_);
+  a64_ctx->guest_to_host_thunk_address =
+      reinterpret_cast<uint64_t>(guest_to_host_thunk_);
 
   auto set_est = [&](int index, float value) {
     uint32_t bits;
