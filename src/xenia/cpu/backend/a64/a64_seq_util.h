@@ -304,14 +304,39 @@ inline bool NeedsPhysicalRemap() {
   return xe::memory::allocation_granularity() > 0x1000;
 }
 
-// Applies the 0xE0000000 +0x1000 remap to w0, branch-free.
+// Applies the 0xE0000000 +0x1000 remap to w0.
+//
+// The remap exists because the 0xE0000000 view aliases the same physical memory
+// as the 0xC0000000 view, 4 KiB further into it, and MapViews rounds a view's
+// file offset down to the host allocation granularity. It cannot be mapped away
+// on this host: the two aliases are less than one 16 KiB page apart, so no pair
+// of mmap offsets can place both correctly, and the CPU side has to make up the
+// difference on every access.
+//
+// A branch rather than a csel. The condition is overwhelmingly one-sided --
+// ordinary guest code addresses the stack and heap, far below 0xE0000000 -- and
+// Apple's optimization guide (5.4.5) recommends a branch over a conditional
+// instruction exactly when the condition is highly predictable. The larger
+// reason is the dependency chain: with csel the address is not final until the
+// cmp and the csel have both resolved, so the load cannot issue; here w0 is
+// already the address on the path that is nearly always taken, and the remap is
+// off the critical path entirely.
+//
+// Note this does not change the emitted size, only what executes: four
+// instructions are still laid down, three of them run. Neither the corpus
+// replay nor the executed-bytes ranking can see it, so it has to be scored by
+// a paired runtime A/B or not at all.
 inline void ApplyPhysicalRemapW0(A64Emitter& e) {
   using namespace Xbyak_aarch64;
-  // w17 = w0 + 0x1000, kept only when w0 >= 0xE0000000.
-  e.mov(e.w17, 0xE0000000u);
-  e.cmp(e.w0, e.w17);
-  e.add(e.w17, e.w0, 1, 12);  // w17 = w0 + 0x1000 via LSL #12
-  e.csel(e.w0, e.w0, e.w17, LO);
+  Xbyak_aarch64::Label skip;
+  // Addresses at or above 0xE0000000 are exactly those whose top three bits are
+  // all set, so one shift and a compare against a 9-bit immediate decide it
+  // without materializing the bound.
+  e.lsr(e.w17, e.w0, 29);
+  e.cmp(e.w17, 7);
+  e.b(NE, skip);
+  e.add(e.w0, e.w0, 1, 12);  // + 0x1000 via LSL #12
+  e.L(skip);
 }
 
 // Compute a guest memory address, returning the XReg for [x21, xN] addressing.
