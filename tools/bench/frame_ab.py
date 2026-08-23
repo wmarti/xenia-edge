@@ -76,7 +76,7 @@ def cpu_seconds(pid):
     return sec + days * 86400
 
 
-def run_once(app, work, warmup, window_frames, timeout, extra=()):
+def run_once(app, work, warmup_s, window_s, timeout, extra=()):
     """(fps, cpu_percent) over `window_frames` after warmup, or (None, None).
 
     CPU percent is the metric the db16cyc core-release work moved: it releases
@@ -97,32 +97,45 @@ def run_once(app, work, warmup, window_frames, timeout, extra=()):
          "--log_level=2", "--hid=nop", "--discord=false", *extra, GAME],
         cwd=work, stdin=subprocess.DEVNULL, stdout=out,
         stderr=subprocess.STDOUT, start_new_session=True)
-    t_start = None
-    f_start = None
-    c_start = None
+    # Wall-clock windows, not frame-count windows. The frame number is only
+    # visible through the log line prefix, and a title that has settled at its
+    # menu can stop logging entirely for minutes at a time while still running
+    # at full speed -- verified by watching its CPU time climb with the log
+    # untouched. Waiting for a frame count that only advances when something
+    # happens to be logged hangs the run instead of measuring it.
     result = (None, None)
-    deadline = time.time() + timeout
     try:
-        while time.time() < deadline:
-            time.sleep(1.0)
+        start = time.perf_counter()
+        while time.perf_counter() - start < warmup_s:
             if p.poll() is not None:
-                break
-            f = current_frame(log)
-            if t_start is None:
-                if f >= warmup:
-                    t_start, f_start = time.perf_counter(), f
-                    c_start = cpu_seconds(p.pid)
-                continue
-            if f - f_start >= window_frames:
-                elapsed = time.perf_counter() - t_start
-                c_end = cpu_seconds(p.pid)
-                cpu = (100.0 * (c_end - c_start) / elapsed
-                       if c_start is not None and c_end is not None else None)
-                result = ((f - f_start) / elapsed, cpu)
-                break
+                return result
+            time.sleep(1.0)
+        f_start = current_frame(log)
+        c_start = cpu_seconds(p.pid)
+        t_start = time.perf_counter()
+        while time.perf_counter() - t_start < window_s:
+            if p.poll() is not None:
+                return result
+            time.sleep(1.0)
+        elapsed = time.perf_counter() - t_start
+        f_end = current_frame(log)
+        c_end = cpu_seconds(p.pid)
+        cpu = (100.0 * (c_end - c_start) / elapsed
+               if c_start is not None and c_end is not None else None)
+        # Frames only if the log actually moved; otherwise say so rather than
+        # reporting a rate computed from a counter that stood still.
+        fps = (f_end - f_start) / elapsed if f_end > f_start else None
+        result = (fps, cpu)
     finally:
         p.kill()
-        p.wait()
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            os.kill(p.pid, 9)
+            p.wait()
+        # The window server can hold a dead app's surface briefly; give the
+        # next run a clean machine rather than one shared with a survivor.
+        time.sleep(3.0)
         out.close()
     return result
 
@@ -134,8 +147,10 @@ def main():
     ap.add_argument("--ref-a", default="A")
     ap.add_argument("--ref-b", default="B")
     ap.add_argument("--runs", type=int, default=3)
-    ap.add_argument("--warmup", type=int, default=1200)
-    ap.add_argument("--window", type=int, default=1500)
+    ap.add_argument("--warmup", type=float, default=180.0,
+                    help="seconds to run before measuring")
+    ap.add_argument("--window", type=float, default=120.0,
+                    help="seconds to measure over")
     ap.add_argument("--timeout", type=float, default=900)
     ap.add_argument("--work", default="/private/tmp/xenia-bench/frameab")
     ap.add_argument("--out", default="")
@@ -158,12 +173,12 @@ def main():
             fps, cpu = run_once(app, f"{args.work}-{tag}", args.warmup,
                                 args.window, args.timeout, extra)
             name = args.ref_a if tag == "a" else args.ref_b
-            if fps is None:
+            if cpu is None:
                 print(f"run {i+1} {name:28} did not reach the window",
                       flush=True)
             else:
-                print(f"run {i+1} {name:28} {fps:6.2f} fps  "
-                      f"{cpu if cpu is not None else float('nan'):6.1f}% CPU",
+                shown = f"{fps:6.2f} fps" if fps is not None else "  n/a fps"
+                print(f"run {i+1} {name:28} {shown}  {cpu:6.1f}% CPU",
                       flush=True)
                 acc.append((fps, cpu))
     if not a_fps or not b_fps:
