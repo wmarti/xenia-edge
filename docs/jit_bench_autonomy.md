@@ -620,6 +620,44 @@ is worth having — `ccaa671b0`, `dcf981c08`, `8c59d9030` and `1dd664b3f` all
 target exactly that path, and -36% is the first evidence any of them work — but
 it must be read as such. The `tp` suites keep their float inputs normal.
 
+## x64 on the guest loop: the six [x64] commits work, and work hugely
+
+`epyc-7502` (Zen 2, AVX2), exclusively allocated, min of 5, measurement error
+1.63%, spreads mostly 0.1%:
+
+| suite | `edge` | branch | delta |
+|---|---|---|---|
+| `vavgsb_lat` | 9.030 | 0.715 | **-92.08%** |
+| `vavgsw_lat` | 6.475 | 0.715 | **-88.96%** |
+| `vpkuhus_lat` | 2.718 | 0.665 | **-75.53%** |
+| `vand_lat` | 1.466 | 0.415 | -71.72% |
+| `vsel_tp` | 1.467 | 0.465 | -68.32% |
+| `vperm_tp` | 1.567 | 0.515 | -67.15% |
+| `vsel_lat` | 1.617 | 0.565 | -65.06% |
+| `vmaddfp_tp` | 1.466 | 0.565 | -61.48% |
+| `vperm_lat` | 1.817 | 0.765 | -57.88% |
+| `vmaddfp_lat` | 2.218 | 1.166 | -47.43% |
+| `vnmsubfp_tp` | 1.516 | 0.965 | -36.32% |
+| `vnmsubfp_lat` | 3.169 | 2.267 | -28.45% |
+| **TOTAL** | **34.527** | **9.783** | **-71.66%** |
+
+All twelve resolved.
+
+**This reverses the conclusion recorded above.** Callgrind put the two largest
+corpus suites at +0.003% and the reading taken from it — "the branch does not
+change what the x64 backend emits", "x64 got essentially nothing" — was wrong.
+The count was not wrong; it measured a workload in which guest code is a
+rounding error, so it could not have detected this and its near-zero result was
+never evidence either way. Withdrawing a claim for being unresolved was right;
+concluding "no change" from it was not.
+
+`1c102190d` is the clearest case. It claims to replace a 16-iteration scalar
+load/lea/sar/store loop through two stack spills with four instructions, and a
+guest→host call per PACK with `vpminuw`/`vpackuswb`. Measured: `vavgsb` 12.6x,
+`vavgsw` 9.1x, `vpkuhus` 4.1x. The corpus suites for exactly those three opcodes
+are the ones sitting at the 0.314s startup floor, which is why this went
+unmeasured for so long.
+
 ## Where the x64 headroom is
 
 The callgrind result says the x64 backend was left where it was, so the leads
