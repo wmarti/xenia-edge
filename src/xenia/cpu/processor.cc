@@ -328,6 +328,30 @@ void Processor::DumpTraceCounts(FILE* f) {
         static_cast<unsigned long long>(row.hottest));
   }
 
+  // Every counter, not just the per-function total and the one hottest PC.
+  // A function total cannot tell an inner loop from the call setup around it,
+  // and that distinction is what decides whether a codegen change is worth
+  // anything: the loop is where the executions are, and it is often a handful
+  // of the function's instructions.
+  std::fprintf(f, "\n\nguestpc,%llu\n",
+               static_cast<unsigned long long>(grand_total));
+  std::fprintf(f, "address,executed\n");
+  for (auto& row : rows) {
+    auto& region = trace_counts_regions_[row.region];
+    for (size_t i = 0; i < region.count; ++i) {
+      uint64_t total = region.retired[i];
+      for (auto& arena : trace_counts_arenas_) {
+        total +=
+            reinterpret_cast<const uint64_t*>(arena.base + region.offset)[i];
+      }
+      if (total) {
+        std::fprintf(f, "\"%08X\",%llu\n",
+                     region.start_address + static_cast<uint32_t>(i * 4),
+                     static_cast<unsigned long long>(total));
+      }
+    }
+  }
+
   // Long format so the column count does not depend on how many guest threads
   // happen to be live. Threads that already exited share the retired row.
   std::fprintf(f, "\n\nguestcoveragethreads\n");
@@ -368,6 +392,19 @@ void Processor::DumpSequences(FILE* f) {
     uint64_t executed = 0;
     uint64_t occurrences = 0;
     uint64_t host_bytes = 0;
+    // Executions x that site's OWN emitted bytes, summed per site. The
+    // alternative - executions x the sequence's average bytes - is only right
+    // when a site's size is uncorrelated with how hot it is, which is exactly
+    // what cannot be assumed of a sequence whose variants differ in size.
+    uint64_t executed_host_bytes = 0;
+    // The same for the bytes the sequence pushed into the function's tail,
+    // kept separate because a tail is the cold side of a branch and its bytes
+    // are not paid on the executed path.
+    uint64_t executed_tail_bytes = 0;
+    uint64_t executed_chain_instructions = 0;
+    uint64_t executed_chains = 0;
+    uint64_t tail_bytes = 0;
+    uint64_t chains = 0;
   };
   std::map<uint64_t, SequenceRow> sequences;
   std::vector<uint64_t> totals;
@@ -390,10 +427,17 @@ void Processor::DumpSequences(FILE* f) {
         continue;
       }
       auto& row = sequences[sample.key];
-      row.executed += totals[sample.guest_index];
+      const uint64_t executed = totals[sample.guest_index];
+      row.executed += executed;
       row.occurrences += 1;
       row.host_bytes += sample.host_bytes;
-      grand_total += totals[sample.guest_index];
+      row.tail_bytes += sample.tail_bytes;
+      row.chains += sample.chains;
+      row.executed_host_bytes += executed * sample.host_bytes;
+      row.executed_tail_bytes += executed * sample.tail_bytes;
+      row.executed_chain_instructions += executed * sample.chain_instructions;
+      row.executed_chains += executed * sample.chains;
+      grand_total += executed;
     }
   }
   if (!grand_total) {
@@ -402,23 +446,45 @@ void Processor::DumpSequences(FILE* f) {
 
   std::vector<std::pair<uint64_t, SequenceRow>> rows(sequences.begin(),
                                                      sequences.end());
+  // Ranked by executed host bytes, which is the cost. Ranking by executions
+  // alone puts a one-instruction sequence above one that is eight times the
+  // size and nearly as hot.
   std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
-    return a.second.executed > b.second.executed;
+    return a.second.executed_host_bytes > b.second.executed_host_bytes;
   });
+  uint64_t grand_host_bytes = 0;
+  for (auto& row : rows) {
+    grand_host_bytes += row.second.executed_host_bytes;
+  }
 
-  std::fprintf(f, "\n\nguestsequences,%llu\n",
-               static_cast<unsigned long long>(grand_total));
-  std::fprintf(f, "key,sequence,executed,share,occurrences,avgbytes\n");
+  std::fprintf(f, "\n\nguestsequences,%llu,%llu\n",
+               static_cast<unsigned long long>(grand_total),
+               static_cast<unsigned long long>(grand_host_bytes));
+  std::fprintf(f,
+               "key,sequence,executed,share,occurrences,avgbytes,"
+               "exechostbytes,hostshare,exectailbytes,execchaininsts,"
+               "execchains,tailbytes,chains\n");
   for (auto& row : rows) {
     std::string label =
         backend_ ? backend_->FormatSequenceKey(row.first) : std::string();
     std::fprintf(
-        f, "\"%016llX\",\"%s\",%llu,%.6f,%llu,%.2f\n",
+        f,
+        "\"%016llX\",\"%s\",%llu,%.6f,%llu,%.2f,%llu,%.6f,%llu,%llu,%llu,"
+        "%llu,%llu\n",
         static_cast<unsigned long long>(row.first), label.c_str(),
         static_cast<unsigned long long>(row.second.executed),
         double(row.second.executed) / double(grand_total),
         static_cast<unsigned long long>(row.second.occurrences),
-        double(row.second.host_bytes) / double(row.second.occurrences));
+        double(row.second.host_bytes) / double(row.second.occurrences),
+        static_cast<unsigned long long>(row.second.executed_host_bytes),
+        grand_host_bytes
+            ? double(row.second.executed_host_bytes) / double(grand_host_bytes)
+            : 0.0,
+        static_cast<unsigned long long>(row.second.executed_tail_bytes),
+        static_cast<unsigned long long>(row.second.executed_chain_instructions),
+        static_cast<unsigned long long>(row.second.executed_chains),
+        static_cast<unsigned long long>(row.second.tail_bytes),
+        static_cast<unsigned long long>(row.second.chains));
   }
 }
 
