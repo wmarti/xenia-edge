@@ -84,6 +84,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // Reserved: sp, x19 (backend context), x20 (context), x21 (membase)
   // Scratch: x0-x18 (caller-saved), v0-v3
   // Available GPRs for register allocator: x22-x28
+  static void HandleStackpointOverflowError(ppc::PPCContext* context);
   static constexpr int GPR_COUNT = 7;
   // Available VEC regs: v4-v15, v16-v31
   static constexpr int VEC_COUNT = 28;
