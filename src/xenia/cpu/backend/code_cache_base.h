@@ -24,6 +24,7 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -31,6 +32,7 @@
 #include "xenia/base/mutex.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/backend/code_cache.h"
+#include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/function.h"
 
 #if XE_PLATFORM_MAC && XE_ARCH_ARM64
@@ -545,6 +547,9 @@ class CodeCacheBase : public CodeCache {
     self().OnCodePlaced(guest_address, function_info, code_execute_address,
                         func_info.code_size.total);
 
+    WriteJitPerfMapEntry(guest_address, function_info, code_execute_address,
+                         func_info.code_size.total);
+
     // Fix up indirection table.
     if (guest_address && indirection_table_base_) {
       UpdateIndirection(guest_address, code_execute_address);
@@ -632,6 +637,39 @@ class CodeCacheBase : public CodeCache {
   // Default no-op for the OnCodePlaced hook.
   void OnCodePlaced(uint32_t guest_address, GuestFunction* function_info,
                     void* code_execute_address, size_t code_size) {}
+
+  // Appends one line per placed function to the jit_perf_map file, so a host
+  // profiler's raw JIT addresses can be attributed to guest functions:
+  //   <host_hex> <size_hex> <name>
+  // Guest code is otherwise invisible to profilers - it has no symbols and
+  // frequently no unwind info, so samples land on bare addresses.
+  void WriteJitPerfMapEntry(uint32_t guest_address,
+                            GuestFunction* function_info,
+                            void* code_execute_address, size_t code_size) {
+    if (cvars::jit_perf_map.empty()) {
+      return;
+    }
+    auto lock = global_critical_region_.Acquire();
+    if (!jit_perf_map_file_) {
+      jit_perf_map_file_ = xe::filesystem::OpenFile(cvars::jit_perf_map, "wt");
+      if (!jit_perf_map_file_) {
+        return;
+      }
+    }
+    std::string name;
+    if (function_info) {
+      name = function_info->name();
+    }
+    if (name.empty()) {
+      name = fmt::format("guest_{:08X}", guest_address);
+    }
+    fmt::print(jit_perf_map_file_, "{:x} {:x} {}\n",
+               reinterpret_cast<uintptr_t>(code_execute_address), code_size,
+               name);
+    std::fflush(jit_perf_map_file_);
+  }
+
+  FILE* jit_perf_map_file_ = nullptr;
 
   std::filesystem::path file_name_;
   xe::memory::FileMappingHandle mapping_ =
