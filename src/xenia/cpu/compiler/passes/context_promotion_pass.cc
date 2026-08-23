@@ -191,13 +191,6 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
       const uint32_t size = static_cast<uint32_t>(GetTypeSize(type));
       Value* previous_value = LookupTrackedValue(offset, size, type);
       if (previous_value) {
-
-      const size_t offset = i->src1.offset;
-      // Reuse only a value of the identical type. Slots are in practice
-      // accessed with one type each, but an explicit check costs nothing and
-      // an ASSIGN across types would be malformed HIR.
-      if (validity.test(static_cast<uint32_t>(offset)) &&
-          context_values_[offset]->type == i->dest->type) {
         // Legit previous value, reuse.
         i->opcode = &hir::OPCODE_ASSIGN_info;
         i->set_src1(previous_value);
@@ -206,17 +199,6 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
         // (Loads don't modify memory, but TrackValue evicts any tracked
         // value overlapping a range we now know with a different shape.)
         TrackValue(offset, size, i->dest);
-
-      } else {
-        // Store the loaded value into the table. VEC128 participates in the
-        // forwarding here; only dead-store elimination still excludes it
-        // (RemoveDeadStoresBlock), so every vector store keeps reaching
-        // context memory and any host-side reader of ctx->v stays correct.
-        // Accumulator chains (vmaddfp v, ..., v) reloaded the register from
-        // the context on every instruction because of the old exclusion --
-        // load_context v128 topped the execution profile at 330k.
-        context_values_[offset] = i->dest;
-        validity.set(static_cast<uint32_t>(offset));
       }
     } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
       const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
@@ -231,20 +213,19 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
         // still clobbers these bytes, so overlapping tracked values die.
         InvalidateTrackedRange(offset, size);
       }
-
-      // Store value into the table for later (all types, see above).
-      context_values_[offset] = value;
-      validity.set(static_cast<uint32_t>(offset));
     }
     i = next;
   }
 }
 
-// Offsets this block stores before it reads them. The incoming value of such
-// an offset is dead on entry, so a predecessor's store to it need not happen.
-// The walk stops at the first volatile instruction: a call or a preempt check
-// can read the whole context, so nothing past it can be assumed overwritten
-// first.
+// Bytes this block stores before it reads them. The incoming value of such a
+// byte is dead on entry, so a predecessor's store to it need not happen. The
+// walk stops at the first volatile instruction: a call or a preempt check can
+// read the whole context, so nothing past it can be assumed overwritten first.
+//
+// VEC128 stores count here even when promotion is off. Whether this pass is
+// allowed to DELETE a vector store is a separate question from whether that
+// store overwrites the bytes, and it does.
 void ContextPromotionPass::ComputeKillSet(Block* block, llvm::BitVector& kill) {
   kill.reset();
   auto& read = context_kill_read_;
@@ -256,14 +237,21 @@ void ContextPromotionPass::ComputeKillSet(Block* block, llvm::BitVector& kill) {
     }
     if (i->opcode == &OPCODE_LOAD_CONTEXT_info) {
       const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
-      if (!kill.test(offset)) {
-        // The incoming value reaches this load, so it is live on entry.
-        read.set(offset);
+      const uint32_t size = static_cast<uint32_t>(GetTypeSize(i->dest->type));
+      for (uint32_t b = offset; b < offset + size; ++b) {
+        if (!kill.test(b)) {
+          // The incoming byte reaches this load, so it is live on entry.
+          read.set(b);
+        }
       }
     } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
       const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
-      if (!read.test(offset)) {
-        kill.set(offset);
+      const uint32_t size =
+          static_cast<uint32_t>(GetTypeSize(i->src2.value->type));
+      for (uint32_t b = offset; b < offset + size; ++b) {
+        if (!read.test(b)) {
+          kill.set(b);
+        }
       }
     }
     i = i->next;
@@ -297,15 +285,13 @@ void ContextPromotionPass::RemoveDeadStoresBlock(Block* block) {
   // In this walk a validity bit means "this byte is fully overwritten by a
   // later store in this block, with no barrier or load in between".
   auto& validity = context_validity_;
-  validity.reset();
-  const bool promote_vec128 =
-      cvars::context_promote_vec128 && !cvars::disable_context_promotion;
-
-  // Seed with what every successor overwrites before reading. Without this the
-  // trailing branch below resets the set and no store before a block's
+  // Seeded with what every successor overwrites before reading. Without this
+  // the trailing branch below resets the set and no store before a block's
   // terminator is ever eliminated, which is most of them.
   ComputeOutgoingKillSet(block, context_kill_);
   validity = context_kill_;
+  const bool promote_vec128 =
+      cvars::context_promote_vec128 && !cvars::disable_context_promotion;
 
   // Walk backwards and mark byte ranges that are written to.
   // If a store's whole range was already written to later, it is dead.
@@ -315,6 +301,12 @@ void ContextPromotionPass::RemoveDeadStoresBlock(Block* block) {
     if (i->opcode->flags & OPCODE_FLAG_VOLATILE) {
       // Volatile instruction - requires all context values be flushed.
       validity.reset();
+    } else if (i->opcode->flags & OPCODE_FLAG_BRANCH) {
+      // A branch does not read context, and everything after it is a
+      // successor, so restore what the successors make dead rather than
+      // dropping to nothing. Checked after VOLATILE so an opcode carrying both
+      // (a call, a return) still flushes.
+      validity = context_kill_;
     } else if (i->opcode == &OPCODE_LOAD_CONTEXT_info) {
       // A load that survived PromoteBlock is a live use of these bytes:
       // earlier stores overlapping it must be kept. (PromoteBlock folds
@@ -323,13 +315,6 @@ void ContextPromotionPass::RemoveDeadStoresBlock(Block* block) {
       const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
       const uint32_t size = static_cast<uint32_t>(GetTypeSize(i->dest->type));
       validity.reset(offset, offset + size);
-
-    } else if (i->opcode->flags & OPCODE_FLAG_BRANCH) {
-      // A branch does not read context, and everything after it is a
-      // successor, so restore what the successors make dead rather than
-      // dropping to nothing. Checked after VOLATILE so an opcode carrying both
-      // (a call) still flushes.
-      validity = context_kill_;
     } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
       const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
       const Value* value = i->src2.value;

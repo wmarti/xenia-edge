@@ -44,13 +44,6 @@ class ContextPromotionPass : public CompilerPass {
  private:
   void PromoteBlock(hir::Block* block);
   void RemoveDeadStoresBlock(hir::Block* block);
-  // Offsets this block overwrites before reading, i.e. offsets whose incoming
-  // value is dead on entry. Stops at the first volatile instruction, which may
-  // read anything.
-  void ComputeKillSet(hir::Block* block, llvm::BitVector& kill);
-  // The intersection of ComputeKillSet over every successor: what is dead on
-  // every path leaving this block. Empty when the block has no successors.
-  void ComputeOutgoingKillSet(hir::Block* block, llvm::BitVector& out);
 
   // Range-keyed value tracking: a tracked value recorded at `offset` covers
   // every byte of [offset, offset + size).
@@ -58,6 +51,14 @@ class ContextPromotionPass : public CompilerPass {
                                  hir::TypeName type);
   void TrackValue(uint32_t offset, uint32_t size, hir::Value* value);
   void InvalidateTrackedRange(uint32_t offset, uint32_t size);
+
+  // Bytes this block overwrites before reading, i.e. bytes whose incoming
+  // value is dead on entry. Stops at the first volatile instruction, which may
+  // read anything.
+  void ComputeKillSet(hir::Block* block, llvm::BitVector& kill);
+  // The intersection of ComputeKillSet over every successor: what is dead on
+  // every path leaving this block. Empty when the block has no successors.
+  void ComputeOutgoingKillSet(hir::Block* block, llvm::BitVector& out);
 
  private:
   // Indexed by base byte offset into the context: the tracked SSA value

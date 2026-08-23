@@ -368,7 +368,7 @@ struct ScopedMultiWaiter {
   ~ScopedMultiWaiter() {
     g_multi_waiters.fetch_sub(1, std::memory_order_release);
   }
-
+};
 
 // A park that a signal handler can safely block on.
 //
