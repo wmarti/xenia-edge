@@ -76,7 +76,7 @@ def cpu_seconds(pid):
     return sec + days * 86400
 
 
-def run_once(app, work, warmup, window_frames, timeout):
+def run_once(app, work, warmup, window_frames, timeout, extra=()):
     """(fps, cpu_percent) over `window_frames` after warmup, or (None, None).
 
     CPU percent is the metric the db16cyc core-release work moved: it releases
@@ -94,7 +94,7 @@ def run_once(app, work, warmup, window_frames, timeout):
     # No --apu=nop: it fails CreateDriver and the guest dies at boot.
     p = subprocess.Popen(
         [app, f"--storage_root={work}/storage", f"--log_file={log}",
-         "--log_level=2", "--hid=nop", "--discord=false", GAME],
+         "--log_level=2", "--hid=nop", "--discord=false", *extra, GAME],
         cwd=work, stdin=subprocess.DEVNULL, stdout=out,
         stderr=subprocess.STDOUT, start_new_session=True)
     t_start = None
@@ -139,16 +139,22 @@ def main():
     ap.add_argument("--timeout", type=float, default=900)
     ap.add_argument("--work", default="/private/tmp/xenia-bench/frameab")
     ap.add_argument("--out", default="")
+    # Flags applied to one ref only. With the same binary on both sides this
+    # turns the harness into a cvar A/B, which isolates one behaviour without a
+    # rebuild and without any chance of an unrelated code difference leaking in.
+    ap.add_argument("--extra-a", nargs="*", default=[])
+    ap.add_argument("--extra-b", nargs="*", default=[])
     args = ap.parse_args()
 
     a_fps, b_fps = [], []
     for i in range(args.runs):
-        order = [("a", args.app_a, a_fps), ("b", args.app_b, b_fps)]
+        order = [("a", args.app_a, a_fps, args.extra_a),
+                 ("b", args.app_b, b_fps, args.extra_b)]
         if i % 2:
             order.reverse()
-        for tag, app, acc in order:
+        for tag, app, acc, extra in order:
             fps, cpu = run_once(app, f"{args.work}-{tag}", args.warmup,
-                                args.window, args.timeout)
+                                args.window, args.timeout, extra)
             name = args.ref_a if tag == "a" else args.ref_b
             if fps is None:
                 print(f"run {i+1} {name:28} did not reach the window",
