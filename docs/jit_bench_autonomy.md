@@ -1087,49 +1087,105 @@ execution:
 | **per iteration** | **~75.8** |
 | × 6,911,168,410 iterations | **523.9 billion = 19.5% of the capture** |
 
-Of that, **21 host instructions per iteration are dead**, and the reason is
-`PPCHIRBuilder::UpdateCR`. Every PPC `cmpwi` materializes all three CR0 bits
-and stores each to context:
+Of that, a large share is dead, and the reason is `PPCHIRBuilder::UpdateCR`.
+Every PPC compare materializes all three bits of a CR field and stores each to
+context:
 
 ```
 v71 = compare_slt v65, 1     ; 2 host I
-store_context +24, v71       ; 1  -- never read
+store_context +24, v71       ; 1  -- nothing reads it
 v72 = compare_sgt v65, 1     ; 2
-store_context +25, v72       ; 1  -- never read
+store_context +25, v72       ; 1  -- nothing reads it
 v73 = compare_eq v65, 1      ; 2
-store_context +26, v73       ; 1  -- never read (the branch uses the SSA value)
-branch_false v73, label2
+store_context +26, v73       ; 1
+branch_false v73, label2     ; consumes the SSA value, not the context
 ```
 
-Seven of those nine instructions are dead per `cmpwi`, three `cmpwi` per
-iteration: **21 of ~76 host instructions, 27.7% of the loop, 145.1 billion
-instructions, 5.39% of the whole capture** — from this one loop.
+The field here is **cr6, not cr0**. `cr0` is the first member of `PPCContext`,
+so the condition register is bytes `[0,32)` and `+24/+25/+26` are `cr6_0/1/2`.
+The `// 0xA24` comment on `cr0` in `ppc_context.h` is stale, and an earlier
+version of this section was written against it: a static table here counted
+offsets `[24,56)` — cr6, cr7, and 24 bytes that are not the condition register
+at all — and reported "70.6% of CR stores dead". **That table was wrong and has
+been removed.** Halo 3's compiler uses cr6 for almost all of its integer
+compares, which is why the numbers looked plausible.
 
-Existing passes cannot remove them. `OPCODE_CONTEXT_BARRIER` is `IsFake()` and
+Existing passes cannot remove these. `OPCODE_CONTEXT_BARRIER` is `IsFake()` and
 carries no flags, so it is not the obstacle; the cross-block DSE is. Its kill
 set is intersected over all successors, and `label14`'s other successor is the
-`lwarx`/`stwcx.` retry block, which never rewrites CR0. The intersection is
+`lwarx`/`stwcx.` retry block, which never rewrites cr6. The intersection is
 empty, so nothing is killed on the hot path.
+
+### What the pass actually recovers
+
+`DeadCRStoreEliminationPass` — backward liveness over the 32 bytes cr0..cr7 —
+removes the `lt` and `gt` write in `label14` and in `label2`, two compares and
+two stores each:
+
+| block | before | after | saved |
+| --- | --- | --- | --- |
+| `label14` | 25.16 | 19.16 | 6 host I |
+| `label2` | 12.69 | 6.69 | 6 host I |
+| `label13` | 37.91 | 37.91 | 0 |
+
+`label13` keeps all three because `label14` opens with `check_preempt`, which
+the pass treats as reading the whole context, so everything is live out of
+`label13`'s back edge. That is deliberate — a preemption point can hand the
+thread to the scheduler — and relaxing it is worth another 6 instructions an
+iteration if it can be justified.
+
+**12 of ~75.8 host instructions per iteration, 15.8% of the loop, 82.9 billion
+instructions, 3.08% of the capture** — from this one loop. The earlier estimate
+of 21 assumed all three compares could go; the third cannot, for the reason
+above.
 
 ### The static picture, across the whole title
 
-8,508 optimized function dumps, counting `store_context` into the CR range
-`[24,56)` against the offsets any `load_context` in the same function reads
-back:
+The same 8,508 functions dumped twice from one binary, `eliminate_dead_cr_stores`
+false against true. Identical function sets, so this is a like-for-like diff:
 
-| off | field | stores | dead at function scope | |
+| | before | after | |
+| --- | --- | --- | --- |
+| HIR instructions | 2,884,274 | 2,703,301 | **-6.27%** |
+| `i8` compares | 202,752 | 148,831 | **-26.59%** |
+| CR stores `[0,32)` | 236,979 | 138,412 | **-41.59%** |
+
+By field, and the asymmetry is the whole point — `lt` and `gt` go, `eq` mostly
+stays because it is the bit the branch consumes:
+
+| off | field | before | after | removed |
 | --- | --- | --- | --- | --- |
-| +24 | `cr0_lt` | 73,333 | 57,456 | 78.3% |
-| +25 | `cr0_gt` | 73,333 | 57,456 | 78.3% |
-| +26 | `cr0_eq` | 73,333 | 57,456 | 78.3% |
-| +27 | `cr0_so` | 4,450 | 3,190 | 71.7% |
-| +48 | `cr6_0` | 14,888 | 23 | 0.2% |
-| +32 | `cr2_0` | 9,526 | 0 | 0.0% |
+| +24 | `cr6_0` (lt) | 73,333 | 33,303 | 40,030 |
+| +25 | `cr6_1` (gt) | 73,333 | 33,030 | 40,303 |
+| +26 | `cr6_2` (eq) | 73,333 | 60,281 | 13,052 |
+| +27 | `cr6_3` (so) | 4,450 | 1,751 | 2,699 |
+| +0 | `cr0_0` | 4,098 | 3,023 | 1,075 |
+| +1 | `cr0_1` | 4,098 | 2,991 | 1,107 |
+| +2 | `cr0_2` | 4,098 | 3,797 | 301 |
 
-**176,356 of 249,722 CR stores — 70.6% — target a field the function never
-reads.** This count is static, not execution-weighted; the 5.39% figure above
-is the sound per-site one. `cr6` is the vector-compare path and is essentially
-all live, so it must be left alone.
+Static, not execution-weighted. The 3.08% above is the sound per-site figure,
+and the runtime A/B is what decides.
+
+### What the first attempt cost, and what it proved
+
+The first version was whole-function: drop any CR write nothing in the function
+reads back. That is what the PowerPC ABI actually permits, since cr0, cr1 and
+cr5-cr7 are caller-volatile. It failed **9,569 of 169,048** PPC tests — and
+every single failure was a `cr` assert, with no GPR, FPR or VR wrong anywhere.
+The transform never miscompiles arithmetic; it drops CR state the test harness
+reads after the function returns. Useful evidence, because it bounds what the
+aggressive version can break to exactly one thing.
+
+The liveness version treats a return as reading everything and passes
+169,048/169,048.
+
+One detail was load-bearing and cost a whole build-and-dump cycle to find:
+`BRANCH_TRUE` and `BRANCH_FALSE` carry `OPCODE_FLAG_VOLATILE`. Letting them fall
+into the blanket "volatile reads everything" case relights every bit and
+eliminates nothing at all — the first liveness build passed the tests and
+removed exactly zero instructions, and the HIR dump was identical to the
+baseline down to the line count. A branch reads no context; it takes its
+target's live set.
 
 ## TODO — the immediately optimizable parts
 
@@ -1139,18 +1195,13 @@ measurement rather than by the code.
 
 ### Tier 1 — implementable now, target already measured
 
-**1. CR-bit liveness in `UpdateCR`.** 70.6% of CR stores are dead at function
-scope; 21 of ~76 host instructions in a loop that is 19.5% of the capture.
-Compute a per-function read set for the CR fields before emission — the scanner
-already walks every instruction — and skip the `StoreContext` for fields nothing
-reads. The compares come off for free: `DeadCodeEliminationPass` drops any
-non-`VOLATILE` instruction whose `dest` has no uses, so once the store is gone
-`compare_slt` and `compare_sgt` go with it. The change is confined to
-`PPCHIRBuilder::UpdateCR` plus the analysis.
-*Risk:* a caller reading CR0 across a call. CR0 is caller-volatile under the PPC
-ABI, but that assumption has to be paid for, not assumed — gate on a cvar,
-require 169,048/169,048 PPC tests, then a paired A/B.
-*Do not touch `UpdateCR6`* — `cr6` is 0.2% dead.
+**1. CR-bit liveness — DONE.** `DeadCRStoreEliminationPass`, backward liveness
+over the 32 bytes `cr0..cr7`. Statically **-41.59% of CR stores, -26.59% of
+`i8` compares, -6.27% of all HIR** across the title's 8,508 functions;
+169,048/169,048 PPC tests. Gated on `eliminate_dead_cr_stores`.
+*What is left in it:* `check_preempt` is treated as reading the whole context,
+which is what keeps the third compare in the spin loop alive. Justifying a
+narrower rule there is worth another 6 host instructions per iteration.
 
 **2. Generalized spin-loop release.** `delay_execution` fires 937,637 times from
 12 sites — **0.001%**. The db16cyc detector sees none of these polls, because
@@ -1160,8 +1211,10 @@ self-looping HIR block whose body has no stores, no calls, no `reserved_load`/
 `DELAY_EXECUTION` core-release path. The db16cyc release measured **-4.99% CPU**
 on its own; this reaches roughly a hundred times more execution.
 *Risk:* the highest of anything on this list — releasing a core inside a loop
-that is not actually waiting will cost frames. Needs the FPS guard as well as
-CPU percent, and a title that is not FPS-capped alongside Halo 3.
+that is not actually waiting will cost frames. Both titles on this machine,
+Halo 3 and Halo Reach, are locked at 30 fps, so neither can show the damage as
+a frame-rate drop; the guard has to be something else — frame-time variance
+inside the window, or a title that is not capped.
 
 **3. `storev_left` / `storev_right` arm selection.** 213 sites, 45.00
 instructions each. `EmitPartialVectorStore` emits all five size arms inline.
