@@ -1032,6 +1032,18 @@ struct ZERO_EXTEND_I64_I32
     : Sequence<ZERO_EXTEND_I64_I32, I<OPCODE_ZERO_EXTEND, I64Op, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     // mov wD, wS implicitly zero-extends to 64 bits on ARM64.
+    if (!i.src1.is_constant &&
+        i.dest.reg().getIdx() == i.src1.reg().getIdx()) {
+      // Already the answer. Every W-form instruction zeroes the upper half of
+      // its X register, and this backend produces I32 values only through W
+      // forms, so an I32 value's upper half is already zero. Widening it in
+      // place is then a move of a register onto itself.
+      //
+      // The mirror case in TRUNCATE_I32_I64 is NOT elidable: there the source
+      // is an I64 whose upper half may be set, and the mov is what establishes
+      // the invariant this relies on.
+      return;
+    }
     auto w_dest = WReg(i.dest.reg().getIdx());
     e.mov(w_dest, i.src1);
   }
