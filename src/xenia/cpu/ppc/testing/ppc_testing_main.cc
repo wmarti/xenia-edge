@@ -773,6 +773,11 @@ struct FunctionResult {
   uint32_t host_bytes;
   uint32_t captured_host_bytes;
   uint32_t wide_move_instructions;
+  // Split out so a per-function join against execution counts can price the
+  // materialization sites separately from the immediates. A chain is one site;
+  // its instruction count varies with where the process happened to load.
+  uint32_t address_chains;
+  uint32_t address_chain_instructions;
 };
 
 // Outside the ARM64 guard on purpose: the totals below are summed and
@@ -1081,10 +1086,14 @@ bool RunCorpusReplay() {
     const uint32_t guest_instructions =
         (record.end_address - record.address) / 4 + 1;
     uint32_t wide_moves = 0;
+    uint32_t fn_address_chains = 0;
+    uint32_t fn_address_chain_instructions = 0;
 #if XE_ARCH_ARM64
     WideMoveStats fn_stats;
     AccumulateWideMoves(guest_function->machine_code(), host_bytes, &fn_stats);
     wide_moves = fn_stats.total;
+    fn_address_chains = fn_stats.address_chains;
+    fn_address_chain_instructions = fn_stats.in_address_chains;
     wide_move_stats.total += fn_stats.total;
     wide_move_stats.in_address_chains += fn_stats.in_address_chains;
     wide_move_stats.in_small_chains += fn_stats.in_small_chains;
@@ -1105,7 +1114,8 @@ bool RunCorpusReplay() {
       }
     }
     results.push_back({record.address, guest_instructions, host_bytes,
-                       record.host_code_size, wide_moves});
+                       record.host_code_size, wide_moves, fn_address_chains,
+                       fn_address_chain_instructions});
   }
   const auto elapsed = std::chrono::steady_clock::now() - start;
   const double compile_seconds =
@@ -1254,10 +1264,13 @@ bool RunCorpusReplay() {
               xe::path_to_utf8(cvars::jit_corpus_csv).c_str());
       return false;
     }
-    fprintf(csv, "guest_address,guest_instructions,host_bytes,captured_bytes\n");
+    fprintf(csv,
+            "guest_address,guest_instructions,host_bytes,captured_bytes,"
+            "wide_moves,address_chains,address_chain_instructions\n");
     for (const auto& r : results) {
-      fprintf(csv, "%08X,%u,%u,%u\n", r.address, r.guest_instructions,
-              r.host_bytes, r.captured_host_bytes);
+      fprintf(csv, "%08X,%u,%u,%u,%u,%u,%u\n", r.address, r.guest_instructions,
+              r.host_bytes, r.captured_host_bytes, r.wide_move_instructions,
+              r.address_chains, r.address_chain_instructions);
     }
     fclose(csv);
     fprintf(stdout, "\n  wrote %s\n",
