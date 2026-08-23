@@ -142,8 +142,10 @@ def main():
     # Flags applied to one ref only. With the same binary on both sides this
     # turns the harness into a cvar A/B, which isolates one behaviour without a
     # rebuild and without any chance of an unrelated code difference leaking in.
-    ap.add_argument("--extra-a", nargs="*", default=[])
-    ap.add_argument("--extra-b", nargs="*", default=[])
+    # Repeatable rather than nargs="*": the values are themselves flags, and
+    # argparse hands a leading "--" to the option parser instead of the list.
+    ap.add_argument("--extra-a", action="append", default=[])
+    ap.add_argument("--extra-b", action="append", default=[])
     args = ap.parse_args()
 
     a_fps, b_fps = [], []

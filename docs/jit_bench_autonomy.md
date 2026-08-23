@@ -506,3 +506,55 @@ that -- is invisible to both the corpus replay and the executed-bytes ranking,
 and can only be scored by a paired runtime A/B. And the ranking still owes an
 independent check against uninstrumented host-PC sampling; `--jit_perf_map`,
 which arrived with the db16cyc series, is what that would need.
+
+## Rebasing onto upstream, and what upstream already had
+
+The upstream for this fork is **has207/edge**, not `origin/edge` -- `origin` is
+this user's own fork. Checking currency against `origin` answered the wrong
+question: the branch was 0 behind `origin/edge` and 76 behind `has207/edge` at
+the same time.
+
+Policy for the rebase, in the user's words: *upstream is bible, drop or alter
+anything we have that's not as good / overlapping garbo.* Eight commits were
+dropped as duplicated or superseded:
+
+| ours | upstream's |
+| --- | --- |
+| SELECT_F64 borrow-mask blend | `bb41c0e3d`, which also handles a constant arm through a GPR cmov |
+| lvrx zero-offset guard | `cc476d526`'s equivalent, same `movi`/`cbz`, different label name |
+| constant vector operands out of aliased scratch | `e6a86116f` |
+| four `[Base/POSIX]` threading commits | `addda160c`, `0cfa18775`, `1cf1169fa`, `cfcc929b6` |
+| db16cyc ISB lowering | `d624e09eb`, which additionally **coalesces** consecutive barriers |
+
+That last one matters beyond deduplication. Upstream's `DELAY_EXECUTION` returns
+early when the previously emitted instruction was already an `isb`, so Halo 3's
+sled of eight `db16cyc` collapses to one instruction. That is the
+"compile-time delay batching" idea, already done and better than the ported
+version, and it changes the meaning of the core-release counter: the count now
+advances once per loop iteration rather than eight times, so the escalation
+threshold moved from 16 to 2.
+
+Two further pieces came back from the dropped commits on their own merits:
+`--jit_perf_map`, which writes a JIT symbol map so a host profiler can attribute
+samples inside the code cache to guest functions, and the core release itself,
+reimplemented on top of upstream's coalescing so every path through the sequence
+still ends in the `isb` the coalescing test looks for.
+
+### A note on automated conflict resolution
+
+141 commits were replayed and a script resolved the "both sides added something
+here" shape by keeping both. It was wrong five times, and every failure was
+silent at the diff level and loud at the compiler:
+
+  - a struct member declared twice, once at its new home and once at the old
+    site the commit existed to move it away from, breaking a size assertion
+  - a class left without its closing brace, so every later definition in the
+    file parsed as a member
+  - upstream's range-keyed context tracking interleaved line-by-line with the
+    offset-keyed version it replaced
+  - call sites left passing an argument upstream's signature had dropped
+  - a declaration deleted while its definition survived
+
+None of this is an argument against automating the mechanical case; it is an
+argument that anything auto-resolved is unverified until it compiles and the
+169,048-case suite passes. Both gates were run before the result was trusted.
