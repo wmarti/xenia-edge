@@ -625,6 +625,10 @@ void EmulatorApp::OnDestroy() {
     discord::DiscordPresence::Shutdown();
   }
 
+  if (emulator_ && emulator_->processor()) {
+    emulator_->processor()->DumpTraceCountsToFile();
+  }
+
   // The profiler needs to shut down before the graphics context.
   Profiler::Shutdown();
 
