@@ -37,6 +37,13 @@ It is a submission host only. Everything real goes through `sbatch`/`srun`.
 Build and time on node-local `/tmp` (~320 GB free). `/home` is NFS at 96%
 capacity and must not carry build trees or timing runs.
 
+Covering both classes is not optional. The x64 backend gates code on
+`kX64EmitAVX512Ortho` in seventeen places, plus `kX64EmitAVX512VBMI`,
+`kX64EmitAVX512DQ`, `kX64EmitAVX512BW` and `kX64EmitGFNI` — none of which a
+Zen 2 node ever executes. A gate that only ever runs on `epyc-7502` leaves
+every one of those paths unmeasured, and a fault in one stays invisible until
+the code reaches an Intel machine.
+
 ## 2. The measurement substrate
 
 `xenia-cpu-ppc-tests` is both the correctness suite and the benchmark workload,
@@ -124,13 +131,19 @@ believed not to touch (`instr__gen_vand`) on the theory that its delta is pure
 measurement error. Measured, that control moved **-9.3%**, which on its face
 would mean the branch's -8.8% total is entirely noise.
 
-It is not. The premise is simply wrong for this branch. Several commits change
-code that every suite executes regardless of which instruction it is testing:
-guest-address zero-extend folding touches every load and store, stackpoints as
-linked records touch every guest frame, and moving `preempt_requested` into the
-`PPCContext` padding hole changes the layout every test shares. There is no
-suite whose emitted code this branch leaves alone, so a suite-based control
-measures the branch's general improvement and reports it as noise.
+That reading was too confident, and later measurement undercut it. `vand` is a
+0.15s suite, and sub-second suites on this machine do not resolve at all: at
+N=25 the same suite came out **+0.84%** with 15.5% spread, and a second tool
+put it at +0.65%. The -9.2% was not a measurement of anything. On x64,
+callgrind — which is deterministic — puts `vand` at **+0.02%**.
+
+So the honest position is that **the control moved by an unknown amount**,
+which is worse for a control than moving by a known one. The argument for
+distrusting a suite-based control does not depend on the number, though: this
+branch changes guest-address zero-extend folding, stackpoint records, and the
+`PPCContext` layout, all of which are on the path every suite executes, so
+there is no suite it demonstrably leaves alone. A control has to be something
+the change provably cannot reach.
 
 **The control must be the same binary against itself.** Running ref A as both
 sides of the comparison isolates measurement error, because the two sides are
@@ -282,10 +295,23 @@ published, so this is the number of record. `instr_mcrf` getting marginally slow
 consistent with the fix: it now copies the CR field instead of comparing it
 against zero.
 
-The gains are close to uniform across suites that test unrelated instructions,
-which is what the diff predicts — `hir_builder`, `ppc_hir_builder`, and
-`ppc_context.h` are on the path every suite executes. `ppc_testing_main.cc` is
-byte-identical between the refs, so the harness is not contributing.
+**Only the suites above about a second are actually measured.** Everything
+under roughly 0.4s — `vand`, `vaddfp`, `vavgsb`, `vavgsw`, `vpkuhus`, `fadd`,
+`fmuls`, `mcrf` — runs a sample spread of 7-92%, and the delta between refs is
+smaller than that spread. Raising the repetition count from 5 to 25 does not
+converge them: at N=25 `vand` came out +0.84% with 15.5% spread and `fadd`
+came out -31.6% with 72.5% spread. The variation is process startup, which no
+amount of repetition removes, because it is not the thing being timed.
+
+Two different tools disagree by more than ten points on the same sub-second
+suite while agreeing to a fraction of a point on the large ones. Treat the
+small-suite figures as **not measured**, which is a different statement from
+"no change".
+
+What survives that: the five suites over a second move -7.8% to -9.8% on a64,
+with spreads of 1.7-4.9%, reproduced across two independent tools and four
+runs. `ppc_testing_main.cc` is byte-identical between the refs, so the harness
+is not contributing to it.
 
 ### ylab
 
@@ -344,9 +370,21 @@ The same corpus, the same common test path, the same gate:
 | `edge` | 493 | 169,058 | 4 (`instr_mcrf`) | 1 (`instr_seq_stacksync`) |
 | `a64-fixes-on-edge` | 493 | 169,059 | 0 | 0 |
 
-**This is identical to the a64 result**, case count for case count: the same
-four `instr_mcrf` failures, the same `instr_seq_stacksync` crash, the same two
-fixes, on a completely different backend and instruction set.
+Repeated on `ad-01` (Xeon Gold 5418Y, Sapphire Rapids), which exercises the
+seventeen `kX64EmitAVX512Ortho` sites and the VBMI/DQ/BW/GFNI paths that a Zen 2
+node never reaches: **the same numbers again**. That run also started from a
+bare node with nothing prepared and completed in eighteen minutes end to end,
+which is what makes the pipeline usable unattended.
+
+| backend | machine | `edge` | `a64-fixes-on-edge` | gate |
+|---|---|---|---|---|
+| `a64` | M4 Pro | 4 failed, 1 crashed | clean, 169,059 | pass, 2 fixes |
+| `x64` AVX2 | `epyc-7502`, Zen 2 | 4 failed, 1 crashed | clean, 169,059 | pass, 2 fixes |
+| `x64` AVX-512 | `ad-01`, Sapphire Rapids | 4 failed, 1 crashed | clean, 169,059 | pass, 2 fixes |
+
+**Three backends and microarchitectures, identical verdicts on 169,059 cases**,
+case count for case count: the same four `instr_mcrf` failures, the same
+`instr_seq_stacksync` crash, the same two fixes.
 
 That agreement is the whole reason for running two machines. The eight `[CPU]`
 commits change PPC semantics — NaN propagation, FPSCR summary bits, denormal
@@ -359,6 +397,400 @@ It is not proof. Both backends share the PPC frontend and the HIR, so a mistake
 made there is reproduced faithfully on both sides rather than exposed by the
 comparison. What the differential rules out is a *backend-specific* divergence,
 which is the failure mode the `[A64]` and `[x64]` commits actually risk.
+
+### x64 performance, by instruction count
+
+Deterministic counts from callgrind on `epyc-7502`, so there is no noise floor
+to argue about — a repeat run reproduces these exactly.
+
+| suite | `edge` | `a64-fixes-on-edge` | delta |
+|---|---|---|---|
+| `instr__gen_vand` (control) | 7,056,240,079 | 7,057,910,328 | **+0.02%** |
+| `instr__gen_fadd` | 3,282,870,661 | 3,282,928,413 | +0.00% |
+| `instr__gen_vpkuhus` | 7,126,542,664 | 7,128,889,457 | +0.03% |
+| `instr__gen_vavgsb` | 7,096,569,406 | 7,070,813,334 | -0.36% |
+| `instr__gen_vavgsw` | 7,097,459,022 | 7,068,726,035 | -0.40% |
+| `instr_mcrf` | 216,830,888 | 215,710,348 | -0.52% |
+| `instr__gen_fmuls` | 3,373,447,955 | 3,336,985,652 | -1.08% |
+| `instr__gen_fmadds` | 40,983,983,671 | 40,281,803,563 | -1.71% |
+| **TOTAL** | **76,233,944,346** | **75,443,767,130** | **-1.04%** |
+
+Two things are worth reading carefully here.
+
+**This table is not comparable to the wall-clock numbers, because it covers
+the wrong suites.** Seven of the eight are sub-second, chosen because they are
+what the six `[x64]` commits name — and those are exactly the suites where
+nothing resolves. The one large suite in the set, `fmadds`, moves -1.71%. Read
+this table as "the small suites do not move much on x64", not as the branch's
+x64 improvement.
+
+**On x64 the control behaves like a control**, moving +0.02%. On a64 the same
+suite moved -9.2%, because the a64 commits change addressing, guest frames and
+`PPCContext` layout — code every suite runs. The same suite is a valid control
+for one backend and a useless one for the other, which is a good argument for
+calibrating against an identical binary rather than against a suite believed to
+be untouched.
+
+A caveat on the metric: these counts cover the whole process, including JIT
+compilation and the test harness, so a change confined to generated code is
+diluted by everything around it. The counts are exact but they are not a
+measurement of the emitted code alone.
+
+### The large x64 suites: no change at all (job 103439)
+
+Five hours of callgrind on `epyc-7502` over the two biggest suites in the
+corpus, which the table above does not reach:
+
+| suite | `edge` | `a64-fixes-on-edge` | delta |
+|---|---|---|---|
+| `instr__gen_vsel` | 171,712,643,046 | 171,717,222,596 | **+0.003%** |
+| `instr__gen_vperm` | 172,050,578,523 | 172,055,008,443 | **+0.003%** |
+
+Different binaries — the counts are close but not equal, so this is not the
+same-binary trap. They execute the same x64 instruction stream. `vmaddfp`
+completed its count (172,949,345,163) but exited non-zero and was dropped.
+
+### The -7.8% x64 wall-clock figure is withdrawn
+
+An exclusively allocated `ad-01` (Sapphire Rapids, AVX-512) reported -7.80%
+overall, with spreads of 11-20%. An exclusively allocated `epyc-7502` (Zen 2,
+AVX2), same tooling, same corpus, reports **+1.16%**, with `vmaddfp` at
+**+16.74%** against ad-01's -7.53%. A sign flip of that size between two
+measurements of the same two binaries is not a property of the binaries.
+
+The cause was in this repo, not in the cluster: `bench_pair.py` calibrated
+A-vs-A on `args.suites[0]`, which both jobs set to `instr__gen_vand` — 0.31s,
+essentially all of it process startup. Startup is extremely reproducible, so
+the calibration reported a 0.07% "measurement error" and the six-second suites
+were read against it. Fixed in `dd3d69b37`: calibration now runs on the
+longest non-startup-bound suite.
+
+Callgrind is the tiebreak and it has no noise floor: on the two largest suites
+the delta is +0.003%. **The branch does not change what the x64 backend
+emits for these suites.** The a64 -8% stands — spreads of 1.7-4.9% against a
+delta of 7.8-9.8%, and 30 of the 45 commits are `[A64]`.
+
+### Eight of thirteen suites cannot measure anything
+
+On ylab every one of `vand`, `vaddfp`, `vavgsb`, `vavgsw`, `vpkuhus`, `fadd`,
+`fmuls`, `mcrf` finishes at 0.314s, which is bare process startup in the
+container. Three of them showed a confident `+15.9%` with a 0.2% spread: that
+is 0.314s → 0.364s, a fixed ~50 ms difference in how long the two binaries
+take to load, and none of it is guest code.
+
+This also clears the open `vpkuhus` lead. `1c102190d` replaces a guest→host
+call per PACK 8_IN_16 unsigned execution with `vpminuw`/`vpackuswb`, and
+`vpkuhus` is exactly that opcode. It showed nothing because the suite runs
+almost no guest code, not because the commit does nothing. Validating it needs
+a workload that executes the pack path — real game code, or a synthetic loop.
+
+`bench_pair.py` now measures startup directly, marks these suites
+startup-bound, and leaves them out of the total.
+
+## What the corpus actually measures
+
+Every test case in the generated corpus is one guest instruction and a `blr`:
+
+```
+test_vsel_1_GEN:
+  #_ REGISTER_IN v1 [...]
+  vsel v4, v1, v2, v3
+  blr
+```
+
+Around that, `ppc_testing_main.cc` resets the guest memory heap
+(`memory_->Reset()`, line 291), tears down and rebuilds `ThreadState`, JITs the
+function, calls it once, and string-compares the registers. Measured cost per
+case on an M4 Pro:
+
+| suite | cases | µs/case |
+|---|---|---|
+| `instr__gen_vand` | 650 | 208.9 |
+| `instr__gen_vsel` | 15,600 | 221.3 |
+| `instr__gen_vperm` | 15,600 | 234.8 |
+| `instr__gen_vmaddfp` | 15,600 | 241.0 |
+| `instr__gen_fmadds` | 3,456 | 285.9 |
+
+Roughly 800,000 cycles to execute one guest `vand`. Sampling `instr__gen_vsel`
+(1,825 main-thread samples, `edge`) shows where they go:
+
+| | samples | share |
+|---|---|---|
+| `BaseHeap::RebuildFreeBlocks` | 859 | 47% |
+| `Memory::Reset` → `__bzero` | 233 | 13% |
+| `ThreadState` ctor (mmap/munmap) | 183 | 10% |
+| Capstone disassembly | 200 | 11% |
+| all JIT frames | 108 | 6% |
+| — of which code generation | 31 | 1.7% |
+| **executing guest code** | **0** | **0%** |
+
+`RebuildFreeBlocks` is a linear scan of the ~1M-entry page table, run once per
+test case. There are no samples in `HostToGuest`, none in `Function::Call`,
+none in JITted code.
+
+## Attributing the a64 gain
+
+`edge` rebuilt with one half of the branch applied at a time, five large suites,
+min of 5:
+
+| build | vs `edge` | detail |
+|---|---|---|
+| `base-only` — 26 `[Base/POSIX]` + `[VFS]` | **+0.11%** | all five unresolved |
+| `cpu-only` — the 55 JIT commits | **-9.47%** | all five resolved, spreads 1.6-6.7% |
+| full branch | **-8.70%** | matches `cpu-only` |
+| `cpu-only`, harness debug dumping off | **-4.32%** | four of five resolved |
+
+The gain is entirely in `src/xenia/cpu`; the POSIX layer contributes nothing.
+That refuted the reading the profile suggested, which is why the split was
+built rather than argued.
+
+**About half the gain is the harness disassembling less code.**
+`ppc_testing_main.cc:268` sets `DebugInfoFlags::kDebugInfoAll`, so every one of
+the 15,600 JITted functions is dumped four ways — PPC source, raw HIR,
+optimised HIR, and the emitted host code walked instruction-by-instruction
+through Capstone by `A64Assembler::DumpMachineCode`. That last cost is
+proportional to how much code the backend emits. Rebuilding both refs with the
+flag set to `kDebugInfoNone` (a measurement-only patch, never landed) takes the
+delta from -9.47% to **-4.32%**. The dumping portion itself falls from 3.60s to
+2.58s, **-28%** — a direct proxy for the branch emitting less host code.
+
+So the -8.7% decomposes as: roughly half a code-size effect visible only
+because the harness disassembles everything, and roughly half JIT throughput
+and per-function overhead. **None of it is the speed of the emitted code**,
+which each suite executes exactly once per test case.
+
+## What this means for the branch's performance commits
+
+Of the 87 commits, ~35 make an explicit performance claim. **None has
+individual runtime evidence** — the finest attribution that exists is the
+four-row table above, and the smallest unit in it is 55 commits at once.
+
+- **Cannot be tested by this corpus at all** — they change how fast an emitted
+  sequence runs, not how large it is: `c4a4239d4` (SELECT_V128 BIT/BIF),
+  `d73cfa239` (vperm REV32 tables), `e16e9995d` (merges as zip), `b07a4187d`,
+  `38e7c5687`, `b1b9aab4f`, and all six `[x64]` commits — the last independently
+  confirmed at +0.003% by callgrind.
+- **Partially evidenced, as code size** — they shrink emitted code, which is
+  what the -28% dumping drop measures: `6c66fa966` (denormal flush in four),
+  `9d5f12670` (FMA fixup in four), `5b15a057a` (NaN paths to the tail),
+  `818537738` (prologue safepoints), `caa641401` (stp/ldp pairing). Smaller is
+  not shown to be faster.
+- **Proven, but as correctness rather than performance**: `752ddf5f9` (mcrf)
+  and `97343ebff` (stacksync), both confirmed on a64, AVX2 and AVX-512.
+
+Closing this gap needs a workload that executes guest code in a loop — real
+game code, or a synthetic harness — not more runs of this corpus.
+
+## Measuring the emitted code
+
+`tools/bench/gen_loop_bench.py` puts the opcode in a guest loop — 512M to 1B
+executions per suite — so the emitted sequence is ~98% of the run instead of
+~0%. `edge` vs the branch, M4 Pro, min of 5, measurement error 0.17%:
+
+| suite | `edge` | branch | delta |
+|---|---|---|---|
+| `vsel_lat` | 1.118 | 0.325 | **-70.95%** |
+| `vsel_tp` | 1.384 | 0.344 | **-75.15%** |
+| `vperm_lat` | 1.472 | 0.498 | -66.18% |
+| `vperm_tp` | 1.380 | 0.342 | -75.19% |
+| `vmaddfp_lat` (nonfinite path) | 3.082 | 1.964 | -36.28% |
+| `vmaddfp_tp` | 1.385 | 0.381 | -72.50% |
+| `vnmsubfp_lat` (nonfinite path) | 3.424 | 2.285 | -33.27% |
+| `vnmsubfp_tp` | 1.438 | 0.439 | -69.43% |
+| **TOTAL** | **14.683** | **6.578** | **-55.20%** |
+
+All eight resolved. Both refs compute the same final register in every suite,
+checked by running a short version with a deliberately wrong `REGISTER_OUT` and
+comparing what the harness reports — so this is not a faster wrong answer.
+
+`vsel_lat` is the cleanest reading. 512M serial selects: `edge` spends 8.7
+cycles each, the branch 2.5. That is three dependent instructions collapsing to
+one, which is exactly what `c4a4239d4` claims, and it had never been measured
+before because the corpus cannot see it.
+
+**These are microbenchmarks of a single opcode, and the percentages are not
+game speedups.** They say the emitted sequence is ~3.4x faster, not that
+anything is 3.4x faster. What fraction of real guest code is `vsel` is a
+separate question, and the next one worth answering — there are titles in
+`~/Documents/X360-Games`.
+
+The float `lat` suites diverge to Inf/NaN within a few iterations and stay
+there, so they measure the nonfinite path rather than ordinary operands. That
+is worth having — `ccaa671b0`, `dcf981c08`, `8c59d9030` and `1dd664b3f` all
+target exactly that path, and -36% is the first evidence any of them work — but
+it must be read as such. The `tp` suites keep their float inputs normal.
+
+## x64 on the guest loop: the six [x64] commits work, and work hugely
+
+`epyc-7502` (Zen 2, AVX2), exclusively allocated, min of 5, measurement error
+1.63%, spreads mostly 0.1%:
+
+| suite | `edge` | branch | delta |
+|---|---|---|---|
+| `vavgsb_lat` | 9.030 | 0.715 | **-92.08%** |
+| `vavgsw_lat` | 6.475 | 0.715 | **-88.96%** |
+| `vpkuhus_lat` | 2.718 | 0.665 | **-75.53%** |
+| `vand_lat` | 1.466 | 0.415 | -71.72% |
+| `vsel_tp` | 1.467 | 0.465 | -68.32% |
+| `vperm_tp` | 1.567 | 0.515 | -67.15% |
+| `vsel_lat` | 1.617 | 0.565 | -65.06% |
+| `vmaddfp_tp` | 1.466 | 0.565 | -61.48% |
+| `vperm_lat` | 1.817 | 0.765 | -57.88% |
+| `vmaddfp_lat` | 2.218 | 1.166 | -47.43% |
+| `vnmsubfp_tp` | 1.516 | 0.965 | -36.32% |
+| `vnmsubfp_lat` | 3.169 | 2.267 | -28.45% |
+| **TOTAL** | **34.527** | **9.783** | **-71.66%** |
+
+All twelve resolved.
+
+**This reverses the conclusion recorded above.** Callgrind put the two largest
+corpus suites at +0.003% and the reading taken from it — "the branch does not
+change what the x64 backend emits", "x64 got essentially nothing" — was wrong.
+The count was not wrong; it measured a workload in which guest code is a
+rounding error, so it could not have detected this and its near-zero result was
+never evidence either way. Withdrawing a claim for being unresolved was right;
+concluding "no change" from it was not.
+
+`1c102190d` is the clearest case. It claims to replace a 16-iteration scalar
+load/lea/sar/store loop through two stack spills with four instructions, and a
+guest→host call per PACK with `vpminuw`/`vpackuswb`. Measured: `vavgsb` 12.6x,
+`vavgsw` 9.1x, `vpkuhus` 4.1x. The corpus suites for exactly those three opcodes
+are the ones sitting at the 0.314s startup floor, which is why this went
+unmeasured for so long.
+
+## Real game code: the first A/B that measures a title's own workload
+
+A Halo 3 menu corpus captured with `--jit_corpus_out` (8,524 functions,
+1,167,562 guest instructions), replayed through both builds. Same corpus file
+both sides — capturing separately would measure scene drift, not codegen.
+
+| | `edge` | `a64-fixes-on-edge` | delta |
+|---|---|---|---|
+| host instructions | 7,792,627 | 7,124,393 | -8.58% |
+| **stable instructions** | 7,241,611 | 6,769,709 | **-6.52%** |
+| host/gi | 6.6743 | 6.1019 | |
+| **host-address chains** | **311,272** | **169,737** | **-45.5%** |
+| as share of emitted | 9.43% | 5.52% | |
+
+Compare the *stable* total, not the raw one: MOVZ/MOVK chains encode host
+addresses, so raw counts move with load address between processes. The stable
+metric charges each chain one instruction.
+
+The branch's effect is broad rather than narrow — only five functions, 0.8% of
+emitted bytes, were left essentially untouched.
+
+### What is left: host-address materialization
+
+169,737 chains, 5.52% of every host instruction emitted, averaging 2.32
+instructions each. Every one is a 64-bit host address — a helper, the
+guest-to-host thunk — built lane by lane, and every one is replaceable by a
+single `ldr` from the backend context, because those addresses are stable once
+the code cache initialises.
+
+The case is unusually complete for an unstarted optimisation:
+
+- The technique is proven in this tree. `616fb633e` moved three constants at
+  indirect-call sites into `A64BackendContext`, citing `call_indirect` at 53.9
+  bytes per occurrence as the largest single per-call cost in the backend.
+- It measurably worked: 141,535 chains removed, 45.5% of the total.
+- It was applied only at call sites. The remaining 169,737 are everywhere else.
+- Generalising it removes ~223,728 instructions, **3.1% of all emitted code**,
+  on real game code rather than a microbenchmark.
+
+The `bench/mtl3-tracedump` worktree built the analysis that finds this — the
+wide-move classifier and its "replaceable by one ldr from the backend context"
+comment are theirs — and wrote two commits making the metric stable and
+fail-closed (`d7d95f9c2`, `7a415f50d`). Neither acts on it, and a search of all
+211 commits on that branch finds no fix.
+
+### Secondary: five functions the branch did not move
+
+`8271ACC8` at 34.80 host instructions per guest instruction, `827196C0` at
+28.53, `822F9260` at 18.88, `8215B774` at 22.70, `825A18C0` at 19.20. Together
+0.8% of emitted bytes, so not where the mass is — but they are the only
+functions 87 commits left alone, and 35:1 on real code is worth understanding.
+
+### What this does not say
+
+Emitted size, not time. Fewer instructions is real icache and decode pressure,
+but it is not a measured speedup. `gen_loop_bench.py` measures time on synthetic
+code; the corpus measures size on real code. Nothing yet measures time on real
+code — the replay compiles the corpus, it does not execute it, because doing so
+needs the kernel and import thunks it deliberately does without.
+
+### Two capture traps, both hit here
+
+- **Do not capture with `--trace_function_coverage`.** It inlines per-guest-
+  instruction counters into the emitted code, so the recorded `host_code_size`
+  is one the replay can never reproduce. The first capture came back 46% larger
+  than its own replay on the same binary.
+- **The faithfulness gate cannot reach zero with `RawModule`.** It does not
+  populate `instruction_flags_`, so `GetInstructionAddressFlags` returns
+  nullptr, `IsPossibleMMIOInstruction` is false, and MMIO-aware stores are never
+  emitted offline — while the capturing `XexModule` had `accessed_mmio` set.
+  Expect a small negative delta on MMIO-touching functions; the clean capture
+  here sat 3% under, with 3,365 of 8,524 functions identical.
+
+## Where the x64 headroom is
+
+The callgrind result says the x64 backend was left where it was, so the leads
+below are all against `edge` as it stands.
+
+**1. x64 forgets its MXCSR mode at every basic block.** `x64_emitter.cc:264`:
+
+```cpp
+while (block) {
+  ForgetMxcsrMode();  // at start of block, mxcsr mode is undefined
+```
+
+This is the pattern `90aefe81e` replaced on a64 with a per-edge meet, where it
+was measured at 1.3% of all emitted instructions on the float corpus suites.
+`vldmxcsr` is considerably more expensive than the ARM `msr fpcr` this
+replaced, and it is forced at the top of every block containing a float op.
+The a64 commit already paid for the design: it documents three attempts
+refuted by disassembled counterexamples — `ControlFlowAnalysisPass` edges are
+stale by emission time and never included fall-through, label `->block`
+back-pointers are equally stale, and branches sit *mid*-block in this HIR so a
+per-block exit mode miscompiles a scalar-then-vector diamond. The x64 emitter
+walks the same HIR through the same `block->label_head` chain. Three of the
+five suites that carry signal are float suites.
+
+**2. x64 `SELECT_V128` on AVX-512 emits three instructions where one would
+do.** `x64_sequences.cc:936`:
+
+```cpp
+if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
+  e.vmovdqa(e.xmm3, src1);
+  e.vpternlogd(e.xmm3, src2, src3, ...);
+  e.vmovdqa(i.dest, e.xmm3);
+```
+
+`vpternlogd` is destructive in its first operand, so when `dest` aliases any
+source both copies go away — permuting the immediate covers the `src2`/`src3`
+cases. The a64 audit behind `c4a4239d4` found 15,605 `SELECT_V128` sites in
+this corpus, *all* of which take an aliased path. Worse, the AVX-512 branch is
+tested first, so on AVX-512 hardware a select that `mayblend == Int8` would
+render as a single `vpblendvb` becomes three instructions instead — AVX-512
+hardware emitting more than AVX2 hardware for the same HIR. `instr__gen_vsel`
+is the largest suite in the corpus at 171.7 billion instructions.
+
+Caveat worth measuring rather than asserting: `vmovdqa` xmm→xmm is
+move-eliminated at rename on recent Intel cores, so the cost here is
+front-end and code-size rather than execution latency.
+
+**3. The same staging pattern at the other `vpternlogd` sites.**
+`x64_seq_vector.cc:740` and `:860` both do `vmovdqa32 xmm3, src1` before
+`vpternlogd xmm3, ...`. Of the four sites in the backend, only `NOT_V128`
+(`x64_sequences.cc:3123`) writes `i.dest` directly.
+
+**4. The float-mode theme is seven commits on a64 and one on x64.** a64 got
+the FPCR entry/return contract, conditional-region merges, the per-edge meet,
+host-transition guards, `VSCR.NJ`-gated denormal flushes, a four-instruction
+flush, and NaN handling gated on the result rather than the operands. x64 has
+`77a164cb7` alone.
+
+Nothing here is written yet — the autonomy boundary is measure-and-report, and
+these are proposals for a human to take or refuse.
 
 ### Real game code (Mac only)
 
@@ -558,3 +990,277 @@ silent at the diff level and loud at the compiler:
 None of this is an argument against automating the mechanical case; it is an
 argument that anything auto-resolved is unverified until it compiles and the
 169,048-case suite passes. Both gates were run before the result was trusted.
+
+## The paired runtime A/B, on the rebased tree
+
+Halo 3 is locked at 30 fps, so frame rate cannot show an improvement on it and
+CPU percent is the figure of merit. Frame rate is still measured, as a guard.
+
+### The branch against upstream
+
+Five interleaved pairs, `has207/edge` (ed0e06112) against this branch:
+
+| pair | upstream | ours | delta |
+| --- | --- | --- | --- |
+| 1 | 99.06% | 89.73% | -9.42% |
+| 2 | 98.99% | 89.76% | -9.32% |
+| 3 | 99.13% | 89.41% | -9.80% |
+| 4 | 99.03% | 89.78% | -9.33% |
+| 5 | 98.97% | 90.40% | -8.67% |
+
+**-9.31% CPU, five pairs of five agreeing, differences spread over 1.14 points.**
+Resolved on both statistics: best-against-best is -9.66% against a 1.10%
+within-ref spread.
+
+### What the db16cyc core release contributes
+
+Isolated on ONE binary with ONE cvar, `db16cyc_yield_after` 0 against 2, so
+nothing else can differ: **-4.99% CPU, four pairs of four agreeing** (-6.73%,
+-4.11%, -4.38%, -4.75%). Roughly half the branch's total, with the rest coming
+from the codegen work.
+
+That is smaller than the -10.15% the same idea measured before the rebase, and
+the reason is real rather than noise: upstream's `DELAY_EXECUTION` now coalesces
+consecutive barriers, so Halo 3's sled of eight `db16cyc` is already one
+instruction and much of what the core release used to recover has been recovered
+more cheaply. The two overlap; this measures what is left.
+
+Tuning it further did not pay. `after=1, sleep=150us` against the default
+`after=2, sleep=60us` came out at a mean of -0.19% with two pairs each way --
+not a result, so the defaults stand on evidence rather than on assumption.
+
+### Reading an interleaved A/B correctly
+
+The summary originally compared each ref's best run and called anything smaller
+than that ref's own max-to-min spread unresolved. That is the wrong statistic
+for interleaved runs. CPU percent drifts down over a session on this machine, so
+both refs fall together and the within-ref spread measures the drift. The
+db16cyc isolation came out as -4.54% against a 6.29% "spread" and was reported
+as unresolved, when every one of its four pairs favoured the release path by
+between 4.1% and 6.7%. Pairing by iteration is what the interleaving is for, and
+the summary now does it.
+
+Three harness faults were found the same way, each of which silently produced no
+result rather than a wrong one:
+
+  - the measurement window was counted in frames, and the frame number is only
+    visible through the log prefix. A settled title stops logging while running
+    at 87% of a core, so the run hung instead of measuring.
+  - the teardown did not wait for the emulator to exit, so two of them competed
+    for the GPU and one storage directory.
+  - the warmup was 180 seconds because nobody had measured what reaching the
+    menu costs. It is 49.2 seconds, identical with a cold or a warm shader
+    cache. That alone turned a 14-minute experiment into 45.
+
+## The spin loop, pinned
+
+The post-rebase capture said one guest thread was 47.37% of all guest
+instruction execution and that 79% of that thread sat in a single function.
+`--dump_translated_hir_functions` settles what it is. The flag dumps **after**
+`compiler_->Compile()`, so the text below is the optimized HIR the backend
+actually emits from, not the frontend's first draft.
+
+Function `0x821A8500`, 151 guest instructions, prologue executed exactly once,
+**37.49% of all guest instruction execution**. Three blocks form the hot cycle:
+
+| block | guest | body |
+| --- | --- | --- |
+| `label14` | `821A855C-8564` | `load_offset` a guest word, `cmpwi 1`, branch |
+| `label2` | `821A8730-8734` | reload what it just stored, `cmpwi 2`, branch |
+| `label13` | `821A873C-874C` | two chained guest loads, `cmpwi 1`, back edge |
+
+No stores to guest memory. No calls on the hot path — both `call sub_821A0278`
+sites are off it (`821A8568` runs 9,953 times, `821A8738` **zero**). Three
+loads, three compares, three branches, 6,911,168,410 times. It is a poll, and
+the inference from the counter shape was right.
+
+### What it costs, and how much of that is dead
+
+Per iteration, priced at the sequence table's measured instructions-per-
+execution:
+
+| | host I |
+| --- | --- |
+| `label14` | 25.16 |
+| `label2` | 12.69 |
+| `label13` | 37.91 |
+| **per iteration** | **~75.8** |
+| × 6,911,168,410 iterations | **523.9 billion = 19.5% of the capture** |
+
+Of that, a large share is dead, and the reason is `PPCHIRBuilder::UpdateCR`.
+Every PPC compare materializes all three bits of a CR field and stores each to
+context:
+
+```
+v71 = compare_slt v65, 1     ; 2 host I
+store_context +24, v71       ; 1  -- nothing reads it
+v72 = compare_sgt v65, 1     ; 2
+store_context +25, v72       ; 1  -- nothing reads it
+v73 = compare_eq v65, 1      ; 2
+store_context +26, v73       ; 1
+branch_false v73, label2     ; consumes the SSA value, not the context
+```
+
+The field here is **cr6, not cr0**. `cr0` is the first member of `PPCContext`,
+so the condition register is bytes `[0,32)` and `+24/+25/+26` are `cr6_0/1/2`.
+The `// 0xA24` comment on `cr0` in `ppc_context.h` is stale, and an earlier
+version of this section was written against it: a static table here counted
+offsets `[24,56)` — cr6, cr7, and 24 bytes that are not the condition register
+at all — and reported "70.6% of CR stores dead". **That table was wrong and has
+been removed.** Halo 3's compiler uses cr6 for almost all of its integer
+compares, which is why the numbers looked plausible.
+
+Existing passes cannot remove these. `OPCODE_CONTEXT_BARRIER` is `IsFake()` and
+carries no flags, so it is not the obstacle; the cross-block DSE is. Its kill
+set is intersected over all successors, and `label14`'s other successor is the
+`lwarx`/`stwcx.` retry block, which never rewrites cr6. The intersection is
+empty, so nothing is killed on the hot path.
+
+### What the pass actually recovers
+
+`DeadCRStoreEliminationPass` — backward liveness over the 32 bytes cr0..cr7 —
+removes the `lt` and `gt` write in `label14` and in `label2`, two compares and
+two stores each:
+
+| block | before | after | saved |
+| --- | --- | --- | --- |
+| `label14` | 25.16 | 19.16 | 6 host I |
+| `label2` | 12.69 | 6.69 | 6 host I |
+| `label13` | 37.91 | 37.91 | 0 |
+
+`label13` keeps all three because `label14` opens with `check_preempt`, which
+the pass treats as reading the whole context, so everything is live out of
+`label13`'s back edge. That is deliberate — a preemption point can hand the
+thread to the scheduler — and relaxing it is worth another 6 instructions an
+iteration if it can be justified.
+
+**12 of ~75.8 host instructions per iteration, 15.8% of the loop, 82.9 billion
+instructions, 3.08% of the capture** — from this one loop. The earlier estimate
+of 21 assumed all three compares could go; the third cannot, for the reason
+above.
+
+### The static picture, across the whole title
+
+The same 8,508 functions dumped twice from one binary, `eliminate_dead_cr_stores`
+false against true. Identical function sets, so this is a like-for-like diff:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| HIR instructions | 2,884,274 | 2,703,301 | **-6.27%** |
+| `i8` compares | 202,752 | 148,831 | **-26.59%** |
+| CR stores `[0,32)` | 236,979 | 138,412 | **-41.59%** |
+
+By field, and the asymmetry is the whole point — `lt` and `gt` go, `eq` mostly
+stays because it is the bit the branch consumes:
+
+| off | field | before | after | removed |
+| --- | --- | --- | --- | --- |
+| +24 | `cr6_0` (lt) | 73,333 | 33,303 | 40,030 |
+| +25 | `cr6_1` (gt) | 73,333 | 33,030 | 40,303 |
+| +26 | `cr6_2` (eq) | 73,333 | 60,281 | 13,052 |
+| +27 | `cr6_3` (so) | 4,450 | 1,751 | 2,699 |
+| +0 | `cr0_0` | 4,098 | 3,023 | 1,075 |
+| +1 | `cr0_1` | 4,098 | 2,991 | 1,107 |
+| +2 | `cr0_2` | 4,098 | 3,797 | 301 |
+
+Static, not execution-weighted. The 3.08% above is the sound per-site figure,
+and the runtime A/B is what decides.
+
+### What the first attempt cost, and what it proved
+
+The first version was whole-function: drop any CR write nothing in the function
+reads back. That is what the PowerPC ABI actually permits, since cr0, cr1 and
+cr5-cr7 are caller-volatile. It failed **9,569 of 169,048** PPC tests — and
+every single failure was a `cr` assert, with no GPR, FPR or VR wrong anywhere.
+The transform never miscompiles arithmetic; it drops CR state the test harness
+reads after the function returns. Useful evidence, because it bounds what the
+aggressive version can break to exactly one thing.
+
+The liveness version treats a return as reading everything and passes
+169,048/169,048.
+
+One detail was load-bearing and cost a whole build-and-dump cycle to find:
+`BRANCH_TRUE` and `BRANCH_FALSE` carry `OPCODE_FLAG_VOLATILE`. Letting them fall
+into the blanket "volatile reads everything" case relights every bit and
+eliminates nothing at all — the first liveness build passed the tests and
+removed exactly zero instructions, and the HIR dump was identical to the
+baseline down to the line count. A branch reads no context; it takes its
+target's live set.
+
+## TODO — the immediately optimizable parts
+
+Ordered by expected payoff against confidence. Every entry names how it will be
+measured, because the campaign has already had two rankings overturned by the
+measurement rather than by the code.
+
+### Tier 1 — implementable now, target already measured
+
+**1. CR-bit liveness — DONE.** `DeadCRStoreEliminationPass`, backward liveness
+over the 32 bytes `cr0..cr7`. Statically **-41.59% of CR stores, -26.59% of
+`i8` compares, -6.27% of all HIR** across the title's 8,508 functions;
+169,048/169,048 PPC tests. Gated on `eliminate_dead_cr_stores`.
+*What is left in it:* `check_preempt` is treated as reading the whole context,
+which is what keeps the third compare in the spin loop alive. Justifying a
+narrower rule there is worth another 6 host instructions per iteration.
+
+**2. Generalized spin-loop release.** `delay_execution` fires 937,637 times from
+12 sites — **0.001%**. The db16cyc detector sees none of these polls, because
+they carry no `db16cyc`; they are plain load/compare/branch. Detect a
+self-looping HIR block whose body has no stores, no calls, no `reserved_load`/
+`reserved_store`, and no `VOLATILE` op, and route it into the same
+`DELAY_EXECUTION` core-release path. The db16cyc release measured **-4.99% CPU**
+on its own; this reaches roughly a hundred times more execution.
+*Risk:* the highest of anything on this list — releasing a core inside a loop
+that is not actually waiting will cost frames. Both titles on this machine,
+Halo 3 and Halo Reach, are locked at 30 fps, so neither can show the damage as
+a frame-rate drop; the guard has to be something else — frame-time variance
+inside the window, or a title that is not capped.
+
+**3. `storev_left` / `storev_right` arm selection.** 213 sites, 45.00
+instructions each. `EmitPartialVectorStore` emits all five size arms inline.
+Move the rare arms to `AddToTail`, or specialize when the address alignment is a
+constant. Corrected estimate ~2%, not the 4.46% the table shows — see the
+attribution caveat in item 6.
+
+**4. `denormal_quirk`.** 5.29% at 19.36 instructions per execution over 15,649
+sites. Already has a cold tail, so the inline number is honest. Unexamined.
+
+### Tier 2 — measurement repairs, needed before Tier 1 results can be trusted
+
+**5. Tail taken-counters.** Tails are separated from inline code but carry no
+execution counter, so executed tail cost (415.1 billion, 15.43%) is an upper
+bound charged at the enclosing site's rate. `check_preempt` alone contributes
+195.1 billion of it and is almost never taken.
+
+**6. Inline branch arms in the byte attribution.** `host_bytes` counts the whole
+emitted body, so any sequence that branches internally without `AddToTail` is
+over-counted — `storev_left` reads 45.00 when one arm of ~5 runs. Either record
+a minimum-path length per sample, or move the arms to tails so the existing
+counter means something.
+
+**7. Per-sample call/MMIO variant attributes.** Still outstanding from the
+original repair list.
+
+**8. Validate against uninstrumented host-PC sampling.** `--jit_perf_map` came
+in with the rebase and makes this possible for the first time. Nothing in the
+model has been checked against a profile that does not come from the model.
+
+### Structural — large, and blocked on one thing
+
+**9. Context traffic.** `load_context i64` 4.60%, `store_context i8` 4.14%,
+`store_context i64` 3.21%, `store_context ci64` 1.39% — **13.34% of executed
+host instructions at ~1 instruction each**, which is to say the cost is the
+count, and the count exists because `DataFlowAnalysisPass::AnalyzeFlow` forces
+cross-block values through local slots and the register allocator is
+block-local. Nothing peephole-shaped will move it. Item 1 attacks a slice of it
+from the frontend instead, which is why it is first.
+
+### Closed — recorded so they are not reopened
+
+| | verdict |
+| --- | --- |
+| wide-move chains → literal pool | 0.11% by exact accounting. Retired twice. Apple's guide §2.8.2 agrees. |
+| cross-block context promotion | Blocked by the block-local register allocator: trades a context access for a local one. |
+| eliminating the `0xE0000000` physical remap by mapping | Structurally impossible — the `0xE0000000` and `0xC0000000` views alias the same physical memory 4 KiB apart, unrepresentable on a 16 KiB-page host. |
+| db16cyc tuning (`after=1/150us` vs `after=2/60us`) | -0.19%, two pairs each way. Not a result; defaults stand on evidence. |
+| `call - symbol` as a major target | Was 17.02 instructions per execution pre-rebase, is 8.95 now. Upstream got there first. |
