@@ -581,6 +581,45 @@ four-row table above, and the smallest unit in it is 55 commits at once.
 Closing this gap needs a workload that executes guest code in a loop — real
 game code, or a synthetic harness — not more runs of this corpus.
 
+## Measuring the emitted code
+
+`tools/bench/gen_loop_bench.py` puts the opcode in a guest loop — 512M to 1B
+executions per suite — so the emitted sequence is ~98% of the run instead of
+~0%. `edge` vs the branch, M4 Pro, min of 5, measurement error 0.17%:
+
+| suite | `edge` | branch | delta |
+|---|---|---|---|
+| `vsel_lat` | 1.118 | 0.325 | **-70.95%** |
+| `vsel_tp` | 1.384 | 0.344 | **-75.15%** |
+| `vperm_lat` | 1.472 | 0.498 | -66.18% |
+| `vperm_tp` | 1.380 | 0.342 | -75.19% |
+| `vmaddfp_lat` (nonfinite path) | 3.082 | 1.964 | -36.28% |
+| `vmaddfp_tp` | 1.385 | 0.381 | -72.50% |
+| `vnmsubfp_lat` (nonfinite path) | 3.424 | 2.285 | -33.27% |
+| `vnmsubfp_tp` | 1.438 | 0.439 | -69.43% |
+| **TOTAL** | **14.683** | **6.578** | **-55.20%** |
+
+All eight resolved. Both refs compute the same final register in every suite,
+checked by running a short version with a deliberately wrong `REGISTER_OUT` and
+comparing what the harness reports — so this is not a faster wrong answer.
+
+`vsel_lat` is the cleanest reading. 512M serial selects: `edge` spends 8.7
+cycles each, the branch 2.5. That is three dependent instructions collapsing to
+one, which is exactly what `c4a4239d4` claims, and it had never been measured
+before because the corpus cannot see it.
+
+**These are microbenchmarks of a single opcode, and the percentages are not
+game speedups.** They say the emitted sequence is ~3.4x faster, not that
+anything is 3.4x faster. What fraction of real guest code is `vsel` is a
+separate question, and the next one worth answering — there are titles in
+`~/Documents/X360-Games`.
+
+The float `lat` suites diverge to Inf/NaN within a few iterations and stay
+there, so they measure the nonfinite path rather than ordinary operands. That
+is worth having — `ccaa671b0`, `dcf981c08`, `8c59d9030` and `1dd664b3f` all
+target exactly that path, and -36% is the first evidence any of them work — but
+it must be read as such. The `tp` suites keep their float inputs normal.
+
 ## Where the x64 headroom is
 
 The callgrind result says the x64 backend was left where it was, so the leads
