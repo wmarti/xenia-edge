@@ -239,6 +239,10 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     return (feature_flags_ & feature_flag) == feature_flag;
   }
 
+  // Places `value` in this function's literal pool and returns the label to
+  // load it from. ldr-literal reaches +/-1 MiB, far beyond any one function.
+  Xbyak_aarch64::Label& AddLiteral64(uint64_t value);
+
   Xbyak_aarch64::Label& AddToTail(TailEmitCallback callback,
                                   uint32_t alignment = 0);
   Xbyak_aarch64::Label& NewCachedLabel();
@@ -377,6 +381,11 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   static const uint32_t vec_reg_map_[VEC_COUNT];
 
   std::vector<TailEmitter> tail_code_;
+  // 64-bit constants placed after the tail so one ldr-literal replaces a
+  // movz/movk chain. Emitted where nothing can fall into them; the label is
+  // bound at the data, not before it, which is why these cannot ride in
+  // tail_code_ (that loop binds the label before calling the emitter).
+  std::vector<std::pair<Xbyak_aarch64::Label*, uint64_t>> literal_pool_;
   std::vector<Xbyak_aarch64::Label*> label_cache_;
 
   // Map from HIR label IDs to xbyak_aarch64 Labels.
