@@ -65,3 +65,34 @@ DEFINE_bool(break_condition_truncate, true, "truncate value to 32-bits", "CPU");
 
 DEFINE_bool(break_on_debugbreak, true, "int3 on JITed __debugbreak requests.",
             "CPU");
+
+// Guest spin-wait release. See DELAY_EXECUTION in a64_seq_memory.cc.
+DEFINE_uint32(
+    db16cyc_yield_after, 2,
+    "After this many consecutive guest db16cyc spin-wait delays on a thread, "
+    "release the core instead of only stalling in it. 0 disables escalation.\n"
+    "A guest wait loop built from db16cyc occupies a core for the whole wait "
+    "no "
+    "matter which delay instruction it lowers to, because the wait's length is "
+    "set by the event being waited for, not by the delay. Apple's CPU "
+    "Optimization Guide 4.0 section 7.3 recommends blocking over spinning for "
+    "exactly this reason: a spin-wait on a P core pushes other work onto the E "
+    "cores and denies the system otherwise idle time.\n"
+    "Counted per EMITTED delay, and consecutive delays are coalesced into one, "
+    "so a guest sled of eight db16cyc advances this by one per loop iteration "
+    "rather than by eight.",
+    "CPU");
+
+DEFINE_uint32(db16cyc_sleep_ns, 60000,
+              "Nanoseconds to sleep when db16cyc_yield_after trips. A plain "
+              "sched_yield is not enough: it returns immediately when other "
+              "cores are idle, leaving the thread spinning.",
+              "CPU");
+
+DEFINE_uint32(
+    db16cyc_consecutive_gap_ns, 1000,
+    "Two db16cyc executions further apart than this do not count as the same "
+    "wait loop, and the consecutive counter restarts. Pure wait-loop "
+    "iterations are ~0.1us apart; sparse use of db16cyc between real work is "
+    "much further apart and must never accumulate to a release.",
+    "CPU");

@@ -9,15 +9,18 @@
 
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 
+#include <algorithm>
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/memory.h"
+#include "xenia/base/threading.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #include "xenia/cpu/backend/a64/a64_emitter.h"
 #include "xenia/cpu/backend/a64/a64_op.h"
 #include "xenia/cpu/backend/a64/a64_seq_util.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
+#include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/hir/instr.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
@@ -58,6 +61,17 @@ static bool IsPossibleMMIOInstruction(A64Emitter& e, const hir::Instr* i) {
 // ============================================================================
 // OPCODE_DELAY_EXECUTION
 // ============================================================================
+// Called from the emitted delay once a thread has clearly been waiting rather
+// than briefly pausing.
+static void SpinWaitRelease(void* ctx) {
+  const uint32_t sleep_ns = cvars::db16cyc_sleep_ns;
+  if (sleep_ns) {
+    xe::threading::NanoSleep(int64_t(sleep_ns));
+  } else {
+    xe::threading::MaybeYield();
+  }
+}
+
 struct DELAY_EXECUTION
     : Sequence<DELAY_EXECUTION, I<OPCODE_DELAY_EXECUTION, VoidOp>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
@@ -65,12 +79,74 @@ struct DELAY_EXECUTION
     // but NOPs on Cortex-X/A7xx, so the sled cost nothing; isb is the usual
     // stand-in - a pipeline flush with no guest-observable effect. Coalesce
     // consecutive barriers so a long sled stays one instruction.
+    //
+    // The coalescing test is also what keeps the escalation below cheap: every
+    // path through this sequence ends in that same isb, so a guest sled of
+    // eight db16cyc emits the counter update once, not eight times.
     constexpr uint32_t kIsbSy = 0xD5033FDFu;
     if (e.getSize() >= sizeof(uint32_t) &&
         *reinterpret_cast<const uint32_t*>(e.getCurr() - sizeof(uint32_t)) ==
             kIsbSy) {
       return;
     }
+    const uint32_t yield_after = cvars::db16cyc_yield_after;
+    if (!yield_after) {
+      e.isb(Xbyak_aarch64::SY);
+      return;
+    }
+
+    // Stalling in the core is the wrong answer for a wait whose length the
+    // delay instruction does not set. Count consecutive delays and release the
+    // core once the guest is clearly waiting, not pausing.
+    //
+    // "Consecutive" is measured in time, not just in count: delays further
+    // apart than the gap threshold mean the guest did real work in between and
+    // the count restarts, so sparse db16cyc use never accumulates to a release.
+    // The state lives in the backend context (x19), so it is per guest thread.
+    // x16/x17 are the emitter's scratch registers.
+    const int32_t spins_offset =
+        static_cast<int32_t>(offsetof(A64BackendContext, db16cyc_spins));
+    const int32_t last_tick_offset =
+        static_cast<int32_t>(offsetof(A64BackendContext, db16cyc_last_tick));
+    static const uint64_t timer_freq = [] {
+      uint64_t freq;
+      asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+      return freq;
+    }();
+    const uint64_t gap_ticks =
+        std::max<uint64_t>(1, uint64_t(cvars::db16cyc_consecutive_gap_ns) *
+                                  timer_freq / 1000000000ull);
+    auto& not_consecutive = e.NewCachedLabel();
+    auto& do_release = e.NewCachedLabel();
+    auto& do_delay = e.NewCachedLabel();
+    // x16 = now (CNTVCT_EL0), x17 = the gap since the previous delay.
+    e.mrs(e.x16, 3, 3, 14, 0, 2);
+    e.ldr(e.x17, ptr(e.GetBackendCtxReg(), last_tick_offset));
+    e.str(e.x16, ptr(e.GetBackendCtxReg(), last_tick_offset));
+    e.sub(e.x17, e.x16, e.x17);
+    e.mov(e.x16, gap_ticks);
+    e.cmp(e.x17, e.x16);
+    e.b(HI, not_consecutive);
+    e.ldr(e.w16, ptr(e.GetBackendCtxReg(), spins_offset));
+    e.add(e.w16, e.w16, 1);
+    e.mov(e.w17, static_cast<uint64_t>(yield_after));
+    e.cmp(e.w16, e.w17);
+    e.b(HS, do_release);
+    e.str(e.w16, ptr(e.GetBackendCtxReg(), spins_offset));
+    e.b(do_delay);
+    e.L(not_consecutive);
+    e.mov(e.w16, 1);
+    e.str(e.w16, ptr(e.GetBackendCtxReg(), spins_offset));
+    e.b(do_delay);
+    e.L(do_release);
+    // Reset before sleeping, so the guest gets a fresh spin budget when the
+    // wait resumes. The sleep also exceeds the gap threshold, so the next
+    // delay restarts the count regardless.
+    e.str(e.wzr, ptr(e.GetBackendCtxReg(), spins_offset));
+    e.CallNativeSafe(reinterpret_cast<void*>(SpinWaitRelease));
+    e.L(do_delay);
+    // Every path lands here, so the last instruction emitted is always the isb
+    // the coalescing test above looks for.
     e.isb(Xbyak_aarch64::SY);
   }
 };
