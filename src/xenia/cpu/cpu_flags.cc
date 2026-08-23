@@ -95,3 +95,12 @@ DEFINE_uint32(
     "iterations are ~0.1us apart; sparse use of db16cyc between real work is "
     "much further apart and must never accumulate to a release.",
     "CPU");
+
+DEFINE_path(
+    jit_perf_map, "",
+    "Writes a JIT symbol map to the given file: one '<host_hex> <size_hex> "
+    "<name>' line per translated guest function. Lets a host profiler attribute "
+    "raw JIT sample addresses to guest functions - guest code has no symbols, so "
+    "samples otherwise land on bare addresses and a time profile cannot be "
+    "checked against a codegen ranking at all.",
+    "CPU");
