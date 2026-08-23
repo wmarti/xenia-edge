@@ -79,18 +79,33 @@ Block* BranchTarget(const Instr* i) {
   }
 }
 
-bool IsPlainCall(const Instr* i) {
+enum class CallKind {
+  kNotACall,
+  // Always executed and always returns here: the callee is free to destroy the
+  // volatile fields, so a write before it cannot be observed after it.
+  kUnconditional,
+  // Returns here too, but only sometimes taken. Liveness is a union over
+  // paths, and on the not-taken path nothing is clobbered, so this may not
+  // kill anything. It reads no condition bits either, so it is transparent.
+  kConditional,
+};
+
+CallKind ClassifyCall(const Instr* i) {
   switch (i->GetOpcodeNum()) {
     case OPCODE_CALL:
-    case OPCODE_CALL_TRUE:
     case OPCODE_CALL_INDIRECT:
-    case OPCODE_CALL_INDIRECT_TRUE:
     case OPCODE_CALL_EXTERN:
-      // A tail call leaves through this function's own return, so treat it as
-      // an exit rather than as a clobber.
-      return !(i->flags & CALL_TAIL);
+      // A tail call leaves through this function's own return, so it is an
+      // exit rather than a clobber -- let it fall through to the volatile
+      // case below.
+      return (i->flags & CALL_TAIL) ? CallKind::kNotACall
+                                    : CallKind::kUnconditional;
+    case OPCODE_CALL_TRUE:
+    case OPCODE_CALL_INDIRECT_TRUE:
+      return (i->flags & CALL_TAIL) ? CallKind::kNotACall
+                                    : CallKind::kConditional;
     default:
-      return false;
+      return CallKind::kNotACall;
   }
 }
 
@@ -141,8 +156,11 @@ uint32_t TransferBlock(Block* block, uint32_t live, bool apply,
           live &= ~mask;
         }
       }
-    } else if (IsPlainCall(i)) {
-      live &= ~kVolatileCR;
+    } else if (const CallKind kind = ClassifyCall(i);
+               kind != CallKind::kNotACall) {
+      if (kind == CallKind::kUnconditional) {
+        live &= ~kVolatileCR;
+      }
     } else if (i->opcode->flags & OPCODE_FLAG_VOLATILE) {
       // Returns, barriers, anything that can expose the context: assume it is
       // all read.
