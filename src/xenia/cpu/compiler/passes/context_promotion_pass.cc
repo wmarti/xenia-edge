@@ -68,6 +68,9 @@ bool ContextPromotionPass::Initialize(Compiler* compiler) {
   context_value_size_.resize(sizeof(ppc::PPCContext));
   context_value_base_.resize(sizeof(ppc::PPCContext));
   context_validity_.resize(static_cast<uint32_t>(sizeof(ppc::PPCContext)));
+  context_kill_.resize(static_cast<uint32_t>(sizeof(ppc::PPCContext)));
+  context_kill_scratch_.resize(static_cast<uint32_t>(sizeof(ppc::PPCContext)));
+  context_kill_read_.resize(static_cast<uint32_t>(sizeof(ppc::PPCContext)));
 
   return true;
 }
@@ -236,6 +239,60 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
     }
   }
 
+  // Offsets this block stores before it reads them. The incoming value of such
+  // an offset is dead on entry, so a predecessor's store to it need not happen.
+  // The walk stops at the first volatile instruction: a call or a preempt check
+  // can read the whole context, so nothing past it can be assumed overwritten
+  // first.
+  void ContextPromotionPass::ComputeKillSet(Block * block,
+                                            llvm::BitVector & kill) {
+    kill.reset();
+    auto& read = context_kill_read_;
+    read.reset();
+    Instr* i = block->instr_head;
+    while (i) {
+      if (i->opcode->flags & OPCODE_FLAG_VOLATILE) {
+        return;
+      }
+      if (i->opcode == &OPCODE_LOAD_CONTEXT_info) {
+        const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
+        if (!kill.test(offset)) {
+          // The incoming value reaches this load, so it is live on entry.
+          read.set(offset);
+        }
+      } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
+        const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
+        if (!read.test(offset)) {
+          kill.set(offset);
+        }
+      }
+      i = i->next;
+    }
+  }
+
+  void ContextPromotionPass::ComputeOutgoingKillSet(Block * block,
+                                                    llvm::BitVector & out) {
+    out.reset();
+    auto edge = block->outgoing_edge_head;
+    if (!edge) {
+      // No successors: the function returns from here and the caller reads the
+      // context, so nothing is dead.
+      return;
+    }
+    bool first = true;
+    while (edge) {
+      ComputeKillSet(edge->dest, context_kill_scratch_);
+      if (first) {
+        out = context_kill_scratch_;
+        first = false;
+      } else {
+        // Only what every path overwrites first is dead.
+        out &= context_kill_scratch_;
+      }
+      edge = edge->outgoing_next;
+    }
+  }
+
   void ContextPromotionPass::RemoveDeadStoresBlock(Block * block) {
     // In this walk a validity bit means "this byte is fully overwritten by a
     // later store in this block, with no barrier or load in between".
@@ -244,12 +301,18 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
     const bool promote_vec128 =
         cvars::context_promote_vec128 && !cvars::disable_context_promotion;
 
+    // Seed with what every successor overwrites before reading. Without this
+    // the trailing branch below resets the set and no store before a block's
+    // terminator is ever eliminated, which is most of them.
+    ComputeOutgoingKillSet(block, context_kill_);
+    validity = context_kill_;
+
     // Walk backwards and mark byte ranges that are written to.
     // If a store's whole range was already written to later, it is dead.
     Instr* i = block->instr_tail;
     while (i) {
       Instr* prev = i->prev;
-      if (i->opcode->flags & (OPCODE_FLAG_VOLATILE | OPCODE_FLAG_BRANCH)) {
+      if (i->opcode->flags & OPCODE_FLAG_VOLATILE) {
         // Volatile instruction - requires all context values be flushed.
         validity.reset();
       } else if (i->opcode == &OPCODE_LOAD_CONTEXT_info) {
@@ -260,6 +323,13 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
         const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
         const uint32_t size = static_cast<uint32_t>(GetTypeSize(i->dest->type));
         validity.reset(offset, offset + size);
+
+      } else if (i->opcode->flags & OPCODE_FLAG_BRANCH) {
+        // A branch does not read context, and everything after it is a
+        // successor, so restore what the successors make dead rather than
+        // dropping to nothing. Checked after VOLATILE so an opcode carrying
+        // both (a call) still flushes.
+        validity = context_kill_;
       } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
         const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
         const Value* value = i->src2.value;
