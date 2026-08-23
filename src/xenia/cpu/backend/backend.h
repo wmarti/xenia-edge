@@ -48,7 +48,19 @@ using SimpleGuestTrampolineProc = void (*)(ppc::PPCContext*);
 struct SequenceSample {
   uint64_t key;
   uint32_t guest_index;
+  // Bytes emitted inline, on the path the guest instruction actually runs.
   uint32_t host_bytes;
+  // Bytes this sequence pushed into the function's tail. Kept apart from
+  // host_bytes because a tail is the cold side of a branch: charging it at the
+  // rate of the hot path is what made preempt-yield materializations in cold
+  // tails read as multi-billion-execution hotspots.
+  uint32_t tail_bytes = 0;
+  // MOVZ/MOVK chains inside host_bytes that build a value wider than 32 bits,
+  // i.e. a host address. Counted here rather than reconstructed later so the
+  // count is attributed to one guest instruction instead of smeared over a
+  // whole function.
+  uint16_t chains = 0;
+  uint16_t chain_instructions = 0;
 };
 
 class Backend {
