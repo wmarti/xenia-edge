@@ -84,11 +84,18 @@ def run_once(app, work, warmup_s, window_s, timeout, extra=()):
     while the machine stops burning cores on a wait. Reporting only fps would
     score that change as no change.
     """
-    shutil.rmtree(work, ignore_errors=True)
+    # The storage directory is REUSED across runs of the same ref, not wiped.
+    # Wiping it throws away the shader cache, so every run recompiles every
+    # shader from cold and boot-to-menu costs minutes instead of seconds. That
+    # cost is not what is being measured, and paying it eight times turned a
+    # ten-minute experiment into three quarters of an hour. Each ref keeps its
+    # own directory, so neither side sees the other's cache.
+    first = not os.path.isdir(os.path.join(work, "storage"))
     os.makedirs(os.path.join(work, "storage", "content"), exist_ok=True)
-    subprocess.run(["cp", "-R", CONTENT,
-                    os.path.join(work, "storage", "content")],
-                   stderr=subprocess.DEVNULL)
+    if first:
+        subprocess.run(["cp", "-R", CONTENT,
+                        os.path.join(work, "storage", "content")],
+                       stderr=subprocess.DEVNULL)
     log = os.path.join(work, "run.log")
     out = open(os.path.join(work, "stdout.log"), "wb")
     # No --apu=nop: it fails CreateDriver and the guest dies at boot.
@@ -147,9 +154,11 @@ def main():
     ap.add_argument("--ref-a", default="A")
     ap.add_argument("--ref-b", default="B")
     ap.add_argument("--runs", type=int, default=3)
-    ap.add_argument("--warmup", type=float, default=180.0,
-                    help="seconds to run before measuring")
-    ap.add_argument("--window", type=float, default=120.0,
+    ap.add_argument("--warmup", type=float, default=60.0,
+                    help="seconds to run before measuring. Halo 3 reaches its "
+                         "menu in a measured 49s, cold cache or warm, so this "
+                         "is that plus a short settle -- not a guess")
+    ap.add_argument("--window", type=float, default=40.0,
                     help="seconds to measure over")
     ap.add_argument("--timeout", type=float, default=900)
     ap.add_argument("--work", default="/private/tmp/xenia-bench/frameab")
