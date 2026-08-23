@@ -441,12 +441,6 @@ typedef struct alignas(64) PPCContext_s {
   // not be reserved, so emitted counters never have to null check.
   uint8_t* trace_counts;
 
-  // Nonzero asks the running fiber to yield at its next JIT safepoint. Other
-  // host threads write it as a single byte store, raced reads are benign. Not
-  // std::atomic because this struct lives in raw memory no constructor runs
-  // over.
-  uint8_t preempt_requested;
-
   // Guest address of the last JIT safepoint this fiber executed, recorded only
   // when log_safepoint_pc is on. A wedged fiber's link register names the last
   // call it made, which is often nowhere near the loop it is actually stuck in;

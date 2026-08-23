@@ -1454,7 +1454,7 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
 
     EmitQuietSnan(e, d, s);
     e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
-    LoadV128Const(e, 0, vec128i(0x404000FFu), 0);  // 3.0f + 255*2^-22
+    LoadV128Const(e, 0, vec128i(0x404000FFu));  // 3.0f + 255*2^-22
     e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL: extract low byte from each lane, reorder RGBA->ARGB in lane 3.
     // Control: bytes 0-11=0xFF (->0), bytes 12-15={0x08,0x04,0x00,0x0C}
@@ -1473,10 +1473,10 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x40407FFFu));
 
-    LoadV128Const(e, 0, vec128i(0x403F8001u), 0);
+    LoadV128Const(e, 0, vec128i(0x403F8001u));
     EmitQuietSnan(e, d, s);
     e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
-    LoadV128Const(e, 0, vec128i(0x40407FFFu), 0);
+    LoadV128Const(e, 0, vec128i(0x40407FFFu));
     e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL: extract low 2 bytes from lanes 0,1 -> pack into lane 3.
     // TBL ctrl for PACK_SHORT_2: bytes 12-15={0x04,0x05,0x00,0x01}, rest=0xFF
@@ -1494,10 +1494,10 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x40407FFFu));
 
-    LoadV128Const(e, 0, vec128i(0x403F8001u), 0);
+    LoadV128Const(e, 0, vec128i(0x403F8001u));
     EmitQuietSnan(e, d, s);
     e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
-    LoadV128Const(e, 0, vec128i(0x40407FFFu), 0);
+    LoadV128Const(e, 0, vec128i(0x40407FFFu));
     e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL ctrl for PACK_SHORT_4: bytes 8-11={0x04,0x05,0x00,0x01},
     // 12-15={0x0C,0x0D,0x08,0x09}
