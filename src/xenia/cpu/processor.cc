@@ -31,6 +31,7 @@
 #include "xenia/cpu/breakpoint.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/export_resolver.h"
+#include "xenia/cpu/jit_corpus.h"
 #include "xenia/cpu/module.h"
 #include "xenia/cpu/ppc/ppc_decode_data.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
@@ -54,6 +55,12 @@
 
 DEFINE_bool(debug, DEFAULT_DEBUG_FLAG,
             "Allow debugging and retain debug information.", "General");
+DEFINE_path(
+    jit_corpus_out, "",
+    "Capture the guest code the JIT compiles to this file, for offline codegen "
+    "replay by xenia-cpu-ppc-tests --jit_corpus_in. Contains copyrighted guest "
+    "code; keep it out of version control.",
+    "CPU");
 DEFINE_bool(break_on_start, false, "Break into the debugger on startup.",
             "CPU");
 
@@ -170,6 +177,15 @@ bool Processor::Setup(std::unique_ptr<backend::Backend> backend) {
   }
 
   RefreshTraceCountsEnabled();
+
+  // Open the JIT corpus, if requested.
+  if (!cvars::jit_corpus_out.empty()) {
+    jit_corpus_writer_ = JitCorpusWriter::Create(cvars::jit_corpus_out);
+    if (jit_corpus_writer_) {
+      XELOGI("Capturing JIT corpus to {}",
+             xe::path_to_utf8(cvars::jit_corpus_out));
+    }
+  }
 
   return true;
 }
@@ -535,6 +551,16 @@ bool Processor::DemandFunction(Function* function) {
 
     // Before we give the symbol back to the rest, let the debugger know.
     OnFunctionDefined(function);
+
+    if (jit_corpus_writer_) {
+      auto* guest_function = static_cast<GuestFunction*>(function);
+      // Externs carry no emitted code, so they have nothing to replay.
+      if (guest_function->machine_code()) {
+        jit_corpus_writer_->RecordFunction(
+            memory_, guest_function->address(), guest_function->end_address(),
+            static_cast<uint32_t>(guest_function->machine_code_length()));
+      }
+    }
 
     function->set_status(Symbol::Status::kDefined);
     symbol_status = function->status();
