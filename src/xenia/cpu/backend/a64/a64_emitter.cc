@@ -1080,7 +1080,9 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
       mov(x0, reinterpret_cast<uint64_t>(builtin_function->handler()));
       mov(x1, reinterpret_cast<uint64_t>(builtin_function->arg0()));
       mov(x2, reinterpret_cast<uint64_t>(builtin_function->arg1()));
-      mov(x9, reinterpret_cast<uint64_t>(backend()->guest_to_host_thunk()));
+      ldr(x9, ptr(GetBackendCtxReg(),
+                  static_cast<uint32_t>(offsetof(
+                      A64BackendContext, guest_to_host_thunk_address))));
       blr(x9);
     }
   } else if (function->behavior() == Function::Behavior::kExtern) {
@@ -1091,7 +1093,9 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
       mov(x0, reinterpret_cast<uint64_t>(extern_function->extern_handler()));
       ldr(x1, ptr(GetContextReg(), static_cast<int32_t>(offsetof(
                                        ppc::PPCContext, kernel_state))));
-      mov(x9, reinterpret_cast<uint64_t>(backend()->guest_to_host_thunk()));
+      ldr(x9, ptr(GetBackendCtxReg(),
+                  static_cast<uint32_t>(offsetof(
+                      A64BackendContext, guest_to_host_thunk_address))));
       blr(x9);
     }
   }
@@ -1117,7 +1121,9 @@ void A64Emitter::CallNativeSafe(void* fn) {
   // GuestToHostThunk: x0=target function, x1/x2=args (set by caller).
   // The thunk rearranges: saves x0 in x9, sets x0=context, calls x9.
   mov(x0, reinterpret_cast<uint64_t>(fn));
-  mov(x9, reinterpret_cast<uint64_t>(backend()->guest_to_host_thunk()));
+  ldr(x9, ptr(GetBackendCtxReg(),
+              static_cast<uint32_t>(
+                  offsetof(A64BackendContext, guest_to_host_thunk_address))));
   blr(x9);
 }
 
@@ -1250,7 +1256,9 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
     // switch above already ran, and the hot path continues assuming
     // held_mode.
     e.cbz(e.x0, restore_held ? rejoin : after);
-    e.mov(e.x9, reinterpret_cast<uint64_t>(e.backend()->guest_to_host_thunk()));
+    e.ldr(e.x9, ptr(e.GetBackendCtxReg(),
+                    static_cast<uint32_t>(offsetof(
+                        A64BackendContext, guest_to_host_thunk_address))));
     e.blr(e.x9);
     // Re-establish the mode the hot path still assumes (the host call left
     // FPCR in the scalar FPU state via the guest-to-host thunk). The

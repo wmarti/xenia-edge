@@ -123,6 +123,10 @@ struct A64BackendContext {
   uint64_t indirection_table_bias;
   uint64_t code_execute_base;
   uint64_t external_indirection_table;
+  // The guest-to-host thunk's address, for the same reason: every
+  // CallNativeSafe and every preempt yield built it inline, at 2-4
+  // instructions a site. Stable once Initialize emits the thunk.
+  uint64_t guest_to_host_thunk_address;
   const A64StackpointNode* stackpoint_head;
   // address of the live reservation, and its granule generation when taken
   uint32_t reserve_address;
