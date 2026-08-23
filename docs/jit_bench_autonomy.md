@@ -658,6 +658,79 @@ guest→host call per PACK with `vpminuw`/`vpackuswb`. Measured: `vavgsb` 12.6x,
 are the ones sitting at the 0.314s startup floor, which is why this went
 unmeasured for so long.
 
+## Real game code: the first A/B that measures a title's own workload
+
+A Halo 3 menu corpus captured with `--jit_corpus_out` (8,524 functions,
+1,167,562 guest instructions), replayed through both builds. Same corpus file
+both sides — capturing separately would measure scene drift, not codegen.
+
+| | `edge` | `a64-fixes-on-edge` | delta |
+|---|---|---|---|
+| host instructions | 7,792,627 | 7,124,393 | -8.58% |
+| **stable instructions** | 7,241,611 | 6,769,709 | **-6.52%** |
+| host/gi | 6.6743 | 6.1019 | |
+| **host-address chains** | **311,272** | **169,737** | **-45.5%** |
+| as share of emitted | 9.43% | 5.52% | |
+
+Compare the *stable* total, not the raw one: MOVZ/MOVK chains encode host
+addresses, so raw counts move with load address between processes. The stable
+metric charges each chain one instruction.
+
+The branch's effect is broad rather than narrow — only five functions, 0.8% of
+emitted bytes, were left essentially untouched.
+
+### What is left: host-address materialization
+
+169,737 chains, 5.52% of every host instruction emitted, averaging 2.32
+instructions each. Every one is a 64-bit host address — a helper, the
+guest-to-host thunk — built lane by lane, and every one is replaceable by a
+single `ldr` from the backend context, because those addresses are stable once
+the code cache initialises.
+
+The case is unusually complete for an unstarted optimisation:
+
+- The technique is proven in this tree. `616fb633e` moved three constants at
+  indirect-call sites into `A64BackendContext`, citing `call_indirect` at 53.9
+  bytes per occurrence as the largest single per-call cost in the backend.
+- It measurably worked: 141,535 chains removed, 45.5% of the total.
+- It was applied only at call sites. The remaining 169,737 are everywhere else.
+- Generalising it removes ~223,728 instructions, **3.1% of all emitted code**,
+  on real game code rather than a microbenchmark.
+
+The `bench/mtl3-tracedump` worktree built the analysis that finds this — the
+wide-move classifier and its "replaceable by one ldr from the backend context"
+comment are theirs — and wrote two commits making the metric stable and
+fail-closed (`d7d95f9c2`, `7a415f50d`). Neither acts on it, and a search of all
+211 commits on that branch finds no fix.
+
+### Secondary: five functions the branch did not move
+
+`8271ACC8` at 34.80 host instructions per guest instruction, `827196C0` at
+28.53, `822F9260` at 18.88, `8215B774` at 22.70, `825A18C0` at 19.20. Together
+0.8% of emitted bytes, so not where the mass is — but they are the only
+functions 87 commits left alone, and 35:1 on real code is worth understanding.
+
+### What this does not say
+
+Emitted size, not time. Fewer instructions is real icache and decode pressure,
+but it is not a measured speedup. `gen_loop_bench.py` measures time on synthetic
+code; the corpus measures size on real code. Nothing yet measures time on real
+code — the replay compiles the corpus, it does not execute it, because doing so
+needs the kernel and import thunks it deliberately does without.
+
+### Two capture traps, both hit here
+
+- **Do not capture with `--trace_function_coverage`.** It inlines per-guest-
+  instruction counters into the emitted code, so the recorded `host_code_size`
+  is one the replay can never reproduce. The first capture came back 46% larger
+  than its own replay on the same binary.
+- **The faithfulness gate cannot reach zero with `RawModule`.** It does not
+  populate `instruction_flags_`, so `GetInstructionAddressFlags` returns
+  nullptr, `IsPossibleMMIOInstruction` is false, and MMIO-aware stores are never
+  emitted offline — while the capturing `XexModule` had `accessed_mmio` set.
+  Expect a small negative delta on MMIO-touching functions; the clean capture
+  here sat 3% under, with 3,365 of 8,524 functions identical.
+
 ## Where the x64 headroom is
 
 The callgrind result says the x64 backend was left where it was, so the leads
