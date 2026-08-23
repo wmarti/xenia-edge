@@ -68,6 +68,12 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   // Preemption safepoints for the guest scheduler. No-op when it is off.
   compiler_->AddPass(std::make_unique<passes::PreemptCheckInjectionPass>());
 
+  // Every PPC compare materializes all of CR0 and stores each bit, and most
+  // functions read only one of them -- and read it as an SSA value, not out of
+  // the context. Run before context promotion, while every condition read the
+  // frontend emitted is still a load_context.
+  compiler_->AddPass(std::make_unique<passes::DeadCRStoreEliminationPass>());
+
   // Passes are executed in the order they are added. Multiple of the same
   // pass type may be used.
 
