@@ -240,12 +240,15 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
       }
       auto& normal_access = e.NewCachedLabel();
       auto& done = e.NewCachedLabel();
-      e.mov(e.w0, 0x7FC00000u);
-      e.cmp(e.w17, e.w0);
-      e.b(LO, normal_access);
-      e.mov(e.w0, 0x7FFFFFFFu);
-      e.cmp(e.w17, e.w0);
-      e.b(HI, normal_access);
+      // MMIO is exactly the top 4 MiB of the 2 GiB guest space,
+      // [0x7FC00000, 0x7FFFFFFF], which is every address whose top ten bits
+      // are 0111111111. Shifting those down and comparing against a 9-bit
+      // immediate decides it in three instructions; materializing both bounds
+      // and comparing twice took six, on the executed path of every guest
+      // load and store that reaches here.
+      e.lsr(e.w0, e.w17, 22);
+      e.cmp(e.w0, 0x1FFu);
+      e.b(NE, normal_access);
       // MMIO path
       void* mmio_fn = (void*)&MMIOAwareLoad<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -429,12 +432,15 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
       }
       auto& normal_access = e.NewCachedLabel();
       auto& done = e.NewCachedLabel();
-      e.mov(e.w0, 0x7FC00000u);
-      e.cmp(e.w17, e.w0);
-      e.b(LO, normal_access);
-      e.mov(e.w0, 0x7FFFFFFFu);
-      e.cmp(e.w17, e.w0);
-      e.b(HI, normal_access);
+      // MMIO is exactly the top 4 MiB of the 2 GiB guest space,
+      // [0x7FC00000, 0x7FFFFFFF], which is every address whose top ten bits
+      // are 0111111111. Shifting those down and comparing against a 9-bit
+      // immediate decides it in three instructions; materializing both bounds
+      // and comparing twice took six, on the executed path of every guest
+      // load and store that reaches here.
+      e.lsr(e.w0, e.w17, 22);
+      e.cmp(e.w0, 0x1FFu);
+      e.b(NE, normal_access);
       // MMIO path — copy value to w2 before w1 in case src2 is in w1
       void* mmio_fn = (void*)&MMIOAwareStore<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -746,12 +752,15 @@ struct LOAD_OFFSET_I32
       }
       auto& normal_access = e.NewCachedLabel();
       auto& done = e.NewCachedLabel();
-      e.mov(e.w0, 0x7FC00000u);
-      e.cmp(e.w17, e.w0);
-      e.b(LO, normal_access);
-      e.mov(e.w0, 0x7FFFFFFFu);
-      e.cmp(e.w17, e.w0);
-      e.b(HI, normal_access);
+      // MMIO is exactly the top 4 MiB of the 2 GiB guest space,
+      // [0x7FC00000, 0x7FFFFFFF], which is every address whose top ten bits
+      // are 0111111111. Shifting those down and comparing against a 9-bit
+      // immediate decides it in three instructions; materializing both bounds
+      // and comparing twice took six, on the executed path of every guest
+      // load and store that reaches here.
+      e.lsr(e.w0, e.w17, 22);
+      e.cmp(e.w0, 0x1FFu);
+      e.b(NE, normal_access);
       // MMIO path
       void* mmio_fn = (void*)&MMIOAwareLoad<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -903,12 +912,15 @@ struct STORE_OFFSET_I32
       }
       auto& normal_access = e.NewCachedLabel();
       auto& done = e.NewCachedLabel();
-      e.mov(e.w0, 0x7FC00000u);
-      e.cmp(e.w17, e.w0);
-      e.b(LO, normal_access);
-      e.mov(e.w0, 0x7FFFFFFFu);
-      e.cmp(e.w17, e.w0);
-      e.b(HI, normal_access);
+      // MMIO is exactly the top 4 MiB of the 2 GiB guest space,
+      // [0x7FC00000, 0x7FFFFFFF], which is every address whose top ten bits
+      // are 0111111111. Shifting those down and comparing against a 9-bit
+      // immediate decides it in three instructions; materializing both bounds
+      // and comparing twice took six, on the executed path of every guest
+      // load and store that reaches here.
+      e.lsr(e.w0, e.w17, 22);
+      e.cmp(e.w0, 0x1FFu);
+      e.b(NE, normal_access);
       // MMIO path — copy value to w2 before w1 in case src3 is in w1
       void* mmio_fn = (void*)&MMIOAwareStore<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
