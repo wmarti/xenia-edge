@@ -10,8 +10,11 @@
 #include "xenia/cpu/processor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <thread>
 #include <vector>
 
 #include "xenia/base/assert.h"
@@ -21,6 +24,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
 #include "xenia/base/exception_handler.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -60,6 +64,23 @@ DEFINE_path(
     "Capture the guest code the JIT compiles to this file, for offline codegen "
     "replay by xenia-cpu-ppc-tests --jit_corpus_in. Contains copyrighted guest "
     "code; keep it out of version control.",
+    "CPU");
+DEFINE_path(
+    trace_function_coverage_out, "",
+    "Write the --trace_function_coverage tables to this file when the emulator "
+    "shuts down. Without it the counters are only reachable through the "
+    "profiler's CSV dump, and a profiler build cannot survive a real title: "
+    "every guest function mints a MicroProfile token and "
+    "MICROPROFILE_MAX_TIMERS "
+    "is 1024, after which the token is invalid and its 0xFFFF timer index is "
+    "written past the end of the timer arrays.",
+    "CPU");
+DEFINE_int32(
+    trace_function_coverage_period, 0,
+    "Rewrite --trace_function_coverage_out every this many seconds while the "
+    "title runs, so a scripted run does not depend on someone quitting the "
+    "emulator by hand. Written to a sibling file and renamed, so a reader "
+    "never sees a partial table. 0 dumps only at shutdown.",
     "CPU");
 DEFINE_bool(break_on_start, false, "Break into the debugger on startup.",
             "CPU");
@@ -199,6 +220,20 @@ void Processor::RefreshTraceCountsEnabled() {
     return;
   }
   trace_counts_enabled_ = true;
+  // A run that has to be quit by hand is not a run that can be repeated, and
+  // the counters only reach a file through a clean shutdown otherwise.
+  if (cvars::trace_function_coverage_period > 0 &&
+      !trace_counts_periodic_started_) {
+    trace_counts_periodic_started_ = true;
+    std::thread([this]() {
+      xe::threading::set_name("Coverage Dump");
+      for (;;) {
+        xe::threading::Sleep(
+            std::chrono::seconds(cvars::trace_function_coverage_period));
+        DumpTraceCountsToFile();
+      }
+    }).detach();
+  }
   if (!trace_counts_dump_section_) {
     trace_counts_dump_section_ =
         Profiler::RegisterDumpSection([this](FILE* f) { DumpTraceCounts(f); });
@@ -206,6 +241,34 @@ void Processor::RefreshTraceCountsEnabled() {
   // Counters accumulate until reset, so the timers have to as well or the two
   // halves of the dump would describe different windows.
   Profiler::ResetAggregation();
+}
+
+// Same tables the profiler dump appends, written on their own to a file the
+// caller names. This is the only route to them on an ordinary build.
+void Processor::DumpTraceCountsToFile() {
+  if (cvars::trace_function_coverage_out.empty() || !trace_counts_enabled_) {
+    return;
+  }
+  // Written to a sibling and renamed, because the periodic writer below can be
+  // running when the process is killed; a reader must never see half a table.
+  std::filesystem::path final_path = cvars::trace_function_coverage_out;
+  std::filesystem::path tmp_path = final_path;
+  tmp_path += ".part";
+  FILE* f = xe::filesystem::OpenFile(tmp_path, "wb");
+  if (!f) {
+    XELOGE("Could not open {} for the coverage dump",
+           xe::path_to_utf8(cvars::trace_function_coverage_out));
+    return;
+  }
+  DumpTraceCounts(f);
+  fclose(f);
+  std::error_code ec;
+  std::filesystem::rename(tmp_path, final_path, ec);
+  if (ec) {
+    XELOGE("Could not move the coverage dump into place: {}", ec.message());
+    return;
+  }
+  XELOGI("Guest coverage written to {}", xe::path_to_utf8(final_path));
 }
 
 // Reads the shared retired totals plus every live arena without disturbing
