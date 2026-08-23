@@ -193,6 +193,39 @@ def main():
     if not a_fps or not b_fps:
         print("\nnot measured: at least one ref never reached the window.")
         return 1
+    def paired(label, idx, lower_is_better):
+        """Per-iteration differences, which is what interleaving is for.
+
+        The refs alternate so that each iteration measures both of them minutes
+        apart, and the difference within an iteration is insensitive to drift
+        across the session. Comparing best-vs-best against a ref's own spread
+        throws that away: on this machine CPU percent falls steadily over a
+        session, so both refs drift down together, the within-ref spread picks
+        up the drift rather than the noise, and a change that wins every single
+        pair gets reported as unresolved.
+        """
+        pairs = [(a[idx], b[idx]) for a, b in zip(a_fps, b_fps)
+                 if a[idx] is not None and b[idx] is not None]
+        if not pairs:
+            return None
+        deltas = [100.0 * (bb - aa) / aa for aa, bb in pairs]
+        mean = sum(deltas) / len(deltas)
+        wins = sum(1 for d in deltas if (d < 0) == lower_is_better)
+        print(f"\n{label} -- paired by iteration")
+        for n, ((aa, bb), d) in enumerate(zip(pairs, deltas), 1):
+            print(f"  pair {n}: {aa:8.2f} vs {bb:8.2f}   {d:+7.2f}%")
+        print(f"  mean {mean:+.2f}%, spread of the differences "
+              f"{max(deltas) - min(deltas):.2f} points, "
+              f"{wins}/{len(deltas)} pairs favour {args.ref_b}")
+        consistent = wins == len(deltas) and len(deltas) >= 3
+        if consistent:
+            print(f"  RESOLVED: every pair agrees in sign.")
+        else:
+            print(f"  NOT RESOLVED: the pairs disagree; this is not a result.")
+        return {"pairs": pairs, "deltas": [round(d, 3) for d in deltas],
+                "mean_delta_pct": round(mean, 3), "agreeing_pairs": wins,
+                "resolved": consistent}
+
     def report(label, idx, best):
         va = [r[idx] for r in a_fps if r[idx] is not None]
         vb = [r[idx] for r in b_fps if r[idx] is not None]
@@ -220,9 +253,12 @@ def main():
     # and the figure of merit for a core-release change is CPU at equal fps.
     fps_r = report("frames per second (higher is better)", 0, max)
     cpu_r = report("CPU percent (lower is better)", 1, min)
+    fps_p = paired("frames per second", 0, False)
+    cpu_p = paired("CPU percent", 1, True)
     if args.out:
         json.dump({"ref_a": args.ref_a, "ref_b": args.ref_b,
                    "fps": fps_r, "cpu": cpu_r,
+                   "fps_paired": fps_p, "cpu_paired": cpu_p,
                    "warmup": args.warmup, "window": args.window},
                   open(args.out, "w"), indent=2)
     return 0
