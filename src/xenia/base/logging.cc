@@ -48,6 +48,17 @@ DEFINE_bool(log_to_logcat, true, "Write log output to Android Logcat.",
             "Logging");
 #else
 DEFINE_path(log_file, "", "Logs are written to the given file", "Logging");
+
+DEFINE_path(
+    present_count_file, "",
+    "If set, the present counter and a monotonic nanosecond timestamp are "
+    "rewritten to this file every 64 presents. The counter itself is an atomic "
+    "that has nothing to do with the log sink; this exists so a benchmark can "
+    "read it without going through the log file, whose freshness depends on "
+    "the "
+    "writer thread and is therefore not independent of anything that changes "
+    "logging timing.",
+    "Logging");
 DEFINE_transient_bool(log_append, false,
                       "Append to existing log file instead of overwriting. "
                       "Used for title-to-title launches.",
@@ -502,7 +513,23 @@ uint32_t logging::GetFrameNumber() {
 }
 
 void logging::IncrementFrameNumber() {
-  global_frame_number_.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t n =
+      global_frame_number_.fetch_add(1, std::memory_order_relaxed) + 1;
+  // Every 64 presents, roughly twice a second at 30 fps, so the cost is a
+  // rounding error on the command processor thread. Truncate-and-rewrite
+  // rather than append: a reader only ever wants the latest pair, and a short
+  // file cannot be read torn in practice.
+  if ((n & 63u) == 0 && !cvars::present_count_file.empty()) {
+    FILE* f = fopen(cvars::present_count_file.string().c_str(), "wb");
+    if (f) {
+      const uint64_t ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+      fprintf(f, "%u %llu\n", n, static_cast<unsigned long long>(ns));
+      fclose(f);
+    }
+  }
 }
 
 uint32_t logging::internal::GetLogLevel() { return cvars::log_level; }

@@ -26,11 +26,22 @@ are locked at 30 and their fps can only ever be a liveness check -- and at a
 menu it is not even that, because the attract sequence makes it swing (an
 identical-binary run gave 29.83 / 34.60 / 29.80).
 
-**The `i> f:` counter in the log is a swap-packet count, not a present count.**
-`logging::IncrementFrameNumber()` fires per PM4_XE_SWAP; Apple's Metal HUD
-(`MTL_HUD_ENABLED=1`) reads ~20% lower and is the oracle. Reach's menu reads
-36.2 by our counter and 29.9 on the HUD. Use our counter only to compare two
-arms that share it; never quote it as fps.
+**The present counter is sound; an earlier claim here that it read ~20% high
+was wrong.** `logging::IncrementFrameNumber()` fires once per PM4_XE_SWAP,
+which is once per present. Measured against Apple's Metal HUD at the GTA IV
+docks: 40.17 presents/s from the counter, 40.6 on the HUD -- agreement within
+1%.
+
+The Reach figures that prompted the original claim (36.2 ours, 29.9 HUD) were
+a 90-second average compared against an instantaneous HUD reading, on a menu
+whose attract sequence varies its frame rate. That is scene variance, not
+counter bias.
+
+Read it through `--present_count_file`, not the log. The log carries the same
+counter, but it is written by a batching writer thread, so its freshness
+depends on logging timing -- which made it useless for judging a change TO
+logging: it read ~9% low purely because the writer had been made to sleep when
+idle.
 
 **Warmup is set by the title, the window by the content.** CPU settles by ~75 s
 in every state here. The window has to be long enough to average what the scene
