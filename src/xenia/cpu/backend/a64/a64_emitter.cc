@@ -1144,7 +1144,7 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
       mov(x2, reinterpret_cast<uint64_t>(builtin_function->arg1()));
       ldr(x9, ptr(GetBackendCtxReg(),
                   static_cast<uint32_t>(offsetof(
-                      A64BackendContext, guest_to_host_thunk_address))));
+                      A64BackendContext, guest_to_host_thunk_no_vec_address))));
       blr(x9);
     }
   } else if (function->behavior() == Function::Behavior::kExtern) {
@@ -1157,7 +1157,7 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
                                        ppc::PPCContext, kernel_state))));
       ldr(x9, ptr(GetBackendCtxReg(),
                   static_cast<uint32_t>(offsetof(
-                      A64BackendContext, guest_to_host_thunk_address))));
+                      A64BackendContext, guest_to_host_thunk_no_vec_address))));
       blr(x9);
     }
   }
