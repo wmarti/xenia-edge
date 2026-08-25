@@ -72,9 +72,10 @@ predate two instrument fixes and their denominators are wrong.
 
 | # | Target | State | Measured |
 | --- | --- | --- | --- |
-| T1 | Reach NETWORK_RECEIVE zero-delay yield trap (~27% of Reach menu CPU) | lever landed, default off (`--zero_delay_spin_limit`) | not yet |
-| T2 | `TimerQueue` spin_wait -> blocking_wait on POSIX (10.3% Halo 3 / 4.3% Reach) | landed | A/B running |
-| T3 | Halo 3 host GPU submit/encode (53% aggregate, no single hot spot) | blocked on present-rate question | not yet |
+| T1 | Reach NETWORK_RECEIVE zero-delay yield trap (~27% of Reach menu CPU) | lever landed, default off (`--zero_delay_spin_limit`) | **-54.58% Reach menu, 3/3 pairs. Null on Halo 3 and GTA IV** -- title-specific, so it stays off |
+| T2 | `TimerQueue` spin_wait -> blocking_wait on POSIX (10.3% Halo 3 / 4.3% Reach) | landed | **-2.74%** |
+| T3 | Halo 3 host GPU submit/encode (53% aggregate, no single hot spot) | unblocked -- the present-rate question was resolved, no unpaced loop exists | not attempted |
+| T4 | Two guest functions hold 18.2% of running samples at the GTA IV docks (`guest_828BF420` 9.2%, `guest_82A46D70` 9.0%) | corpus capture in progress | not yet |
 | B1 | `PACK_D3DCOLOR` returned 0xFFFFFFFF always | fixed, guard proven to fail on the bug | correctness |
 
 ## T3's present-rate question, resolved: there is no unpaced present loop
