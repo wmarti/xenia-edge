@@ -714,6 +714,12 @@ class XThread : public XObject, public cpu::Thread {
   std::unique_ptr<xe::threading::Fiber> fiber_;
   SchedulerLinks scheduler_links_;
   // Set by the first ReclaimExited so both terminal paths reclaim once.
+  // Consecutive zero-timeout Delay calls with no real work between them, and
+  // the raw host tick of the last one. Used only by the zero_delay_spin_limit
+  // escalation; touched exclusively by the owning thread, so no atomics.
+  uint32_t zero_delay_spins_ = 0;
+  uint64_t zero_delay_last_tick_ = 0;
+
   std::atomic<bool> self_reference_dropped_{false};
   // Owned by XObject::Enter/LeaveCooperativeWait.
   std::atomic<XObject*> cooperative_wait_object_{nullptr};

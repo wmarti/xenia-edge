@@ -29,6 +29,22 @@
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 
+DEFINE_int32(
+    zero_delay_spin_limit, 0,
+    "Consecutive zero-timeout guest delays on one thread before the emulator "
+    "stops yielding the timeslice and parks the thread for "
+    "zero_delay_park_ns instead. 0 disables the escalation and keeps "
+    "upstream's plain sched_yield. A guest Sleep(0) poll loop otherwise runs "
+    "at host syscall rate rather than at guest rate and holds a core for the "
+    "whole wait: measured 46.9% of on-core CPU at the Halo Reach menu, 59% of "
+    "that inside the yield trap itself. Only affects --guest_scheduler=false; "
+    "the fiber scheduler never reaches this path.",
+    "Kernel");
+DEFINE_int32(zero_delay_park_ns, 60000,
+             "Nanoseconds to park a thread that tripped zero_delay_spin_limit. "
+             "60us matches the shipped db16cyc core-release policy.",
+             "Kernel");
+
 DEFINE_bool(ignore_thread_priorities, false,
             "Ignores game-specified thread priorities.", "Kernel");
 UPDATE_from_bool(ignore_thread_priorities, 2026, 4, 9, 12, true);
@@ -1268,7 +1284,37 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
     }
   } else {
     if (timeout_ms == 0) {
-      if (priority_ <= xe::threading::ThreadPriority::kBelowNormal) {
+      // A guest thread that keeps asking for a zero delay is polling. Yielding
+      // leaves it runnable, so on a machine with a spare core sched_yield
+      // returns almost immediately and the loop spins at host syscall rate --
+      // it is the largest single CPU consumer at the Halo Reach menu.
+      //
+      // Escalate only after the thread has done this many times in a row with
+      // no real work in between, so a thread that genuinely alternates between
+      // working and yielding is never parked.
+      //
+      // Raw ticks, not Clock::QueryHostUptimeMillis(): on macOS that is an
+      // uncached mach_timebase_info() plus two 64-bit divides, which would be
+      // added to the very path being made cheaper.
+      const int32_t spin_limit = cvars::zero_delay_spin_limit;
+      bool park = false;
+      if (spin_limit > 0) {
+        const uint64_t now = Clock::host_tick_count_raw();
+        const uint64_t gap = now - zero_delay_last_tick_;
+        // A gap wide enough to mean the thread did something else resets the
+        // run. Expressed in raw ticks against the host frequency so it does
+        // not inherit the millisecond clock's granularity.
+        if (zero_delay_last_tick_ == 0 ||
+            gap > Clock::host_tick_frequency_raw() / 1000) {
+          zero_delay_spins_ = 0;
+        }
+        zero_delay_last_tick_ = now;
+        park = ++zero_delay_spins_ >= static_cast<uint32_t>(spin_limit);
+      }
+      if (park) {
+        zero_delay_spins_ = 0;
+        xe::threading::NanoSleep(cvars::zero_delay_park_ns);
+      } else if (priority_ <= xe::threading::ThreadPriority::kBelowNormal) {
         xe::threading::NanoSleep(100);
       } else {
         xe::threading::MaybeYield();
