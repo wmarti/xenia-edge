@@ -127,6 +127,9 @@ struct A64BackendContext {
   // CallNativeSafe and every preempt yield built it inline, at 2-4
   // instructions a site. Stable once Initialize emits the thunk.
   uint64_t guest_to_host_thunk_address;
+  // Same thunk without the vector save/restore, for transitions where
+  // no HIR value can be live in q4-q31. See EmitGuestToHostThunkNoVec.
+  uint64_t guest_to_host_thunk_no_vec_address;
   const A64StackpointNode* stackpoint_head;
   // address of the live reservation, and its granule generation when taken
   uint32_t reserve_address;
@@ -166,6 +169,9 @@ class A64Backend : public Backend {
 
   HostToGuestThunk host_to_guest_thunk() const { return host_to_guest_thunk_; }
   GuestToHostThunk guest_to_host_thunk() const { return guest_to_host_thunk_; }
+  GuestToHostThunk guest_to_host_thunk_no_vec() const {
+    return guest_to_host_thunk_no_vec_;
+  }
   ResolveFunctionThunk resolve_function_thunk() const {
     return resolve_function_thunk_;
   }
@@ -237,6 +243,7 @@ class A64Backend : public Backend {
 
   HostToGuestThunk host_to_guest_thunk_ = nullptr;
   GuestToHostThunk guest_to_host_thunk_ = nullptr;
+  GuestToHostThunk guest_to_host_thunk_no_vec_ = nullptr;
   ResolveFunctionThunk resolve_function_thunk_ = nullptr;
   void* synchronize_guest_and_host_stack_helper_ = nullptr;
   void* vrsqrtefp_scalar_helper_ = nullptr;
