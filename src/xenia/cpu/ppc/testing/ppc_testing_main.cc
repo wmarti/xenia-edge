@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <cstdlib>
+
 #include "xenia/base/console_app_main.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
@@ -68,6 +70,13 @@ DEFINE_bool(
     "understates the instruction count and is not comparable with "
     "another run -- which is why it fails by default.",
     "CPU");
+DEFINE_string(jit_corpus_disasm, "",
+              "Print the guest, HIR and emitted host disassembly for this "
+              "guest address (hex) during --jit_corpus_in, and nothing else. "
+              "Answers what a function actually emitted, which a size alone "
+              "cannot -- use a corpus holding only the function of interest, "
+              "as this forces disassembly for every function compiled.",
+              "CPU");
 DEFINE_path(jit_corpus_csv, "",
             "Write per-function corpus replay results here as CSV, for joining "
             "against profile data offline.",
@@ -917,6 +926,12 @@ bool RunCorpusReplay() {
             corpus->functions().size());
   }
 
+  // Disassembly is built during translation, so this has to be latched before
+  // the first compile rather than at the point it is printed.
+  if (!cvars::jit_corpus_disasm.empty()) {
+    cvars::disassemble_functions = true;
+  }
+
   auto memory = std::make_unique<Memory>();
   memory->Initialize();
 
@@ -1080,6 +1095,26 @@ bool RunCorpusReplay() {
     auto* guest_function = static_cast<GuestFunction*>(function);
     if (guest_function->end_address() != record.end_address) {
       ++extent_mismatched;
+    }
+    if (!cvars::jit_corpus_disasm.empty()) {
+      const uint32_t want = static_cast<uint32_t>(
+          std::strtoul(cvars::jit_corpus_disasm.c_str(), nullptr, 16));
+      if (record.address == want) {
+        auto* info = guest_function->debug_info();
+        fprintf(stdout, "\n=== %.8X..%.8X, %zu host bytes ===\n",
+                record.address, record.end_address,
+                guest_function->machine_code_length());
+        if (info && info->source_disasm()) {
+          fprintf(stdout, "\n--- guest ---\n%s", info->source_disasm());
+        }
+        if (info && info->hir_disasm()) {
+          fprintf(stdout, "\n--- HIR (optimized) ---\n%s", info->hir_disasm());
+        }
+        if (info && info->machine_code_disasm()) {
+          fprintf(stdout, "\n--- host ---\n%s", info->machine_code_disasm());
+        }
+        fflush(stdout);
+      }
     }
     const uint32_t host_bytes =
         static_cast<uint32_t>(guest_function->machine_code_length());
