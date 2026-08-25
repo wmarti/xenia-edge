@@ -334,7 +334,11 @@ inline void ApplyPhysicalRemapW0(A64Emitter& e) {
   // without materializing the bound.
   e.lsr(e.w17, e.w0, 29);
   e.cmp(e.w17, 7);
-  e.b(NE, skip);
+  // b_near, not the shadow: skip is bound one instruction later, so the branch
+  // is provably in range. The shadow would expand to `b.eq over; b skip;
+  // over:`, which lays down five instructions here instead of four and runs
+  // four instead of three - on every guest memory address on this host.
+  e.b_near(NE, skip);
   e.add(e.w0, e.w0, 1, 12);  // + 0x1000 via LSL #12
   e.L(skip);
 }
