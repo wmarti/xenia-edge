@@ -69,6 +69,8 @@ class TextureCache {
   uint64_t make_up_to_date_mips_invalid() const {
     return make_up_to_date_mips_invalid_;
   }
+  uint64_t watch_callbacks() const { return watch_callbacks_; }
+  uint64_t watch_callbacks_ = 0;
   uint64_t make_up_to_date_calls_ = 0;
   uint64_t make_up_to_date_base_invalid_ = 0;
   uint64_t make_up_to_date_mips_invalid_ = 0;

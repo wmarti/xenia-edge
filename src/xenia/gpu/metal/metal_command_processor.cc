@@ -1972,6 +1972,17 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           fprintf(cf, "uptodate_mips_invalid %llu\n",
                   static_cast<unsigned long long>(
                       texture_cache_->make_up_to_date_mips_invalid()));
+          fprintf(cf, "watch_callbacks %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->watch_callbacks()));
+          if (shared_memory_) {
+            fprintf(cf, "fire_watch_events %llu\n",
+                    static_cast<unsigned long long>(
+                        shared_memory_->fire_watches_events()));
+            fprintf(cf, "fire_watch_pages %llu\n",
+                    static_cast<unsigned long long>(
+                        shared_memory_->fire_watches_pages()));
+          }
         }
         fclose(cf);
       }
