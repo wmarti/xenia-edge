@@ -1189,6 +1189,76 @@ target's live set.
 
 ## TODO — the immediately optimizable parts
 
+### 2026-08-25: the ranking is no longer a model
+
+Everything below used to be ordered by *executed host instructions* — emitted
+instruction count per sequence times guest execution count. That is a model of
+cost, and item 8 has always said nothing had ever checked it against a profile
+that did not come from the model. It has now been checked.
+
+`tools/bench/live.py profile` samples a running emulator, drops every stack
+whose innermost frame is a blocking primitive, and bisects the remaining JIT
+addresses through `--jit_perf_map` into guest function names. Measured on
+Halo: Reach in the campaign (NOBLE ACTUAL), driven there unattended by
+`--input_script`, four 12-second windows:
+
+| | share of all CPU | windows | range |
+| --- | --- | --- | --- |
+| guest JIT code | **53.5%** | 4/4 | 52.5–53.9 |
+| `iokit_user_client_trap` (GPU submit) | 6.5% | 4/4 | 6.0–7.2 |
+| `GuestToHostThunk` | **4.5%** | 4/4 | 3.7–5.0 |
+| `_platform_memmove` | 2.2% | 4/4 | 2.1–2.4 |
+| `objc_msgSend` | 1.9% | 4/4 | 1.7–2.4 |
+
+By thread: GPU Commands 21.6%, RENDER 15.5%, NETWORK_RECEIVE 12.8%,
+MAIN_THREAD 12.6%, each in 4/4 windows with a spread under 2.5 points.
+
+Sanity check from an independent path: 6.5% of thread-time on a core across
+~28 threads is ~180% CPU, against 160% measured by `ps` on the same run.
+
+Two corrections it forced. The hottest single entry is **not** a guest
+function — `code_cache_base.h` names a body `guest_{:08X}` when it has no
+`function_info`, so the JIT's own transition thunks, emitted at the head of the
+code cache with a guest address of zero, all arrive called `guest_00000000`.
+And `sample` records every thread whether or not it is on a core, so an
+incomplete blocked-primitive list made guest code read as 11.7% of CPU instead
+of 53%.
+
+### Tier 0 — found by the profile, not by the model
+
+**0. The transition thunks write FPCR unconditionally — IMPLEMENTED, ungated.**
+`GuestToHostThunk` is 4.5% of all CPU. Histogramming sample addresses across
+its 152 bytes puts **79.4%** of that on the FPCR reload and `msr`, with 75.1%
+on the single instruction *after* the `msr` — the signature of a
+context-synchronizing write flushing the pipeline. All 28 vector save/restores
+together are 20.4% of the thunk; the `blr` into the host function is 0.0%.
+
+So roughly **3.6% of all CPU is one `msr fpcr`** — about twice what widening
+the dead-context-store pass across the whole context could return.
+
+`a64_emitter.cc` already tracks FPCR mode across blocks precisely because the
+write is serializing; the thunks were never given the same treatment. The fix
+reads FPCR back and skips the write when it already matches, at the two
+per-transition sites (`EmitGuestToHostThunk`, `EmitHostToGuestThunk`).
+`EmitResolveFunctionThunk` is left alone — one resolve per call site, ever.
+*Still owed:* the 169,048-case corpus gate, and a before/after profile of the
+same scene. None of this is a result until both exist.
+
+**0b. NETWORK_RECEIVE burns 12.8% of all CPU and does no work.** Its stack is
+`XThread::Delay` → `cthread_yield` → `swtch_pri`, with `KeDelayExecutionThread`
+and `RtlEnter/LeaveCriticalSection` around it. Same shape as item 2 below, now
+located rather than inferred — and it is why the thunk is hot, since every one
+of those kernel exports is a guest→host transition.
+
+**0c. `iokit_user_client_trap` at 6.5%** is GPU submission, and GPU Commands is
+21.6% of CPU while the device sits at 25–45% utilisation. Not a JIT problem,
+but it is the largest single line in the profile and the model was never going
+to show it.
+
+**0d. `_sigtramp` plus libunwind at ~2.3%** points at the signal-based memory
+watch path firing far more than it should. Unexamined.
+
+
 Ordered by expected payoff against confidence. Every entry names how it will be
 measured, because the campaign has already had two rankings overturned by the
 measurement rather than by the code.
@@ -1241,9 +1311,12 @@ counter means something.
 **7. Per-sample call/MMIO variant attributes.** Still outstanding from the
 original repair list.
 
-**8. Validate against uninstrumented host-PC sampling.** `--jit_perf_map` came
-in with the rebase and makes this possible for the first time. Nothing in the
-model has been checked against a profile that does not come from the model.
+**8. Validate against uninstrumented host-PC sampling — DONE, and it moved
+things.** See the table above. The model was not wrong that guest code is where
+the time is (53.5%), but it could not see the 4.5% in a transition thunk, the
+12.8% in a polling guest thread, or the 6.5% in GPU submission, because none of
+those are emitted guest instructions. Reweighting the model in cycles rather
+than instruction counts is the remaining half of this item.
 
 ### Structural — large, and blocked on one thing
 
@@ -1254,6 +1327,18 @@ count, and the count exists because `DataFlowAnalysisPass::AnalyzeFlow` forces
 cross-block values through local slots and the register allocator is
 block-local. Nothing peephole-shaped will move it. Item 1 attacks a slice of it
 from the frontend instead, which is why it is first.
+
+*What the profile makes of this.* Context traffic is 13.34% of executed host
+instructions inside guest code, and guest code is 53.5% of CPU, so all of it is
+~7% of total CPU. Only the store half is reachable by dead-store elimination —
+`store_context i8` 4.14 + `i64` 3.21 + `ci64` 1.39 = 8.74% — and only the dead
+fraction of that goes. CR stores were 41.59% dead; at a similar rate for GPRs
+that is **~2% of total CPU**, against 3.6% for one `msr fpcr`. Worth doing, and
+the machinery exists: widening `DeadCRStoreEliminationPass` from the 32 bytes of
+`cr0..cr7` to the whole `PPCContext` needs a GPR ABI kill mask at calls (r3–r12
+volatile, r14–r31 callee-saved, r1/r2/r13 special), returns treated as reading
+everything, and branches handled before the VOLATILE check. But it is no longer
+first.
 
 ### Closed — recorded so they are not reopened
 
