@@ -1264,23 +1264,82 @@ mechanism was real, the reasoning about it was sound, and it was still the wrong
 cause. It would have been very easy to build the fix, see the crash change
 shape, and claim it.
 
-### What would actually be needed
+### Root cause: a HIR block can branch out of its middle
 
-Promotion cannot be extended without giving the allocator a way to keep the
-value alive to its last use, and the two passes cannot simply be asked to agree
-on where the chains are: `SimplificationPass`, `ConstantPropagationPass`,
-`MemorySequenceCombinationPass` and `DeadCodeEliminationPass` all run between
-them (`ppc_translator.cc:102-150`) and are free to restructure the CFG, so the
-chain the allocator recomputes need not be the chain promotion fused.
+`StartsExtendedBlock` treated "exactly one incoming edge, from exactly the
+layout-previous block" as proof that every definition earlier in the chain has
+run by the time a later block runs. That is false in this HIR, and the reason is
+structural: **a block is not split at a conditional branch.** The frontend emits
+`branch_true cond, target` and keeps appending the fall-through code to the same
+block, so a block can branch out from its middle and carry on for another twenty
+instructions.
 
-The approach being tried: before `PrepareBlockState()` discards state at a chain
-boundary, force anything still live through a local slot, reusing the
-`SpillOneRegister` machinery that already inserts the store after the definition,
-the load before the next use, and renames the remaining uses. That makes
-correctness independent of the two passes agreeing — where the chain holds the
-value stays in a register, and where it breaks it goes to memory.
+Halo Reach's `827EA298` is the case that found it:
 
-Both cvars are **default off** until that is demonstrated on a booting title.
+```
+label33:
+  ...
+  branch_true v839, label34        <- instruction 10 of the block
+  v842 = load_context +288         <- instruction 11
+  ... 20 more instructions ...
+  branch label35                   <- the actual tail
+label34:
+  ; in: label33, dom:1, uncond:0
+  v877 = load_offset.1 v842, 50    <- promotion put v842 here
+```
+
+`label34` has one incoming edge, from its layout predecessor, and `v842` is
+defined on the path that does **not** reach it. Promotion rewrote label34's
+`load_context +288` into a use of `v842`, and the guest read a register never
+written on that path.
+
+`hir::Edge::DOMINATES` is no help and is actively misleading here: it is set
+purely from "dest has exactly one incoming edge"
+(`control_flow_analysis_pass.cc`), which for this shape is not dominance at all.
+The dump prints `dom:1` on precisely the edge that does not dominate.
+
+### The corrected predicate, and the measurement that killed the feature
+
+The missing condition is that the incoming edge must leave the predecessor from
+its **trailing run of branches**, or be the fall-through — either way the
+predecessor has provably run to completion. With that in, the four-way cvar
+matrix is clean where three of four legs faulted, and a 240 s scripted campaign
+run completes on both arms at ~18,626 functions and frame ~8,080.
+
+Then the opportunity was counted over the 18,625-function corpus
+(134,753 non-head blocks):
+
+| | blocks | share |
+| --- | --- | --- |
+| single edge from layout-previous — the old predicate | 15,800 | 11.73% |
+| ...and the predecessor provably ran to completion | **2,729** | **2.03%** |
+| **unsafe continuations the old predicate accepted** | **13,071** | **9.70%** |
+
+**83% of what the old predicate accepted was wrong.** And what remains is worth
+nothing: with promotion on, `load_context` over the whole title moves 603,043 ->
+603,050 (+7, against two extra functions in the corpus — noise), every other op
+count moves +0.00%, and the HIR of the crashing function is byte-identical with
+the feature on and off.
+
+So the entire apparent value of extended-block promotion came from the 9.70% of
+cases that were miscompiles. **The feature has been reverted.** Kept from it:
+the instruction-ordinal fix, which is a real latent bug on its own merits, and
+this write-up.
+
+### What it would actually take
+
+Not a tighter predicate — the predicate is now correct and finds almost nothing.
+The prerequisite is **real basic blocks**: splitting a HIR block at every
+conditional branch so that a branch target is entered only by running a
+predecessor to its end. That is a frontend/CFG change, not a pass change, and
+`ControlFlowAnalysisPass` would have to build fall-through edges as well (today
+it only creates edges from a trailing run of branch instructions, so a plain
+fall-through has no edge at all — which is a second reason the 2.03% is so
+small).
+
+Until then, cross-block context traffic — 33.4% of all HIR ops — is not
+addressable this way, and the honest statement is that the branch has no
+mechanism for it.
 
 ### What this says about the gate
 

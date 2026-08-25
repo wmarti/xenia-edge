@@ -13,7 +13,6 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/profiling.h"
 #include "xenia/cpu/compiler/compiler.h"
-#include "xenia/cpu/compiler/passes/extended_block.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
 
@@ -41,7 +40,6 @@ DEFINE_bool(
     "CPU");
 
 DECLARE_bool(disable_context_promotion);
-DECLARE_bool(extended_block_promote);
 
 namespace xe {
 namespace cpu {
@@ -93,15 +91,11 @@ bool ContextPromotionPass::Run(HIRBuilder* builder) {
   // This is more generally done by DSE, however if it could be done here
   // instead as it may be faster (at least on the block-level).
 
-  // Promote loads to values, over extended blocks rather than one block at a
-  // time. Inside a chain with a single way in, a value stored in one block is
-  // still the value the next block would load back, and the definition
-  // dominates the use, so the load can become an assign.
+  // Promote loads to values.
+  // Process each block independently, for now.
   auto block = builder->first_block();
   while (block) {
-    const bool reset =
-        !cvars::extended_block_promote || StartsExtendedBlock(block);
-    PromoteBlock(block, reset);
+    PromoteBlock(block);
     block = block->next;
   }
 
@@ -179,11 +173,9 @@ Value* ContextPromotionPass::LookupTrackedValue(uint32_t offset, uint32_t size,
   return value;
 }
 
-void ContextPromotionPass::PromoteBlock(Block* block, bool reset_tracking) {
+void ContextPromotionPass::PromoteBlock(Block* block) {
   auto& validity = context_validity_;
-  if (reset_tracking) {
-    validity.reset();
-  }
+  validity.reset();
   const bool promote_vec128 =
       cvars::context_promote_vec128 && !cvars::disable_context_promotion;
 
