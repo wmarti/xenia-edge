@@ -955,3 +955,42 @@ writes them.
 Note the zero-delay lever is *not* this. That lever acts on zero-length delay
 calls into the kernel; this loop never leaves guest code, which is exactly why
 the lever measured null at the docks.
+
+## T5: the counters are guest-written, so the ring is the guest's own
+
+Scanned all 13,564 captured functions for D-form accesses to `+0x40A0` and
+`+0x40A8`. Both counters are written by guest code:
+
+| | |
+| --- | --- |
+| `+0x40A0` incremented | `82A46804`, in `82A467D8` |
+| `+0x40A8` incremented | `82A4610C` in `82A46098`, `82A462E8` in `82A46198` |
+
+The producer's sequence is unambiguous:
+
+    82A467F8 lwz  r11, 0x40A0(r31)
+    82A46800 addi r11, r11, 1
+    82A46804 stw  r11, 0x40A0(r31)     ; submitted++
+    82A46808 bl   82A00DC0             ; then does the work
+
+and the consumer does the same increment on `+0x40A8`. So **`+0x40A0` is a
+submitted count and `+0x40A8` a completed count**, and `828BF420` spins until
+fewer than two operations are outstanding.
+
+**This narrows T5 but does not close it.** No host write is needed to explain
+the counters, which removes the most attractive hypothesis -- that the emulator
+controls the wait the way it controls Reach's zero-delay spin. What advances
+`+0x40A8` is a guest function; the open question is now *which thread calls it
+and what that thread is itself waiting on*. If the consumer thread is blocked on
+something the host owns, the emulator still sets the pace, one level removed.
+
+`82A00DC0` was checked in case it named the subsystem. It does not: it opens
+with `std`, `rlwinm`, `dcbt` and a decrementing pointer pair, which is a byte
+copy helper, and the producer calls it with r5 = 0x18 -- a 24-byte move, not a
+submission to an identifiable device.
+
+**Caveat on the scan:** the corpus was captured by a run the disk guard cut
+short, so a function that only compiles later would be missing. Every writer
+found sits in the same `82A46xxx`-`82A4Dxxx` region as the spin loop, which is
+consistent with one subsystem, but absence of a *host* writer is weaker evidence
+than the presence of the guest ones.
