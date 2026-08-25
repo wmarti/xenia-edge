@@ -12,30 +12,9 @@
 #include <cstring>
 
 #include "xenia/base/assert.h"
-#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
-#include "xenia/cpu/compiler/passes/extended_block.h"
-
-// Split in two so the two halves of the change can be bisected against each
-// other. They are not independent -- extending the allocator alone is a no-op
-// because nothing else creates a value that outlives its block -- but
-// extending promotion alone is meaningful, and tells us which half is wrong.
-DEFINE_bool(
-    extended_block_regalloc, false,
-    "Allocate registers over extended blocks rather than one block at a time. "
-    "Only does anything when extended_block_promote is also on, since nothing "
-    "else produces a value that lives across a block boundary.",
-    "CPU");
-
-DEFINE_bool(
-    extended_block_promote, false,
-    "Promote context loads over extended blocks -- chains of layout-adjacent "
-    "blocks with a single way in -- instead of one block at a time. Off by "
-    "default: with it on the guest faults during module launch, and the cause "
-    "is not yet found. See docs/jit_bench_autonomy.md.",
-    "CPU");
 
 namespace xe {
 namespace cpu {
@@ -98,16 +77,20 @@ bool RegisterAllocationPass::Run(HIRBuilder* builder) {
   // were doing lower SSA and do this right.
 
   // Number every block and instruction in the function before allocating
-  // anything. The usage lists are sorted by instruction ordinal, and the
-  // allocator decides a register is dead by asking whether a use is the last
-  // one in that order. Instructions are born with ordinal UINT32_MAX
-  // (hir_builder.cc), so numbering block-by-block as allocation walked meant a
-  // value was sorted while the blocks its later uses live in were still
-  // unnumbered: those uses all compared equal at UINT32_MAX, the tail of the
-  // list came out in arbitrary order, and a register could be retired with a
-  // real use still ahead of it. Nothing noticed while every value was
-  // block-local. Extended-block scope is what creates values that outlive
-  // their block, and it turned this into a miscompile.
+  // anything. Instructions are born with ordinal UINT32_MAX
+  // (hir_builder.cc), the usage lists are sorted by that ordinal
+  // (CompareValueUse), and AdvanceUses decides a register has died by asking
+  // whether a use is the last one in that order. Numbering block by block
+  // inside this walk meant a value whose uses reach a later block was sorted
+  // while that block was still unnumbered: those uses all compared equal at
+  // UINT32_MAX while the subtraction overflowed against the real ones, so the
+  // tail of the list came out in arbitrary order and a register could be
+  // retired with a real use still ahead of it.
+  //
+  // Nothing in the tree currently creates a value that outlives its block, so
+  // this is unreachable today. It is fixed rather than left as a trap for the
+  // next pass that does -- see docs/jit_bench_autonomy.md for the one that
+  // did.
   {
     uint16_t pre_block_ordinal = 0;
     uint32_t pre_instr_ordinal = 0;
@@ -121,42 +104,8 @@ bool RegisterAllocationPass::Run(HIRBuilder* builder) {
 
   auto block = builder->first_block();
   while (block) {
-    // Reset all state -- but only at the head of an extended block. Inside
-    // one, a value defined earlier still dominates every later use, so the
-    // register holding it stays valid and does not have to be dropped and
-    // reloaded at the boundary.
-    if (!cvars::extended_block_regalloc || StartsExtendedBlock(block)) {
-      // Anything still live here is about to lose its register: the reset
-      // below clears upcoming_uses and marks every register available, so the
-      // next value allocated can be handed a register a later use still
-      // expects to read. Force those through memory first.
-      //
-      // This is not hypothetical bookkeeping. ContextPromotionPass decides
-      // what a chain is, and then simplification, constant propagation,
-      // memory-sequence combination and dead code elimination all run before
-      // this pass and are free to restructure the CFG. The chain the
-      // allocator recomputes need not be the chain promotion fused, so a value
-      // promoted across a boundary can arrive at a block that no longer looks
-      // like a continuation.
-      for (size_t si = 0; si < xe::countof(usage_sets_.all_sets); ++si) {
-        auto usage_set = usage_sets_.all_sets[si];
-        if (!usage_set) {
-          break;
-        }
-        TypeName spill_type = INT64_TYPE;
-        if (usage_set == usage_sets_.float_set) {
-          spill_type = FLOAT64_TYPE;
-        } else if (usage_set == usage_sets_.vec_set) {
-          spill_type = VEC128_TYPE;
-        }
-        while (!usage_set->upcoming_uses.empty()) {
-          if (!SpillOneRegister(builder, block, spill_type)) {
-            break;
-          }
-        }
-      }
-      PrepareBlockState();
-    }
+    // Reset all state.
+    PrepareBlockState();
 
     auto instr = block->instr_head;
     while (instr) {
@@ -309,14 +258,8 @@ void RegisterAllocationPass::AdvanceUses(Instr* instr) {
         // Remove the iterator.
         auto value = upcoming_use.value;
         upcoming_uses.erase(upcoming_uses.begin() + j);
-        // Both of these hold only while a value cannot outlive its block.
-        // Under extended-block scope a chain has a single way in, so the
-        // definition still dominates the use -- it just may sit in an earlier
-        // block of the same chain.
-        assert_true(cvars::extended_block_regalloc ||
-                    next_use->instr->block == instr->block);
-        assert_true(cvars::extended_block_regalloc ||
-                    value->def->block == instr->block);
+        assert_true(next_use->instr->block == instr->block);
+        assert_true(value->def->block == instr->block);
         upcoming_uses.emplace_back(value, next_use);
         // i remains the same.
         continue;
@@ -463,14 +406,8 @@ bool RegisterAllocationPass::SpillOneRegister(HIRBuilder* builder, Block* block,
   assert_true(!usage_set->upcoming_uses.empty());
   auto furthest_usage = std::ranges::max_element(usage_set->upcoming_uses,
                                                  &RegisterUsage::Compare);
-  // With extended-block scope these may sit in an earlier block of the same
-  // chain. Every insertion below is relative to an instruction rather than to
-  // `block`, so that is fine -- but say so, because the old assertion was the
-  // only record that the scope was ever one block.
-  assert_true(cvars::extended_block_regalloc ||
-              furthest_usage->value->def->block == block);
-  assert_true(cvars::extended_block_regalloc ||
-              furthest_usage->use->instr->block == block);
+  assert_true(furthest_usage->value->def->block == block);
+  assert_true(furthest_usage->use->instr->block == block);
   auto spill_value = furthest_usage->value;
   Value::Use* prev_use = furthest_usage->use->prev;
   Value::Use* next_use = furthest_usage->use;
