@@ -1506,8 +1506,8 @@ traps) where operands really are in flight, and it keeps the full thunk. Two
 thunks, differing only in the save/restore; the light one's frame is 16 bytes.
 169,048/169,048 cases. Runtime number still owed.
 
-**0f. `NanoSleep` truncates every sub-microsecond sleep to zero — free fix,
-not yet applied.** `threading_posix.cc:240` is
+**0f. `NanoSleep` truncated every sub-microsecond sleep to zero — LANDED,
+unmeasured.** `threading_posix.cc:240` is
 `void NanoSleep(int64_t duration) { Sleep(std::chrono::nanoseconds(duration)); }`,
 which resolves to the template at `threading.h:141` and `duration_cast`s to
 **microseconds**. So `NanoSleep(100)` becomes `nanosleep({0, 0})` — a syscall
@@ -1520,8 +1520,8 @@ both functions. `NanoSleep(60000)` in the db16cyc release path is unaffected —
 line and reports ~93k `nanosleep(0)`/s on one Halo Reach thread. Unconditional,
 no behaviour change intended, measurable on its own.
 
-**0g. `page_size()` is an uncached libc call on every guest address
-translation — free fix, not yet applied.** `memory_posix.cc:94` is
+**0g. `page_size()` was an uncached libc call on every guest address
+translation — LANDED, unmeasured.** `memory_posix.cc:94` is
 `size_t page_size() { return getpagesize(); }` with
 `allocation_granularity()` calling straight through. `PPCContext::TranslateVirtual`
 (`ppc_context.h:461`) evaluates it as the **first** operand of
@@ -1542,6 +1542,30 @@ disassembly scan.
 Ordered by expected payoff against confidence. Every entry names how it will be
 measured, because the campaign has already had two rankings overturned by the
 measurement rather than by the code.
+
+### What landed on 2026-08-25, and what each is still owed
+
+Six commits. **Not one of them has a runtime number yet**, which is the single
+biggest gap in this list and the next thing being closed.
+
+| commit | evidence it has | evidence it lacks |
+| --- | --- | --- |
+| `[Base]` NanoSleep sub-us truncation | upstream `0ac27adc6` verbatim; both functions read in this tree | any measurement here |
+| `[Base/PPC]` getpagesize off the translation path | 964 `bl` sites decoded from the shipped binary | any measurement |
+| `[A64]` near branch in the physical remap | gate 169,048/169,048 | deliberately unsized — needs the sequence coverage table |
+| `[A64]` ccmp denormal screen | gate 169,048/169,048; 17→15 executed at n=3 | instruction counts only, no time |
+| `[A64]` near branches in vector-store dispatch | reasoning only | **zero corpus coverage** — stvlx/stvrx cannot be assembled |
+| `[CPU]` extended-block promotion | reverted; see above | — |
+
+Also still owed from earlier: **the no-vec thunk runtime profile** (0e). Its
+first attempt failed with the emulator exiting before `sample` fired, and it has
+not been retried. The change has 169,048/169,048 and no runtime number.
+
+The A/B that closes most of this is a two-build paired run of `57a51a146`
+against the branch head — one binary per arm, since none of these is behind a
+cvar. Expected combined effect is on the order of 1%, which is near this
+harness's resolution, so the run has to be long and interleaved or the result
+is not worth quoting.
 
 ### Tier 1 — implementable now, target already measured
 
