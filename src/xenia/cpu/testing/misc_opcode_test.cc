@@ -637,7 +637,8 @@ TEST_CASE("LOAD_VECTOR_RIGHT", "[memory]") {
 // ============================================================================
 constexpr std::array<uint8_t, 16> kStoreVectorSource = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
-constexpr uint32_t kPartialStoreOffsets[] = {0, 1, 4, 8, 12, 15};
+constexpr uint32_t kPartialStoreOffsets[] = {0, 1, 2,  3,  4,  5,  6,  7,
+                                             8, 9, 10, 11, 12, 13, 14, 15};
 
 TEST_CASE("STORE_VECTOR_LEFT", "[memory]") {
   TestFunction test([](HIRBuilder& b) {

@@ -2204,17 +2204,21 @@ EMITTER_OPCODE_TABLE(OPCODE_LVR, LVR_V128);
 static void EmitPartialVectorStore(A64Emitter& e,
                                    const Xbyak_aarch64::XReg& dst,
                                    const Xbyak_aarch64::XReg& src,
-                                   const Xbyak_aarch64::WReg& count) {
+                                   const Xbyak_aarch64::WReg& count,
+                                   bool count_may_be_16) {
   // Unqualified Label here is hir::Label.
   Xbyak_aarch64::Label from8, from4, from2, from1, done;
 
-  e.cmp(count, 8);
-  e.b(Xbyak_aarch64::HS, from8);
-  e.cmp(count, 4);
-  e.b(Xbyak_aarch64::HS, from4);
-  e.cmp(count, 2);
-  e.b(Xbyak_aarch64::HS, from2);
-  e.cbnz(count, from1);
+  // count is in 0..16, so its highest set bit selects the largest access.
+  // Test it directly instead of materialising and comparing three bounds.
+  // STVL may produce 16 (bit 4), while STVR is known to stop at 15.
+  if (count_may_be_16) {
+    e.tbnz(count, 4, from8);
+  }
+  e.tbnz(count, 3, from8);
+  e.tbnz(count, 2, from4);
+  e.tbnz(count, 1, from2);
+  e.tbnz(count, 0, from1);
   e.b(done);
 
   e.L(from8);
@@ -2269,7 +2273,7 @@ struct STVL_V128 : Sequence<STVL_V128, I<OPCODE_STVL, VoidOp, I64Op, V128Op>> {
     e.mov(e.w1, 16);
     e.sub(e.w2, e.w1, e.w2);
     e.add(e.x1, e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH));
-    EmitPartialVectorStore(e, e.x0, e.x1, e.w2);
+    EmitPartialVectorStore(e, e.x0, e.x1, e.w2, true);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_STVL, STVL_V128);
@@ -2294,7 +2298,7 @@ struct STVR_V128 : Sequence<STVR_V128, I<OPCODE_STVR, VoidOp, I64Op, V128Op>> {
     e.and_(e.x0, e.x0, ~0xFull);
     e.add(e.x1, e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH) + 16);
     e.sub(e.x1, e.x1, e.x2);
-    EmitPartialVectorStore(e, e.x0, e.x1, e.w2);
+    EmitPartialVectorStore(e, e.x0, e.x1, e.w2, false);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_STVR, STVR_V128);
