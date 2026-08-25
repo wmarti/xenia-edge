@@ -3313,6 +3313,23 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                               bool load_mips) {
   SCOPE_profile_cpu_f("gpu");
 
+  // Diagnostic: is the ~469 uploads per present at the GTA IV docks many
+  // distinct textures (streaming) or a few re-uploaded constantly (churn)?
+  // Total uploads alone cannot tell those apart, and the answer decides
+  // whether the fix is in the cache's invalidation or nowhere.
+  ++upload_calls_;
+  {
+    auto it = upload_key_counts_.find(texture.key());
+    if (it == upload_key_counts_.end()) {
+      upload_key_counts_.emplace(texture.key(), 1u);
+    } else {
+      ++it->second;
+      if (it->second > upload_key_max_repeats_) {
+        upload_key_max_repeats_ = it->second;
+      }
+    }
+  }
+
   MetalTexture* metal_texture = static_cast<MetalTexture*>(&texture);
   if (!metal_texture || !metal_texture->metal_texture()) {
     XELOGE("LoadTextureDataFromResidentMemoryImpl: Invalid Metal texture");

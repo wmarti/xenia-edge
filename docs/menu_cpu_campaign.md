@@ -363,6 +363,59 @@ their encoder pairs (3.13% of on-core in encoder creation alone) and their
 memmove traffic together -- which is a far larger prize than batching, and does
 not require touching upload ordering at all.
 
+## The texture cache re-uploads the same 1,315 textures ~709 times each
+
+Measured at the GTA IV docks over a 45.5 s window, 1,984 presents at 43.6/s,
+camera stationary:
+
+| | |
+| --- | --- |
+| upload calls | **932,729** (470.1 per present, ~20,500/s) |
+| distinct texture keys | **1,315 at the start, 1,315 at the end -- zero new** |
+| most-uploaded single key | **37,595 times** |
+
+Not streaming. The working set does not change at all during the window, and
+the same textures are re-uploaded roughly 709 times each. One is re-uploaded
+37,595 times.
+
+This subsumes almost every GPU-side target in this document. Each upload drags
+with it a command buffer (527 per present, 484 of them uploads), a compute
+encoder and a blit encoder (encoder creation alone is 3.13% of on-core against
+0.88% for the actual copy), its share of `_platform_memmove`, and the
+write-watch `mprotect` traffic that re-arms the pages afterwards -- 388
+`__mprotect` samples on the GPU Commands thread plus `TriggerCallbacks` and
+`_sigtramp`. Removing the churn removes all of it together.
+
+It also reframes two ticks of work: batching those command buffers optimises
+the submission cost of uploads that should not be happening. The corruption
+those attempts caused is still unexplained, but it no longer matters much
+whether it is fixed.
+
+### Where to look
+
+`TextureCache::LoadTextureDataFromResidentMemory` (`texture_cache.cc:962`,
+`:1057`) uploads when `base_outdated` or `mips_outdated` is set. Those come from
+the write-watch machinery, which marks a texture outdated when the guest writes
+anywhere in the pages backing it. Three candidates, in order of how cheaply
+they can be told apart:
+
+1. **The guest genuinely writes those pages every frame** -- a scratch or
+   streaming buffer that happens to share pages with resident textures. Then the
+   invalidation is correct and the fix is granularity, not logic.
+2. **The watch is re-armed too broadly**, so an unrelated write in the same page
+   invalidates a texture whose bytes did not change.
+3. **Something clears the outdated flags unconditionally**, so every draw
+   re-uploads regardless of whether a write occurred.
+
+The cheapest discriminator is to count invalidations against writes: log how
+many times a texture is marked outdated and how many distinct guest pages
+triggered it. If a handful of pages are responsible for most invalidations,
+that is (1) or (2) and the page can be identified.
+
+**Do not "fix" this by weakening invalidation without proving the guest did not
+write.** A texture that is genuinely stale renders wrong, and this campaign has
+already shipped two rendering regressions that every counter called a win.
+
 ## Open defects found, not yet resolved
 
 - **`vector_nan_propagation_test.cc` fails 2 assertions in this tree.** It expects
