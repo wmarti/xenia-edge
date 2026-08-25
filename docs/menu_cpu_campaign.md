@@ -233,6 +233,41 @@ the producer claim path every logging thread goes through, so switching it to
 `notify_all` on every log line. A consumer-only condition variable would be the
 shape to try.
 
+## Correction: the constant-sizing win is real but smaller than first reported
+
+`077903aa7` was committed as "+28% frame throughput, -18.3% CPU per frame". A
+second independent 3-pair run, this time reading throughput from
+`--present_count_file` rather than scraping the log, does not reproduce that
+magnitude:
+
+| run | presents/s before -> after | CPU before -> after |
+| --- | --- | --- |
+| first (log-derived counter) | 35.90 -> 45.91 (**+28.0%**) | 392.50 -> 409.92 (+4.4%) |
+| second (present counter) | 37.01 -> 42.11 (**+13.8%**) | 396.13 -> 410.75 (+3.7%) |
+
+Per-pair throughput in the second run: +4.25%, +17.30%, +20.32%. The docks
+presents noise floor is ~7%, so individual pairs are barely separable even
+though every one favours the change.
+
+**What is solid:** the direction. Six of six pairs across two independent runs
+favour the fix on both metrics, and the mechanism is confirmed twice --
+`_platform_memmove` falls from 5.79% of on-core to 1.6%, and `Bind`'s share of
+the GPU Commands thread falls with it. The CPU figure is stable across runs
+(+4.4%, +3.7%), which on an uncapped title means more frames for slightly more
+total CPU.
+
+**What is not:** the magnitude. CPU per present improves 18.3% by the first
+run's numbers and 8.9% by the second. Quote it as **roughly -9% to -18% CPU per
+frame, throughput up somewhere between 4% and 28%**, and do not repeat the
+single 28% figure as though it were the result. It came from one run whose
+before-arm happened to sit at the low end of the scene's variance.
+
+**Method note.** This is the reason the docks state needs more than three pairs
+for a throughput claim: the scene is uncapped and its frame rate wanders, so
+three pairs can straddle a 5x range in the measured effect while the sign stays
+constant. CPU is far tighter (0.28% floor) and should carry the claim wherever
+the title is frame-capped -- which is both Halo states, but not this one.
+
 ## Open defects found, not yet resolved
 
 - **`vector_nan_propagation_test.cc` fails 2 assertions in this tree.** It expects
