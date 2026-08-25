@@ -162,6 +162,33 @@ Consequences for the campaign:
   something here too, but far less than at the Reach menu: total spin is 6.8%
   of on-core against Reach's 33%.
 
+## The zero-delay lever is Reach-specific, and the docks noise floor
+
+`--zero_delay_spin_limit=16` measured on all three states, same binary, one
+cvar apart:
+
+| state | CPU | verdict |
+| --- | --- | --- |
+| **Reach menu** | 152.79 -> **69.47** | **-54.58%, 3/3 pairs. Confirmed by Metal HUD at 29.97 fps and by NETWORK_RECEIVE falling 5,986 -> 1,863 samples.** |
+| Halo 3 menu | 83.0/83.8/83.6 vs 83.9/83.7 | null, as predicted -- no NETWORK_RECEIVE thread, a third of Reach's spin |
+| GTA IV docks | 391.05 vs 390.30 | **null**, pairs disagree, mean -0.19% |
+
+So the lever is not a general win: it acts on one guest thread in one title.
+GTA IV has a 61%-spin and a 98%-spin thread and `swtch_pri` at 6.8%, and still
+returns nothing -- those threads are a small share of a 390% total, and the 2x
+discount on sampled shares would have predicted about 2 points at best.
+It stays default-off.
+
+**GTA IV docks noise floor**, taken from that run because the cvar is inert
+there, so both arms are effectively the same binary:
+
+- CPU: 390.51 / 391.59 / 391.05 -- spread **0.28%**
+- swaps/s: 38.11 / 38.10 / 35.72 -- spread **6.7%**
+
+CPU is tight here; the swap rate is not, because the scene is uncapped and
+run-to-run frame pacing varies. Any throughput claim in this state needs to
+clear ~7%, which the constant-upload fix does by 4x.
+
 ## Open defects found, not yet resolved
 
 - **`vector_nan_propagation_test.cc` fails 2 assertions in this tree.** It expects
