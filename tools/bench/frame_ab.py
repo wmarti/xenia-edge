@@ -105,9 +105,19 @@ def run_once(app, work, warmup_s, window_s, timeout, extra=(), game=None):
     out = open(os.path.join(work, "stdout.log"), "wb")
     # No --apu=nop: it fails CreateDriver and the guest dies at boot.
     before = macwin.frontmost() if macwin else ""
+    # --hid=nop unless the caller is driving the guest. The scripted input
+    # driver (src/xenia/hid/script) is how a run reaches gameplay unattended,
+    # and it needs a real HID backend to attach to -- forcing nop here silently
+    # produced a menu-idle measurement while looking like an in-game one. A
+    # menu-idle A/B is a legitimate experiment, it just is not the same
+    # experiment, and the two are told apart in the log by whether fps reports
+    # a number: a settled menu stops logging frames entirely, so fps comes back
+    # n/a while CPU percent keeps reporting.
+    driving = any("--input_script" in str(a) for a in extra)
+    hid = [] if driving else ["--hid=nop"]
     p = subprocess.Popen(
         [app, f"--storage_root={work}/storage", f"--log_file={log}",
-         "--log_level=2", "--hid=nop", "--discord=false", *extra,
+         "--log_level=2", *hid, "--discord=false", *extra,
          game or GAME],
         cwd=work, stdin=subprocess.DEVNULL, stdout=out,
         stderr=subprocess.STDOUT, start_new_session=True)
