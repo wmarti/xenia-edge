@@ -37,14 +37,30 @@ THREAD_RE = re.compile(r"^\s*(\d+)\s+Thread_(\w+)(?::?\s*(.*?))?\s*$")
 # A stack sitting in one of these was not on a core. `sample` records every
 # thread at every interval whether it is running or blocked, so counting all
 # of them gives each thread an identical total and measures nothing.
+# Truly parked: the thread is off the run queue and consuming nothing. Samples
+# on these stacks are dropped from the CPU accounting entirely.
 BLOCKED = (
     "__psynch_cvwait", "__psynch_mutexwait", "__psynch_rw_", "mach_msg2_trap",
     "kevent_id", "kevent", "semaphore_wait_trap", "semaphore_timedwait_trap",
     "semaphore_wait_signal_trap", "__semwait_signal", "mach_wait_until",
     "__select", "__workq_kernreturn", "poll", "read", "__sigsuspend",
-    "swtch_pri", "thread_switch", "__ulock_wait", "start_wqthread",
+    "__ulock_wait", "start_wqthread",
     "__wait4", "__accept", "__recvfrom", "guarded_kqueue_np",
 )
+
+# NOT blocked. sched_yield() lands here via cthread_yield, and it leaves the
+# thread RUNNABLE: it gives up the rest of its quantum and is immediately
+# eligible again, so on a machine with a spare core it returns almost at once
+# and the loop spins at syscall rate. These samples are real CPU.
+#
+# They were in BLOCKED, which silently deleted the largest single consumer in
+# the profile. At the Halo Reach menu the NETWORK_RECEIVE thread is 5,438
+# samples, 3,130 of them swtch_pri; counting those as blocked reported the
+# thread at 29.4% of on-core CPU when its true share is about 2.4x that.
+# Reported separately rather than merged into ordinary work, because a thread
+# spinning in yield is not the same finding as a thread doing arithmetic --
+# one is removable by scheduling policy, the other is not.
+SPINNING = ("swtch_pri", "thread_switch", "sched_yield", "cthread_yield")
 
 
 def emulators():
@@ -271,14 +287,17 @@ def parse_sample(text):
 
 
 def self_times(nodes):
-    """Self samples per (thread, label), skipping stacks that were blocked.
+    """(work, spin, running) self-sample maps keyed by (thread, label).
 
     A node's count includes its children, so self time is the node minus the
     children directly beneath it. A node whose label names a blocking
-    primitive contributed no CPU, and neither did anything above it on that
-    stack, so its self time is dropped rather than counted.
+    primitive consumed no CPU and is dropped.
+
+    A node whose label names a yield trap DID consume CPU -- see SPINNING --
+    and is returned separately so it can be reported as what it is rather than
+    either deleted or disguised as useful work. `running` counts both.
     """
-    out, running = {}, 0
+    work, spin, running = {}, {}, 0
     for i, (depth, count, label, thread) in enumerate(nodes):
         child = 0
         for j in range(i + 1, len(nodes)):
@@ -292,9 +311,10 @@ def self_times(nodes):
             continue
         if any(b in label for b in BLOCKED):
             continue
-        out[(thread, label)] = out.get((thread, label), 0) + self_n
+        bucket = spin if any(sp in label for sp in SPINNING) else work
+        bucket[(thread, label)] = bucket.get((thread, label), 0) + self_n
         running += self_n
-    return out, running
+    return work, spin, running
 
 
 def do_profile(a):
@@ -310,7 +330,10 @@ def do_profile(a):
     if not os.path.exists(out):
         sys.exit(f"sample failed: {(r.stderr or r.stdout).strip()[:400]}")
     nodes, threads = parse_sample(open(out, errors="replace").read())
-    selves, running = self_times(nodes)
+    work, spin, running = self_times(nodes)
+    selves = dict(work)
+    for k, n in spin.items():
+        selves[k] = selves.get(k, 0) + n
     if not running:
         sys.exit("no running samples: every thread was blocked")
 
@@ -325,15 +348,24 @@ def do_profile(a):
             return f"[jit, unmapped] 0x{m.group(1)}"
         return re.sub(r"\s+\(in .*", "", label)
 
-    by_thread = {}
+    by_thread, spin_thread = {}, {}
     for (thread, label), n in selves.items():
         by_thread[thread] = by_thread.get(thread, 0) + n
+    for (thread, label), n in spin.items():
+        spin_thread[thread] = spin_thread.get(thread, 0) + n
+    spin_total = sum(spin.values())
     print(f"\n{running} running samples of {sum(threads.values())} taken "
           f"({100.0*running/max(sum(threads.values()),1):.1f}% on a core; the "
-          f"rest were blocked)")
-    print("\nCPU by thread")
+          f"rest were parked)")
+    if spin_total:
+        print(f"of those, {spin_total} ({100.0*spin_total/running:.1f}%) are a "
+              f"thread spinning in a yield trap -- runnable, not parked, and "
+              f"burning syscalls rather than doing work")
+    print("\nCPU by thread   (spin = share of that thread stuck in yield)")
     for name, n in sorted(by_thread.items(), key=lambda kv: -kv[1])[:14]:
-        print(f"  {100.0*n/running:5.1f}%  {n:>6}  {name}")
+        sp = spin_thread.get(name, 0)
+        tag = f"   spin {100.0*sp/n:4.0f}%" if sp else ""
+        print(f"  {100.0*n/running:5.1f}%  {n:>6}  {name}{tag}")
 
     merged = {}
     for (_, label), n in selves.items():
