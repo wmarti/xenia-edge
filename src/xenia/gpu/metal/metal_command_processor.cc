@@ -1963,6 +1963,15 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           fprintf(cf, "upload_max_repeats %llu\n",
                   static_cast<unsigned long long>(
                       texture_cache_->upload_max_repeats()));
+          fprintf(cf, "uptodate_calls %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->make_up_to_date_calls()));
+          fprintf(cf, "uptodate_base_invalid %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->make_up_to_date_base_invalid()));
+          fprintf(cf, "uptodate_mips_invalid %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->make_up_to_date_mips_invalid()));
         }
         fclose(cf);
       }

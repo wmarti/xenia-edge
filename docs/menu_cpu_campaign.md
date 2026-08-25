@@ -391,6 +391,50 @@ the submission cost of uploads that should not be happening. The corruption
 those attempts caused is still unexplained, but it no longer matters much
 whether it is fixed.
 
+### Two of the three candidates are now settled
+
+**It is not the stale-flag path.** `Texture::MakeUpToDateAndWatch`
+(`texture_cache.cc:639`) returns early WITHOUT clearing `base_outdated_` /
+`mips_outdated_` when the shared-memory range is not valid, which would make the
+caller re-upload the same texture on every subsequent draw forever. That was the
+obvious suspect and it is wrong. Instrumented and measured at the docks:
+
+| | per present | share of calls |
+| --- | --- | --- |
+| `upload_calls` | 431.4 | |
+| `uptodate_calls` | 431.4 | |
+| `uptodate_base_invalid` | 1.5 | **0.34%** |
+| `uptodate_mips_invalid` | 0.2 | 0.05% |
+
+It succeeds 99.6% of the time. The flags are cleared and the watch re-armed on
+essentially every upload, so the textures are being invalidated again by the
+watch actually firing -- not by a flag that never clears.
+
+**So the guest, or something that looks like the guest, is writing those pages.**
+Which leaves granularity, and there is a concrete reason to suspect it on this
+machine specifically.
+
+### The Apple Silicon page-size mismatch
+
+`Memory::system_page_size_` is `xe::memory::page_size()`, which is **16,384
+bytes** here (confirmed: `sysconf(_SC_PAGESIZE)` returns 16384 on M4 Pro). The
+Xbox 360 guest page is 4,096 bytes. Write watches are armed and re-armed at
+system-page granularity, so **one system page spans four guest pages**, and a
+guest write anywhere in that 16 KiB invalidates every texture whose data lies in
+it -- including three guest pages the write never touched.
+
+On a 4 KiB-page host (Windows and Linux on x86) that fan-out does not exist.
+This is a plausible 4x over-invalidation that is specific to Apple Silicon, and
+it would explain re-uploading a third of a static working set every frame.
+
+**Not yet established, and the next measurement.** Count write-watch callbacks
+against textures invalidated per callback. If a single callback invalidates ~4
+textures on average, the mismatch is confirmed and the fix is to track dirtiness
+at guest-page granularity underneath a system-page protection -- protect at
+16 KiB because the hardware forces it, but re-validate per 4 KiB and only
+invalidate textures whose own bytes fall in a dirtied 4 KiB sub-range. If the
+fan-out is ~1, the guest really is writing all of it and the churn is real work.
+
 ### Where to look
 
 `TextureCache::LoadTextureDataFromResidentMemory` (`texture_cache.cc:962`,
