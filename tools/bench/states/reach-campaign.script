@@ -1,0 +1,26 @@
+# Title screen -> NOBLE ACTUAL -> unpaused gameplay, hands-off.
+# Same sequence that got there before, with the pause-menu exit appended so
+# the profile window lands on gameplay rather than on a menu.
+75000 -
+120  A
+3000 -
+120  A
+4000 -
+120  A
+4000 -
+120  A
+6000 -
+120  A
+8000 -
+120  START
+2000 -
+120  A
+20000 -
+120  START
+2000 -
+120  A
+25000 -
+120  B          # leave the pause menu the START above opens
+3000 -
+120  B
+900000 -
