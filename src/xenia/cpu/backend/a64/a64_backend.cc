@@ -159,9 +159,18 @@ HostToGuestThunk A64HelperEmitter::EmitHostToGuestThunk() {
                         offsetof(ppc::PPCContext, virtual_membase))));
   // Restore the guest scalar FPCR on every host->guest entry so host-side
   // work done before the call can't leak a stale rounding / non-IEEE mode.
-  ldr(w11,
-      ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, fpcr_fpu))));
-  msr(3, 3, 4, 4, 0, x11);
+  // Conditional for the same reason as the guest->host thunk: the write is
+  // context-synchronizing and the value is usually already correct.
+  {
+    Xbyak_aarch64::Label fpcr_unchanged;
+    ldr(w11,
+        ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, fpcr_fpu))));
+    mrs(x12, 3, 3, 4, 4, 0);  // mrs x12, FPCR
+    cmp(w11, w12);
+    b(Xbyak_aarch64::EQ, fpcr_unchanged);
+    msr(3, 3, 4, 4, 0, x11);
+    L(fpcr_unchanged);
+  }
   // x0 still holds target, x2 holds return address.
   // The guest function's prolog stores x0 to GUEST_RET_ADDR on its stack
   // frame. Move the target to a scratch reg and put the guest return
@@ -289,9 +298,26 @@ GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunk() {
   // Host callbacks may change FPCR. Restore the guest scalar FPCR before
   // resuming the JIT so later guest ops observe the cached PPC mode.
   // x19 (backend context) is callee-saved, so it survives the host call.
-  ldr(w11,
-      ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, fpcr_fpu))));
-  msr(3, 3, 4, 4, 0, x11);
+  //
+  // Read it back and skip the write when it already matches. `msr fpcr` is
+  // context-synchronizing, which the emitter already accounts for when it
+  // tracks the mode across blocks -- but the thunks wrote it unconditionally
+  // on every transition. A live profile of Halo Reach put 5.2% of all CPU in
+  // this thunk and 75% of that on the single instruction *after* this msr,
+  // the classic signature of a pipeline flush; all 28 vector save/restores
+  // together came to a fifth of it. Host callbacks almost never touch FPCR,
+  // so the common case becomes a read, a compare and a not-taken branch.
+  // x0 holds the host return value here and must not be touched.
+  {
+    Xbyak_aarch64::Label fpcr_unchanged;
+    ldr(w11,
+        ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, fpcr_fpu))));
+    mrs(x12, 3, 3, 4, 4, 0);  // mrs x12, FPCR
+    cmp(w11, w12);
+    b(Xbyak_aarch64::EQ, fpcr_unchanged);
+    msr(3, 3, 4, 4, 0, x11);
+    L(fpcr_unchanged);
+  }
 
   code_offsets.epilog = getSize();
 
