@@ -28,15 +28,24 @@ FRAME_RE = re.compile(rb"^.> f:(\d+)", re.M)
 
 
 def frames(path):
+    """Present count and its timestamp, from --present_count_file.
+
+    NOT from the log. The log's `f:` prefix carries the same counter, but the
+    log is written by a batching writer thread, so its freshness depends on
+    logging timing -- which made it useless for judging a change TO logging: it
+    read ~9% low purely because the writer had been made to sleep when idle.
+    This file is rewritten directly by the counter's own increment.
+
+    Returns (count, monotonic_ns) or (0, 0).
+    """
     try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            back = min(f.tell(), 262144)
-            f.seek(-back, os.SEEK_END)
-            hits = FRAME_RE.findall(f.read())
-        return int(hits[-1]) if hits else 0
-    except OSError:
-        return 0
+        with open(path, "r") as f:
+            parts = f.read().split()
+        if len(parts) >= 2:
+            return int(parts[0]), int(parts[1])
+    except (OSError, ValueError):
+        pass
+    return 0, 0
 
 
 def cpu_seconds(pid):
@@ -58,7 +67,8 @@ def cpu_seconds(pid):
 def run_once(app, game, script, storage, work, warmup, window, extra):
     os.makedirs(work, exist_ok=True)
     log = os.path.join(work, "run.log")
-    for p in (log, os.path.join(work, "stdout.log")):
+    counter = os.path.join(work, "presents.txt")
+    for p in (log, counter, os.path.join(work, "stdout.log")):
         try:
             os.unlink(p)
         except OSError:
@@ -68,6 +78,7 @@ def run_once(app, game, script, storage, work, warmup, window, extra):
     env["MTL_HUD_ENABLED"] = "1"
     cmd = [app, f"--storage_root={storage}", f"--log_file={log}",
            "--log_level=2", "--hid=nop", "--discord=false",
+           f"--present_count_file={counter}",
            f"--input_script={script}", *extra, game]
     p = subprocess.Popen(cmd, cwd=work, stdin=subprocess.DEVNULL, stdout=out,
                          stderr=subprocess.STDOUT, start_new_session=True)
@@ -77,18 +88,23 @@ def run_once(app, game, script, storage, work, warmup, window, extra):
             if p.poll() is not None:
                 return None, None, "exited during warmup"
             time.sleep(1.0)
-        f0, c0 = frames(log), cpu_seconds(p.pid)
+        (f0, n0), c0 = frames(counter), cpu_seconds(p.pid)
         t1 = time.perf_counter()
         while time.perf_counter() - t1 < window:
             if p.poll() is not None:
                 return None, None, "exited during window"
             time.sleep(1.0)
-        f1, c1 = frames(log), cpu_seconds(p.pid)
+        (f1, n1), c1 = frames(counter), cpu_seconds(p.pid)
         elapsed = time.perf_counter() - t1
         if c0 is None or c1 is None:
             return None, None, "no cpu time"
         cpu = 100.0 * (c1 - c0) / elapsed
-        swaps = (f1 - f0) / elapsed if f1 > f0 else 0.0
+        # Rate over the counter's OWN timestamps, so a late sample does not
+        # look like a slow one.
+        if f1 > f0 and n1 > n0:
+            swaps = (f1 - f0) / ((n1 - n0) / 1e9)
+        else:
+            swaps = 0.0
         return cpu, swaps, None
     finally:
         try:
