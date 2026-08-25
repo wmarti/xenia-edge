@@ -117,6 +117,51 @@ cvar to pace anything would trade GPU work for spin CPU on the command
 processor thread, which at the Halo 3 menu is already the largest single
 consumer at 24.8%.
 
+## GTA IV at the docks: the state where the JIT actually matters
+
+Added 2026-08-25 on request. `tools/bench/states/gtaiv-docks.script`, verified
+by screenshot at Roman's taxi in the docks with the radar and tutorial text up.
+Settles by ~75 s and holds **400-416% CPU** (4.1 cores) against 86% for the
+Halo 3 menu and 153% for Reach's. It is the only state here that is **not
+frame-capped**: 31-35 fps, GPU 14-16 ms, so fps is a genuine work-equality
+guard rather than a liveness check.
+
+Profile at the docks, 25 s sample, 388% process CPU:
+
+| | share | spin |
+| --- | --- | --- |
+| XThread16D1B (guest) | 21.4% | 0% |
+| GPU Commands | 19.8% | 0% |
+| XThread1E013 (guest) | 16.8% | 0% |
+| IOGPU submit thread | 9.8% | 0% |
+| user-interactive dispatch queue | 7.9% | 1% |
+| XThread28F0B | 5.8% | **61%** |
+| Main XThread | 5.4% | 1% |
+
+Hottest by self time: `guest_828BF420` 8.4%, `guest_82A46D70` 7.3%,
+`swtch_pri` 6.8%, `iokit_user_client_trap` 6.7%, **`_platform_memmove` 5.8%**,
+`guest_829321A0` 3.3%, `guest_82199924` 3.0%, `mach_absolute_time` 1.3%,
+`objc_msgSend` 1.3%, **`__mprotect` 1.2%**, `_platform_memset` 1.2%,
+`MetalCommandProcessor::WriteRegister` 0.8%, `_sigtramp` 0.7%.
+
+**`guest JIT code: 50.3% mapped to a function.`** That single line is why this
+state was worth adding. Both menus are dominated by threads spinning in yield
+traps -- work the JIT cannot touch -- so every JIT change measured against them
+was being asked to move a small remainder. Here half of all on-core CPU is
+executing translated guest code, spin is only 6.8%, and the two hottest guest
+functions are 15.7% between them.
+
+Consequences for the campaign:
+- **JIT and backend work should be measured here, not at a menu.** The a64
+  emission changes that returned -0.25% in a Reach campaign run have roughly
+  twice the surface to act on in this state.
+- **New targets visible only here:** `_platform_memmove` at 5.8% and
+  `__mprotect` + `_sigtramp` at 1.9% (the signal-based memory watch path).
+  Neither appears meaningfully in either menu profile.
+- The 61%-spin and 98%-spin threads suggest `zero_delay_spin_limit` may return
+  something here too, but far less than at the Reach menu: total spin is 6.8%
+  of on-core against Reach's 33%.
+
 ## Open defects found, not yet resolved
 
 - **`vector_nan_propagation_test.cc` fails 2 assertions in this tree.** It expects
