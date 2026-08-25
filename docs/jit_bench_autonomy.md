@@ -1282,6 +1282,21 @@ to show it.
 **0d. `_sigtramp` plus libunwind at ~2.3%** points at the signal-based memory
 watch path firing far more than it should. Unexamined.
 
+**0e. The transition thunk saved 28 vector registers it did not need —
+IMPLEMENTED, gated.** With the FPCR write conditional, the vector save/restore
+became 61% of the thunk: q4–q31, 896 bytes through a 464-byte frame, on every
+host transition. A guest-to-guest `OPCODE_CALL` emits a bare `blr` into another
+translated function whose prolog saves only x0/x30 and which then uses q4–q31
+freely, so no HIR value can be live in a vector register across a call or the
+existing code would already be broken; `ContextPromotionPass` stops its walk at
+the first volatile instruction, "a call or a preempt check", so no promoted
+value spans one either. `CallExtern` — the path every kernel export takes — is
+therefore safe without the saves. `CallNativeSafe` is not: it is emitted inside
+a sequence (inline MMIO fallback, `SpinWaitRelease`, memory tracers, debug
+traps) where operands really are in flight, and it keeps the full thunk. Two
+thunks, differing only in the save/restore; the light one's frame is 16 bytes.
+169,048/169,048 cases. Runtime number still owed.
+
 
 Ordered by expected payoff against confidence. Every entry names how it will be
 measured, because the campaign has already had two rankings overturned by the
@@ -1352,17 +1367,37 @@ cross-block values through local slots and the register allocator is
 block-local. Nothing peephole-shaped will move it. Item 1 attacks a slice of it
 from the frontend instead, which is why it is first.
 
-*What the profile makes of this.* Context traffic is 13.34% of executed host
-instructions inside guest code, and guest code is 53.5% of CPU, so all of it is
-~7% of total CPU. Only the store half is reachable by dead-store elimination —
-`store_context i8` 4.14 + `i64` 3.21 + `ci64` 1.39 = 8.74% — and only the dead
-fraction of that goes. CR stores were 41.59% dead; at a similar rate for GPRs
-that is **~2% of total CPU**, against 3.6% for one `msr fpcr`. Worth doing, and
-the machinery exists: widening `DeadCRStoreEliminationPass` from the 32 bytes of
-`cr0..cr7` to the whole `PPCContext` needs a GPR ABI kill mask at calls (r3–r12
-volatile, r14–r31 callee-saved, r1/r2/r13 special), returns treated as reading
-everything, and branches handled before the VOLATILE check. But it is no longer
-first.
+*Widening the dead-store pass to cover it — MEASURED AND REJECTED.* The plan
+was to take `DeadCRStoreEliminationPass` from the 32 bytes of `cr0..cr7` to the
+whole `PPCContext`. Dumping every translated function of the title with
+`--dump_translated_hir_functions` and counting says not to.
+
+Across 18,362 functions and 1,022,844 `store_context` ops:
+
+| | share of all context stores | |
+| --- | --- | --- |
+| overwritten before any read, same block | **0.14%** | no ABI assumption |
+| caller-volatile GPR live only to a return | ~4.4% | needs the PPC ABI |
+
+The first number is the one that matters, and it is nothing.
+`ContextPromotionPass` and the existing cross-block DSE already remove
+within-block redundancy completely, so a widened liveness pass with
+conservative call handling has nothing left to take. The second is real but
+needs the ABI to hold for hand-written guest asm, and ~4.4% of stores is ~1% of
+emitted HIR — not worth that risk.
+
+*Why CR was different.* The CR pass removed 41.59% of CR stores because a PPC
+compare materialises lt/gt/eq and stores all three while the branch consumes
+only the SSA value. That is a frontend pattern peculiar to the condition
+register. GPR stores have no equivalent: they are not redundant.
+
+*So what the 22% actually is.* Of 2,990,109 HIR ops across the title,
+`store_context` is 22.0% and `load_context` 12.5% — 34.5% together, at 3.21 HIR
+ops per guest instruction. That ratio says the frontend is lean. The stores are
+not waste; they exist because the register allocator is block-local, so every
+value crossing a block boundary must go through the context. Eliminating them
+means a global allocator, not another peephole. Which is what this item already
+said — the measurement just closed off the cheap route around it.
 
 ### Closed — recorded so they are not reopened
 
