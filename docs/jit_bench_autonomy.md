@@ -204,6 +204,19 @@ to be stood up.
   is to *submit* `sbatch` work and collect it afterwards, never to compute on
   the login node.
 
+### Which python to run the bench tools with
+
+`tools/bench/macwin.py` needs pyobjc for `--park`, window enumeration and
+window-targeted capture. The system `/usr/bin/python3` does not have it;
+`bench-work/venv/bin/python3` does. Run `frame_ab.py`, `live.py` and anything
+else that touches windows with the venv interpreter, or `--park` degrades to
+`--park ignored: pyobjc not importable` and the emulator window lands wherever
+macOS puts it -- on top of whatever the user is doing.
+
+Note also that `--extra-a` / `--extra-b` values must be passed with `=`
+(`--extra-a=--guest_scheduler=false`). Given as a separate argument, argparse
+takes the leading `--` as an option and the run dies before it starts.
+
 ### Running a pass
 
 One command per machine, and both are idempotent — anything already done is
@@ -1506,8 +1519,8 @@ traps) where operands really are in flight, and it keeps the full thunk. Two
 thunks, differing only in the save/restore; the light one's frame is 16 bytes.
 169,048/169,048 cases. Runtime number still owed.
 
-**0f. `NanoSleep` truncates every sub-microsecond sleep to zero — free fix,
-not yet applied.** `threading_posix.cc:240` is
+**0f. `NanoSleep` truncated every sub-microsecond sleep to zero — LANDED,
+unmeasured.** `threading_posix.cc:240` is
 `void NanoSleep(int64_t duration) { Sleep(std::chrono::nanoseconds(duration)); }`,
 which resolves to the template at `threading.h:141` and `duration_cast`s to
 **microseconds**. So `NanoSleep(100)` becomes `nanosleep({0, 0})` — a syscall
@@ -1520,8 +1533,8 @@ both functions. `NanoSleep(60000)` in the db16cyc release path is unaffected —
 line and reports ~93k `nanosleep(0)`/s on one Halo Reach thread. Unconditional,
 no behaviour change intended, measurable on its own.
 
-**0g. `page_size()` is an uncached libc call on every guest address
-translation — free fix, not yet applied.** `memory_posix.cc:94` is
+**0g. `page_size()` was an uncached libc call on every guest address
+translation — LANDED, unmeasured.** `memory_posix.cc:94` is
 `size_t page_size() { return getpagesize(); }` with
 `allocation_granularity()` calling straight through. `PPCContext::TranslateVirtual`
 (`ppc_context.h:461`) evaluates it as the **first** operand of
@@ -1542,6 +1555,77 @@ disassembly scan.
 Ordered by expected payoff against confidence. Every entry names how it will be
 measured, because the campaign has already had two rankings overturned by the
 measurement rather than by the code.
+
+### What landed on 2026-08-25, and what each is still owed
+
+Six commits. **Not one of them has a runtime number yet**, which is the single
+biggest gap in this list and the next thing being closed.
+
+| commit | evidence it has | evidence it lacks |
+| --- | --- | --- |
+| `[Base]` NanoSleep sub-us truncation | upstream `0ac27adc6` verbatim; both functions read in this tree | any measurement here |
+| `[Base/PPC]` getpagesize off the translation path | 964 `bl` sites decoded from the shipped binary | any measurement |
+| `[A64]` near branch in the physical remap | gate 169,048/169,048 | deliberately unsized — needs the sequence coverage table |
+| `[A64]` ccmp denormal screen | gate 169,048/169,048; 17→15 executed at n=3 | instruction counts only, no time |
+| `[A64]` near branches in vector-store dispatch | reasoning only | **zero corpus coverage** — stvlx/stvrx cannot be assembled |
+| `[CPU]` extended-block promotion | reverted; see above | — |
+
+Also still owed from earlier: **the no-vec thunk runtime profile** (0e). Its
+first attempt failed with the emulator exiting before `sample` fired, and it has
+not been retried. The change has 169,048/169,048 and no runtime number.
+
+The A/B that closes most of this is a two-build paired run of `57a51a146`
+against the branch head — one binary per arm, since none of these is behind a
+cvar. Expected combined effect is on the order of 1%, which is near this
+harness's resolution, so the run has to be long and interleaved or the result
+is not worth quoting.
+
+### The 2026-08-25 changes, measured in-game: -0.25% CPU
+
+Paired A/B, `57a51a146` against `6a8ca82ba`, Halo Reach campaign driven to
+gameplay by `--input_script`, 190 s warmup, 120 s window, 3 interleaved pairs,
+`--guest_scheduler=false` on both arms.
+
+| | fps | CPU % |
+| --- | --- | --- |
+| base@57a51a146 | 29.82 (29.81, 29.82, 29.82) | 154.07 (154.08, 154.07, 154.10) |
+| head@6a8ca82ba | 29.83 (29.82, 29.83, 29.82) | **153.61** (153.74, 153.75, 153.61) |
+| paired mean | +0.01%, pairs disagree — **not a result** | **-0.25%, 3/3 pairs agree** |
+
+Run-to-run spread is 0.09% against a 0.25% effect, so it clears its own noise
+floor by roughly 3x, and every pair agrees in sign. fps sits on the 30 fps cap
+on both arms, which is what makes the CPU comparison meaningful: the two builds
+are doing the same work.
+
+What is in that -0.25%: the NanoSleep truncation fix, `getpagesize` off the
+translation path, the near branch in the physical remap, the `ccmp` denormal
+screen, and the near branches in the vector-store dispatch. Five changes, and
+this measures only their sum -- none is separable without five more builds, and
+the per-change instruction-count estimates that predicted roughly -0.5% to -1%
+were optimistic by about half.
+
+**A methodology defect found here, and it invalidates how the earlier A/Bs were
+read.** `frame_ab.py` forced `--hid=nop`, which disables the scripted input
+driver (`src/xenia/hid/script`), so every run through that harness measured the
+title **idling at its menu** rather than running. The tell was in the output the
+whole time: a settled menu stops logging frames entirely, so fps came back `n/a`
+while CPU percent kept reporting. `n/a fps` means the guest is not doing
+anything, and it was read past for several runs. `--hid=nop` is now dropped
+whenever `--input_script` is passed.
+
+Menu-idle is not a useless experiment -- it is just a different one, and it is
+noisier: an interleaved menu run over the same two builds gave a run-to-run
+spread of 3.57% against the same ~1.7% apparent effect, i.e. unresolved, where
+the in-game run resolves cleanly at a third of the effect size. **In-game with
+the input script is the methodology from here.**
+
+*A second trap, recorded because it produced a plausible-looking number that was
+garbage.* A `pgrep -f frame_ab` wait loop matches its own shell, so it never
+terminates and reports the run as finished when it is not. Two harness processes
+ended up interleaved into one log -- both ref labels appear in it -- with two
+emulators competing for cores. That run reported -1.71% CPU with 3/3 pairs
+agreeing and it was discarded, not published. Wait on the output JSON existing,
+never on a `pgrep` of the harness's own name.
 
 ### Tier 1 — implementable now, target already measured
 
