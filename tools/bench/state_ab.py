@@ -64,6 +64,14 @@ def cpu_seconds(pid):
     return total
 
 
+MIN_FREE_GB = 2.0
+
+
+def free_gb(path):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize / (1024 ** 3)
+
+
 def run_once(app, game, script, storage, work, warmup, window, extra):
     os.makedirs(work, exist_ok=True)
     log = os.path.join(work, "run.log")
@@ -153,12 +161,10 @@ def main():
     # produces a profile that looks like a hung guest -- two threads pinned on
     # one PC, everything else parked -- and nothing says why. That cost two
     # discarded profiles and a wrong "the emulator is wedged" conclusion.
-    st = os.statvfs(a.storage)
-    free_gb = st.f_bavail * st.f_frsize / (1024 ** 3)
-    if free_gb < 2.0:
-        sys.exit(f"error: only {free_gb:.1f} GB free on the storage volume; "
-                 f"free space before measuring (shader caches and logs grow "
-                 f"during a run)")
+    if free_gb(a.storage) < MIN_FREE_GB:
+        sys.exit(f"error: only {free_gb(a.storage):.1f} GB free on the storage "
+                 f"volume; free space before measuring (shader caches and logs "
+                 f"grow during a run)")
 
     refs = [(a.ref_a, a.app_a, a.extra_a), (a.ref_b, a.app_b, a.extra_b)]
     # A,B,B,A,A,B -- interleaved so drift across the run does not favour a ref.
@@ -167,8 +173,24 @@ def main():
         order += [0, 1] if i % 2 == 0 else [1, 0]
 
     res = {refs[0][0]: [], refs[1][0]: []}
+    aborted = None
     for n, idx in enumerate(order):
         name, app, extra = refs[idx]
+        # Checked before every leg, not just at startup. GTA IV rewrites about
+        # 2 GB of shader cache, so a run that begins with room can exhaust the
+        # volume midway; the legs after that point are degenerate in exactly
+        # the way a hung guest is, and averaging them into the earlier ones
+        # produces a confident number built on contaminated data. This happened
+        # on a guest_scheduler A/B: legs 1-2 ran clean, the volume hit 0, and
+        # legs 3-6 were unusable.
+        have = free_gb(a.storage)
+        if have < MIN_FREE_GB:
+            aborted = (n + 1, have)
+            print(f"  ABORTED before leg {n+1}: only {have:.1f} GB free "
+                  f"(need {MIN_FREE_GB:.1f}); the legs already collected are "
+                  f"reported below but this is NOT a complete A/B",
+                  flush=True)
+            break
         cpu, swaps, err = run_once(app, a.game, a.script, a.storage,
                                    f"{a.work}-{idx}", a.warmup, a.window, extra)
         if err:
@@ -201,8 +223,15 @@ def main():
         for i in range(n):
             d = 100.0 * (vb[i][1] - va[i][1]) / va[i][1] if va[i][1] else 0.0
             print(f"  pair {i+1}: {va[i][1]:6.2f} vs {vb[i][1]:6.2f}   {d:+.2f}%")
+    if aborted:
+        leg, have = aborted
+        print(f"\n*** INCOMPLETE: aborted before leg {leg} with {have:.1f} GB "
+              f"free. Whatever is printed above rests on fewer pairs than were "
+              f"asked for, and the volume was filling while they ran. Free "
+              f"space and repeat the whole A/B; do not quote this. ***")
     if a.out:
-        json.dump(res, open(a.out, "w"), indent=1)
+        json.dump({"results": res, "aborted": aborted}, open(a.out, "w"),
+                  indent=1)
 
 
 if __name__ == "__main__":
