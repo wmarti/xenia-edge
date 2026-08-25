@@ -1268,7 +1268,10 @@ touch FP mode would remove it. And the vector save/restore is now 61% of the
 thunk — it stores all 28 Q registers unconditionally, whether or not the guest
 has anything live in them, which is the next thing here worth attacking.
 
-**0b. NETWORK_RECEIVE burns 12.8% of all CPU and does no work.** Its stack is
+**0b. NETWORK_RECEIVE burns 12.8% of all CPU polling.** (Per-thread aggregate,
+11.7–14.0% across four windows — *not* the largest line in the profile, as was
+claimed at one point: GPU Commands at 21.6% and RENDER at 15.5% are both bigger
+threads.) Its stack is
 `XThread::Delay` → `cthread_yield` → `swtch_pri`, with `KeDelayExecutionThread`
 and `RtlEnter/LeaveCriticalSection` around it. Same shape as item 2 below, now
 located rather than inferred — and it is why the thunk is hot, since every one
@@ -1319,14 +1322,34 @@ self-looping HIR block whose body has no stores, no calls, no `reserved_load`/
 `reserved_store`, and no `VOLATILE` op, and route it into the same
 `DELAY_EXECUTION` core-release path. The db16cyc release measured **-4.99% CPU**
 on its own; this reaches roughly a hundred times more execution.
+*The prototype already exists and is not in this tree.* Commit `0a895a85c`
+"[Kernel] Escalate hot guest Delay(0) loops to a real core release" (XeniOS,
+2026-08-08) does exactly this and lives only on the `jitq/*` branches. That, not
+`PreciseSleep`, is the directly relevant starting point — the observed
+zero-timeout path goes through `MaybeYield()` / `sched_yield()`
+(`xthread.cc:~1270`, `threading_posix.cc:~219`) and never reaches `PreciseSleep`
+at all.
+
 *Risk:* the highest of anything on this list — releasing a core inside a loop
-that is not actually waiting will cost frames. Both titles on this machine,
+that is not actually waiting will cost frames. Validation has to cover total
+CPU, frame pacing, and input/network responsiveness, not CPU alone. And the
+guard title has to be *verified* uncapped: GTA IV being present on disk
+establishes nothing about whether it is capped or whether it exercises the same
+path. Both titles on this machine,
 Halo 3 and Halo Reach, are locked at 30 fps, so neither can show the damage as
 a frame-rate drop; the guard has to be something else — frame-time variance
 inside the window, or a title that is not capped.
 
 **3. `storev_left` / `storev_right` arm selection.** 213 sites, 45.00
-instructions each. `EmitPartialVectorStore` emits all five size arms inline.
+instructions of *emitted footprint* — not of executed work. The sequence
+branches over size arms and one invocation runs exactly one arm
+(`a64_seq_vector.cc:~2200`), so 45 was never a per-execution cost.
+
+Worse, it is circular as a success metric: `host_bytes` counts the inline body
+and excludes tail bytes, so moving arms to `AddToTail` makes this ranking report
+a saving **by construction**, with executed work possibly unchanged. A tail move
+is an I-cache claim and cannot be measured with this model. Calling it a
+performance win needs taken-arm counters or an uninstrumented runtime A/B. `EmitPartialVectorStore` emits all five size arms inline.
 Move the rare arms to `AddToTail`, or specialize when the address alignment is a
 constant. Corrected estimate ~2%, not the 4.46% the table shows — see the
 attribution caveat in item 6.
@@ -1367,37 +1390,64 @@ cross-block values through local slots and the register allocator is
 block-local. Nothing peephole-shaped will move it. Item 1 attacks a slice of it
 from the frontend instead, which is why it is first.
 
-*Widening the dead-store pass to cover it — MEASURED AND REJECTED.* The plan
-was to take `DeadCRStoreEliminationPass` from the 32 bytes of `cr0..cr7` to the
-whole `PPCContext`. Dumping every translated function of the title with
-`--dump_translated_hir_functions` and counting says not to.
+*Widening the dead-store pass — PROVISIONALLY REJECTED, AND THE NUMBERS ARE
+WITHDRAWN PENDING RE-DERIVATION.* The plan was to take
+`DeadCRStoreEliminationPass` from the 32 bytes of `cr0..cr7` to the whole
+`PPCContext`. The counting that argued against it does not survive audit and is
+withdrawn:
 
-Across 18,362 functions and 1,022,844 `store_context` ops:
+- The op mix (2,990,109 HIR ops, `store_context` 22.0% ≈ 658k) and the
+  dead-store denominator (1,022,844 stores) were produced by two throwaway
+  scripts run minutes apart **against a directory the emulator was still
+  writing into** — 14,057 functions in one, 18,362 in the other. They were then
+  published side by side as one corpus. 22.0% of 2,990,109 is ~658k, not
+  1,022,844; and 1,022,844 is 34.2%, uncomfortably close to the claimed 34.5%
+  *combined* load+store share. Whether the gap is corpus growth or a counting
+  error cannot be established, because the dumps were deleted.
+- The 0.14% measures exactly one static pattern — a store overwritten before
+  any read **within one block** — and is not execution-weighted. It is not
+  "anything removable by any peephole", which is how it was used.
 
-| | share of all context stores | |
-| --- | --- | --- |
-| overwritten before any read, same block | **0.14%** | no ABI assumption |
-| caller-volatile GPR live only to a return | ~4.4% | needs the PPC ABI |
-
-The first number is the one that matters, and it is nothing.
-`ContextPromotionPass` and the existing cross-block DSE already remove
-within-block redundancy completely, so a widened liveness pass with
-conservative call handling has nothing left to take. The second is real but
-needs the ABI to hold for hand-written guest asm, and ~4.4% of stores is ~1% of
-emitted HIR — not worth that risk.
+`tools/bench/hir_stats.py` now does this counting: it refuses to run against a
+directory still being written, prints its denominators, and asserts that the
+op-mix store count and the dead-store denominator are the same number — the
+cross-check whose absence let the above through. Nothing here is closed until
+it is re-derived on a frozen corpus.
 
 *Why CR was different.* The CR pass removed 41.59% of CR stores because a PPC
 compare materialises lt/gt/eq and stores all three while the branch consumes
 only the SSA value. That is a frontend pattern peculiar to the condition
 register. GPR stores have no equivalent: they are not redundant.
 
-*So what the 22% actually is.* Of 2,990,109 HIR ops across the title,
-`store_context` is 22.0% and `load_context` 12.5% — 34.5% together, at 3.21 HIR
-ops per guest instruction. That ratio says the frontend is lean. The stores are
-not waste; they exist because the register allocator is block-local, so every
-value crossing a block boundary must go through the context. Eliminating them
-means a global allocator, not another peephole. Which is what this item already
-said — the measurement just closed off the cheap route around it.
+*What the context share is, stated without the overreach it was stated with.*
+Explicit guest register state does live in `PPCContext`, and the frontend
+stores every guest register write there. Three claims made around that were
+wrong and are retracted:
+
+- **"3.21 HIR ops per guest instruction says the frontend is lean."** It says
+  no such thing. It is a static IR-density ratio with no baseline to compare
+  against, and it is silent on how expensively any of those ops expand into
+  a64.
+- **"Every cross-block value must go through the context."** False. Generic
+  cross-block SSA reaches memory as a local stack slot, not a context field.
+  Worth being exact about the route, because the obvious candidate is dead
+  code: `DataFlowAnalysisPass` — which is what would lower cross-block values
+  through `StoreLocal`/`LoadLocal` — is declared but **never instantiated
+  anywhere in the tree**. The only thing that actually allocates a local is
+  `SpillOneRegister` in the register allocator. So cross-block values exist in
+  registers until the allocator has to spill one.
+- **"Only a global allocator can move the 53.5%."** False, and the most
+  misleading of the three. The 53.5% is *all* guest JIT execution. Emission
+  quality, code layout, memory behaviour, helper routines and frontend
+  transformations can each move it. The allocator is one lever among several,
+  not the only one.
+
+What the allocator work does need, stated precisely: cross-block context
+promotion **and** allocation continuity, together. Promotion alone replaces a
+`load_context` with a value the block-local allocator then tends to materialise
+through a local slot — trading a context access for a stack access. And even
+with both, calls, exits, preemption points and joins still force state back to
+the context.
 
 ### Closed — recorded so they are not reopened
 
