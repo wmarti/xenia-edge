@@ -16,6 +16,7 @@
 #include "third_party/disruptorplus/include/disruptorplus/spin_wait.hpp"
 #include "third_party/disruptorplus/include/disruptorplus/spin_wait_strategy.hpp"
 #include "xenia/base/assert.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/threading.h"
 #include "xenia/base/threading_timer_queue.h"
 
@@ -42,7 +43,35 @@ using WaitItem = TimerQueueWaitItem;
     edit2: (30.12.2024) After uplifting version of MSVC compiler Xenia cannot be
    correctly initialized if you're using proton.
 */
+/*
+    edit3: (2026-08-25) Measured on macOS/arm64. The spin strategy is the second
+   largest CPU consumer in this emulator at a title's main menu:
+   xe::threading::TimerQueue is 3.9% of on-core CPU at the Halo Reach menu and
+   8.7% at the Halo 3 menu, of which 80% and 72% respectively is the thread
+   sitting in a sched_yield trap rather than doing anything. A further 0.50%
+   (Reach) and 1.25% (Halo 3) of whole-process on-core CPU is sysctl, because
+   spin_wait's constructor calls std::thread::hardware_concurrency() -- an
+   uncached syscall on this platform -- and a spin_wait is constructed on every
+   wait.
+
+   So chrispy's original reading was right, and the two reasons it was reverted
+   do not apply here. The wrong-args-to-wait_until bug is fixed in this vendored
+   copy: blocking_wait_strategy::wait_until_published takes the predicate
+   overload of condition_variable::wait_until, which is correct. And edit2's
+   proton/MSVC initialisation failure is a Windows problem. Windows therefore
+   keeps upstream's behaviour exactly; only POSIX changes.
+
+   Correctness of the switch: blocking_wait_strategy only wakes on
+   signal_all_when_blocking(), and both publish paths call it --
+   multi_threaded_claim_strategy::publish and sequence_barrier::publish -- so a
+   queued timer wakes the dispatch thread immediately rather than waiting out
+   its timeout.
+*/
+#if XE_PLATFORM_WIN32
 using WaitStrat = dp::spin_wait_strategy;
+#else
+using WaitStrat = dp::blocking_wait_strategy;
+#endif
 
 class TimerQueue {
  public:
@@ -87,7 +116,7 @@ class TimerQueue {
         // Consume new wait items and add them to sorted wait queue
         dp::sequence_t available = claim_strategy_.wait_until_published(
             next_sequence, next_sequence - 1,
-            wait_queue_.empty() ? clock::time_point::max()
+            wait_queue_.empty() ? clock::now() + kIdleWait
                                 : wait_queue_.front()->due_);
 
         // Check for timeout
@@ -161,6 +190,13 @@ class TimerQueue {
   const std::thread& dispatch_thread() const { return dispatch_thread_; }
 
  private:
+  // How long to wait when no timer is queued at all. Not time_point::max():
+  // a blocking strategy converts this to a timespec, and an unbounded value is
+  // a known overflow hazard there. A queued timer wakes the thread through
+  // signal_all_when_blocking() long before this expires, so the only effect is
+  // one harmless wakeup a minute in a process with no timers armed.
+  static constexpr clock::duration kIdleWait = std::chrono::seconds(60);
+
   // This ring buffer will be used to introduce timers queued by the public API
   static constexpr size_t kWaitCount = 512;
   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
