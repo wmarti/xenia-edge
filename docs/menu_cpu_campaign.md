@@ -189,6 +189,50 @@ CPU is tight here; the swap rate is not, because the scene is uncapped and
 run-to-run frame pacing varies. Any throughput claim in this state needs to
 clear ~7%, which the constant-upload fix does by 4x.
 
+## Rejected: bounding the logger's idle spin
+
+The logger's writer thread (`logging.cc:293`) waits on the same disruptorplus
+`spin_wait_strategy` the timer queue used, and at the GTA IV docks it was the
+second largest spinner -- 853 of 27,842 on-core samples, behind only the
+guest's own poll loop. `WriteThread` also carries an idle backoff
+(`idle_loops >= 1000` -> sleep 50 ms) that is **dead code**: the untimed
+`wait_until_published` does not return until something is published, so the
+counter never increments.
+
+Bounding the wait to 1 ms made that backoff reachable, and the profile looked
+like a win: `swtch_pri` fell 7.4% -> 4.1% of on-core (2,078 -> 1,132 samples)
+and the logger thread dropped out of the top threads.
+
+**It is not a win, and the profile was misleading.** `spin_wait_strategy`'s
+timed overload spins in `spin_once()` pause-loops until its deadline, whereas
+the untimed escalation reaches `sleep_for(1 ms)` every twentieth yield. So the
+change traded cheap yield syscalls for expensive busy-waiting: `swtch_pri` fell
+because the spin moved to a form the sampler attributes elsewhere, not because
+it stopped.
+
+Measured, GTA IV docks, 3 interleaved pairs: CPU pairs disagree (mean -1.10%,
+not a result) and swaps/s is down 6.4-10.4% consistently. Whole-run `cputime`
+over identical runs went 611.3 -> 621.4 s on one attempt and 630.4 -> 625.9 s
+on the next, i.e. inside +/-1.7% noise. Reverted.
+
+**Two lessons kept:**
+- A fall in one sampled symbol is not a saving. `swtch_pri` halving looked
+  decisive and meant only that the same waiting had changed shape.
+- The swaps/s guard in `state_ab.py` reads the tail of the log file, so it is
+  **not independent of anything that changes logging timing**. Making the
+  logger sleep up to 50 ms when idle biases it: the log is current at window
+  start, when shader compilation is still logging, and stale at window end.
+  Any future change to logging must be judged by the Metal HUD or by whole-run
+  CPU time, never by that counter.
+
+The underlying observation still stands and is worth someone's time: the
+logger's declared idle backoff has never once executed. Fixing it needs a wait
+that actually sleeps rather than spins, and the strategy object is shared with
+the producer claim path every logging thread goes through, so switching it to
+`blocking_wait_strategy` -- the timer queue's fix -- would put a mutex and a
+`notify_all` on every log line. A consumer-only condition variable would be the
+shape to try.
+
 ## Open defects found, not yet resolved
 
 - **`vector_nan_propagation_test.cc` fails 2 assertions in this tree.** It expects
