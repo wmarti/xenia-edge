@@ -633,3 +633,59 @@ genuinely different builds produce screenshots that appear to be the same one.
 incremental benchmark build. Note this cuts both ways -- it also means earlier
 captures in this campaign may carry a stamp older than the code they show, so
 a screenshot's label is evidence only when the build flow refreshed it.
+
+## Three-state sweep on HEAD `cbdbde7b4` (2026-08-26)
+
+First run of all three states on one build, after correcting a stale version.h
+that had the binary reporting a commit ~50 behind its own code.
+
+| state             | presents/s | CPU    | menu renders |
+|-------------------|-----------:|-------:|--------------|
+| GTA IV docks      |      41.39 | 430.8% | see below    |
+| Halo 3 menu       |      29.95 |  84.0% | clean        |
+| Reach menu (spin_limit=16) | 29.93 |  74.9% | clean        |
+
+Both menus sit exactly at the 30 fps cap (29.93/29.92 on the HUD), so nothing
+that landed has cost throughput. Halo 3 shows its full menu tree and Reach its
+title and campaign entry, both against the correct `cbdbde7b4` stamp.
+
+GTA IV is the odd one out and the reason it was added: uncapped and CPU-bound at
+430% across ~10 cores, so CPU savings there convert into frames instead of
+headroom. It is the only one of the three that can price a JIT change directly.
+
+## Open defect: dark wedges at the GTA IV docks
+
+Both docks captures (150 s and 240 s into the script, different time-of-day
+lighting) show large hard-edged black triangles converging on the centre of the
+frame. They survive a lighting change, so they are not a transient.
+
+What is established:
+
+- Seen at HEAD `cbdbde7b4`, at both capture times.
+- Seen at `1860207a4` in the previous sweep.
+- **Not** seen at `1860207a4` in `gta-prof4/hud.jpg`, a clean capture of the same
+  state at a different camera position.
+
+The same binary therefore produces both a clean and a wedged frame, which rules
+out any commit in this campaign as the cause and points at scene or camera state.
+
+The constant-sizing change was the obvious suspect -- truncated float constants
+would give exactly this "vertices stretched off-screen" shape -- and it was
+checked and cleared:
+
+- `rebuild_packed_float_constants` tight-packs the buffer, writing only
+  referenced vec4s contiguously from offset 0, so `float_count * 16` is the
+  correct length for *that* buffer rather than an assumption about it.
+- Packing and sizing key off the same object: `dxil_vertex_shader` is
+  `static_cast<DxilShader*>(vertex_shader)`, and `UpdateGuestConstantCaches` is
+  called with it immediately above the sizing.
+- `float_count` is 256 whenever `float_dynamic_addressing` is set, so the
+  dynamic-indexing case uploads the full CBV and cannot be truncated.
+
+Unresolved: whether this is a backend defect or correct rendering of dark
+geometry. Settling it needs an upstream control build at the same scene point,
+which is blocked on disk (a build needs ~9 GB; 2 GB free).
+
+**Consequence for the harness:** while this artifact is present, the GTA IV
+screenshot gate cannot detect a *new* rendering regression in the same region of
+the frame. The menu gates are unaffected and remain the trustworthy ones.
