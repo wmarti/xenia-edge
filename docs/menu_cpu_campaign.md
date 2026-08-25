@@ -305,19 +305,42 @@ Deferring uploads to the end of the frame puts them after most of the draws
 that read them. The per-`RequestTextures` bracket is not naive -- it is what
 guarantees an upload precedes its consumer.
 
-### What a correct fix would look like
+### Submission-boundary scope was tried too. It corrupts identically.
 
-Flush the upload batch at every **submission boundary** rather than at frame
-end: one upload command buffer per draw-submission instead of per
-`RequestTextures`. That is ~32 per present rather than 484, keeps the ordering
-guarantee, and would still remove roughly 90% of the submissions. It needs a
-hook wherever `current_command_buffer_` is committed, of which there are three,
-plus the resolve and query paths that submit independently.
+The obvious correction to the frame-wide attempt is to flush at every
+**submission boundary** instead: `MetalCommandProcessor::EndCommandBuffer` is a
+single chokepoint, called ~32 times a frame (that is what `submission_other`
+31.1 per present counts -- recreations of `current_command_buffer_`), and it
+runs immediately before that submission's draw buffer commits. One upload
+buffer per submission is ~32 per present instead of 484, and Metal executes a
+queue's buffers in commit order, so the ordering argument looks airtight.
 
-Not attempted here: it is a real change to upload ordering and this campaign
-has already shipped one miscompile and one plausible-looking measurement
-artifact. It should be done with a frame-diff against the unmodified build as
-the gate, not a CPU number.
+**It produces the same corruption, pixel for pixel** -- blown-out geometry,
+missing textures, tail lights as red blobs. Reverted.
+
+That the two scopes fail *identically* is the useful part: the problem is not
+the width of the batch.
+
+**Ruled out by inspection, so nobody repeats it:**
+- *Ordering against the draw buffer.* The flush happens before
+  `current_command_buffer_->commit()` in the same function.
+- *Staging buffer lifetime.* `release_buffer_immediate` already defers to
+  `buffer_pool->ReleaseAfter(cmd, buffer)` or the command buffer's completion
+  handler, so widening the batch does not free anything early.
+
+**Still open, and where to look next.** `LoadTextureDataFromResidentMemoryImpl`
+picks its command buffer in preference order (`metal_texture_cache.cc:1100-1114`):
+the *current draw command buffer* first -- "it needs no extra buffer at all" --
+then the batch, then a private one. Holding a batch open changes which uploads
+take the first branch, so the change is not only "fewer command buffers", it
+also moves uploads out of the draw buffer they used to be encoded into. That is
+a reordering relative to draws already encoded in the current command buffer,
+and it is the remaining candidate.
+
+Anyone attempting this should instrument that preference (count uploads per
+branch, with and without the batch) before changing scope again. Two attempts
+have now looked correct on every counter and been wrong on screen; the gate is
+a frame comparison, not a CPU or throughput number.
 
 ## The upload batching question is the wrong question: 469 uploads per present
 
@@ -549,3 +572,64 @@ already shipped two rendering regressions that every counter called a win.
   Static inventory workflow running over the 23 unmerged `origin/a64-fixes-on-edge`
   commits, the CNTVCT_EL0 profiler, `bc2f386ff` (signal-wake WaitMultiple), the
   instrument inventory, and menu architecture.
+
+## Reach menu, paired A/B against upstream (2026-08-26)
+
+Two interleaved pairs, `bench-work/reach-ab.log`:
+
+| leg                    | fps   | CPU    |
+|------------------------|-------|--------|
+| upstream `052365bc0`   | 29.81 | 212.4% |
+| ours `1860207a4`       | 29.84 | 162.2% |
+| ours `1860207a4`       | 29.84 | 161.2% |
+| upstream `052365bc0`   | 29.82 | 213.9% |
+
+**-24.2% CPU at an unchanged framerate.** Both pairs agree to within 1.5%, far
+outside the 0.28% noise floor, and the legs are interleaved so drift cannot
+produce the ordering.
+
+fps is pinned at the 30 fps cap in *both* legs (29.81-29.84), which is the point:
+Reach cannot convert CPU savings into frames, so the entire delta is headroom
+rather than throughput traded away. On a capped title this is the only shape a
+win can take, and it is why CPU% -- not fps -- is the metric here.
+
+What the delta actually contains, checked rather than assumed:
+
+- 146 commits separate the two legs. Exactly **one** of them is upstream's
+  (`052365bc0..6290cb274` is a single commit), so this is our branch, not
+  upstream progress being credited to us.
+- **Neither build had the zero-delay lever.** `zero_delay` appears 0 times in
+  both full CONFIG DUMPs, because `10ea11bd8` postdates `1860207a4`. The -54.58%
+  zero-delay result is therefore *not* inside this number, and the two must never
+  be added together -- they overlap on the same idle-spin time.
+- `052365bc0` is a genuine `has207/edge` commit, not a local approximation of
+  upstream.
+
+Caveat worth keeping: `1860207a4` is not HEAD. HEAD (`cf426a292`) carries four
+further commits plus the zero-delay cvar, so this number is a floor for the
+branch as it stands, not a measurement of it.
+
+## A screenshot can name the wrong commit (2026-08-26)
+
+`build/version.h` is generated by `xenia-build.py`, **not** by CMake. An
+incremental `cmake --build` never regenerates it, so the binary's window title
+and log banner keep naming whatever commit was checked out the last time
+`xenia-build.py` ran, while the compiled code moves on.
+
+This tree was in that state: the binary reported `1860207a4` while actually
+containing code from ~50 commits later. It was caught by testing the binary for
+strings that postdate the claimed commit --
+
+    strings <binary> | grep -qx zero_delay_spin_limit   # PRESENT
+
+-- all of which were present, proving the stamp and not the code was stale.
+
+This matters because the stamp is the *only* provenance a screenshot carries.
+Every visual gate in this campaign is labelled with that string, so a stale
+version.h makes a capture claim to be a commit it is not, and makes two
+genuinely different builds produce screenshots that appear to be the same one.
+
+`tools/bench/stamp_version.sh` regenerates it from HEAD; run it before any
+incremental benchmark build. Note this cuts both ways -- it also means earlier
+captures in this campaign may carry a stamp older than the code they show, so
+a screenshot's label is evidence only when the build flow refreshed it.
