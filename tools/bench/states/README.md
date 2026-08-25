@@ -46,3 +46,17 @@ idle.
 **Warmup is set by the title, the window by the content.** CPU settles by ~75 s
 in every state here. The window has to be long enough to average what the scene
 does: 90 s at a Reach menu, less where the scene is static.
+
+**GTA IV regenerates ~2 GB of shader cache every run, and a full disk looks
+exactly like a hung guest.** A run on a nearly full volume produces degenerate
+profiles -- low present rates and implausible CPU -- that are indistinguishable
+from a title that failed to reach its state. `state_ab.py` refuses to measure
+below 2 GB free for this reason; a hand-written run script does not inherit that
+guard, and one written for the three-state sweep measured on 628 MiB before the
+mistake was caught.
+
+Delete `storage/cache*` between runs (never `storage/content`, which holds the
+GTA IV save the docks script depends on). Reclaim build output rather than the
+save: `build/third_party` is 3.7 GB and rebuilds from the in-tree submodule
+sources with no downloads, and deleting build output does not disturb an
+already-linked `Xenia-edge.app`, so benchmarking continues without a rebuild.
