@@ -690,3 +690,86 @@ which is blocked on disk (a build needs ~9 GB; 2 GB free).
 **Consequence for the harness:** while this artifact is present, the GTA IV
 screenshot gate cannot detect a *new* rendering regression in the same region of
 the frame. The menu gates are unaffected and remain the trustworthy ones.
+
+## T4: where 98 host instructions go for 9 guest instructions
+
+`guest_82A46D70` is 9.0% of running samples at the GTA IV docks and is nine
+guest instructions long -- a leaf accessor filling a three-word struct:
+
+    li   r11, 0            ; [r4+0] = 0
+    stw  r11, 0(r4)
+    lwz  r11, 0x40A0(r3)   ; [r4+4] = [r3+0x40A0]
+    stw  r11, 4(r4)
+    lwz  r11, 0x40A8(r3)
+    lwz  r10, 0x40A0(r3)
+    subf r11, r11, r10     ; [r4+8] = [r3+0x40A0] - [r3+0x40A8]
+    stw  r11, 8(r4)
+    blr
+
+It compiles to 392 bytes -- 98 host instructions, 10.89 per guest instruction
+against a 6.50 corpus average. `--jit_corpus_disasm` says where they go, and it
+is not address materialization: the function has one address chain of three
+instructions.
+
+Six of the nine guest instructions touch memory, and each becomes the same
+eight-instruction sequence:
+
+    mov  w0, w22             ; guest base register
+    mov  w17, #0x40a0        ; displacement, too wide for an add immediate
+    add  w0, w0, w17
+    lsr  w17, w0, #29        ; physical-remap test: is it >= 0xE0000000?
+    cmp  w17, #7
+    b.ne +8
+    add  w0, w0, #1, lsl #12
+    ldr  w24, [x21, x0]      ; the access itself
+
+That is **48 of 98 instructions (49%) in memory-access sequence, of which 24
+(24%) are the remap test alone**. The remaining ~15 are prologue, the preempt
+check, and the return dispatch -- which already has a fast path when the guest
+LR matches the host return address, so it is not the thing to attack.
+
+**The opportunity, unmeasured:** guest `82A46D78` and `82A46D84` both address
+`r3+0x40A0` and each pays the full seven-instruction computation. `r3` is not
+redefined between them, and the address arithmetic is pure -- it reads no
+memory -- so it is CSE-able even though the *load* is not (an intervening store
+through `r4` may alias). Eliminating one recomputation here is ~7 instructions
+of 98.
+
+**Why this is recorded as a target and not attempted:** the remap test is
+address translation. A wrong guest address is silent and catastrophic, unlike
+the rendering regressions this campaign has already shipped and caught on
+screen. Hoisting the test to a base register is *not* obviously safe -- base+0
+and base+8 can straddle the 0xE0000000 boundary, and nothing in the JIT can
+prove they do not. Any attempt needs a correctness gate that fails on the bug
+before it needs a benchmark.
+
+## The corpus replay does not reproduce its own capture, and neither easy explanation holds
+
+Replaying the 13,564-function GTA IV corpus on the build that captured it:
+
+    vs capture   241 functions identical, 13,323 differ
+                 captured 37,140,228 bytes, replayed 38,440,072  (+3.50%)
+
+The tool's own verdict is that this invalidates the run. Both obvious causes
+were tested and **both are refuted**:
+
+1. **Address-materialization chains differing between processes.** Refuted:
+   `|delta|/4` exceeds the function's chain count in 10,930 of 13,564 functions
+   (mean 4.27 instructions per chain), and the *identical* group averages more
+   chains (9.4) than the modal +44 group (4.5).
+2. **Memory-access codegen differing because the offline `Memory` lacks the
+   guest heap.** Refuted: the 1,472 functions with **zero** memory operations
+   are 0% identical and still have a median delta of exactly +44 bytes.
+
+Every delta is a whole number of instructions (0 of 13,564 are not a multiple
+of 4). The distribution is strongly modal at +44 bytes (11 instructions, 4,506
+functions), with 88 and 132 also common and 2,551 functions *smaller* than
+capture. That shape -- a fixed block, in both directions, independent of memory
+ops and calls -- is not explained. Coverage instrumentation was checked and is
+off in both.
+
+**Consequence:** the `vs capture` line cannot currently certify a replay, so a
+codegen change scored on emitted bytes from this corpus is scored on an
+instrument with a known, unexplained offset. The tool already computes the
+metric that survives this -- `stable`, which it labels "compare THIS across
+processes" -- and that is the only number to compare until the +44 is explained.
