@@ -64,12 +64,35 @@ def frontmost():
     return ""
 
 
-def shot(window_id, path):
-    """Photograph one window by id. Never the screen, never a region."""
-    r = subprocess.run(["screencapture", "-x", "-o", "-l", str(window_id), path],
+def shot(window_id, path, max_width=1000, quality=60):
+    """Photograph one window by id. Never the screen, never a region.
+
+    Downscaled on the way out. A Retina capture of this window is 2560px wide
+    and around 2.4MB, and nothing that reads one back needs that: the HUD
+    numbers and the menu text stay legible at 1000px, and the file lands
+    around a fifteenth of the size.
+    """
+    raw = path if path.lower().endswith(".png") else path + ".raw.png"
+    r = subprocess.run(["screencapture", "-x", "-o", "-l", str(window_id), raw],
                        capture_output=True, text=True)
-    if r.returncode != 0 or not os.path.exists(path):
+    if r.returncode != 0 or not os.path.exists(raw):
         return False, (r.stderr or "").strip()
+    try:
+        from PIL import Image
+        im = Image.open(raw)
+        if im.width > max_width:
+            im = im.resize((max_width, round(im.height * max_width / im.width)),
+                           Image.LANCZOS)
+        if path.lower().endswith((".jpg", ".jpeg")):
+            im.convert("RGB").save(path, "JPEG", quality=quality, optimize=True)
+            if raw != path:
+                os.remove(raw)
+        else:
+            im.save(path, "PNG", optimize=True)
+    except Exception as e:
+        # Pillow absent or the image is unreadable: the full-size capture is
+        # still on disk and still correct, so say so rather than failing.
+        return True, f"(not downscaled: {e})"
     return True, ""
 
 
@@ -138,6 +161,7 @@ def main():
     p.add_argument("--owner", default="")
     p = sub.add_parser("shot"); p.add_argument("out")
     p.add_argument("--pid", type=int); p.add_argument("--owner", default="Xenia")
+    p.add_argument("--max-width", type=int, default=1000)
     p = sub.add_parser("park"); p.add_argument("x", type=int); p.add_argument("y", type=int)
     sub.add_parser("displays")
     sub.add_parser("frontmost")
@@ -150,7 +174,7 @@ def main():
         ws = windows(a.pid, a.owner or None)
         if not ws:
             print("no matching window", file=sys.stderr); return 1
-        ok, err = shot(ws[0]["id"], a.out)
+        ok, err = shot(ws[0]["id"], a.out, a.max_width)
         print(f"{'captured' if ok else 'FAILED'} window {ws[0]['id']} "
               f"({ws[0]['w']}x{ws[0]['h']}) -> {a.out} {err}")
         return 0 if ok else 1
