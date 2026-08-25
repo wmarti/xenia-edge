@@ -743,7 +743,7 @@ and base+8 can straddle the 0xE0000000 boundary, and nothing in the JIT can
 prove they do not. Any attempt needs a correctness gate that fails on the bug
 before it needs a benchmark.
 
-## The corpus replay does not reproduce its own capture, and neither easy explanation holds
+## The corpus replay did not reproduce its own capture: --guest_scheduler
 
 Replaying the 13,564-function GTA IV corpus on the build that captured it:
 
@@ -773,3 +773,57 @@ codegen change scored on emitted bytes from this corpus is scored on an
 instrument with a known, unexplained offset. The tool already computes the
 metric that survives this -- `stable`, which it labels "compare THIS across
 processes" -- and that is the only number to compare until the +44 is explained.
+
+
+### Resolved: the replay was compiling with a different pass pipeline
+
+The cause is `--guest_scheduler`. It gates `PreemptCheckInjectionPass`
+(`preempt_check_injection_pass.cc:45`), it defaults to **true**, and every
+benchmark state in this campaign runs `--guest_scheduler=false` for the Reach
+livelock. The replay tool took its own process default, so every capture here
+was being replayed under a different compiler than the one that produced it.
+
+Found from the minimal case rather than by inspection. The smallest function in
+the corpus with the modal +44 delta is one guest instruction -- a bare `blr` --
+and `--jit_corpus_disasm` shows it emitting 44 host instructions offline against
+33 at capture. Counting the blocks: prologue 9, **preempt check 2**, return
+dispatch 14, fast return 5, **preempt slow path 9**, indirect-target slow path
+5. The preempt check plus its handler is exactly 11 instructions, exactly 44
+bytes, exactly the mode.
+
+Matching the setting on the 13,564-function GTA IV corpus:
+
+| | identical | total vs capture |
+| --- | ---: | ---: |
+| replay under its own default | 241 | +3.50% |
+| replay matching the capture | 5,548 | -0.95% |
+
+`kVersion` is now 2 and the header carries the setting, so a replay applies what
+was captured and says so when it differs. v1 corpora are rejected by the
+existing version check.
+
+### The residual is real, smaller, and still unattributed
+
+Matching `guest_scheduler` does not make the replay exact: -0.95% on GTA IV and
+-3.32% on Halo 3, now with the replay **smaller** than capture. The differing
+functions are the large ones (mean 168.7 guest instructions against 22.8 for the
+identical ones, 28.0 address chains against 3.7).
+
+`emit_mmio_aware_stores_for_recorded_exception_addresses` was the obvious next
+suspect -- it emits extra store code only for addresses that actually faulted at
+runtime, which offline has no equivalent, and it would push in the observed
+direction. **Refuted by a controlled capture:** disabling it on *both* sides
+moved 112 bytes of 27,289,116 and changed the identical count from 3,404 to
+3,403.
+
+Branch distance is the untested hypothesis -- a live code cache is larger and
+more spread out than an offline one, and this backend chooses near or far
+branch forms by distance. It is not tested because the obvious probe does not
+work: compiling one large function from a single-function corpus **SIGSEGVs**,
+which is the "recompiling untrusted guest code can fault" case the tool already
+documents. The single-function technique is sound for small leaves and not for
+large functions.
+
+**Standing rule until this is closed:** score a codegen change on `stable`,
+which the tool labels "compare THIS across processes", not on emitted-byte
+totals against capture.
