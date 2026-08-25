@@ -1241,8 +1241,32 @@ write is serializing; the thunks were never given the same treatment. The fix
 reads FPCR back and skips the write when it already matches, at the two
 per-transition sites (`EmitGuestToHostThunk`, `EmitHostToGuestThunk`).
 `EmitResolveFunctionThunk` is left alone — one resolve per call site, ever.
-*Still owed:* the 169,048-case corpus gate, and a before/after profile of the
-same scene. None of this is a result until both exist.
+
+**Gated and measured.** 169,048/169,048 cases, 493 suites, 0 failed, 0 crashed,
+0 timed out.
+
+The after-profile could not be taken in the same scene — the input script does
+not land the guest in an identical place twice — so shares of total CPU are not
+comparable across the two runs. The split *inside* the thunk is, because the 28
+vector save/restores are byte-identical in both builds and act as a fixed
+yardstick however often the thunk is entered:
+
+| | FPCR share of thunk | vector share | FPCR/vector | hottest instruction |
+| --- | --- | --- | --- | --- |
+| before | 79.4% | 20.4% | **3.89** | `+0x54`, right after the `msr` — 75.1% |
+| after (4 windows) | 37.0% | 61.2% | **0.61** | `+0x50`, the new `mrs` — 22–28% |
+
+A **6.4x** relative reduction in FPCR cost per transition, and the flush
+signature is gone: nothing in the thunk now exceeds 28% where one instruction
+held 75%. Carried back at an unchanged transition rate that is ~3% of total
+CPU, but that last step assumes a rate this measurement did not hold fixed, so
+treat it as an estimate rather than a number.
+
+*What is left in the thunk.* The `mrs` is now its hottest instruction, so the
+read is not free either; skipping the check entirely for shims known never to
+touch FP mode would remove it. And the vector save/restore is now 61% of the
+thunk — it stores all 28 Q registers unconditionally, whether or not the guest
+has anything live in them, which is the next thing here worth attacking.
 
 **0b. NETWORK_RECEIVE burns 12.8% of all CPU and does no work.** Its stack is
 `XThread::Delay` → `cthread_yield` → `swtch_pri`, with `KeDelayExecutionThread`
