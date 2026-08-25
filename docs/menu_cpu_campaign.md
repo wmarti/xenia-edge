@@ -75,7 +75,8 @@ predate two instrument fixes and their denominators are wrong.
 | T1 | Reach NETWORK_RECEIVE zero-delay yield trap (~27% of Reach menu CPU) | lever landed, default off (`--zero_delay_spin_limit`) | **-54.58% Reach menu, 3/3 pairs. Null on Halo 3 and GTA IV** -- title-specific, so it stays off |
 | T2 | `TimerQueue` spin_wait -> blocking_wait on POSIX (10.3% Halo 3 / 4.3% Reach) | landed | **-2.74%** |
 | T3 | Halo 3 host GPU submit/encode (53% aggregate, no single hot spot) | unblocked -- the present-rate question was resolved, no unpaced loop exists | not attempted |
-| T4 | Two guest functions hold 18.2% of running samples at the GTA IV docks (`guest_828BF420` 9.2%, `guest_82A46D70` 9.0%) | corpus capture in progress | not yet |
+| T4 | Redundant guest address computation (`guest_828BF420`, `guest_82A46D70`) | sized, not attempted | 13.90% of executed memory operands, but **~0.38% CPU after discount** vs a 0.28% floor; 94% of it in two functions |
+| T5 | Those two functions are a **guest spin-wait**: `828BF420` loops calling `82A46D70` until two counters differ by <2. 18.2% of on-core time at the docks | open | not yet -- blocked on identifying what writes the counters |
 | B1 | `PACK_D3DCOLOR` returned 0xFFFFFFFF always | fixed, guard proven to fail on the bug | correctness |
 
 ## T3's present-rate question, resolved: there is no unpaced present loop
@@ -881,3 +882,76 @@ falls in hot code.
 execution frequency rather than by count. `--trace_function_coverage` already
 exists and gives per-function execution counts; the redundancy above is
 per-function, so the two can be joined without new instrumentation.
+
+## T4 repriced, and T5: GTA IV's hottest code is a guest spin-wait
+
+Joined the static redundancy count against `--trace_function_coverage` executed
+counts from a GTA IV docks run (90.9 billion executed guest instructions).
+
+**The opportunity is real but concentrated to the point of being a special case:**
+
+| | |
+| --- | ---: |
+| weighted redundant / executed memory operands | 13.90% (static was 8.02%) |
+| `82A46D70` share of the weighted opportunity | **84.64%** |
+| `828BF420` share | 9.58% |
+| top 3 functions | **95.47%** |
+
+So a general HIR value-numbering pass would be built to serve two functions.
+
+### The instruction-count framing overstates the win by 5.7x
+
+`82A46D70` is **51.3% of executed host instructions** (87 emitted instructions x
+4.455 billion invocations of 755.4 billion total) and **9.0% of sampled on-core
+time**. Those are both correct measurements of different things, and the ratio
+between them is 5.7x: this function retires instructions far more cheaply than
+the average, which is what a short dependency-free sequence of L1 hits does.
+
+Priced in executed host instructions the CSE looks like **3.48-4.18%**. Priced
+on sampled time, which is the unit a CPU campaign is denominated in:
+
+- `82A46D70`: 6 of 87 instructions x 9.0% = 0.62%
+- `828BF420`: 6 of 405 instructions x 9.2% = 0.14%
+- **total 0.76%, ~0.38% after the standing 2x discount, against a 0.28% floor**
+
+The instruction-count headline is the same trap as the sampled-share one this
+campaign already corrected for, in a different currency. It is recorded here so
+the 3.48% figure is never quoted on its own.
+
+### T5: the two functions are a spin loop and its body
+
+`828BF420` contains a six-instruction loop at `828BF474`:
+
+    828BF474 addi  r4, r1, 0x50      ; &out
+    828BF478 lwz   r3, 0x22A4(r30)   ; object
+    828BF47C bl    +0x1878F4         ; -> 0x82A46D70   (offset resolves exactly)
+    828BF480 lwz   r11, 0x58(r1)     ; out[2]
+    828BF484 cmplwi cr6, r11, 2
+    828BF488 bge   cr6, -0x14        ; -> 0x828BF474, loop while >= 2
+
+`82A46D70` writes `out[2] = [r3+0x40A0] - [r3+0x40A8]`, and `r4 = r1+0x50`, so
+`[r1+0x58]` is exactly that difference. **The guest spins re-reading two counters
+until their difference falls below 2**, and that is what 4.455 billion
+invocations in a ~240 s window (about 18.6 million calls per second) are.
+
+Together the pair is 18.2% of sampled on-core time at the docks.
+
+This reframes T4 entirely: eliminating a redundant address computation makes the
+*waiting* about 7% cheaper. The prize is not 0.38% for a cheaper spin, it is the
+18.2% the spin costs -- if the wait can be shortened at all.
+
+**Established** (all checkable from the disassembly and counters above): the call
+target, the loop back-edge, the data flow from the two counters to the loop
+condition, the invocation count, and the sampled share.
+
+**Not established**: what `[r3+0x40A0]` and `[r3+0x40A8]` are, and crucially
+*who writes them*. If another guest thread advances them, the host cannot help
+and this is the guest's own design. If the host advances them -- a queue the GPU
+or APU drains -- then the emulator controls how long the guest waits, and this
+belongs in the same family as the Reach zero-delay result. That is the next
+question, and it is answerable: watch those two guest addresses and record what
+writes them.
+
+Note the zero-delay lever is *not* this. That lever acts on zero-length delay
+calls into the kernel; this loop never leaves guest code, which is exactly why
+the lever measured null at the docks.
