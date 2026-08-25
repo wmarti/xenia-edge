@@ -1613,11 +1613,14 @@ while CPU percent kept reporting. `n/a fps` means the guest is not doing
 anything, and it was read past for several runs. `--hid=nop` is now dropped
 whenever `--input_script` is passed.
 
-Menu-idle is not a useless experiment -- it is just a different one, and it is
-noisier: an interleaved menu run over the same two builds gave a run-to-run
-spread of 3.57% against the same ~1.7% apparent effect, i.e. unresolved, where
-the in-game run resolves cleanly at a third of the effect size. **In-game with
-the input script is the methodology from here.**
+Menu-idle is not a useless experiment, it is a different one, and **its noise
+floor is currently unknown**. The only menu run taken over these two builds was
+the contaminated one described below, so its 3.57% spread measures two
+benchmark processes fighting for cores, not the menu. Do not quote it as a
+noise floor -- an earlier draft of this section did, which is the same error as
+publishing the -1.71% from that run. A clean interleaved menu A/B against an
+identical binary is needed before any menu result can be believed, and the
+campaign that targets menu CPU has to establish it first.
 
 *A second trap, recorded because it produced a plausible-looking number that was
 garbage.* A `pgrep -f frame_ab` wait loop matches its own shell, so it never
