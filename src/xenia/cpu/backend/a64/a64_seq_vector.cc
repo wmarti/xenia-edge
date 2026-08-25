@@ -1449,9 +1449,6 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     // Clamp to [3.0f, 3.0f + 255*2^-22].
     // Quiet first, then clamp: NaN packs as zero (see EmitQuietSnan).
     e.fmov(VReg(0).s4, 3.0f);
-    e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
-    LoadV128Const(e, 0, vec128i(0x404000FFu));  // 3.0f + 255*2^-22
-
     EmitQuietSnan(e, d, s);
     e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x404000FFu));  // 3.0f + 255*2^-22
