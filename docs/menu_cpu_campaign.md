@@ -268,6 +268,57 @@ three pairs can straddle a 5x range in the measured effect while the sign stays
 constant. CPU is far tighter (0.28% floor) and should carry the claim wherever
 the title is frame-capped -- which is both Halo states, but not this one.
 
+## The biggest remaining GPU cost, sized: 527 command buffers per present
+
+`iokit_user_client_trap` is 8.6% of on-core CPU at the GTA IV docks and
+**2,204 of its 2,214 samples are `IOGPUCommandQueueSubmitCommandBuffers`** --
+the cost scales with the number of command buffers submitted, nothing else.
+Sizing it needed a count per frame, which only existed as `COUNT_profile_set`
+counters visible in the profiler UI. `--gpu_counters_file` now writes them out.
+
+Measured at the docks, 45 s window, 1,792 presents:
+
+| | per present |
+| --- | --- |
+| **command buffers** | **527.4** |
+| of which `texture_upload_batch` | **484.4** |
+| `submission_other` | 31.1 |
+| `submission_copy_draw_sync` | 8.0 |
+| render passes | 60.1 |
+
+Roughly **19,400 command buffer submissions a second**. `RequestTextures`
+brackets an upload batch, and it is called per draw, so a draw that uploads
+anything gets its own command buffer.
+
+### The obvious fix is wrong, and the same data says why
+
+Widening the bracket to the whole frame works exactly as intended on the
+numbers: command buffers fall to 55.8 per present, `texture_upload_batch` to
+11.9, and presents rise 39.8 -> 47.8/s (+20%).
+
+**It also corrupts the image** -- blown-out geometry, missing textures, tail
+lights as red blobs. Verified by screenshot, reverted.
+
+The reason is in the table above: `submission_other` is **31.1 per present**,
+so draw work is committed across ~32 command buffers per frame, not one.
+Deferring uploads to the end of the frame puts them after most of the draws
+that read them. The per-`RequestTextures` bracket is not naive -- it is what
+guarantees an upload precedes its consumer.
+
+### What a correct fix would look like
+
+Flush the upload batch at every **submission boundary** rather than at frame
+end: one upload command buffer per draw-submission instead of per
+`RequestTextures`. That is ~32 per present rather than 484, keeps the ordering
+guarantee, and would still remove roughly 90% of the submissions. It needs a
+hook wherever `current_command_buffer_` is committed, of which there are three,
+plus the resolve and query paths that submit independently.
+
+Not attempted here: it is a real change to upload ordering and this campaign
+has already shipped one miscompile and one plausible-looking measurement
+artifact. It should be done with a frame-diff against the unmodified build as
+the gate, not a CPU number.
+
 ## Open defects found, not yet resolved
 
 - **`vector_nan_propagation_test.cc` fails 2 assertions in this tree.** It expects
