@@ -42,7 +42,7 @@ class ContextPromotionPass : public CompilerPass {
   bool Run(hir::HIRBuilder* builder) override;
 
  private:
-  void PromoteBlock(hir::Block* block);
+  void PromoteBlock(hir::Block* block, bool reset_tracking);
   void RemoveDeadStoresBlock(hir::Block* block);
 
   // Range-keyed value tracking: a tracked value recorded at `offset` covers
