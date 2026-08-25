@@ -3708,11 +3708,11 @@ EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128, MAX_I64);
 // OPCODE_DENORMAL_QUIRK
 // ============================================================================
 // quirk = (any operand denormal) && (all operands finite), as i8 0/1.
-// Hot path: biased running-minimum screen over the operand magnitudes
-// (mag - 1 wraps zero to the top, so zero never reads as denormal) and a
-// single bound compare. The all-finite verdict runs only when the screen
-// hits, out of line when the near-branch bound allows. Pure integer moves -
-// no FP arithmetic, no FPCR mode interaction.
+// Hot path: a biased screen over the operand magnitudes (mag - 1 wraps zero to
+// the top, so zero never reads as denormal) compared against 2^52 - 1 and
+// chained across operands with ccmp. The all-finite verdict runs only when the
+// screen hits, out of line when the near-branch bound allows. Pure integer
+// moves - no FP arithmetic, no FPCR mode interaction.
 struct DENORMAL_QUIRK
     : Sequence<DENORMAL_QUIRK,
                I<OPCODE_DENORMAL_QUIRK, I8Op, F64Op, F64Op, F64Op>> {
@@ -3794,21 +3794,29 @@ struct DENORMAL_QUIRK
       slow_path = &e.NewCachedLabel();
     }
 
-    // Hot: min over (magnitude - 1); below 2^52 - 1 means some operand is
-    // denormal.
+    // Hot: compare each biased magnitude against the bound and chain the
+    // comparisons with ccmp. A running minimum needed cmp+csel to reduce and
+    // then one more compare against the bound at the end; ccmp does the
+    // reduction and the test in one instruction, because "no denormal yet" is
+    // exactly the HS it leaves behind. Once some operand has come in below the
+    // bound the condition is false, ccmp writes NZCV = 0 instead of comparing,
+    // and its clear carry is the same LO a compare would have left - so the
+    // verdict sticks. Measured on the emitted body: 15 host instructions for
+    // three operands where the minimum form emitted 17, 11 where it emitted
+    // 12, and 7 either way for one operand.
+    // and/sub/fmov leave NZCV alone, so the chain survives the next operand's
+    // setup with no spill.
+    e.mov(e.x1, 0x000FFFFFFFFFFFFFull);
     for (int k = 0; k < n; ++k) {
       e.fmov(e.x0, ops[k]);
       e.and_(e.x0, e.x0, 0x7FFFFFFFFFFFFFFFull);
+      e.sub(e.x0, e.x0, 1);
       if (k == 0) {
-        e.sub(e.x2, e.x0, 1);
+        e.cmp(e.x0, e.x1);
       } else {
-        e.sub(e.x0, e.x0, 1);
-        e.cmp(e.x2, e.x0);
-        e.csel(e.x2, e.x2, e.x0, LO);
+        e.ccmp(e.x0, e.x1, 0, HS);
       }
     }
-    e.mov(e.x0, 0x000FFFFFFFFFFFFFull);
-    e.cmp(e.x2, e.x0);
     e.b_near(LO, *slow_path);
     // movz form: mov(dest, WReg(31)) would assemble as the SP-alias ADD.
     e.mov(i.dest, uint64_t(0));
@@ -3818,9 +3826,9 @@ struct DENORMAL_QUIRK
       emit_finite_check(e);
     }
     e.L(done);
-    // Both paths reach here with the bound compare still in NZCV: hot ran
-    // cmp(min-1, 2^52-1) and fell through on HS with dest = 0; cold ran
-    // cmp(max, inf-bound) and cset LO into dest. Either way LO is true
+    // Both paths reach here with the bound compare still in NZCV: hot ended
+    // its ccmp chain against 2^52-1 and fell through on HS with dest = 0; cold
+    // ran cmp(max, inf-bound) and cset LO into dest. Either way LO is true
     // exactly when dest != 0, and the mov/cset/b in between touch no flags,
     // so the adjacent SELECT can pick on LO without re-testing.
     e.DeclareFlagsNonzeroCond(i.dest.reg().getIdx(), false, Xbyak_aarch64::LO);
