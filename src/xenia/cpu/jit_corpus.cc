@@ -12,9 +12,14 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/memory.h"
+
+// Defined in the kernel; gates PreemptCheckInjectionPass and so the code the
+// backend emits, which is why a corpus has to record it.
+DECLARE_bool(guest_scheduler);
 
 namespace xe {
 namespace cpu {
@@ -53,8 +58,12 @@ std::unique_ptr<JitCorpusWriter> JitCorpusWriter::Create(
            xe::path_to_utf8(path));
     return nullptr;
   }
+  uint32_t config_flags = 0;
+  if (cvars::guest_scheduler) {
+    config_flags |= JitCorpus::kConfigGuestScheduler;
+  }
   const uint32_t header[4] = {JitCorpus::kMagic, JitCorpus::kVersion,
-                              JitCorpus::kPageSize, 0};
+                              JitCorpus::kPageSize, config_flags};
   if (fwrite(header, sizeof(header), 1, file) != 1) {
     fclose(file);
     return nullptr;
@@ -156,6 +165,7 @@ std::unique_ptr<JitCorpus> JitCorpus::Read(const std::filesystem::path& path) {
   }
 
   auto corpus = std::make_unique<JitCorpus>();
+  corpus->config_flags_ = header[3];
   // Pages arrive in first-touch order; collect them with their data and sort at
   // the end so the replay can map contiguous runs in one allocation.
   std::vector<std::pair<uint32_t, std::vector<uint8_t>>> pages;

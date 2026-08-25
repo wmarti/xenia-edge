@@ -19,6 +19,8 @@
 #include "xenia/base/string_buffer.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/jit_corpus.h"
+
+DECLARE_bool(guest_scheduler);
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
 #include "xenia/cpu/processor.h"
@@ -924,6 +926,22 @@ bool RunCorpusReplay() {
             "note: corpus was truncated mid-record (capture was killed); "
             "replaying the %zu complete function records.\n",
             corpus->functions().size());
+  }
+
+  // A replay compiles with whatever cvars this process has, so any setting that
+  // changes codegen has to be taken from the capture rather than from the
+  // defaults of a different binary. guest_scheduler is the one that bites:
+  // it gates PreemptCheckInjectionPass, and replaying a --guest_scheduler=false
+  // capture under the default made 13,323 of 13,564 functions differ from their
+  // own capture. Applied before the first compile, and reported, because a
+  // silently mismatched replay still prints a confident total.
+  if (corpus->captured_with_guest_scheduler() != cvars::guest_scheduler) {
+    fprintf(stdout,
+            "  config     capture had --guest_scheduler=%s, this process has "
+            "%s; using the capture's\n",
+            corpus->captured_with_guest_scheduler() ? "true" : "false",
+            cvars::guest_scheduler ? "true" : "false");
+    cvars::guest_scheduler = corpus->captured_with_guest_scheduler();
   }
 
   // Disassembly is built during translation, so this has to be latched before

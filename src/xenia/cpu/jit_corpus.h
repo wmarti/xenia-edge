@@ -46,8 +46,17 @@ class JitCorpus {
  public:
   // 'XJC1' -- bump kVersion on any layout change.
   static constexpr uint32_t kMagic = 0x3143584Au;
-  static constexpr uint32_t kVersion = 1;
+  static constexpr uint32_t kVersion = 2;
   static constexpr uint32_t kPageSize = 0x1000u;
+
+  // Codegen-affecting settings latched at capture, carried in the header's
+  // fourth word. A replay that does not reproduce these is not comparing the
+  // same compiler: --guest_scheduler gates PreemptCheckInjectionPass, and a
+  // preempt check plus its out-of-line handler is 11 a64 instructions at every
+  // injection point. Replaying a --guest_scheduler=false capture under the
+  // default (true) made 13,323 of 13,564 functions differ from their own
+  // capture and inflated the total by 3.50%.
+  static constexpr uint32_t kConfigGuestScheduler = 1u << 0;
 
   // A guest function that reached the backend, and what it emitted.
   struct FunctionRecord {
@@ -84,10 +93,17 @@ class JitCorpus {
   // True when the file ended mid-record, i.e. capture was killed.
   bool truncated() const { return truncated_; }
 
+  // The codegen settings this corpus was captured under.
+  uint32_t config_flags() const { return config_flags_; }
+  bool captured_with_guest_scheduler() const {
+    return (config_flags_ & kConfigGuestScheduler) != 0;
+  }
+
  private:
   std::vector<FunctionRecord> functions_;
   std::vector<uint32_t> page_addresses_;
   std::vector<uint8_t> page_data_;
+  uint32_t config_flags_ = 0;
   bool truncated_ = false;
 };
 
