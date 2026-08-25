@@ -30,6 +30,11 @@ times, so this samples the log at a fixed rate and pairs frame counts with the
 sampling clock.
 """
 import argparse, json, os, shutil, subprocess, sys, time, re
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import macwin
+except Exception:  # pyobjc absent: parking and focus checks go quiet
+    macwin = None
 
 GAME = ("/Users/admin/Documents/X360-Games/4D5307E6/00007000/"
         "5B98A58CE2D8B103DB49A0B813996BD84D")
@@ -99,6 +104,7 @@ def run_once(app, work, warmup_s, window_s, timeout, extra=(), game=None):
     log = os.path.join(work, "run.log")
     out = open(os.path.join(work, "stdout.log"), "wb")
     # No --apu=nop: it fails CreateDriver and the guest dies at boot.
+    before = macwin.frontmost() if macwin else ""
     p = subprocess.Popen(
         [app, f"--storage_root={work}/storage", f"--log_file={log}",
          "--log_level=2", "--hid=nop", "--discord=false", *extra,
@@ -118,6 +124,15 @@ def run_once(app, work, warmup_s, window_s, timeout, extra=(), game=None):
             if p.poll() is not None:
                 return result
             time.sleep(1.0)
+        if macwin:
+            after = macwin.frontmost()
+            ws = macwin.windows(pid=p.pid)
+            if ws:
+                w = ws[0]
+                print(f"    window {w['id']} at {w['x']},{w['y']} "
+                      f"{w['w']}x{w['h']}"
+                      + ("" if after == before
+                         else f"  [took focus from {before!r}]"), flush=True)
         f_start = current_frame(log)
         c_start = cpu_seconds(p.pid)
         t_start = time.perf_counter()
@@ -173,9 +188,31 @@ def main():
                     help="path to the title to launch; defaults to Halo 3. "
                          "Halo 3 and Halo Reach are both locked at 30 fps, so "
                          "CPU percent is the figure of merit on either")
+    # Geometry is seeded into the wxConfig both binaries read, so parking the
+    # window cannot become a difference between the refs -- and it is applied
+    # before the frame is constructed, which is the only point at which macOS
+    # lets a position be chosen without Accessibility.
+    ap.add_argument("--park", default="",
+                    help="X,Y to park the emulator window at, so a run does "
+                         "not sit on top of whatever else is on screen. "
+                         "'auto' tucks it into the bottom-right corner")
     ap.add_argument("--extra-a", action="append", default=[])
     ap.add_argument("--extra-b", action="append", default=[])
     args = ap.parse_args()
+
+    if args.park and macwin:
+        if args.park == "auto":
+            dx, dy, dw, dh = macwin.displays()[0]
+            # Leave a corner on screen: a window with no pixels on any display
+            # risks being throttled, and then CPU percent measures a stalled
+            # emulator rather than a running one.
+            px, py = dx + dw - 220, dy + dh - 180
+        else:
+            px, py = (int(v) for v in args.park.split(","))
+        macwin.park(px, py)
+        print(f"window parked at {px},{py} (both refs)", flush=True)
+    elif args.park:
+        print("--park ignored: pyobjc not importable", flush=True)
 
     a_fps, b_fps = [], []
     for i in range(args.runs):
