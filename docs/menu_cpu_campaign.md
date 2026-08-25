@@ -305,19 +305,42 @@ Deferring uploads to the end of the frame puts them after most of the draws
 that read them. The per-`RequestTextures` bracket is not naive -- it is what
 guarantees an upload precedes its consumer.
 
-### What a correct fix would look like
+### Submission-boundary scope was tried too. It corrupts identically.
 
-Flush the upload batch at every **submission boundary** rather than at frame
-end: one upload command buffer per draw-submission instead of per
-`RequestTextures`. That is ~32 per present rather than 484, keeps the ordering
-guarantee, and would still remove roughly 90% of the submissions. It needs a
-hook wherever `current_command_buffer_` is committed, of which there are three,
-plus the resolve and query paths that submit independently.
+The obvious correction to the frame-wide attempt is to flush at every
+**submission boundary** instead: `MetalCommandProcessor::EndCommandBuffer` is a
+single chokepoint, called ~32 times a frame (that is what `submission_other`
+31.1 per present counts -- recreations of `current_command_buffer_`), and it
+runs immediately before that submission's draw buffer commits. One upload
+buffer per submission is ~32 per present instead of 484, and Metal executes a
+queue's buffers in commit order, so the ordering argument looks airtight.
 
-Not attempted here: it is a real change to upload ordering and this campaign
-has already shipped one miscompile and one plausible-looking measurement
-artifact. It should be done with a frame-diff against the unmodified build as
-the gate, not a CPU number.
+**It produces the same corruption, pixel for pixel** -- blown-out geometry,
+missing textures, tail lights as red blobs. Reverted.
+
+That the two scopes fail *identically* is the useful part: the problem is not
+the width of the batch.
+
+**Ruled out by inspection, so nobody repeats it:**
+- *Ordering against the draw buffer.* The flush happens before
+  `current_command_buffer_->commit()` in the same function.
+- *Staging buffer lifetime.* `release_buffer_immediate` already defers to
+  `buffer_pool->ReleaseAfter(cmd, buffer)` or the command buffer's completion
+  handler, so widening the batch does not free anything early.
+
+**Still open, and where to look next.** `LoadTextureDataFromResidentMemoryImpl`
+picks its command buffer in preference order (`metal_texture_cache.cc:1100-1114`):
+the *current draw command buffer* first -- "it needs no extra buffer at all" --
+then the batch, then a private one. Holding a batch open changes which uploads
+take the first branch, so the change is not only "fewer command buffers", it
+also moves uploads out of the draw buffer they used to be encoded into. That is
+a reordering relative to draws already encoded in the current command buffer,
+and it is the remaining candidate.
+
+Anyone attempting this should instrument that preference (count uploads per
+branch, with and without the batch) before changing scope again. Two attempts
+have now looked correct on every counter and been wrong on screen; the gate is
+a frame comparison, not a CPU or throughput number.
 
 ## Open defects found, not yet resolved
 
