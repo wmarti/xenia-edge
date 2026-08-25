@@ -474,12 +474,49 @@ resident textures. That is the shape of GPU render-target resolves writing back
 to guest memory and invalidating every texture that overlaps the written range,
 rather than of a guest scribbling on texture data.
 
-**Next discriminator, and it is one counter.** `FireWatches` already takes
-`invalidated_by_gpu`. Splitting the event and page counts on that flag separates
-"the GPU resolved into this memory" from "the CPU wrote to it". If it is
-overwhelmingly GPU, the question becomes whether a resolve needs to invalidate
-textures whose bytes it did not actually overwrite -- the range is the resolve
-target's extent, and overlapping textures may only intersect part of it.
+**Split by origin, and it is close to even -- so the churn is largely real.**
+Over 2,112 presents at the docks:
+
+| origin | events/present | pages/present | pages per event |
+| --- | --- | --- | --- |
+| GPU (`invalidated_by_gpu`) | 43.7 (46.5%) | 3,929 (55%) | 89.8 |
+| CPU (guest writes) | 50.3 (53.5%) | 3,218 (45%) | 64.0 |
+
+At 16 KiB a page that is roughly **85 MiB a frame written by the GPU and 51 MiB
+a frame written by the guest**, both into memory that overlaps resident
+textures. Neither side is firing spuriously: these are ranges something actually
+wrote.
+
+**So this line of investigation ends without a fix, and that is the finding.**
+Four hypotheses were tested and killed with measurement: stale outdated-flags
+(0.34% of calls), the upload branch preference (uploads never use the draw
+command buffer), the host/guest page-size mismatch (~2.5% of a 1.24 MiB range,
+not 4x), and spurious invalidation (both origins are writing real bytes).
+
+What remains is not a bug with a small fix. GTA IV at the docks genuinely
+rewrites on the order of 100 MiB a frame of memory that has resident textures
+mapped over it. The plausible remaining explanations need real GPU-emulation
+judgement rather than another counter:
+
+- **Textures that should have been evicted.** 1,311 textures stay resident
+  while the guest reuses their backing memory for other purposes. A texture
+  whose memory has been repurposed should be dropped, not re-uploaded on every
+  draw that still binds its fetch constant.
+- **Resolve extents wider than the data.** A resolve invalidates every texture
+  overlapping its target extent; overlapping textures may intersect only part of
+  it, and a sub-range test at texture granularity would cut the GPU half.
+
+Both are substantial changes to cache policy, and both are exactly the kind of
+change this campaign has twice got wrong in ways only a screenshot caught. They
+should be attempted with a frame comparison as the gate and more room than a
+single tick.
+
+**What the four ticks did establish**, and it is worth keeping: the GPU-side
+cost of this state is dominated by texture upload traffic that is a *consequence*
+of invalidation volume, not by the submission mechanics that were the obvious
+target. Batching command buffers, caching pipeline formats, and shrinking the
+per-draw memcpy all attack symptoms downstream of ~100 MiB/frame of
+invalidation.
 
 ### Where to look
 

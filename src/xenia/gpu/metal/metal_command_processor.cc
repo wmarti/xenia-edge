@@ -1982,6 +1982,12 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
             fprintf(cf, "fire_watch_pages %llu\n",
                     static_cast<unsigned long long>(
                         shared_memory_->fire_watches_pages()));
+            fprintf(cf, "fire_watch_gpu_events %llu\n",
+                    static_cast<unsigned long long>(
+                        shared_memory_->fire_watches_gpu_events()));
+            fprintf(cf, "fire_watch_gpu_pages %llu\n",
+                    static_cast<unsigned long long>(
+                        shared_memory_->fire_watches_gpu_pages()));
           }
         }
         fclose(cf);
