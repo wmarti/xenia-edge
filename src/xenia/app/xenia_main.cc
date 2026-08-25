@@ -61,6 +61,7 @@
 #include "xenia/hid/sdl/sdl_hid.h"
 #endif  // !XE_PLATFORM_ANDROID
 #include "xenia/hid/keyboard/keyboard_hid.h"
+#include "xenia/hid/script/script_hid.h"
 
 // apu and gpu are defined in emulator.cc, alongside the code that reads them.
 DECLARE_string(apu);
@@ -492,6 +493,17 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
 std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
     ui::Window* window) {
   std::vector<std::unique_ptr<hid::InputDriver>> drivers;
+  // Scripted input loads ahead of any real backend and regardless of `hid=`,
+  // so a benchmark can drive a title's menus with --hid=nop and nothing else
+  // attached. Setup() fails when --input_script is empty, so it costs nothing
+  // when it is not wanted.
+  {
+    auto scripted =
+        xe::hid::script::Create(window, EmulatorWindow::kZOrderHidInput);
+    if (scripted && XSUCCEEDED(scripted->Setup())) {
+      drivers.emplace_back(std::move(scripted));
+    }
+  }
   if (cvars::hid.compare("nop") == 0) {
     drivers.emplace_back(
         xe::hid::nop::Create(window, EmulatorWindow::kZOrderHidInput));
