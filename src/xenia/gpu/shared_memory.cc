@@ -286,6 +286,14 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last,
   // four guest pages and can invalidate textures the write never touched.
   ++fire_watches_events_;
   fire_watches_pages_ += uint64_t(page_last - page_first + 1);
+  // Split on the flag so "the GPU resolved into this memory" can be told apart
+  // from "the CPU wrote to it". The former means a resolve is invalidating
+  // every texture overlapping its target extent, including ones whose bytes it
+  // never wrote; the latter means the guest genuinely dirtied the data.
+  if (invalidated_by_gpu) {
+    ++fire_watches_gpu_events_;
+    fire_watches_gpu_pages_ += uint64_t(page_last - page_first + 1);
+  }
   uint32_t address_first = page_first << page_size_log2_;
   uint32_t address_last =
       (page_last << page_size_log2_) + ((1 << page_size_log2_) - 1);
