@@ -204,6 +204,19 @@ to be stood up.
   is to *submit* `sbatch` work and collect it afterwards, never to compute on
   the login node.
 
+### Which python to run the bench tools with
+
+`tools/bench/macwin.py` needs pyobjc for `--park`, window enumeration and
+window-targeted capture. The system `/usr/bin/python3` does not have it;
+`bench-work/venv/bin/python3` does. Run `frame_ab.py`, `live.py` and anything
+else that touches windows with the venv interpreter, or `--park` degrades to
+`--park ignored: pyobjc not importable` and the emulator window lands wherever
+macOS puts it -- on top of whatever the user is doing.
+
+Note also that `--extra-a` / `--extra-b` values must be passed with `=`
+(`--extra-a=--guest_scheduler=false`). Given as a separate argument, argparse
+takes the leading `--` as an option and the run dies before it starts.
+
 ### Running a pass
 
 One command per machine, and both are idempotent — anything already done is
