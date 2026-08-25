@@ -33,7 +33,13 @@ FRAME_RE = re.compile(rb"^.> f:(\d+)", re.M)
 # is the column the count starts at, not a run of leading spaces. Matching on
 # whitespace alone parses nothing at all and reports an empty profile.
 NODE_RE = re.compile(r"^([\s+!:|]*)(\d+)\s+(.*?)\s*$")
-THREAD_RE = re.compile(r"^\s*(\d+)\s+Thread_(\w+)(?::?\s*(.*?))?\s*$")
+# \S+ not \w+: `sample` writes "Thread_<multiple>" when it merges several
+# short-lived threads under one header, and \w+ does not match the angle
+# brackets. Those headers were dropped, and every sample under them was
+# folded into whichever thread was named last -- at the GTA IV docks that
+# silently moved 3,657 samples of com.Metal.CommandQueueDispatch, plus
+# CompletionQueueDispatch, FramePacing and libMTLHud, onto their neighbours.
+THREAD_RE = re.compile(r"^\s*(\d+)\s+Thread_(\S+?):?(?:\s+(.*?))?\s*$")
 # A stack sitting in one of these was not on a core. `sample` records every
 # thread at every interval whether it is running or blocked, so counting all
 # of them gives each thread an identical total and measures nothing.
@@ -273,7 +279,11 @@ def parse_sample(text):
     """
     nodes, threads, cur = [], {}, None
     for ln in text.splitlines():
-        if ln.startswith("Binary Images:"):
+        # `sample` appends a flat "Total number in stack" table after the call
+        # graph and before "Binary Images:". Parsing it as tree nodes added
+        # ~2,200 phantom nodes and inflated the denominator by ~8.5%.
+        if ln.startswith("Binary Images:") or ln.startswith(
+                "Total number in stack"):
             break
         mt = THREAD_RE.match(ln)
         if mt and "Thread_" in ln:
