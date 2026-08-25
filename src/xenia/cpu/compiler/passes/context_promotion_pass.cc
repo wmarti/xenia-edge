@@ -41,7 +41,7 @@ DEFINE_bool(
     "CPU");
 
 DECLARE_bool(disable_context_promotion);
-DECLARE_bool(extended_block_scope);
+DECLARE_bool(extended_block_promote);
 
 namespace xe {
 namespace cpu {
@@ -100,7 +100,7 @@ bool ContextPromotionPass::Run(HIRBuilder* builder) {
   auto block = builder->first_block();
   while (block) {
     const bool reset =
-        !cvars::extended_block_scope || StartsExtendedBlock(block);
+        !cvars::extended_block_promote || StartsExtendedBlock(block);
     PromoteBlock(block, reset);
     block = block->next;
   }
