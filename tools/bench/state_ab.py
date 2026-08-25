@@ -133,6 +133,17 @@ def main():
         if not os.path.exists(path):
             sys.exit(f"error: {label} does not exist: {path}")
 
+    # Refuse to measure on a nearly full disk. A run that cannot write its log
+    # produces a profile that looks like a hung guest -- two threads pinned on
+    # one PC, everything else parked -- and nothing says why. That cost two
+    # discarded profiles and a wrong "the emulator is wedged" conclusion.
+    st = os.statvfs(a.storage)
+    free_gb = st.f_bavail * st.f_frsize / (1024 ** 3)
+    if free_gb < 2.0:
+        sys.exit(f"error: only {free_gb:.1f} GB free on the storage volume; "
+                 f"free space before measuring (shader caches and logs grow "
+                 f"during a run)")
+
     refs = [(a.ref_a, a.app_a, a.extra_a), (a.ref_b, a.app_b, a.extra_b)]
     # A,B,B,A,A,B -- interleaved so drift across the run does not favour a ref.
     order = []
