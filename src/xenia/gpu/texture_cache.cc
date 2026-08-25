@@ -642,14 +642,23 @@ bool TextureCache::Texture::MakeUpToDateAndWatch(
   const bool watch_base = base_outdated_;
   const bool watch_mips = mips_outdated_;
   assert_true(global_lock.owns_lock());
+  ++texture_cache().make_up_to_date_calls_;
+  // Both early returns leave base_outdated_/mips_outdated_ SET, so the caller
+  // has already re-uploaded the texture and it will be re-uploaded again on the
+  // next draw that binds it -- indefinitely, if the range never becomes valid.
+  // Counted because the GTA IV docks re-uploads 1,315 textures about 709 times
+  // each with no new textures appearing, and this is the only path that repeats
+  // an upload without the guest having written anything.
   if (watch_base &&
       !shared_memory.IsRangeValid(
           key().base_page << 12, xe::align(GetGuestBaseSize(), UINT32_C(16)))) {
+    ++texture_cache().make_up_to_date_base_invalid_;
     return false;
   }
   if (watch_mips &&
       !shared_memory.IsRangeValid(
           key().mip_page << 12, xe::align(GetGuestMipsSize(), UINT32_C(16)))) {
+    ++texture_cache().make_up_to_date_mips_invalid_;
     return false;
   }
 

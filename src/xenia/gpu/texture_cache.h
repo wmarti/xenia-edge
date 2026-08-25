@@ -58,6 +58,21 @@ namespace gpu {
 // because textures are streamed this way anyway.
 class TextureCache {
  public:
+  // Diagnostics for texture re-upload churn. MakeUpToDateAndWatch returns
+  // early without clearing the outdated flags when the shared-memory range is
+  // not valid, which makes the caller re-upload the same texture on every
+  // subsequent draw.
+  uint64_t make_up_to_date_calls() const { return make_up_to_date_calls_; }
+  uint64_t make_up_to_date_base_invalid() const {
+    return make_up_to_date_base_invalid_;
+  }
+  uint64_t make_up_to_date_mips_invalid() const {
+    return make_up_to_date_mips_invalid_;
+  }
+  uint64_t make_up_to_date_calls_ = 0;
+  uint64_t make_up_to_date_base_invalid_ = 0;
+  uint64_t make_up_to_date_mips_invalid_ = 0;
+
   // Hard limit, originating from the half-pixel offset filling hack in the
   // resolve shaders only filling up to 3 pixels, due to the bit counts used for
   // passing the scale to shaders, and because the full 490 MB EDRAM buffer is
