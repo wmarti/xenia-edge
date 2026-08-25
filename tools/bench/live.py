@@ -43,7 +43,7 @@ BLOCKED = (
     "__psynch_cvwait", "__psynch_mutexwait", "__psynch_rw_", "mach_msg2_trap",
     "kevent_id", "kevent", "semaphore_wait_trap", "semaphore_timedwait_trap",
     "semaphore_wait_signal_trap", "__semwait_signal", "mach_wait_until",
-    "__select", "__workq_kernreturn", "poll", "read", "__sigsuspend",
+    "__select", "__workq_kernreturn", "poll", "__read", "__sigsuspend",
     "__ulock_wait", "start_wqthread",
     "__wait4", "__accept", "__recvfrom", "guarded_kqueue_np",
 )
@@ -309,9 +309,17 @@ def self_times(nodes):
         self_n = count - child
         if self_n <= 0:
             continue
-        if any(b in label for b in BLOCKED):
+        # SPINNING is tested BEFORE BLOCKED, and both are substring tests.
+        # A bare "read" in BLOCKED matched "cthread_yield" and "thread_switch",
+        # which silently sent both back to the blocked bin and defeated half of
+        # the spin accounting; it is "__read" now, but the ordering is what
+        # makes that class of collision harmless rather than merely unlikely.
+        if any(sp in label for sp in SPINNING):
+            bucket = spin
+        elif any(b in label for b in BLOCKED):
             continue
-        bucket = spin if any(sp in label for sp in SPINNING) else work
+        else:
+            bucket = work
         bucket[(thread, label)] = bucket.get((thread, label), 0) + self_n
         running += self_n
     return work, spin, running
