@@ -4507,10 +4507,29 @@ bool MetalCommandProcessor::IssueDrawDxil(
   MetalDxilBinder::Constants constants;
   constants.system = {&spirv_system_constants_,
                       uint32_t(sizeof(spirv_system_constants_))};
+  // Upload only what the shader declares, not the whole 4 KiB CBV.
+  // rebuild_packed_float_constants writes float_count vec4s tight-packed and
+  // zero-fills the rest, and the SPIR-V translator declares the uniform block
+  // as an array of exactly float_count vec4s -- so everything past that point
+  // is zeros the shader has no way to address. float_count is either the
+  // tight-packed bit count or exactly 256 when float_dynamic_addressing is
+  // set, which is the full 4 KiB again, so this can never truncate something
+  // the shader can reach.
+  //
+  // These two blocks are 8 KiB of the ~9.8 KiB this path memcpys per draw.
+  // MetalDxilBinder::Bind was 32.6% of the GPU Commands thread at the GTA IV
+  // docks state, 87% of it inside the copy.
+  auto declared_float_bytes = [](const Shader* shader) -> uint32_t {
+    if (!shader) {
+      return 0;
+    }
+    return std::min(uint32_t(shader->constant_register_map().float_count) * 16u,
+                    uint32_t(kCbvSizeBytes));
+  };
   constants.float_vertex = {msl_cached_float_constants_vertex_.data(),
-                            uint32_t(kCbvSizeBytes)};
+                            declared_float_bytes(dxil_vertex_shader)};
   constants.float_pixel = {msl_cached_float_constants_pixel_.data(),
-                           uint32_t(kCbvSizeBytes)};
+                           declared_float_bytes(dxil_pixel_shader)};
   constants.bool_loop = {msl_cached_bool_loop_constants_.data(),
                          uint32_t(kBoolLoopConstantsSize)};
   constants.fetch = {msl_cached_fetch_constants_.data(),
