@@ -12,9 +12,21 @@
 #include <cstring>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/cpu/compiler/passes/extended_block.h"
+
+DEFINE_bool(
+    extended_block_scope, true,
+    "Allocate registers and promote context loads over extended blocks -- "
+    "chains of layout-adjacent blocks with a single way in -- instead of one "
+    "block at a time. The frontend stores every guest register write to the "
+    "context and reloads it in the next block, which is 34.5% of all HIR ops "
+    "on a real title; a value that stays in a register across the boundary "
+    "needs neither.",
+    "CPU");
 
 namespace xe {
 namespace cpu {
@@ -83,8 +95,13 @@ bool RegisterAllocationPass::Run(HIRBuilder* builder) {
     // Sequential block ordinals.
     block->ordinal = block_ordinal++;
 
-    // Reset all state.
-    PrepareBlockState();
+    // Reset all state -- but only at the head of an extended block. Inside
+    // one, a value defined earlier still dominates every later use, so the
+    // register holding it stays valid and does not have to be dropped and
+    // reloaded at the boundary.
+    if (!cvars::extended_block_scope || StartsExtendedBlock(block)) {
+      PrepareBlockState();
+    }
 
     // Renumber all instructions in the block. This is required so that
     // we can sort the usage pointers below.
@@ -394,8 +411,14 @@ bool RegisterAllocationPass::SpillOneRegister(HIRBuilder* builder, Block* block,
   assert_true(!usage_set->upcoming_uses.empty());
   auto furthest_usage = std::ranges::max_element(usage_set->upcoming_uses,
                                                  &RegisterUsage::Compare);
-  assert_true(furthest_usage->value->def->block == block);
-  assert_true(furthest_usage->use->instr->block == block);
+  // With extended-block scope these may sit in an earlier block of the same
+  // chain. Every insertion below is relative to an instruction rather than to
+  // `block`, so that is fine -- but say so, because the old assertion was the
+  // only record that the scope was ever one block.
+  assert_true(cvars::extended_block_scope ||
+              furthest_usage->value->def->block == block);
+  assert_true(cvars::extended_block_scope ||
+              furthest_usage->use->instr->block == block);
   auto spill_value = furthest_usage->value;
   Value::Use* prev_use = furthest_usage->use->prev;
   Value::Use* next_use = furthest_usage->use;
