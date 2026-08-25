@@ -90,6 +90,7 @@ class A64HelperEmitter : public A64Emitter {
 
   HostToGuestThunk EmitHostToGuestThunk();
   GuestToHostThunk EmitGuestToHostThunk();
+  GuestToHostThunk EmitGuestToHostThunkNoVec();
   ResolveFunctionThunk EmitResolveFunctionThunk();
   void* EmitGuestAndHostSynchronizeStackHelper();
   void* EmitVRsqrtefpHelper(void** out_vector_entry);
@@ -353,6 +354,86 @@ GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunk() {
       code_offsets.prolog_stack_alloc - code_offsets.prolog;
   func_info.stack_size = g2h_stack;
   func_info.lr_save_offset = 0x1C8;  // stp x29, x30, [sp, #0x1C0]
+
+  void* fn = Emplace(func_info);
+  return reinterpret_cast<GuestToHostThunk>(fn);
+}
+
+// --------------------------------------------------------------------------
+// GuestToHostThunkNoVec
+// --------------------------------------------------------------------------
+// The same transition without the vector save/restore, for call sites where no
+// HIR value can be live in q4-q31.
+//
+// The full thunk saves all 28 guest-allocatable Q registers on every host
+// transition -- 896 bytes moved through a 464-byte frame -- and once the FPCR
+// write is conditional a live profile of Halo: Reach makes that 61% of what
+// the thunk costs. Most of those saves protect nothing.
+//
+// Two facts say when. A guest-to-guest OPCODE_CALL emits a bare blr into
+// another translated function, whose prolog saves only x0/x30 and which then
+// uses q4-q31 freely -- if any HIR value were live in a vector register across
+// a call that would already be broken. And ContextPromotionPass stops its walk
+// at the first volatile instruction, "a call or a preempt check", so no
+// promoted context value spans one either.
+//
+// So an HIR-level transition (CallExtern) needs none of it. What does need it
+// is CallNativeSafe, which is emitted *inside* a sequence -- the inline MMIO
+// fallback, SpinWaitRelease, the memory tracers, the debug traps -- where
+// operands genuinely are in flight. Those keep the full thunk.
+GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunkNoVec() {
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+
+  code_offsets.prolog = getSize();
+
+  const size_t g2h_stack = 16;  // x29/x30 only, 16-byte aligned
+  sub(sp, sp, static_cast<uint32_t>(g2h_stack));
+  code_offsets.prolog_stack_alloc = getSize();
+  stp(x29, x30, ptr(sp, 0x00));
+
+  code_offsets.body = getSize();
+
+  mov(x9, x0);   // x9 = target function (scratch)
+  mov(x0, x20);  // x0 = PPCContext*
+  blr(x9);
+
+  // Same conditional FPCR restore as the full thunk, and the same
+  // postcondition: on the way out FPCR equals fpcr_fpu either way.
+  {
+    Xbyak_aarch64::Label fpcr_unchanged;
+    ldr(w11,
+        ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, fpcr_fpu))));
+    mrs(x12, 3, 3, 4, 4, 0);  // mrs x12, FPCR
+    cmp(w11, w12);
+    b(Xbyak_aarch64::EQ, fpcr_unchanged);
+    msr(3, 3, 4, 4, 0, x11);
+    L(fpcr_unchanged);
+  }
+
+  code_offsets.epilog = getSize();
+
+  ldp(x29, x30, ptr(sp, 0x00));
+  add(sp, sp, static_cast<uint32_t>(g2h_stack));
+  ret();
+
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = g2h_stack;
+  func_info.lr_save_offset = 0x08;  // stp x29, x30, [sp, #0x00]
 
   void* fn = Emplace(func_info);
   return reinterpret_cast<GuestToHostThunk>(fn);
@@ -1096,6 +1177,7 @@ bool A64Backend::Initialize(Processor* processor) {
 
   host_to_guest_thunk_ = thunk_emitter.EmitHostToGuestThunk();
   guest_to_host_thunk_ = thunk_emitter.EmitGuestToHostThunk();
+  guest_to_host_thunk_no_vec_ = thunk_emitter.EmitGuestToHostThunkNoVec();
   resolve_function_thunk_ = thunk_emitter.EmitResolveFunctionThunk();
 
   if (!host_to_guest_thunk_ || !guest_to_host_thunk_ ||
@@ -1332,6 +1414,9 @@ void A64Backend::InitializeBackendContext(void* ctx) {
   assert_not_null(guest_to_host_thunk_);
   a64_ctx->guest_to_host_thunk_address =
       reinterpret_cast<uint64_t>(guest_to_host_thunk_);
+  assert_not_null(guest_to_host_thunk_no_vec_);
+  a64_ctx->guest_to_host_thunk_no_vec_address =
+      reinterpret_cast<uint64_t>(guest_to_host_thunk_no_vec_);
 
   auto set_est = [&](int index, float value) {
     uint32_t bits;
