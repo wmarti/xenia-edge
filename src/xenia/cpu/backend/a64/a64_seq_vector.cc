@@ -2208,13 +2208,18 @@ static void EmitPartialVectorStore(A64Emitter& e,
   // Unqualified Label here is hir::Label.
   Xbyak_aarch64::Label from8, from4, from2, from1, done;
 
+  // The near forms: every label below is bound within this helper, at most 28
+  // instructions ahead, so all of them are provably inside b.cond's +/-1 MiB.
+  // The shadowed forms would each expand to `<inverse> over; b target; over:`,
+  // which costs one more instruction laid down per branch and one more
+  // executed on whichever arm is taken.
   e.cmp(count, 8);
-  e.b(Xbyak_aarch64::HS, from8);
+  e.b_near(Xbyak_aarch64::HS, from8);
   e.cmp(count, 4);
-  e.b(Xbyak_aarch64::HS, from4);
+  e.b_near(Xbyak_aarch64::HS, from4);
   e.cmp(count, 2);
-  e.b(Xbyak_aarch64::HS, from2);
-  e.cbnz(count, from1);
+  e.b_near(Xbyak_aarch64::HS, from2);
+  e.cbnz_near(count, from1);
   e.b(done);
 
   e.L(from8);
