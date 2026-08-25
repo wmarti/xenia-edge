@@ -91,7 +91,17 @@ void AndroidShutdown() {
 }
 #endif
 
-size_t page_size() { return getpagesize(); }
+// getpagesize() is an out-of-line libc call and the value cannot change for
+// the life of the process, but it was being called on every use. The hottest
+// caller is PPCContext::TranslateVirtual, which asks for the granularity on
+// every guest address translation: a scan of the shipped binary found 964
+// direct calls to the getpagesize stub across 553 functions, including the
+// RtlEnter/LeaveCriticalSection trampolines and the GPU interrupt path. Read
+// it once.
+size_t page_size() {
+  static const size_t page_size_ = static_cast<size_t>(getpagesize());
+  return page_size_;
+}
 size_t allocation_granularity() { return page_size(); }
 
 uint32_t ToPosixProtectFlags(PageAccess access) {
