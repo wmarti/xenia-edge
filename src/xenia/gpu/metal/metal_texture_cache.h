@@ -37,6 +37,17 @@ class MetalHeapPool;
 
 class MetalTextureCache : public TextureCache {
  public:
+  // Which command buffer each texture upload landed in. Diagnostic only:
+  // widening the upload batch corrupted the image twice, and the remaining
+  // suspect is that holding a batch open moves uploads out of the current draw
+  // command buffer -- which is only eligible when no render encoder is active
+  // -- and into a separately committed one. These say whether that happens.
+  uint64_t upload_branch_current_cb() const {
+    return upload_branch_current_cb_;
+  }
+  uint64_t upload_branch_batch() const { return upload_branch_batch_; }
+  uint64_t upload_branch_private() const { return upload_branch_private_; }
+
   MetalTextureCache(MetalCommandProcessor* command_processor,
                     const RegisterFile& register_file,
                     MetalSharedMemory& shared_memory,
@@ -250,6 +261,9 @@ class MetalTextureCache : public TextureCache {
   MTL::CommandBuffer* upload_batch_command_buffer_ = nullptr;
   bool upload_batch_command_buffer_has_work_ = false;
   uint32_t upload_batch_depth_ = 0;
+  uint64_t upload_branch_current_cb_ = 0;
+  uint64_t upload_branch_batch_ = 0;
+  uint64_t upload_branch_private_ = 0;
   MetalTexture* bindless_used_first_ = nullptr;
   MetalTexture* bindless_used_last_ = nullptr;
   std::unique_ptr<MetalHeapPool> texture_heap_pool_;

@@ -1944,6 +1944,17 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                 static_cast<unsigned long long>(total));
         fprintf(cf, "render_passes_total %llu\n",
                 static_cast<unsigned long long>(render_passes_total_));
+        if (texture_cache_) {
+          fprintf(cf, "upload_via_current_cb %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_branch_current_cb()));
+          fprintf(cf, "upload_via_batch %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_branch_batch()));
+          fprintf(cf, "upload_via_private %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_branch_private()));
+        }
         fclose(cf);
       }
     }

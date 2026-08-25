@@ -319,6 +319,50 @@ has already shipped one miscompile and one plausible-looking measurement
 artifact. It should be done with a frame-diff against the unmodified build as
 the gate, not a CPU number.
 
+## The upload batching question is the wrong question: 469 uploads per present
+
+`--gpu_counters_file` now also reports which command buffer each texture upload
+lands in. Measured at the docks over 1,984 presents at 44.5/s:
+
+| | per present |
+| --- | --- |
+| `upload_via_current_cb` | **0.00** |
+| `upload_via_batch` | **469.3** |
+| `upload_via_private` | 1.03 |
+| `texture_upload_batch` command buffers | 399.2 |
+
+Two things follow.
+
+**The third hypothesis for the corruption is dead.** Uploads never land in the
+current draw command buffer -- `use_current_command_buffer` additionally
+requires `!HasActiveRenderEncoder()`, and that is evidently never true when an
+upload happens. So widening the batch does not move uploads out of the draw
+buffer they were previously encoded into, because they were never in it. Also
+ruled out earlier: ordering against the draw buffer, and staging-buffer
+lifetime. Encoder nesting is ruled out too -- the compute encoder ends at
+`metal_texture_cache.cc:1284` and the blit at `:1415`, both before the next
+pair. The cause of the corruption remains unidentified.
+
+**And the target was misjudged.** 469 texture uploads per present is roughly
+20,900 uploads a second. Batching them into fewer command buffers attacks the
+submission cost of a workload that should not exist at this size in a settled
+scene, where the camera is stationary and the visible set is not changing. The
+529-command-buffers-per-present figure is a symptom.
+
+The question worth answering next is why the texture cache uploads ~469 times a
+frame at all: whether the same textures are re-uploaded every frame (an
+invalidation or key problem), whether one texture is uploaded per level or per
+slice and is being counted per sub-upload, or whether GTA IV genuinely streams
+that hard at the docks. `upload_via_batch` counts calls into
+`LoadTextureDataFromResidentMemoryImpl`, so a per-texture-identity counter would
+separate "many textures" from "the same texture repeatedly". That is the next
+measurement, and it is cheap.
+
+If it is re-upload churn, fixing it removes the uploads, their command buffers,
+their encoder pairs (3.13% of on-core in encoder creation alone) and their
+memmove traffic together -- which is a far larger prize than batching, and does
+not require touching upload ordering at all.
+
 ## Open defects found, not yet resolved
 
 - **`vector_nan_propagation_test.cc` fails 2 assertions in this tree.** It expects

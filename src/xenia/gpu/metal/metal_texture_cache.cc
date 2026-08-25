@@ -1111,6 +1111,11 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   if (!cmd) {
     cmd = command_processor_->CreateAccountedCommandBuffer(
         MetalCommandProcessor::CommandBufferKind::kTextureUploadPrivate);
+    ++upload_branch_private_;
+  } else if (use_upload_batch) {
+    ++upload_branch_batch_;
+  } else {
+    ++upload_branch_current_cb_;
   }
   if (!cmd) {
     release_buffer_immediate(constants_buffer, constants_buffer_size);
