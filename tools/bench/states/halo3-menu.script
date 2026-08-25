@@ -1,0 +1,4 @@
+# Halo 3 main menu. No input needed: the title reaches its menu unattended and
+# stays there. Present only so every benchmarked state has a file, and so
+# --input_script is uniform across titles.
+900000 -

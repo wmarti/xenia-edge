@@ -1,0 +1,19 @@
+# GTA IV -> "The Cousins Bellic": Niko and Roman in the taxi at the docks.
+#
+# This title will NOT boot to a playable state without a controller present:
+# with --hid=nop and no --input_script it stops at "Please reconnect
+# controller" forever. The scripted driver only registers when a script is
+# given, so this file is a prerequisite, not a convenience.
+#
+# Boot to the opening cinematic takes ~45s on this machine (measured: CPU
+# climbs 108 -> 348% over the first minute and the cinematic is still running
+# at t=135s, so it does not end on its own in a useful window). A skips it.
+45000 -
+120  A
+2500 -
+120  A
+2500 -
+120  A
+2500 -
+120  A
+900000 -

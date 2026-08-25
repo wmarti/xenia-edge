@@ -1,0 +1,4 @@
+# Halo Reach main menu. Reaches it unattended; the attract sequence cycles, so
+# a measurement window shorter than ~90s does not average it (a 35s window read
+# 21.6 fps where a 90s window reads 36.2).
+900000 -
