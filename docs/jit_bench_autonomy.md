@@ -1187,6 +1187,153 @@ removed exactly zero instructions, and the HIR dump was identical to the
 baseline down to the line count. A branch reads no context; it takes its
 target's live set.
 
+## The extended-block change was a miscompile, and the gate did not see it
+
+`--extended_block_scope` was landed with 169,048/169,048 corpus cases passing
+and, correctly, no runtime claim attached to it. Running it was the next thing
+that happened. The emulator does not reach gameplay with it on.
+
+### The measurement
+
+Two 240 s runs of Halo Reach's campaign under `--input_script`, one binary, one
+cvar apart:
+
+| `--extended_block_scope` | functions translated | outcome |
+| --- | --- | --- |
+| `false` | 18,614 | ran the full window |
+| `true` | 8 | access violation during `KernelState: Launching module...` |
+
+Re-run as an A/B on a fresh session it reproduces exactly, at the same guest PC
+and the same fault address:
+
+```
+a (true):  crash=1  PC: 0x827EA6CC  Access Violation: read at 0x0000007000000051
+b (false): crash=0
+```
+
+The fault address is the tell. The guest stack is at `0x7015FB40` — r1 and r31
+both hold it — so the high half of `0x0000007000000051` is a stack pointer's and
+the low half is not. That is a register read as though it held a different
+value than it does.
+
+### Bisecting it
+
+The change has two halves, so they were split into two cvars —
+`extended_block_promote` (context promotion forwards values along a chain) and
+`extended_block_regalloc` (the allocator keeps registers along one) — and run
+against each other. 75 s each, same binary:
+
+| promote | regalloc | result |
+| --- | --- | --- |
+| false | true | clean |
+| **true** | **false** | **crash, `0x0000007000000051`** |
+| **true** | **true** | **crash, `0x0000007000000051`** |
+| false | false | clean |
+
+So it is **promotion** that breaks it, and extending the allocator neither
+causes the fault nor repairs it. Allocator-only is a no-op exactly as expected:
+nothing else in the tree produces a value that outlives its block, so there is
+nothing for an extended allocator to keep alive.
+
+That points straight at the shape of the defect. Promotion replaces a
+`load_context` in a later block with the value defined in an earlier one, which
+creates a value whose live range crosses a block boundary. The allocator's
+`PrepareBlockState()` clears `upcoming_uses` and marks every register available;
+it does not check whether anything is still live. So the register holding the
+promoted value is handed to the next value allocated, and the later use reads
+whatever landed there. `0x0000007000000051` has the high half of the guest stack
+pointer (`0x7015FB40`, in r1 and r31) and a low half that belongs to something
+else — a register read as though it held a different value, which is the
+signature.
+
+### A real defect found on the way, which was *not* this one
+
+Chasing it turned up a separate latent bug, fixed on its own merits: instruction
+ordinals. `hir_builder.cc:736` gives every instruction `ordinal = UINT32_MAX` at
+birth, and `RegisterAllocationPass::Run` numbered them **block by block, inside
+the same walk that allocates**. The allocator sorts usage lists by ordinal
+(`CompareValueUse`) and decides a register has died by asking whether a use is
+the last one in that order, so a value sorted while its later blocks are still
+unnumbered gets a scrambled tail — every unnumbered use comparing equal at
+`UINT32_MAX`, and `a->ordinal - b->ordinal` overflowing against the real ones.
+
+Numbering the whole function first is obviously correct and is kept. **But it
+did not fix the crash** — the fault address was unchanged, byte for byte, and
+the bisect above was run with the fix already in. Worth recording plainly: the
+mechanism was real, the reasoning about it was sound, and it was still the wrong
+cause. It would have been very easy to build the fix, see the crash change
+shape, and claim it.
+
+### What would actually be needed
+
+Promotion cannot be extended without giving the allocator a way to keep the
+value alive to its last use, and the two passes cannot simply be asked to agree
+on where the chains are: `SimplificationPass`, `ConstantPropagationPass`,
+`MemorySequenceCombinationPass` and `DeadCodeEliminationPass` all run between
+them (`ppc_translator.cc:102-150`) and are free to restructure the CFG, so the
+chain the allocator recomputes need not be the chain promotion fused.
+
+The approach being tried: before `PrepareBlockState()` discards state at a chain
+boundary, force anything still live through a local slot, reusing the
+`SpillOneRegister` machinery that already inserts the store after the definition,
+the load before the next use, and renames the remaining uses. That makes
+correctness independent of the two passes agreeing — where the chain holds the
+value stays in a register, and where it breaks it goes to memory.
+
+Both cvars are **default off** until that is demonstrated on a booting title.
+
+### What this says about the gate
+
+The gate is 169,048 PPC instruction-semantics cases. It passed all of them on a
+build that cannot boot a title. That is not a gate failure, it is a statement of
+what the gate covers: each case is a short, mostly single-block sequence, so a
+defect that only appears once a value survives a block boundary has no case to
+fail. **A corpus pass is evidence about instruction semantics and nothing else.**
+It is not evidence of compiler-pass correctness, and it was cited here as though
+the two were the same thing.
+
+Two process consequences, both adopted:
+
+- No compiler-pass change is described as verified until a title boots and runs
+  a full window with it enabled. The gate comes first because it is cheap, not
+  because it is sufficient.
+- `d3e2396ea` is labelled `docs:` and carries this source change. A commit whose
+  message describes only documentation shipped a crashing default, and the
+  branch head carried it. Source and prose do not go in the same commit again.
+
+## The context counts, re-derived on a frozen corpus
+
+The earlier figures were withdrawn because two throwaway scripts run minutes
+apart against a directory the emulator was still writing had been published as
+one corpus. `tools/bench/hir_stats.py` replaces them: it refuses a directory
+that is still changing, prints its own denominators, and asserts that the op-mix
+store count and the dead-store denominator are the same number.
+
+Over the settled 18,614-function dump above (`--extended_block_scope=false`,
+so this is the shipping configuration), 4,944,539 HIR ops:
+
+| | count | share of HIR |
+| --- | --- | --- |
+| `store_context` | 1,047,911 | 21.2% |
+| `load_context` | 602,883 | 12.2% |
+| **context total** | **1,650,794** | **33.4%** |
+
+and of those 1,047,911 stores:
+
+| | count | share of stores |
+| --- | --- | --- |
+| overwritten before any read, same block | 1,436 | 0.14% |
+| volatile GPR pending at a return (ABI) | 45,625 | 4.35% |
+
+The 0.14% stands, now on a corpus that can be recounted. It remains a static
+share of one pattern and is not execution-weighted.
+
+**The HIR-ops-per-guest-instruction ratio cannot be re-derived and stays
+withdrawn.** The dump does not annotate guest instructions — a function's text
+is HIR only — so there is no denominator in it. The script prints `0 guest
+instructions` rather than inventing one. Recovering that ratio needs the dumper
+to emit the guest instruction count per function, which it does not do today.
+
 ## TODO — the immediately optimizable parts
 
 ### 2026-08-25: the ranking is no longer a model
@@ -1300,6 +1447,38 @@ traps) where operands really are in flight, and it keeps the full thunk. Two
 thunks, differing only in the save/restore; the light one's frame is 16 bytes.
 169,048/169,048 cases. Runtime number still owed.
 
+**0f. `NanoSleep` truncates every sub-microsecond sleep to zero — free fix,
+not yet applied.** `threading_posix.cc:240` is
+`void NanoSleep(int64_t duration) { Sleep(std::chrono::nanoseconds(duration)); }`,
+which resolves to the template at `threading.h:141` and `duration_cast`s to
+**microseconds**. So `NanoSleep(100)` becomes `nanosleep({0, 0})` — a syscall
+that returns immediately and releases nothing. That call is the *low-priority*
+arm of the same `XThread::Delay` block as 0b (`xthread.cc:1271`), so
+below-normal-priority guest threads spin on a no-op syscall exactly the way
+normal-priority ones spin on `sched_yield`. Verified in this tree by reading
+both functions. `NanoSleep(60000)` in the db16cyc release path is unaffected —
+60,000 ns casts to 60 µs exactly. Upstream `0ac27adc6` fixes it on a parallel
+line and reports ~93k `nanosleep(0)`/s on one Halo Reach thread. Unconditional,
+no behaviour change intended, measurable on its own.
+
+**0g. `page_size()` is an uncached libc call on every guest address
+translation — free fix, not yet applied.** `memory_posix.cc:94` is
+`size_t page_size() { return getpagesize(); }` with
+`allocation_granularity()` calling straight through. `PPCContext::TranslateVirtual`
+(`ppc_context.h:461`) evaluates it as the **first** operand of
+`allocation_granularity() > 0x1000 && guest_address >= 0xE0000000u`, so the
+call happens on every translation regardless of the address. Confirmed against
+the shipped binary rather than by reading: decoding `__text` and resolving the
+stub at `0x10124cbe4` through the indirect symbol table finds **964 direct `bl`
+to `_getpagesize` across 553 functions** — one each in the
+`RtlEnter/LeaveCriticalSection` trampolines, two in `KeDelayExecutionThread`,
+and six in each `ExecutePacketType3_INTERRUPT`. Two independent fixes, both
+semantics-preserving: cache the value in a function-local `static const`, and
+swap the `&&` operands so the address test short-circuits first. Both operands
+are pure. Expected worth is a few tenths of a percent, not more — recorded
+because it is real, cheap, and independently checkable by re-running the same
+disassembly scan.
+
 
 Ordered by expected payoff against confidence. Every entry names how it will be
 measured, because the campaign has already had two rankings overturned by the
@@ -1340,22 +1519,149 @@ Halo 3 and Halo Reach, are locked at 30 fps, so neither can show the damage as
 a frame-rate drop; the guard has to be something else — frame-time variance
 inside the window, or a title that is not capped.
 
-**3. `storev_left` / `storev_right` arm selection.** 213 sites, 45.00
-instructions of *emitted footprint* — not of executed work. The sequence
-branches over size arms and one invocation runs exactly one arm
-(`a64_seq_vector.cc:~2200`), so 45 was never a per-execution cost.
+*Two sibling commits on the same parallel line, both absent here, and one of
+them is free.* `0ac27adc6` "[Base] Fix NanoSleep sub-microsecond truncation" —
+**taken, see 0f above**. And `wait_timeout_backoff`
+(`jitq/bench/kernel-wait-stack:src/xenia/kernel/xobject.cc:37`) applies the same
+escalation to `XObject::Wait`/`SignalAndWait`/`WaitMultiple`: 64 cheap yields,
+then a park growing 25 us per miss to a 250 us cap, reset after a 1 ms gap,
+default off. This tree has bare `MaybeYield()` at all four timeout sites
+(`xobject.cc:540, 637, 810, 842`). Its cvar comment independently corroborates
+the measurement here — "the top non-JIT CPU cost on device for poll-heavy
+titles (~11-15%)" — but the NETWORK_RECEIVE stack shows no wait shim, so it is
+not the fix for *that* thread.
 
-Worse, it is circular as a success metric: `host_bytes` counts the inline body
-and excludes tail bytes, so moving arms to `AddToTail` makes this ranking report
-a saving **by construction**, with executed work possibly unchanged. A tail move
-is an I-cache claim and cannot be measured with this model. Calling it a
-performance win needs taken-arm counters or an uninstrumented runtime A/B. `EmitPartialVectorStore` emits all five size arms inline.
-Move the rare arms to `AddToTail`, or specialize when the address alignment is a
-constant. Corrected estimate ~2%, not the 4.46% the table shows — see the
-attribution caveat in item 6.
+*Two corrections `0a895a85c` needs before it is portable.* It calls
+`Clock::QueryHostUptimeMillis()` per delay, which on macOS is an uncached
+`mach_timebase_info()` plus two 64-bit divides (`clock_posix.cc:20-79`) added to
+the very path being made cheaper — the db16cyc emitter's raw
+`mach_absolute_time()` tick comparison is the right precedent. And its 2 ms gap
+cannot, at 1 ms clock granularity, distinguish a tight loop from a thread doing
+real work between yields, so genuine workers drift toward a forced sleep; the
+db16cyc analogue uses 1 us in raw ticks.
 
-**4. `denormal_quirk`.** 5.29% at 19.36 instructions per execution over 15,649
-sites. Already has a cold tail, so the inline number is honest. Unexamined.
+*`--guest_scheduler` narrows this much further than it first appears.* With the
+tree default `guest_scheduler=true` (`kernel_flags.cc:18`) `XThread::Delay`
+never reaches `MaybeYield`: `fiber_` is non-null (`xthread.cc:437`), so
+`Delay(0)` becomes `YieldCurrentThread(false)` — an fcontext switch, no syscall
+— and `Delay(>0)` parks the fiber. Any change to the `timeout_ms == 0` non-fiber
+branch is therefore **dead code under the default configuration**. It cannot
+regress the default, which lowers landing risk, but it also will never be
+exercised by anyone running defaults, which lowers confidence. It only matters
+for `guest_scheduler=false`, which is the configuration the Reach campaign is
+forced into by the livelock bisected to upstream `34357e257` — so **fixing that
+livelock attacks the same 12.8% from the supported end**, and is probably the
+better use of the same effort.
+
+*`timeout_ms == 0` is not the same as "the guest passed 0".* `XThread::Delay`
+converts with integer division (`timeout_ms = -ticks/10000`), so any relative
+interval under 1 ms floors to 0 and lands in the same branch. Nothing measured
+so far distinguishes a genuine `Sleep(0)` from a truncated 100 us sleep, and the
+right fix differs between the two. **Measure the interval distribution before
+changing anything**: a per-`XThread` histogram of the raw `*interval_ptr` at
+`KeDelayExecutionThread` (`xboxkrnl_threading.cc:468`) plus a call count, dumped
+at shutdown. Zero risk, and the branch already has precedent for this style of
+counter.
+
+*The strongest evidence against this whole class of fix is in the tree's own
+history, and it is not in this repository either.* `docs/xmp_poll_throttle.md`
+(`88ad8a535`, same parallel line, 230 lines) records a guest render thread at
+90% of a core that looked exactly like a spin-wait-policy problem and was not:
+the cause was an emulator-inserted 10 ms `Sleep` in `XmpApp` landing on the
+frame *producer*, and the spinning consumer was a symptom. Removing it took that
+thread to 15.6% and whole-process CPU from 1.39 to 0.77 cores at identical fps.
+**Three spin-wait levers measured inert before the real cause was found**,
+including the shipped db16cyc release and `wait_timeout_backoff` itself. Its
+stated lesson: *"a guest thread at 100% duty is not necessarily a spin-wait
+policy problem. Ask what the thread is waiting for, and profile that producer
+instead."* So before escalating anything, name the producer: `--jit_perf_map` to
+identify the loop, then a hardware write watchpoint on the polled slot (needs
+`settings set platform.plugin.darwin.ignored-exceptions EXC_BAD_ACCESS`, or lldb
+stops on Xenia's own write-watch faults and never reaches it).
+
+*One caveat on the 12.8% itself.* Blocked stacks were filtered out of that
+profile, but `sched_yield` leaves a thread runnable, not blocked, so the
+`swtch_pri` samples should have counted as on-core. If they were excluded the
+thread's true share is nearer ~32% and 12.8% is the non-yield remainder. That is
+a 2.5x difference in the size of the prize and has to be resolved from the raw
+`sample` output before either number is quoted again.
+
+*The guard, in full.* CPU alone cannot approve this: a change that makes a
+waiting thread sleep always reduces that thread's CPU, including when it is
+doing damage. All three of these, not one — (1) total process CPU, paired and
+interleaved, whole-process cores rather than the thread's own line, because the
+XMP case shows the cost can move to another thread; (2) **frame pacing, not
+frame rate** — a 30 fps cap hides a mean regression but not a variance one, and
+**this instrument does not exist yet**: `frame_ab.py` derives fps from the frame
+number in the log prefix and its own docstring notes the emulator does not stamp
+times, so a host timestamp per presented frame reported as p50/p95/p99 plus a
+count of frames over ~1.5x the cap period has to be built first; (3) input and
+network responsiveness, via `--input_script` replaying a fixed sequence with
+guest-visible response latency recorded — neither CPU nor pacing can see a
+controller or packet handled a few hundred microseconds late.
+
+**3. `storev_left` / `storev_right` arm selection — RESOLVED, and the headline
+number was wrong by 2.05x.** 213 sites, 45.00 instructions of *emitted
+footprint*. The sequence branches over size arms and one invocation runs exactly
+one arm (`a64_seq_vector.cc:~2200`), so 45 was never a per-execution cost.
+
+Every instruction of the 45 is now accounted for: 13 of prologue (`rev32`, the
+scratch store, `ComputeMemoryAddress`, `ApplyPhysicalRemapW0`, the offset
+arithmetic) plus 32 for `EmitPartialVectorStore`. Executed, by guest address
+alignment `off = addr & 15`:
+
+| arm taken | STVL `off` | STVR `off` | executed |
+| --- | --- | --- | --- |
+| `from8` | 0–8 | 8–15 | 21 |
+| `from4` | 9–12 | 4–7 | 23 |
+| `from2` | 13–14 | 2–3 | 25 |
+| `from1` | 15 | 1 | 22 |
+| nothing stored | — | 0 | 20 |
+
+Uniform-alignment mean **22.06 (STVL) / 22.00 (STVR)**, so the honest share is
+4.46% x 22/45 = **2.18%** of executed host instructions, not 4.46%.
+
+*Two ideas killed by this measurement, both worth recording.* Moving rare arms
+to `AddToTail` removes nothing from any executed path — it would only make
+`host_bytes` report a fabricated ~17-instruction saving, which is exactly the
+circularity item 6 warns about. And constant-alignment specialization has **zero
+sites to specialize**: the 45.00 average across all 213 sites is exact, which is
+only possible if every site is the register-address/register-source form, and
+`stvlx/stvrx` build `ea = CalculateEA_0(rA, rB)` — a runtime GPR sum
+(`ppc_emit_altivec.cc:254-289`).
+
+What was taken instead: the four dispatch branches were going through
+`A64Emitter::b(Cond, Label)`, which shadows an unbound forward label into
+`<inverse> over; b target; over:`. All four labels are bound within the helper,
+so the near forms are provably in range — 28 emitted where there were 32, and
+one fewer executed on 15 of 16 alignments.
+
+*What is still on the table and deliberately not taken.* Every arm's second
+access offset (`sub w6, count, N`) can be folded into a fixed immediate off the
+block-aligned address, and STVL's `count == 0` test is provably dead. Together
+~22 -> ~19 executed, alignment-independent. Not implemented: **the corpus cannot
+test any of it.** `stvlx/stvrx/lvlx/lvrx` are Xenon-only opcodes the assembler
+cannot build — `bench-work/ppcbin` holds `instr_stvl.skipped`,
+`instr_stvr.skipped`, `instr_stvlx128.skipped`, `instr_stvrx128.skipped` and no
+matching `.bin` — so the 169,048-case gate exercises this code **zero times**. A
+silent off-by-one there corrupts guest memory with nothing to catch it. It needs
+a hand-written AArch64 harness over all 16 alignments first.
+
+**4. `denormal_quirk` — PARTLY DONE.** 5.29% at 19.36 instructions per
+execution over 15,649 sites. Unlike storev the inline number is nearly honest:
+the cold finiteness check is emitted inline and branched over only at sites
+where `near_tail_branches_safe_` is false (functions of 3072+ HIR ops,
+`a64_emitter.cc:219`), which reconciles 19.36 against a clean-path 17.2 at a
+`!tail_ok` weight of ~16%. True executed share ~**4.7%**, so this one was not
+badly over-counted.
+
+The running-minimum screen is now a `ccmp` chain: 17 -> 15 executed for three
+operands, 12 -> 11 for two, unchanged at 7 for one, and one fewer `csel` in the
+dependency chain per extra operand. Operand counts come from
+`ppc_emit_fpu.cc`: `fmadds/fmsubs/fnmadds/fnmsubs` n=3, `fadds/fsubs/fmuls/fdivs`
+n=2, `fsqrts` n=1. Blended ~-10% of a 4.7% share ~= -0.47% of executed JIT host
+instructions. **Instruction counts, not measured time** — no runtime A/B has
+been run on it.
 
 ### Tier 2 — measurement repairs, needed before Tier 1 results can be trusted
 
