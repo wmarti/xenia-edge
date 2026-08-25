@@ -223,11 +223,18 @@ def main():
         print(f"  mean {mean:+.2f}%, spread of the differences "
               f"{max(deltas) - min(deltas):.2f} points, "
               f"{wins}/{len(deltas)} pairs favour {args.ref_b}")
+        agree = wins == len(deltas) or wins == 0
         consistent = wins == len(deltas) and len(deltas) >= 3
         if consistent:
             print(f"  RESOLVED: every pair agrees in sign.")
-        else:
+        elif not agree:
             print(f"  NOT RESOLVED: the pairs disagree; this is not a result.")
+        else:
+            # Saying "they disagree" when they unanimously agree but are merely
+            # few is the same fault as a gate that passes on nothing: a true
+            # statement about the verdict, a false one about the data.
+            print(f"  NOT RESOLVED: only {len(deltas)} pair(s); every one of "
+                  f"them agrees in sign, but three are required.")
         return {"pairs": pairs, "deltas": [round(d, 3) for d in deltas],
                 "mean_delta_pct": round(mean, 3), "agreeing_pairs": wins,
                 "resolved": consistent}
