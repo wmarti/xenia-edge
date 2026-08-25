@@ -1604,14 +1604,25 @@ this measures only their sum -- none is separable without five more builds, and
 the per-change instruction-count estimates that predicted roughly -0.5% to -1%
 were optimistic by about half.
 
-**A methodology defect found here, and it invalidates how the earlier A/Bs were
-read.** `frame_ab.py` forced `--hid=nop`, which disables the scripted input
-driver (`src/xenia/hid/script`), so every run through that harness measured the
-title **idling at its menu** rather than running. The tell was in the output the
-whole time: a settled menu stops logging frames entirely, so fps came back `n/a`
-while CPU percent kept reporting. `n/a fps` means the guest is not doing
-anything, and it was read past for several runs. `--hid=nop` is now dropped
-whenever `--input_script` is passed.
+**A methodology defect found here — and the first explanation of it was wrong.**
+Every run through `frame_ab.py` had measured the title **idling at its menu**
+rather than running. The tell was in the output the whole time: a settled menu
+stops logging frames, so fps came back `n/a` while CPU percent kept reporting,
+and that was read past for several runs.
+
+The cause was originally recorded as `--hid=nop` suppressing the scripted input
+driver. **That is false.** `EmulatorApp::CreateInputDrivers` (`xenia_main.cc`)
+constructs the scripted driver first and unconditionally, ahead of any real
+backend and regardless of `hid=`, with a comment saying it exists so a benchmark
+can drive a title's menus with `--hid=nop` and nothing else attached; `Setup()`
+fails only on an empty `--input_script`. The real cause was simpler and less
+interesting: the runs did not pass `--input_script` at all.
+
+The "fix" that followed from the wrong diagnosis -- dropping `--hid=nop`
+whenever `--input_script` was present -- was worse than the bug, because it
+attaches SDL as well and puts a real controller's state into a benchmark. It has
+been reverted. `n/a fps` is a signal about the guest's state, not about the HID
+backend.
 
 Menu-idle is not a useless experiment, it is a different one, and **its noise
 floor is currently unknown**. The only menu run taken over these two builds was
