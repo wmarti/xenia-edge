@@ -572,3 +572,39 @@ already shipped two rendering regressions that every counter called a win.
   Static inventory workflow running over the 23 unmerged `origin/a64-fixes-on-edge`
   commits, the CNTVCT_EL0 profiler, `bc2f386ff` (signal-wake WaitMultiple), the
   instrument inventory, and menu architecture.
+
+## Reach menu, paired A/B against upstream (2026-08-26)
+
+Two interleaved pairs, `bench-work/reach-ab.log`:
+
+| leg                    | fps   | CPU    |
+|------------------------|-------|--------|
+| upstream `052365bc0`   | 29.81 | 212.4% |
+| ours `1860207a4`       | 29.84 | 162.2% |
+| ours `1860207a4`       | 29.84 | 161.2% |
+| upstream `052365bc0`   | 29.82 | 213.9% |
+
+**-24.2% CPU at an unchanged framerate.** Both pairs agree to within 1.5%, far
+outside the 0.28% noise floor, and the legs are interleaved so drift cannot
+produce the ordering.
+
+fps is pinned at the 30 fps cap in *both* legs (29.81-29.84), which is the point:
+Reach cannot convert CPU savings into frames, so the entire delta is headroom
+rather than throughput traded away. On a capped title this is the only shape a
+win can take, and it is why CPU% -- not fps -- is the metric here.
+
+What the delta actually contains, checked rather than assumed:
+
+- 146 commits separate the two legs. Exactly **one** of them is upstream's
+  (`052365bc0..6290cb274` is a single commit), so this is our branch, not
+  upstream progress being credited to us.
+- **Neither build had the zero-delay lever.** `zero_delay` appears 0 times in
+  both full CONFIG DUMPs, because `10ea11bd8` postdates `1860207a4`. The -54.58%
+  zero-delay result is therefore *not* inside this number, and the two must never
+  be added together -- they overlap on the same idle-spin time.
+- `052365bc0` is a genuine `has207/edge` commit, not a local approximation of
+  upstream.
+
+Caveat worth keeping: `1860207a4` is not HEAD. HEAD (`cf426a292`) carries four
+further commits plus the zero-delay cvar, so this number is a floor for the
+branch as it stands, not a measurement of it.
