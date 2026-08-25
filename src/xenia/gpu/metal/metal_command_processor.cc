@@ -1954,6 +1954,15 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           fprintf(cf, "upload_via_private %llu\n",
                   static_cast<unsigned long long>(
                       texture_cache_->upload_branch_private()));
+          fprintf(
+              cf, "upload_calls %llu\n",
+              static_cast<unsigned long long>(texture_cache_->upload_calls()));
+          fprintf(cf, "upload_distinct_keys %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_distinct_keys()));
+          fprintf(cf, "upload_max_repeats %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_max_repeats()));
         }
         fclose(cf);
       }

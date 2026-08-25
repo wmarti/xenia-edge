@@ -37,6 +37,13 @@ class MetalHeapPool;
 
 class MetalTextureCache : public TextureCache {
  public:
+  // Upload churn diagnostics. distinct == calls means every upload is a
+  // different texture (streaming); distinct << calls means the same textures
+  // are being re-uploaded (an invalidation problem).
+  uint64_t upload_calls() const { return upload_calls_; }
+  uint64_t upload_distinct_keys() const { return upload_key_counts_.size(); }
+  uint32_t upload_max_repeats() const { return upload_key_max_repeats_; }
+
   // Which command buffer each texture upload landed in. Diagnostic only:
   // widening the upload batch corrupted the image twice, and the remaining
   // suspect is that holding a batch open moves uploads out of the current draw
@@ -261,6 +268,10 @@ class MetalTextureCache : public TextureCache {
   MTL::CommandBuffer* upload_batch_command_buffer_ = nullptr;
   bool upload_batch_command_buffer_has_work_ = false;
   uint32_t upload_batch_depth_ = 0;
+  uint64_t upload_calls_ = 0;
+  uint32_t upload_key_max_repeats_ = 0;
+  std::unordered_map<TextureKey, uint32_t, TextureKey::Hasher>
+      upload_key_counts_;
   uint64_t upload_branch_current_cb_ = 0;
   uint64_t upload_branch_batch_ = 0;
   uint64_t upload_branch_private_ = 0;
