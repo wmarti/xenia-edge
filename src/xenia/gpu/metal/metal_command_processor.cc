@@ -69,6 +69,14 @@ DEFINE_int32(
     "Metal per-command-buffer draw ring size (descriptor-table pages). "
     "Higher reduces ring churn but uses more memory.",
     "Metal");
+DEFINE_path(
+    gpu_counters_file, "",
+    "If set, cumulative Metal command-buffer counts by kind and the render "
+    "pass total are rewritten to this file each profiling window. The same "
+    "numbers go to COUNT_profile_set, which only reaches the profiler UI and "
+    "so is unreadable by an unattended benchmark.",
+    "Metal");
+
 DEFINE_bool(
     metal_use_dxil, true,
     "Translate guest shaders through SPIR-V -> DXIL -> AIR with Apple's Metal "
@@ -1900,6 +1908,45 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
       command_buffer_kind_window_start_[i] = now;
       return per_frame;
     };
+    // The same per-frame counts, to a file, when asked. COUNT_profile_set only
+    // reaches the profiler UI, which an unattended benchmark cannot read -- and
+    // without a command-buffer-per-frame count there is no way to size the GPU
+    // submission cost, which is ~15% of on-core CPU at the GTA IV docks with
+    // IOGPUCommandQueueSubmitCommandBuffers accounting for 2,204 of 2,214
+    // iokit_user_client_trap samples.
+    if (!cvars::gpu_counters_file.empty()) {
+      FILE* cf = fopen(cvars::gpu_counters_file.string().c_str(), "wb");
+      if (cf) {
+        fprintf(cf, "frames %llu\n",
+                static_cast<unsigned long long>(gpu_time_window_frames_));
+        static const char* const kKindNames[] = {"submission_other",
+                                                 "submission_copy_draw_sync",
+                                                 "submission_zpd",
+                                                 "submission_uniforms_rollover",
+                                                 "submission_prim_end",
+                                                 "submission_wait",
+                                                 "texture_upload_batch",
+                                                 "texture_upload_private",
+                                                 "texture_other",
+                                                 "rt_resolve",
+                                                 "rt_dump",
+                                                 "rt_other"};
+        uint64_t total = 0;
+        for (size_t i = 0; i < kCommandBufferKindCount; ++i) {
+          total += command_buffer_kind_counts_[i];
+          fprintf(
+              cf, "%s %llu\n",
+              i < sizeof(kKindNames) / sizeof(kKindNames[0]) ? kKindNames[i]
+                                                             : "unknown",
+              static_cast<unsigned long long>(command_buffer_kind_counts_[i]));
+        }
+        fprintf(cf, "command_buffers_total %llu\n",
+                static_cast<unsigned long long>(total));
+        fprintf(cf, "render_passes_total %llu\n",
+                static_cast<unsigned long long>(render_passes_total_));
+        fclose(cf);
+      }
+    }
     COUNT_profile_set("gpu/cb_submission_other_per_frame",
                       kind_per_frame(CommandBufferKind::kSubmissionOther));
     COUNT_profile_set(
