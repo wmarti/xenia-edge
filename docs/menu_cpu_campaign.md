@@ -706,10 +706,16 @@ guest instructions long -- a leaf accessor filling a three-word struct:
     stw  r11, 8(r4)
     blr
 
-It compiles to 392 bytes -- 98 host instructions, 10.89 per guest instruction
-against a 6.50 corpus average. `--jit_corpus_disasm` says where they go, and it
-is not address materialization: the function has one address chain of three
-instructions.
+**Corrected 2026-08-26:** the 98-instruction figure below was measured under the
+replay's own `--guest_scheduler=true` default, which injects a preempt check the
+benchmarked build does not have. Re-measured under the capture's actual config
+the function is **87 instructions, 348 bytes, 9.67 host/gi** -- and the replay
+now reproduces the capture exactly (348 replayed, 348 captured, 0 differ), so
+these numbers are the emitted code and not an offline approximation of it. The
+shares below are restated against 87.
+
+`--jit_corpus_disasm` says where they go, and it is not address materialization:
+the function has one address chain of three instructions.
 
 Six of the nine guest instructions touch memory, and each becomes the same
 eight-instruction sequence:
@@ -723,10 +729,12 @@ eight-instruction sequence:
     add  w0, w0, #1, lsl #12
     ldr  w24, [x21, x0]      ; the access itself
 
-That is **48 of 98 instructions (49%) in memory-access sequence, of which 24
-(24%) are the remap test alone**. The remaining ~15 are prologue, the preempt
-check, and the return dispatch -- which already has a fast path when the guest
-LR matches the host return address, so it is not the thing to attack.
+That is **50 of 87 instructions (57%) in memory-access sequence, of which 24
+(28%) are the remap test alone**. Prologue, return dispatch and the two
+out-of-line stubs are 33 (38%); the return dispatch already has a fast path when
+the guest LR matches the host return address, so it is not the thing to attack.
+Only 4 instructions (5%) are the arithmetic and context stores the guest asked
+for.
 
 **The opportunity, unmeasured:** guest `82A46D78` and `82A46D84` both address
 `r3+0x40A0` and each pays the full seven-instruction computation. `r3` is not
@@ -827,3 +835,49 @@ large functions.
 **Standing rule until this is closed:** score a codegen change on `stable`,
 which the tool labels "compare THIS across processes", not on emitted-byte
 totals against capture.
+
+## T4 sized: redundant guest address computation is 2.12% of emitted code
+
+Measured over the 13,564-function GTA IV corpus by decoding every D-form memory
+operand and counting repeats of the same `(base register, displacement)` where
+the base is provably not redefined in between and no branch intervenes:
+
+| | |
+| --- | ---: |
+| D-form memory operands | 363,483 |
+| redundant address computations | 29,148 (**8.02%**) |
+| functions containing at least one | 4,180 (30.8%) |
+| upper bound at ~7 host instructions each | **2.12% of emitted instructions** |
+
+The count is deliberately conservative -- a branch clears the state, and an
+opcode-31 instruction is assumed to write both its register fields -- so the
+true redundancy is at least this.
+
+**Read this as a ceiling, not a forecast.** It is static code size, not executed
+instructions: an eliminated computation in cold code saves nothing, and the
+campaign's standing correction is that shares over-predict reclaimable CPU by
+about 2x. Against a 0.28% CPU noise floor at the docks a real win would be
+detectable, but only if it lands near the top of this range.
+
+### Why this needs a HIR pass and not an emitter-side cache
+
+The obvious implementation -- have the a64 emitter remember "this guest address
+is already in host register X" -- is the wrong place. The HIR is SSA, so keying
+on `(value id, displacement)` is sound in principle; `v6.i64` really is the same
+value at both `load_offset v6, 40A0` sites. But the cached quantity is a *host
+register*, and the register allocator may spill, reload or reassign it between
+the two uses. An emitter cache would have to duplicate the allocator's model of
+liveness to stay correct, and the failure mode is a wrong guest address: silent,
+data-dependent, and not visible on a screenshot the way the two rendering
+regressions were.
+
+The correct shape is an explicit address-computation opcode in the HIR that the
+existing value-numbering machinery can dedupe, leaving lifetimes to the
+allocator. That is a design, not a patch, and it is not being started on the
+strength of a 2.12% ceiling without first checking how much of the redundancy
+falls in hot code.
+
+**Next step before any implementation:** weight the 29,148 redundancies by
+execution frequency rather than by count. `--trace_function_coverage` already
+exists and gives per-function execution counts; the redundancy above is
+per-function, so the two can be joined without new instrumentation.
