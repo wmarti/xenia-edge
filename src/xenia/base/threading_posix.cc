@@ -237,7 +237,28 @@ void Sleep(std::chrono::microseconds duration) {
   } while (ret == -1 && errno == EINTR);
 }
 
-void NanoSleep(int64_t duration) { Sleep(std::chrono::nanoseconds(duration)); }
+void NanoSleep(int64_t duration) {
+  // Do not route through Sleep(microseconds): the duration_cast there
+  // truncates sub-microsecond requests to a zero-length nanosleep, which
+  // returns immediately after the syscall and releases nothing. Poll loops
+  // built on small NanoSleeps then degrade into syscall storms (measured
+  // ~93k nanosleep(0)/s on one guest thread).
+  if (duration <= 0) {
+    return;
+  }
+  timespec rqtp = {static_cast<time_t>(duration / 1000000000LL),
+                   static_cast<long>(duration % 1000000000LL)};
+  timespec rmtp = {};
+  auto p_rqtp = &rqtp;
+  auto p_rmtp = &rmtp;
+  int ret = 0;
+  do {
+    ret = nanosleep(p_rqtp, p_rmtp);
+    // Swap requested for remaining in case of signal interruption
+    // in which case, we start sleeping again for the remainder
+    std::swap(p_rqtp, p_rmtp);
+  } while (ret == -1 && errno == EINTR);
+}
 
 void PreciseSleep(std::chrono::nanoseconds duration) {
   if (duration.count() <= 0) {
