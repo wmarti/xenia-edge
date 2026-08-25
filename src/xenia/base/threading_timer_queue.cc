@@ -55,11 +55,32 @@ using WaitItem = TimerQueueWaitItem;
    wait.
 
    So chrispy's original reading was right, and the two reasons it was reverted
-   do not apply here. The wrong-args-to-wait_until bug is fixed in this vendored
-   copy: blocking_wait_strategy::wait_until_published takes the predicate
-   overload of condition_variable::wait_until, which is correct. And edit2's
-   proton/MSVC initialisation failure is a Windows problem. Windows therefore
-   keeps upstream's behaviour exactly; only POSIX changes.
+   do not apply here. The wrong-args-to-wait_until bug is NOT fixed in this
+   vendored copy -- blocking_wait_strategy.hpp:119 still passes the predicate
+   and the timeout to wait_for in the wrong order -- but that member template
+   is never instantiated on this path: the queue waits on a time_point, which
+   selects the time_point overload at :172, and that one has its arguments
+   right. Anyone who later calls a duration-based wait with this strategy gets
+   a compile error, which is the correct failure mode. And edit2's proton/MSVC
+   initialisation failure is a Windows problem. Windows therefore keeps
+   upstream's behaviour exactly; only POSIX changes.
+
+   KNOWN LIMITATION, macOS only. This class declares clock = steady_clock and
+   static_asserts it, but a std::condition_variable timed wait cannot honour
+   that here. _LIBCPP_HAS_COND_CLOCKWAIT is 0 on macOS (__config: it needs
+   Android API >= 30 or glibc >= 2.30), so wait_until falls back to
+   __do_timed_wait -> wait_for, which re-anchors on system_clock::now() and
+   hands a CLOCK_REALTIME deadline to pthread_cond_timedwait. A wall-clock step
+   -- NTP step, a manual date change, restore from sleep -- can therefore delay
+   one wait by the size of the step, which delays the timers due in it.
+   spin_wait_strategy could not do this because it compared against the steady
+   clock in its poll loop.
+   The blast radius is one wait, not a permanent skew: TimerThreadMain re-reads
+   steady_clock every iteration and fires everything already due, so the queue
+   catches up on the next wake rather than drifting. Linux takes the
+   clockwait path and is unaffected; Windows still spins. Fixing it properly
+   needs a Darwin wait built on pthread_cond_timedwait_relative_np, which is a
+   bigger change than this one and is not attempted here.
 
    Correctness of the switch: blocking_wait_strategy only wakes on
    signal_all_when_blocking(), and both publish paths call it --
@@ -190,11 +211,13 @@ class TimerQueue {
   const std::thread& dispatch_thread() const { return dispatch_thread_; }
 
  private:
-  // How long to wait when no timer is queued at all. Not time_point::max():
-  // a blocking strategy converts this to a timespec, and an unbounded value is
-  // a known overflow hazard there. A queued timer wakes the thread through
-  // signal_all_when_blocking() long before this expires, so the only effect is
-  // one harmless wakeup a minute in a process with no timers armed.
+  // How long to wait when no timer is queued at all, rather than
+  // time_point::max(). Not for the reason first given here: libc++ does handle
+  // an unbounded deadline, clamping it explicitly in wait_for before the cast.
+  // It is bounded so the wait does not depend on a library's overflow handling
+  // at all, and so an idle queue is provably not parked forever. A queued timer
+  // wakes the thread through signal_all_when_blocking() long before this
+  // expires, so the cost is one wakeup a minute in a process with no timers.
   static constexpr clock::duration kIdleWait = std::chrono::seconds(60);
 
   // This ring buffer will be used to introduce timers queued by the public API
