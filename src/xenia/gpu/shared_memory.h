@@ -20,6 +20,12 @@ namespace gpu {
 // system page size granularity.
 class SharedMemory {
  public:
+  // Invalidation-event diagnostics; see FireWatches.
+  uint64_t fire_watches_events() const { return fire_watches_events_; }
+  uint64_t fire_watches_pages() const { return fire_watches_pages_; }
+  uint64_t fire_watches_events_ = 0;
+  uint64_t fire_watches_pages_ = 0;
+
   static constexpr uint32_t kBufferSizeLog2 = 29;
   static constexpr uint32_t kBufferSize = 1 << kBufferSizeLog2;
 

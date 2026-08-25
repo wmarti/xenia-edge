@@ -450,13 +450,36 @@ On a 4 KiB-page host (Windows and Linux on x86) that fan-out does not exist.
 This is a plausible 4x over-invalidation that is specific to Apple Silicon, and
 it would explain re-uploading a third of a static working set every frame.
 
-**Not yet established, and the next measurement.** Count write-watch callbacks
-against textures invalidated per callback. If a single callback invalidates ~4
-textures on average, the mismatch is confirmed and the fix is to track dirtiness
-at guest-page granularity underneath a system-page protection -- protect at
-16 KiB because the hardware forces it, but re-validate per 4 KiB and only
-invalidate textures whose own bytes fall in a dirtied 4 KiB sub-range. If the
-fan-out is ~1, the guest really is writing all of it and the churn is real work.
+**Measured, and the page-size mismatch is NOT the dominant cause.** Counting
+invalidation events against the pages and textures each one touches, at the
+docks over 1,984 presents:
+
+| | per present |
+| --- | --- |
+| `FireWatches` events | 85.6 |
+| pages covered | 6,647.7 -- **77.6 pages per event** |
+| texture watch callbacks | 755.4 -- **8.8 textures per event** |
+| uploads | 482.4 |
+
+Each event covers about **1.24 MiB** of guest memory, and ~85 of them fire per
+frame -- on the order of 100 MiB invalidated per frame. Rounding a range that
+size to 16 KiB boundaries instead of 4 KiB adds at most ~2.5% at its two edges.
+So the host/guest page mismatch is real, and on this evidence it is worth
+roughly a couple of percent of the invalidation traffic, not a factor of four.
+It is not the explanation for the churn.
+
+**What the churn actually is: a few very large range invalidations, not many
+small ones.** 85 events a frame, each averaging 1.24 MiB, each hitting 8.8
+resident textures. That is the shape of GPU render-target resolves writing back
+to guest memory and invalidating every texture that overlaps the written range,
+rather than of a guest scribbling on texture data.
+
+**Next discriminator, and it is one counter.** `FireWatches` already takes
+`invalidated_by_gpu`. Splitting the event and page counts on that flag separates
+"the GPU resolved into this memory" from "the CPU wrote to it". If it is
+overwhelmingly GPU, the question becomes whether a resolve needs to invalidate
+textures whose bytes it did not actually overwrite -- the range is the resolve
+target's extent, and overlapping textures may only intersect part of it.
 
 ### Where to look
 
