@@ -29,9 +29,22 @@ import argparse, os, re, subprocess, sys, time
 
 APP_RE = re.compile(r"Contents/MacOS/Xenia-edge$")
 FRAME_RE = re.compile(rb"^.> f:(\d+)", re.M)
-# `sample` indents by two spaces per level and puts the sample count first.
-NODE_RE = re.compile(r"^(\s*)(\d+)\s+(.*?)\s*$")
-THREAD_RE = re.compile(r"^\s*(\d+)\s+Thread_(\w+)(?::\s*(.*?))?\s*$")
+# `sample` draws the call graph with +, ! and : as tree characters, so depth
+# is the column the count starts at, not a run of leading spaces. Matching on
+# whitespace alone parses nothing at all and reports an empty profile.
+NODE_RE = re.compile(r"^([\s+!:|]*)(\d+)\s+(.*?)\s*$")
+THREAD_RE = re.compile(r"^\s*(\d+)\s+Thread_(\w+)(?::?\s*(.*?))?\s*$")
+# A stack sitting in one of these was not on a core. `sample` records every
+# thread at every interval whether it is running or blocked, so counting all
+# of them gives each thread an identical total and measures nothing.
+BLOCKED = (
+    "__psynch_cvwait", "__psynch_mutexwait", "__psynch_rw_", "mach_msg2_trap",
+    "kevent_id", "kevent", "semaphore_wait_trap", "semaphore_timedwait_trap",
+    "semaphore_wait_signal_trap", "__semwait_signal", "mach_wait_until",
+    "__select", "__workq_kernreturn", "poll", "read", "__sigsuspend",
+    "swtch_pri", "thread_switch", "__ulock_wait", "start_wqthread",
+    "__wait4", "__accept", "__recvfrom", "guarded_kqueue_np",
+)
 
 
 def emulators():
@@ -136,7 +149,29 @@ def load_perf_map(path):
             continue
         syms.append((start, start + size, parts[2].strip()))
     syms.sort()
-    return syms
+    return disambiguate(syms)
+
+
+def disambiguate(syms):
+    """Give repeated names their own identity.
+
+    code_cache_base.h falls back to `guest_{:08X}` when a translated body has
+    no function_info, and the JIT's own transition thunks are emitted before
+    any guest function with a guest address of zero -- so six distinct stubs
+    all arrive called guest_00000000 and collapse into one line that reads
+    like a single very hot guest function. It is not one, and it is not guest
+    code.
+    """
+    counts = {}
+    for _, _, name in syms:
+        counts[name] = counts.get(name, 0) + 1
+    out, seen = [], {}
+    for start, end, name in syms:
+        if counts[name] > 1:
+            seen[name] = seen.get(name, 0) + 1
+            name = f"{name}#{seen[name]}@{start:x}"
+        out.append((start, end, name))
+    return out
 
 
 def guest_symbol(syms, addr):
@@ -214,65 +249,105 @@ def do_watch(a):
         sys.stdout.flush()
 
 
+def parse_sample(text):
+    """(nodes, threads) from a `sample` call graph.
+
+    nodes are (depth, count, label, thread); depth is the column the count
+    starts at, which `sample` steps by two per level.
+    """
+    nodes, threads, cur = [], {}, None
+    for ln in text.splitlines():
+        if ln.startswith("Binary Images:"):
+            break
+        mt = THREAD_RE.match(ln)
+        if mt and "Thread_" in ln:
+            cur = (mt.group(3) or "").strip() or f"tid {mt.group(2)}"
+            threads[cur] = threads.get(cur, 0) + int(mt.group(1))
+            continue
+        m = NODE_RE.match(ln)
+        if m and cur is not None:
+            nodes.append((len(m.group(1)), int(m.group(2)), m.group(3), cur))
+    return nodes, threads
+
+
+def self_times(nodes):
+    """Self samples per (thread, label), skipping stacks that were blocked.
+
+    A node's count includes its children, so self time is the node minus the
+    children directly beneath it. A node whose label names a blocking
+    primitive contributed no CPU, and neither did anything above it on that
+    stack, so its self time is dropped rather than counted.
+    """
+    out, running = {}, 0
+    for i, (depth, count, label, thread) in enumerate(nodes):
+        child = 0
+        for j in range(i + 1, len(nodes)):
+            d2, c2 = nodes[j][0], nodes[j][1]
+            if d2 <= depth:
+                break
+            if d2 == depth + 2:
+                child += c2
+        self_n = count - child
+        if self_n <= 0:
+            continue
+        if any(b in label for b in BLOCKED):
+            continue
+        out[(thread, label)] = out.get((thread, label), 0) + self_n
+        running += self_n
+    return out, running
+
+
 def do_profile(a):
     pid, cmd = pick_pid(a.pid)
     syms = load_perf_map(a.map or arg_value(cmd, "--jit_perf_map"))
     out = f"/tmp/xe-sample-{pid}.txt"
     print(f"sampling pid {pid} for {a.secs}s"
           + (f" ({len(syms)} guest symbols)" if syms else
-             " (no JIT symbol map: guest frames will stay as addresses)"),
+             " (no JIT symbol map: guest frames stay as addresses)"),
           flush=True)
     r = subprocess.run(["sample", str(pid), str(a.secs), "-mayDie", "-f", out],
                        capture_output=True, text=True)
     if not os.path.exists(out):
         sys.exit(f"sample failed: {(r.stderr or r.stdout).strip()[:400]}")
-    text = open(out, errors="replace").read()
+    nodes, threads = parse_sample(open(out, errors="replace").read())
+    selves, running = self_times(nodes)
+    if not running:
+        sys.exit("no running samples: every thread was blocked")
 
-    # Per-thread totals, then self time per symbol. `sample` prints a call
-    # graph where a node's count includes its children, so self time is the
-    # node minus the children directly under it.
-    threads, cur, lines = {}, None, text.splitlines()
-    nodes = []
-    for ln in lines:
-        mt = THREAD_RE.match(ln)
-        if mt and "Thread_" in ln:
-            cur = (mt.group(3) or f"tid {mt.group(2)}").strip()
-            threads[cur] = threads.get(cur, 0) + int(mt.group(1))
-            continue
-        m = NODE_RE.match(ln)
-        if m and cur is not None and "Binary Images" not in ln:
-            nodes.append((len(m.group(1)), int(m.group(2)), m.group(3), cur))
-
-    self_time = {}
-    for i, (depth, count, label, thread) in enumerate(nodes):
-        child = 0
-        for d2, c2, _, _ in nodes[i + 1:]:
-            if d2 <= depth:
-                break
-            if d2 == depth + 2:
-                child += c2
-        s = count - child
-        if s <= 0:
-            continue
-        name = label
-        addr = re.search(r"\b0x([0-9a-f]{6,})\b", label)
-        if syms and addr:
-            g = guest_symbol(syms, int(addr.group(1), 16))
+    def pretty(label):
+        """JIT frames arrive as `??? (in <unknown binary>) [0xADDR]`."""
+        m = re.search(r"\[0x([0-9a-f]+)", label)
+        if syms and m:
+            g = guest_symbol(syms, int(m.group(1), 16))
             if g:
-                name = f"[guest] {g}"
-        self_time[name] = self_time.get(name, 0) + s
+                return f"[guest] {g}"
+        if "???" in label and m:
+            return f"[jit, unmapped] 0x{m.group(1)}"
+        return re.sub(r"\s+\(in .*", "", label)
 
-    total = sum(threads.values()) or 1
-    print(f"\nthreads by samples ({total} total)")
-    for name, n in sorted(threads.items(), key=lambda kv: -kv[1])[:12]:
-        print(f"  {100.0*n/total:5.1f}%  {n:>6}  {name}")
-    print(f"\nhottest by self time")
-    for name, n in sorted(self_time.items(), key=lambda kv: -kv[1])[:20]:
-        print(f"  {100.0*n/total:5.1f}%  {n:>6}  {name[:110]}")
-    guest = sum(n for k, n in self_time.items() if k.startswith("[guest] "))
-    if syms:
-        print(f"\nguest JIT code accounts for {100.0*guest/total:.1f}% of samples")
-    print(f"\nfull sample: {out}")
+    by_thread = {}
+    for (thread, label), n in selves.items():
+        by_thread[thread] = by_thread.get(thread, 0) + n
+    print(f"\n{running} running samples of {sum(threads.values())} taken "
+          f"({100.0*running/max(sum(threads.values()),1):.1f}% on a core; the "
+          f"rest were blocked)")
+    print("\nCPU by thread")
+    for name, n in sorted(by_thread.items(), key=lambda kv: -kv[1])[:14]:
+        print(f"  {100.0*n/running:5.1f}%  {n:>6}  {name}")
+
+    merged = {}
+    for (_, label), n in selves.items():
+        k = pretty(label)
+        merged[k] = merged.get(k, 0) + n
+    print("\nhottest by self time")
+    for name, n in sorted(merged.items(), key=lambda kv: -kv[1])[:25]:
+        print(f"  {100.0*n/running:5.1f}%  {n:>6}  {name[:100]}")
+
+    guest = sum(n for k, n in merged.items() if k.startswith("[guest] "))
+    unmapped = sum(n for k, n in merged.items() if k.startswith("[jit, unmapped]"))
+    print(f"\nguest JIT code: {100.0*guest/running:.1f}% mapped to a function, "
+          f"{100.0*unmapped/running:.1f}% JIT but outside the map")
+    print(f"full sample: {out}")
 
 
 def main():
