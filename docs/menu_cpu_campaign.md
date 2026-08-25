@@ -77,6 +77,46 @@ predate two instrument fixes and their denominators are wrong.
 | T3 | Halo 3 host GPU submit/encode (53% aggregate, no single hot spot) | blocked on present-rate question | not yet |
 | B1 | `PACK_D3DCOLOR` returned 0xFFFFFFFF always | fixed, guard proven to fail on the bug | correctness |
 
+## T3's present-rate question, resolved: there is no unpaced present loop
+
+The ranking workflow flagged a risk that Halo 3's 53% aggregate host GPU cost
+might be an artifact of an unpaced present loop rather than addressable CPU,
+on the grounds that three defaults compose badly on macOS. Two of those three
+are confirmed:
+
+- `metal_allow_tearing` defaults **true** (`metal_presenter.mm:58`), so
+  `metal_layer.displaySyncEnabled = NO` and the compositor does not gate
+  presents.
+- `framerate_limit` defaults **0** (`gpu_flags.cc:55`), so
+  `CommandProcessor::ThrottlePresentation()` returns immediately. The Metal
+  presenter's own comment calls `framerate_limit` "authoritative" while it is
+  off by default.
+
+**But the conclusion does not follow, because presentation is paced by the
+guest.** `logging::IncrementFrameNumber()` has exactly one call site
+(`pm4_command_processor_implement.h:802`), immediately after `IssueSwap`, on
+the PM4_XE_SWAP path. The `i> f:` counter in the log is therefore a count of
+host presents, and `frame_ab.py` measures **29.85 presents/s at the Halo 3
+menu and 29.84 at Reach's** over 120s windows. Both titles present at 30/s
+because the guest issues swap packets at 30/s and the host presents once per
+packet.
+
+The 88.5 fps that raised the alarm came from a `live.py status` window that
+`live.py` itself labelled "not steady state, do not read this as a
+measurement".
+
+**Consequence: T3 is a genuine target.** The GPU submit and encode cost is
+real per-frame CPU at 30 presents/s, not three times the frames the title
+needs, and capping presentation would return nothing because it is already
+capped.
+
+**A second finding, recorded before anyone reaches for it:**
+`ThrottlePresentation` enforces `framerate_limit` with a **busy spin** on
+`Clock::QueryGuestTickCount()` (`command_processor.cc:462-470`). Setting that
+cvar to pace anything would trade GPU work for spin CPU on the command
+processor thread, which at the Halo 3 menu is already the largest single
+consumer at 24.8%.
+
 ## Open defects found, not yet resolved
 
 - **`vector_nan_propagation_test.cc` fails 2 assertions in this tree.** It expects
