@@ -10,6 +10,7 @@
 #include "xenia/cpu/backend/x64/x64_backend.h"
 
 #include <cstddef>
+#include <cstring>
 
 #include "third_party/capstone/include/capstone/capstone.h"
 #include "third_party/capstone/include/capstone/x86.h"
@@ -1885,6 +1886,39 @@ void X64Backend::SetGuestRoundingMode(void* ctx, unsigned int mode) {
   auto ppc_context = ((ppc::PPCContext*)ctx);
   ppc_context->fpscr.bits.rn = control;
   ppc_context->fpscr.bits.ni = control >> 2;
+}
+
+bool X64Backend::ResetGuestInvocationReplayState(void* ctx) {
+  if (!ctx) {
+    return false;
+  }
+
+  auto* ppc_context = reinterpret_cast<ppc::PPCContext*>(ctx);
+  X64BackendContext* bctx = BackendContextForGuestContext(ctx);
+  const uint32_t scalar_control =
+      ppc_context->fpscr.bits.rn | (ppc_context->fpscr.bits.ni << 2);
+  const bool njm = (ppc_context->vscr_vec.u32[3] & uint32_t{0x00010000}) != 0;
+
+  // Preserve backend-owned pointers, the stackpoint allocation, tick source
+  // and constants. Everything below is transient output or bookkeeping from a
+  // prior invocation.
+  std::memset(bctx->helper_scratch_u64s, 0, sizeof(bctx->helper_scratch_u64s));
+  bctx->cached_reserve_value_ = 0;
+  bctx->reserve_address = 0;
+  bctx->reserve_generation = 0;
+  bctx->current_stackpoint_depth = 0;
+
+  ppc_context->preempt_requested = 0;
+  ppc_context->scratch = 0;
+  ppc_context->last_safepoint_pc = 0;
+
+  // _mm_setcsr installs the scalar control word and clears all MXCSR exception
+  // status bits because every entry in mxcsr_table has them clear.
+  SetGuestRoundingMode(ctx, scalar_control);
+  bctx->mxcsr_vmx = njm ? DEFAULT_VMX_MXCSR : _MM_MASK_MASK;
+  bctx->flags = (njm ? (1u << kX64BackendNJMOn) : 0) |
+                ((scalar_control & 0b100) ? (1u << kX64BackendNonIEEEMode) : 0);
+  return true;
 }
 
 bool X64Backend::PopulatePseudoStacktrace(GuestPseudoStackTrace* st) {

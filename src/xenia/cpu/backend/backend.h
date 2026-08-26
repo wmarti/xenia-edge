@@ -118,6 +118,15 @@ class Backend {
   * */
   virtual void PrepareForReentry(void* ctx) {}
 
+  // Resets backend-private and non-architectural per-thread state before a
+  // deterministic offline guest-function replay. The caller must restore the
+  // captured PPC architectural state first because implementations derive the
+  // host scalar rounding mode and VMX non-Java mode from that state.
+  //
+  // Backends must return false unless they implement the complete reset
+  // contract. Replay must fail closed when this returns false.
+  virtual bool ResetGuestInvocationReplayState(void* ctx) { return false; }
+
   // returns true if populated st
   virtual bool PopulatePseudoStacktrace(GuestPseudoStackTrace* st) {
     return false;

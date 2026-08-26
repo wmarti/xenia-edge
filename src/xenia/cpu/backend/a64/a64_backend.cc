@@ -1581,6 +1581,59 @@ void A64Backend::SetGuestRoundingMode(void* ctx, unsigned int mode) {
   ppc_context->fpscr.bits.ni = control >> 2;
 }
 
+bool A64Backend::ResetGuestInvocationReplayState(void* ctx) {
+  if (!ctx) {
+    return false;
+  }
+
+  auto* ppc_context = reinterpret_cast<ppc::PPCContext*>(ctx);
+  A64BackendContext* bctx = BackendContextForGuestContext(ctx);
+  const uint32_t scalar_control =
+      ppc_context->fpscr.bits.rn | (ppc_context->fpscr.bits.ni << 2);
+  const bool njm = (ppc_context->vscr_vec.u32[3] & uint32_t{0x00010000}) != 0;
+
+  // These fields are outputs or bookkeeping from a prior invocation. Do not
+  // disturb the backend-owned pointers, estimate constants, code-cache
+  // constants, tick source, or the always-flushing VMX FPCR constant.
+  std::memset(bctx->helper_scratch_v128s, 0,
+              sizeof(bctx->helper_scratch_v128s));
+  std::memset(bctx->helper_scratch_u64s, 0, sizeof(bctx->helper_scratch_u64s));
+  bctx->cached_reserve_value_ = 0;
+  bctx->stackpoint_head = nullptr;
+  bctx->reserve_address = 0;
+  bctx->reserve_generation = 0;
+  bctx->pending_stackpoint_sync_node = nullptr;
+  bctx->db16cyc_spins = 0;
+  bctx->db16cyc_last_tick = 0;
+  bctx->spin_wait_spins = 0;
+  bctx->spin_wait_site = 0;
+  bctx->spin_wait_armed = 0;
+  bctx->spin_wait_reset_tick = 0;
+
+  ppc_context->preempt_requested = 0;
+  ppc_context->scratch = 0;
+  ppc_context->last_safepoint_pc = 0;
+
+  // Enter replay in scalar mode, with the two architectural controls restored
+  // from the captured FPSCR and VSCR rather than inherited from the previous
+  // call. SetGuestRoundingMode also installs fpcr_fpu in the live host FPCR.
+  SetGuestRoundingMode(ctx, scalar_control);
+  bctx->fpcr_vmx = njm ? DEFAULT_VMX_FPCR : (DEFAULT_VMX_FPCR & ~(1u << 24));
+  bctx->flags = (njm ? (1u << kA64BackendNJMOn) : 0) |
+                ((scalar_control & 0b100) ? (1u << kA64BackendNonIEEEMode) : 0);
+
+  // FPCR control and FPSR status are separate on AArch64. Captured PPC sticky
+  // exception bits remain in PPCContext, while stale host exceptions must not
+  // leak between timed invocations.
+#if XE_COMPILER_MSVC
+  // ARM64_FPSR register ID.
+  _WriteStatusReg(0x5A21, 0);
+#else
+  __asm__ volatile("msr fpsr, xzr");
+#endif
+  return true;
+}
+
 bool A64Backend::PopulatePseudoStacktrace(GuestPseudoStackTrace* st) {
   if (!cvars::a64_enable_host_guest_stack_synchronization) {
     return false;
