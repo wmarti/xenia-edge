@@ -132,6 +132,9 @@ class CodeCacheBase : public CodeCache {
                : kGeneratedCodeExecuteBase;
   }
   size_t total_size() const override { return kGeneratedCodeSize; }
+  uint64_t placement_generation() const override {
+    return placement_generation_.load(std::memory_order_acquire);
+  }
 
   bool PatchCode(void* execute_address, const void* data,
                  size_t size) override {
@@ -554,6 +557,12 @@ class CodeCacheBase : public CodeCache {
     if (guest_address && indirection_table_base_) {
       UpdateIndirection(guest_address, code_execute_address);
     }
+
+    // Publish only after the placement and its indirection update are
+    // complete. Relaxed execution would be sufficient for the count itself,
+    // but release pairs with the benchmark's acquire snapshot and makes the
+    // completed-placement meaning explicit.
+    placement_generation_.fetch_add(1, std::memory_order_release);
   }
 
   uint32_t PlaceData(const void* data, size_t length) {
@@ -681,6 +690,7 @@ class CodeCacheBase : public CodeCache {
   uint8_t* generated_code_write_base_ = nullptr;
   size_t generated_code_offset_ = 0;
   std::atomic<size_t> generated_code_commit_mark_ = {0};
+  std::atomic<uint64_t> placement_generation_{0};
   std::vector<std::pair<uint64_t, GuestFunction*>> generated_code_map_;
 
   bool encoded_indirection_ = true;

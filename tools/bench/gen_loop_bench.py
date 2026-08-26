@@ -50,10 +50,30 @@ rotates the destination through all three operand positions.
 No assembler is required: third_party/binutils ships patches and a build.sh but
 no binaries, and PPC is fixed-width, so the encodings are written out directly.
 
+The optional ``--callret`` mode emits a matched pair instead of the vector
+opcode suites:
+
+  callret - an unrolled set of linked ``bl`` calls to a normal ``blr`` leaf.
+            One complete unrolled pass runs before the counted loop so the
+            first lazy resolution can backpatch every registered call site
+            before virtually all calls in the invocation.
+  control - the same outer-LR save/restore and loop, with each call replaced
+            by a PPC nop. Subtracting this suite removes loop bookkeeping
+            from the reported cost.
+
+The benchmark runner executes one complete invocation to warm and verify the
+workload, resets guest memory and thread state while preserving the JIT cache,
+then times one more complete invocation in-process. It rejects the measurement
+if any new code placement occurs in that timed invocation. Current-thread CPU
+time is the primary metric; monotonic uptime wall time is diagnostic only.
+
 Usage:
   gen_loop_bench.py --out-bin <corpus dir> --out-src <dir>... [--iters N]
+  gen_loop_bench.py --callret --out-bin <dir> --out-src <dir>... [--iters N]
 """
 import argparse
+import hashlib
+import json
 import pathlib
 import struct
 import sys
@@ -116,6 +136,83 @@ def bne(displacement_bytes):
 
 
 BLR = 0x4E800020
+MFLR_R12 = 0x7D8802A6
+MTLR_R12 = 0x7D8803A6
+NOP = 0x60000000
+
+
+def branch(displacement_bytes, link=False):
+    """Relative ``b`` / ``bl`` with a signed, word-aligned displacement."""
+    if displacement_bytes & 3:
+        raise ValueError("branch displacement must be word-aligned")
+    if not -(1 << 25) <= displacement_bytes < (1 << 25):
+        raise ValueError("branch displacement is outside PPC LI range")
+    return (18 << 26) | (displacement_bytes & 0x03FFFFFC) | int(link)
+
+
+def build_callret(width, iters):
+    """Build a linked-call loop and return (words, execution metadata).
+
+    r12 owns the runner-provided outer LR for the entire benchmark. Each leaf
+    call is therefore free to replace LR with its own return address, while
+    the final mtlr/blr still returns to the PPC test harness.
+    """
+    if iters <= 0:
+        raise ValueError("iterations must be positive")
+    if not 1 <= width <= 1024:
+        raise ValueError("callret width must be in the range 1..1024")
+
+    words = [MFLR_R12]
+    call_indices = []
+
+    # The pre-loop sites let the first call resolve the leaf; on a backpatching
+    # backend it also gives the registry a chance to patch every pending site
+    # before the counted loop starts. The runner's separate full invocation is
+    # the actual benchmark warmup, so these calls remain part of the timed
+    # workload and its denominator.
+    for _ in range(width):
+        call_indices.append(len(words))
+        words.append(0)
+
+    loop_index = len(words)
+    for _ in range(width):
+        call_indices.append(len(words))
+        words.append(0)
+    words.append(addic_dot(3, 3, -1))
+    loop_branch_index = len(words)
+    words.append(bne((loop_index - loop_branch_index) * 4))
+    words.extend([MTLR_R12, BLR])
+
+    leaf_index = len(words)
+    words.append(BLR)
+    for call_index in call_indices:
+        words[call_index] = branch((leaf_index - call_index) * 4, link=True)
+
+    return words, {
+        "iterations": iters,
+        "width": width,
+        "preloop_calls": width,
+        "loop_calls": width * iters,
+        "calls_per_invocation": width * (iters + 1),
+    }
+
+
+def build_callret_control(width, iters):
+    """Build the same loop with each linked call replaced by a PPC nop."""
+    if iters <= 0:
+        raise ValueError("iterations must be positive")
+    if not 1 <= width <= 1024:
+        raise ValueError("callret width must be in the range 1..1024")
+
+    words = [MFLR_R12]
+    words.extend([NOP] * width)
+    loop_index = len(words)
+    words.extend([NOP] * width)
+    words.append(addic_dot(3, 3, -1))
+    loop_branch_index = len(words)
+    words.append(bne((loop_index - loop_branch_index) * 4))
+    words.extend([MTLR_R12, BLR])
+    return words
 
 
 def emit_op(name, dest, srcs):
@@ -188,6 +285,85 @@ def annotations(iters):
     return lines
 
 
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_suite(out_bin, srcs, suite, label, words, source_lines):
+    """Write one generated suite and return its integrity metadata."""
+    blob = b"".join(struct.pack(">I", word) for word in words)
+    map_text = f"{0:016x} t {label}\n"
+    source_text = "\n".join(source_lines) + "\n"
+    (out_bin / f"{suite}.bin").write_bytes(blob)
+    (out_bin / f"{suite}.map").write_text(map_text)
+    for directory in srcs:
+        (directory / f"{suite}.s").write_text(source_text)
+    return {
+        "name": suite,
+        "test_label": label,
+        "binary_bytes": len(blob),
+        "binary_sha256": sha256(blob),
+        "map_sha256": sha256(map_text.encode()),
+        "source_sha256": sha256(source_text.encode()),
+        "expected_test_cases": 1,
+    }
+
+
+def generate_callret(out_bin, srcs, iters, width):
+    """Generate the linked-call workload, its control, and a strict manifest."""
+    call_words, execution = build_callret(width, iters)
+    control_words = build_callret_control(width, iters)
+
+    call_suite = "instr_bench_callret"
+    call_label = "test_bench_callret"
+    call_source = [
+        "# Generated by tools/bench/gen_loop_bench.py --callret - do not edit.",
+        f"# {execution['loop_calls']:,} loop calls after "
+        f"{execution['preloop_calls']:,} pre-loop calls.",
+        "# r12 preserves the PPC test runner's outer LR across linked calls.",
+        f"{call_label}:",
+        f"  #_ REGISTER_IN r3 {iters:d}",
+        "  #_ REGISTER_OUT r3 0",
+    ]
+    control_suite = "instr_bench_callret_control"
+    control_label = "test_bench_callret_control"
+    control_source = [
+        "# Generated by tools/bench/gen_loop_bench.py --callret - do not edit.",
+        "# Matched empty-loop control: every linked call is a PPC nop.",
+        f"{control_label}:",
+        f"  #_ REGISTER_IN r3 {iters:d}",
+        "  #_ REGISTER_OUT r3 0",
+    ]
+
+    suites = {
+        "workload": write_suite(out_bin, srcs, call_suite, call_label,
+                                call_words, call_source),
+        "control": write_suite(out_bin, srcs, control_suite, control_label,
+                               control_words, control_source),
+    }
+    manifest = {
+        "schema": "xenia-callret-bench-v2",
+        "generator": "tools/bench/gen_loop_bench.py",
+        "execution": execution,
+        "measurement_boundary": {
+            "timer": "in_process_warmed_invocation",
+            "primary_metric": "current_thread_cpu_ns",
+            "diagnostic_metric": "clock_uptime_raw_ns",
+            "control_subtracted": True,
+            "full_workload_warmup_invocations": 1,
+            "warmup_inside_timed_region": False,
+            "root_resolve_inside_timed_region": False,
+            "one_time_jit_cost_inside_timed_region": False,
+            "reject_code_placement_during_timed_region": True,
+            "metric_prefix": "XENIA_PPC_BENCHMARK_V1",
+        },
+        "suites": suites,
+    }
+    manifest_path = out_bin / "callret_bench_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest_path, manifest
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-bin", required=True,
@@ -196,11 +372,14 @@ def main():
                     help="testing source dir(s) for the .s; pass one per ref, "
                          "since the harness scans each ref's own tree")
     ap.add_argument("--iters", type=int, default=2_000_000)
-    ap.add_argument("--width", type=int, default=8,
-                    help="opcodes per loop iteration")
+    ap.add_argument("--width", type=int,
+                    help="operations per loop iteration (default: 8 for "
+                         "opcode loops, 64 for --callret)")
     ap.add_argument("--ops", nargs="+",
                     default=["vsel", "vperm", "vmaddfp", "vnmsubfp", "vand"])
     ap.add_argument("--shapes", nargs="+", default=["lat", "tp"])
+    ap.add_argument("--callret", action="store_true",
+                    help="generate only the linked-call and empty-loop suites")
     args = ap.parse_args()
 
     out_bin = pathlib.Path(args.out_bin)
@@ -210,12 +389,34 @@ def main():
         if not d.is_dir():
             sys.exit(f"not a directory: {d}")
 
+    width = args.width if args.width is not None else (64 if args.callret else 8)
+    if args.callret:
+        try:
+            manifest_path, manifest = generate_callret(
+                out_bin, srcs, args.iters, width)
+        except ValueError as e:
+            sys.exit(str(e))
+        execution = manifest["execution"]
+        print(f"{'suite':32}{'calls/iter':>12}{'total calls':>18}{'bytes':>8}")
+        workload = manifest["suites"]["workload"]
+        control = manifest["suites"]["control"]
+        print(f"{workload['name']:32}{execution['width']:12d}"
+              f"{execution['calls_per_invocation']:18,d}"
+              f"{workload['binary_bytes']:8d}")
+        print(f"{control['name']:32}{0:12d}{0:18d}"
+              f"{control['binary_bytes']:8d}")
+        print(f"\nmanifest  -> {manifest_path}")
+        print(f".bin/.map -> {out_bin}")
+        for d in srcs:
+            print(f".s        -> {d}")
+        return 0
+
     made = []
     for op in args.ops:
         for shape in args.shapes:
             suite = f"instr_bench_{op}_{shape}"
             label = f"test_bench_{op}_{shape}"
-            words, per_iter = build(op, shape, args.width, args.iters)
+            words, per_iter = build(op, shape, width, args.iters)
             blob = b"".join(struct.pack(">I", w) for w in words)
             (out_bin / f"{suite}.bin").write_bytes(blob)
             (out_bin / f"{suite}.map").write_text(

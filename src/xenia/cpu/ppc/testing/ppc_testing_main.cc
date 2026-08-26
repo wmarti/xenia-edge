@@ -17,6 +17,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/string_buffer.h"
+#include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/jit_corpus.h"
 
@@ -30,6 +31,12 @@ DECLARE_bool(guest_scheduler);
 #include <chrono>
 #include <cstring>
 #include <unordered_set>
+
+#if XE_PLATFORM_MAC
+#include <mach/mach.h>
+#include <mach/thread_info.h>
+#include <time.h>
+#endif
 
 #if XE_ARCH_AMD64
 #include "xenia/cpu/backend/x64/x64_backend.h"
@@ -54,6 +61,11 @@ DEFINE_bool(test_only_skipped, false,
 DEFINE_path(test_passed_file, "",
             "Write the name of every passing test case here, one per line.",
             "Other");
+DEFINE_bool(test_benchmark_warmed, false,
+            "Run exactly one selected test once to warm and verify its JIT "
+            "code, reset its guest state, then time one verified invocation "
+            "in-process. macOS only.",
+            "CPU");
 DEFINE_transient_string(test_name, "", "Test suite name.", "General");
 
 DEFINE_path(jit_corpus_in, "",
@@ -94,6 +106,32 @@ using namespace xe::literals;
 typedef std::vector<std::pair<std::string, std::string>> AnnotationList;
 
 constexpr uint32_t START_ADDRESS = 0x80000000;
+
+#if XE_PLATFORM_MAC
+bool ReadCurrentThreadCpuNanoseconds(thread_t thread,
+                                     uint64_t& cpu_nanoseconds_out) {
+  thread_basic_info_data_t info = {};
+  mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+  const kern_return_t result =
+      thread_info(thread, THREAD_BASIC_INFO,
+                  reinterpret_cast<thread_info_t>(&info), &count);
+  if (result != KERN_SUCCESS || count < THREAD_BASIC_INFO_COUNT ||
+      info.user_time.seconds < 0 || info.user_time.microseconds < 0 ||
+      info.system_time.seconds < 0 || info.system_time.microseconds < 0) {
+    return false;
+  }
+  constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
+  constexpr uint64_t kNanosecondsPerMicrosecond = 1000ull;
+  cpu_nanoseconds_out =
+      static_cast<uint64_t>(info.user_time.seconds) * kNanosecondsPerSecond +
+      static_cast<uint64_t>(info.user_time.microseconds) *
+          kNanosecondsPerMicrosecond +
+      static_cast<uint64_t>(info.system_time.seconds) * kNanosecondsPerSecond +
+      static_cast<uint64_t>(info.system_time.microseconds) *
+          kNanosecondsPerMicrosecond;
+  return true;
+}
+#endif  // XE_PLATFORM_MAC
 
 // Load skip list from file
 std::unordered_set<std::string> LoadSkipList(
@@ -349,7 +387,7 @@ class TestRunner {
     return true;
   }
 
-  bool Run(TestCase& test_case) {
+  bool PrepareTestState(TestCase& test_case) {
     // Setup test state from annotations.
     if (!SetupTestState(test_case)) {
       fprintf(stderr, "    [%s] Test setup failed\n", test_case.name.c_str());
@@ -391,6 +429,13 @@ class TestRunner {
       a64_backend->SetGuestRoundingMode(thread_state_->context(), 0);
     }
 #endif
+    return true;
+  }
+
+  bool Run(TestCase& test_case) {
+    if (!PrepareTestState(test_case)) {
+      return false;
+    }
 
     // Execute test.
     auto fn = processor_->ResolveFunction(test_case.address);
@@ -405,8 +450,11 @@ class TestRunner {
     ctx->lr = 0xBCBCBCBC;
     fn->Call(thread_state_.get(), uint32_t(ctx->lr));
 
-    // Assert test state expectations.
-    bool result = CheckTestResults(test_case);
+    return VerifyTestResults(test_case, fn);
+  }
+
+  bool VerifyTestResults(TestCase& test_case, Function* fn) {
+    const bool result = CheckTestResults(test_case);
     if (!result) {
       // Also dump all disasm/etc.
       if (fn->is_guest()) {
@@ -415,6 +463,125 @@ class TestRunner {
     }
 
     return result;
+  }
+
+  bool RunWarmedBenchmark(TestSuite& suite, TestCase& test_case) {
+#if !XE_PLATFORM_MAC
+    fprintf(stderr, "    [%s] Warmed in-process benchmarking is macOS-only\n",
+            test_case.name.c_str());
+    fflush(stderr);
+    return false;
+#else
+    // First execute the complete workload, not a reduced proxy. This resolves
+    // all lazily reached functions and lets call-site backpatching finish.
+    if (!Setup(suite)) {
+      fprintf(stderr, "    [%s] Benchmark warmup setup failed\n",
+              test_case.name.c_str());
+      fflush(stderr);
+      return false;
+    }
+    if (!Run(test_case)) {
+      fprintf(stderr, "    [%s] Benchmark warmup verification failed\n",
+              test_case.name.c_str());
+      fflush(stderr);
+      return false;
+    }
+
+    // Reset memory and ThreadState while preserving this suite's Processor,
+    // Backend and JIT cache. Resolve the root before taking either clock.
+    if (!Setup(suite)) {
+      fprintf(stderr, "    [%s] Timed benchmark reset failed\n",
+              test_case.name.c_str());
+      fflush(stderr);
+      return false;
+    }
+    if (!PrepareTestState(test_case)) {
+      return false;
+    }
+    auto* fn = processor_->ResolveFunction(test_case.address);
+    if (!fn) {
+      fprintf(stderr, "    [%s] Entry function not found after warmup\n",
+              test_case.name.c_str());
+      fflush(stderr);
+      return false;
+    }
+    auto* code_cache = processor_->backend()->code_cache();
+    if (!code_cache) {
+      fprintf(stderr, "    [%s] Backend has no code cache\n",
+              test_case.name.c_str());
+      fflush(stderr);
+      return false;
+    }
+    const uint64_t placement_generation_before =
+        code_cache->placement_generation();
+
+    const thread_t current_thread = mach_thread_self();
+    uint64_t thread_cpu_start = 0;
+    if (current_thread == MACH_PORT_NULL ||
+        !ReadCurrentThreadCpuNanoseconds(current_thread, thread_cpu_start)) {
+      if (current_thread != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), current_thread);
+      }
+      fprintf(stderr, "    [%s] Unable to read current-thread CPU time\n",
+              test_case.name.c_str());
+      fflush(stderr);
+      return false;
+    }
+
+    const uint64_t wall_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    auto* ctx = thread_state_->context();
+    ctx->lr = 0xBCBCBCBC;
+    fn->Call(thread_state_.get(), uint32_t(ctx->lr));
+    const uint64_t wall_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
+    uint64_t thread_cpu_end = 0;
+    const bool cpu_read_succeeded =
+        ReadCurrentThreadCpuNanoseconds(current_thread, thread_cpu_end);
+    mach_port_deallocate(mach_task_self(), current_thread);
+    const uint64_t placement_generation_after =
+        code_cache->placement_generation();
+
+    // Always verify the timed invocation before accepting a metric.
+    if (!VerifyTestResults(test_case, fn)) {
+      return false;
+    }
+    if (!cpu_read_succeeded || thread_cpu_end <= thread_cpu_start) {
+      fprintf(stderr,
+              "    [%s] Current-thread CPU interval is missing or zero\n",
+              test_case.name.c_str());
+      fflush(stderr);
+      return false;
+    }
+    if (wall_end <= wall_start) {
+      fprintf(stderr, "    [%s] Uptime wall interval is missing or zero\n",
+              test_case.name.c_str());
+      fflush(stderr);
+      return false;
+    }
+    if (placement_generation_after != placement_generation_before) {
+      fprintf(stderr,
+              "    [%s] Code placement changed in timed region "
+              "(%llu -> %llu)\n",
+              test_case.name.c_str(),
+              static_cast<unsigned long long>(placement_generation_before),
+              static_cast<unsigned long long>(placement_generation_after));
+      fflush(stderr);
+      return false;
+    }
+
+    const uint64_t thread_cpu_ns = thread_cpu_end - thread_cpu_start;
+    const uint64_t uptime_raw_ns = wall_end - wall_start;
+    fprintf(stdout,
+            "XENIA_PPC_BENCHMARK_V1\tthread_cpu_ns=%llu\t"
+            "uptime_raw_ns=%llu\tplacement_generation_before=%llu\t"
+            "placement_generation_after=%llu\n",
+            static_cast<unsigned long long>(thread_cpu_ns),
+            static_cast<unsigned long long>(uptime_raw_ns),
+            static_cast<unsigned long long>(placement_generation_before),
+            static_cast<unsigned long long>(placement_generation_after));
+    fflush(stdout);
+    return true;
+#endif  // XE_PLATFORM_MAC
   }
 
   bool SetupTestState(TestCase& test_case) {
@@ -677,6 +844,15 @@ bool RunTests(const std::vector<std::string>& test_names) {
     fprintf(stderr, "Filtered out %d test cases based on skip list.\n",
             skipped_count);
   }
+  if (cvars::test_benchmark_warmed &&
+      (test_suites.size() != 1 || all_tests.size() != 1)) {
+    fprintf(stderr,
+            "--test_benchmark_warmed requires exactly one loaded suite and "
+            "one runnable test case (got %zu suites, %zu cases).\n",
+            test_suites.size(), all_tests.size());
+    fflush(stderr);
+    return false;
+  }
   fprintf(stderr, "Running %zu test suites, %zu test cases...\n",
           test_suites.size(), all_tests.size());
 
@@ -716,8 +892,19 @@ bool RunTests(const std::vector<std::string>& test_names) {
             test_suite.name().c_str(), suite_tests.size(), pct);
     fflush(stdout);
     for (size_t i = 0; i < suite_tests.size(); i++) {
-      ProtectedRunTest(test_suite, runner, *suite_tests[i], failed_count,
-                       passed_count, passed_names);
+      if (cvars::test_benchmark_warmed) {
+        if (runner.RunWarmedBenchmark(test_suite, *suite_tests[i])) {
+          ++passed_count;
+          passed_names.push_back(suite_tests[i]->name);
+        } else {
+          fprintf(stderr, "  [%s] FAILED\n", suite_tests[i]->name.c_str());
+          fflush(stderr);
+          ++failed_count;
+        }
+      } else {
+        ProtectedRunTest(test_suite, runner, *suite_tests[i], failed_count,
+                         passed_count, passed_names);
+      }
       ++tests_done;
       if ((i + 1) % 500 == 0 && i + 1 < suite_tests.size()) {
         pct = static_cast<int>(tests_done * 100 / total_tests);
