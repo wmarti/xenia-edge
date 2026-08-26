@@ -12,6 +12,7 @@
 #include <algorithm>
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/threading.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
@@ -87,26 +88,52 @@ static uint64_t SpinWaitTimerFreq() {
   return freq;
 }
 
-// Cold: reached once per --spin_wait_yield_after iterations of a tagged loop
-// (or per kSpinWaitRetripIters once armed). Validates that the counted
-// iterations were actually back-to-back polling before releasing the core; a
-// count that took longer than max_iter_ns per iteration means real work ran
-// in between, and the state resets instead.
-static void InjectedSpinWaitTrip(void* raw_context) {
+// Cold: reached once per --spin_wait_yield_after iterations of tagged
+// loops on this thread (or per kSpinWaitRetripIters once armed).
+// The iteration counter is shared by every tagged site on the thread, so all
+// state transitions are keyed to `site`, the guest address of the loop header
+// whose back-edge check hit the threshold. A sleep requires the SAME site to
+// trip twice in a row with the intervening iterations averaging under
+// --spin_wait_max_iter_ns each: the first trip from a new site only
+// establishes tracking. That closes the cross-loop hole where an armed budget
+// earned by one loop could be served to a different one, and it makes the
+// zero-initialized state (site 0, tick 0) mean "nothing tracked yet" instead
+// of rejecting on a bogus since-boot elapsed time.
+static void InjectedSpinWaitTrip(void* raw_context, uint64_t site) {
   auto* bctx = reinterpret_cast<A64BackendContext*>(
       reinterpret_cast<char*>(raw_context) - sizeof(A64BackendContext));
   uint64_t now;
   asm volatile("mrs %0, cntvct_el0" : "=r"(now));
+  const uint32_t site32 = uint32_t(site);
+  if (site32 != bctx->spin_wait_site) {
+    bctx->spin_wait_site = site32;
+    bctx->spin_wait_armed = 0;
+    bctx->spin_wait_spins = 0;
+    bctx->spin_wait_reset_tick = now;
+    return;
+  }
   const uint64_t elapsed_ticks = now - bctx->spin_wait_reset_tick;
   const uint64_t iters = bctx->spin_wait_armed ? kSpinWaitRetripIters
                                                : cvars::spin_wait_yield_after;
   const uint64_t budget_ticks = iters * uint64_t(cvars::spin_wait_max_iter_ns) *
                                 SpinWaitTimerFreq() / 1000000000ull;
   if (elapsed_ticks <= budget_ticks) {
-    // Confirmed: nothing but polling since the last reset. Release the core.
+    // Confirmed: nothing but polling at this site since the last reset.
+    // Release the core. NanoSleep is a request, not a bound -- Darwin
+    // nanosleep can overshoot by 100-500us under load (threading_posix.cc),
+    // which is fine for a waiting loop and is exactly why a site doing real
+    // work must never reach this branch.
+    if (!bctx->spin_wait_armed) {
+      // One line per escalation episode, so a run's log names every site that
+      // ever slept. The adoption gate for this lever is that no unintended
+      // site appears.
+      XELOGI("SpinWait: escalating guest loop {:08X}", site32);
+    }
     SpinWaitRelease(raw_context);
+    const uint32_t threshold = cvars::spin_wait_yield_after;
     bctx->spin_wait_armed = 1;
-    bctx->spin_wait_spins = cvars::spin_wait_yield_after - kSpinWaitRetripIters;
+    bctx->spin_wait_spins =
+        threshold > kSpinWaitRetripIters ? threshold - kSpinWaitRetripIters : 0;
     asm volatile("mrs %0, cntvct_el0" : "=r"(now));
     bctx->spin_wait_reset_tick = now;
   } else {
@@ -122,7 +149,7 @@ struct DELAY_EXECUTION
     : Sequence<DELAY_EXECUTION, I<OPCODE_DELAY_EXECUTION, VoidOp>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     if (i.instr->flags & hir::DELAY_EXECUTION_INJECTED) {
-      EmitInjectedSpinCheck(e);
+      EmitInjectedSpinCheck(e, i);
       return;
     }
     // db16cyc throttles a guest spin loop. yield is the literal translation
@@ -204,7 +231,7 @@ struct DELAY_EXECUTION
   // threshold. The fast path is six instructions and touches no timer; all
   // validation, sleeping and state management lives in InjectedSpinWaitTrip.
   // x16/x17 are the emitter's scratch registers.
-  static void EmitInjectedSpinCheck(A64Emitter& e) {
+  static void EmitInjectedSpinCheck(A64Emitter& e, const EmitArgType& i) {
     const uint32_t threshold = cvars::spin_wait_yield_after;
     if (!threshold) {
       // Pass is gated on the same cvar, but a stale corpus replay with
@@ -220,6 +247,10 @@ struct DELAY_EXECUTION
     e.mov(e.w17, static_cast<uint64_t>(threshold));
     e.cmp(e.w16, e.w17);
     e.b(Xbyak_aarch64::LO, not_yet);
+    // The guest-to-host thunk passes x1 through as the helper's second
+    // argument; the pass stashed the loop header's guest address on the
+    // instr the same way the preempt pass names its safepoints.
+    e.mov(e.w1, static_cast<uint64_t>(uint32_t(i.instr->src1.offset)));
     e.CallNativeSafe(reinterpret_cast<void*>(InjectedSpinWaitTrip));
     e.L(not_yet);
   }
