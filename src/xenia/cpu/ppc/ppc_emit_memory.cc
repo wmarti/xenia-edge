@@ -957,7 +957,14 @@ Value* UnpackSingleKeepNaN(HIRBuilder& f, Value* sbits) {
             51);
   Value* nan_bits =
       f.Or(f.And(dbits, f.LoadConstantUint64(~(1ull << 51))), qbit);
-  return f.Cast(f.Select(is_nan, nan_bits, dbits), FLOAT64_TYPE);
+  Value* out = f.Cast(f.Select(is_nan, nan_bits, dbits), FLOAT64_TYPE);
+  // Both arms carry a single's value widened to double: dbits is the
+  // conversion itself (exponent nonzero unless the value is a true zero) and
+  // nan_bits only rewrites the quiet bit of an all-ones exponent. A double
+  // denormal cannot come out of here, which DENORMAL_QUIRK simplification
+  // uses to fold the single-precision quirk screen over lfs-fed operands.
+  out->flags |= VALUE_NEVER_F64_DENORMAL;
+  return out;
 }
 
 int InstrEmit_lfs(PPCHIRBuilder& f, const InstrData& i) {

@@ -78,6 +78,12 @@ static inline bool IsScalarIntegralType(TypeName type_name) {
 enum ValueFlags {
   VALUE_IS_CONSTANT = (1 << 1),
   VALUE_IS_ALLOCATED = (1 << 2),  // Used by backends. Do not set.
+  // The producer guarantees this FLOAT64 value is never a double denormal:
+  // its magnitude is zero, at least 2^-1022, or non-finite. Set where the
+  // guarantee comes from construction (e.g. lfs's NaN-repairing unpack of a
+  // 32-bit float: the smallest single denormal, 2^-149, is far inside
+  // double's normal range) and consumed by DENORMAL_QUIRK simplification.
+  VALUE_NEVER_F64_DENORMAL = (1 << 3),
 };
 
 struct RegAssignment {

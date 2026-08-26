@@ -1694,3 +1694,35 @@ Default flipped to 16 (this commit). Evidence it LACKS: any multiplayer /
 networking session -- the affected thread is Reach's netcode poll loop and
 the park is guest-observable timing; nothing here exercises live netplay.
 If networked play ever regresses, this default is the first suspect.
+
+## T7: the single-precision denormal quirk folds away over provably-single data
+
+Fresh-capture ranking put `denormal_quirk` at **4.89% of executed host
+instructions (18.32 per execution, 7.59e9 executions)** -- the screen that
+gives single-precision ops the 360's default-QNaN answer when a double
+denormal operand slips in. But a double denormal cannot come out of
+single-precision data: the smallest single denormal (2^-149) is far above
+double's normal floor (2^-1022). So a quirk whose operands all trace to
+lfs unpacks, TO_SINGLE results, selects between such values, or
+non-denormal constants is statically 0 and folds away, Select consumer
+and all.
+
+Implemented as `VALUE_NEVER_F64_DENORMAL` (set where lfs's NaN-repairing
+unpack is constructed -- both select arms carry a single widened to double)
+plus a `SimplificationPass` rule recursing through TO_SINGLE / CONVERT-
+from-f32 / SELECT defs, after context promotion has connected FPR
+store/load chains. Unprovable defs (lfd, double arithmetic, load_context
+from unknown context) keep the full screen.
+
+Evidence it HAS: **169,048/169,048 semantics pass**; docks corpus replay
+laid-down stable **10,208,128 -> 9,867,116 (-341,012, -3.34%)** with 1,790
+functions shrinking; coverage-weighted executed saving **2.47% of all
+executed host instructions, 5.30% of non-spin** (uniform intra-function
+weighting, the instrument's documented caveat). Priced ~0.4-0.5% CPU by
+the standing conversion.
+
+Evidence it LACKS: a runtime pair (Halo 3 menu guard queued); any case in
+the 169k suite that exercises the fold itself -- suite operands come from
+context and stay unprovable, so the suite proves no-collateral-damage
+while the fold's own soundness rests on the 2^-149 >> 2^-1022 argument
+and the three construction sites.

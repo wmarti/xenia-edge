@@ -28,6 +28,8 @@ SimplificationPass::SimplificationPass() : ConditionalGroupSubpass() {}
 
 SimplificationPass::~SimplificationPass() {}
 
+static bool IsNeverF64Denormal(hir::Value* v, int depth);
+
 bool SimplificationPass::Run(HIRBuilder* builder, bool& result) {
   result = false;
 
@@ -1392,6 +1394,16 @@ bool SimplificationPass::SimplifyBasicArith(hir::Instr* i,
     case OPCODE_SHL: {
       return SimplifySHLArith(i, builder);
     }
+    case OPCODE_DENORMAL_QUIRK: {
+      if (IsNeverF64Denormal(i->src1.value, 4) &&
+          IsNeverF64Denormal(i->src2.value, 4) &&
+          IsNeverF64Denormal(i->src3.value, 4)) {
+        i->Replace(&OPCODE_ASSIGN_info, 0);
+        i->set_src1(builder->LoadZeroInt8());
+        return true;
+      }
+      return false;
+    }
   }
   return false;
 }
@@ -1407,6 +1419,43 @@ bool SimplificationPass::SimplifyBasicArith(hir::HIRBuilder* builder) {
     block = block->next;
   }
   return result;
+}
+
+// True when this FLOAT64 value provably cannot be a double denormal: a
+// constant without denormal bits, a value the producer marked (lfs unpack),
+// a round-to-single result (its smallest nonzero magnitude, single denormal
+// 2^-149, is far above double's 2^-1022 normal floor), a conversion from a
+// 32-bit float, or a select between two such values. Finiteness is NOT
+// implied and NOT needed: DENORMAL_QUIRK's finite arm only matters when the
+// denormal arm can hit.
+static bool IsNeverF64Denormal(hir::Value* v, int depth) {
+  if (!v || v->type != FLOAT64_TYPE) {
+    return false;
+  }
+  if (v->IsConstant()) {
+    uint64_t bits;
+    std::memcpy(&bits, &v->constant.f64, sizeof(bits));
+    return (bits & 0x7FF0000000000000ull) != 0 ||
+           (bits & 0x000FFFFFFFFFFFFFull) == 0;
+  }
+  if (v->flags & VALUE_NEVER_F64_DENORMAL) {
+    return true;
+  }
+  hir::Instr* def = v->GetDefSkipAssigns();
+  if (!def || depth <= 0) {
+    return false;
+  }
+  switch (def->GetOpcodeNum()) {
+    case OPCODE_TO_SINGLE:
+      return true;
+    case OPCODE_CONVERT:
+      return def->src1.value && def->src1.value->type == FLOAT32_TYPE;
+    case OPCODE_SELECT:
+      return IsNeverF64Denormal(def->src2.value, depth - 1) &&
+             IsNeverF64Denormal(def->src3.value, depth - 1);
+    default:
+      return false;
+  }
 }
 
 static bool CouldEverProduceDenormal(hir::Instr* i) {
