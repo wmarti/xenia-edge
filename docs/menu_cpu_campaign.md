@@ -1028,3 +1028,87 @@ short, so a function that only compiles later would be missing. Every writer
 found sits in the same `82A46xxx`-`82A4Dxxx` region as the spin loop, which is
 consistent with one subsystem, but absence of a *host* writer is weaker evidence
 than the presence of the guest ones.
+
+## T5: the spin loop has no hint, so nothing in the emulator can see it
+
+Two mechanisms in this tree can make a spinning guest thread yield, and
+**neither one reaches this loop**:
+
+1. `PreemptCheckInjectionPass` injects `OPCODE_CHECK_PREEMPT` at function entry
+   and at every back-edge target -- exactly the right points -- but returns
+   immediately when `!cvars::guest_scheduler`
+   (`preempt_check_injection_pass.cc:45`). `guest_scheduler=false` is permanent
+   here, so the pass is off.
+2. `OPCODE_DELAY_EXECUTION` implements a per-guest-thread, `CNTVCT_EL0`-timed
+   consecutive-spin counter that escalates to a host sleep or yield, emitted
+   inline on a64 (`a64_seq_memory.cc:107-150`, tuned by `db16cyc_yield_after=2`,
+   `db16cyc_consecutive_gap_ns=1000`, `db16cyc_sleep_ns=60000`). It only fires
+   on a guest loop that contains the `db16cyc` hint, which PPC spells
+   `or r28,r28,r28` = `0x7FFFFB78` (`ppc_emit_alu.cc:781`).
+
+Scanned all 13,564 captured functions for `0x7FFFFB78`:
+
+| | |
+| --- | --- |
+| functions containing `db16cyc` | **11 of 13,564** |
+| occurrences in `828BF420` | **0** |
+| occurrences in `82A46D70` | **0** |
+
+So this loop spins with no mitigation of any kind.
+
+### The loop, decoded
+
+    828BF474  38810050  addi   r4, r1, 0x50      ; out = &frame[0x50]
+    828BF478  807E22A4  lwz    r3, 0x22A4(r30)   ; the object
+    828BF47C  481878F5  bl     82A46D70
+    828BF480  81610058  lwz    r11, 0x58(r1)     ; out[2]
+    828BF484  2B0B0002  cmplwi cr6, r11, 2
+    828BF488  4098FFEC  bge    cr6, 828BF474     ; spin while outstanding >= 2
+
+and the callee is nine instructions with no branch:
+
+    82A46D70  39600000  li     r11, 0
+    82A46D74  91640000  stw    r11, 0(r4)        ; out[0] = 0
+    82A46D78  816340A0  lwz    r11, 0x40A0(r3)   ; submitted
+    82A46D7C  91640004  stw    r11, 4(r4)        ; out[1] = submitted
+    82A46D80  816340A8  lwz    r11, 0x40A8(r3)   ; completed
+    82A46D84  814340A0  lwz    r10, 0x40A0(r3)   ; submitted, re-read
+    82A46D88  7D6B5050  subf   r11, r11, r10     ; submitted - completed
+    82A46D8C  91640008  stw    r11, 8(r4)        ; out[2] = outstanding
+    82A46D90  4E800020  blr
+
+This confirms the earlier reading of the counters, and adds the part that
+matters for a fix: **every store in the loop is to the caller's own stack
+frame** (`r4 = r1+0x50`). The loop reads two fields of a guest object, computes
+a difference into its own frame, and branches. It makes no observable progress.
+That is a spin-wait by shape, not by inference.
+
+### Why the cheap version of the fix does not work
+
+The obvious pass -- "inject the existing `DELAY_EXECUTION` escalation at
+back-edge targets of spin-shaped loops" -- needs a shape filter, because the
+`db16cyc` escalation is only safe on loops the *guest* marked. Its trigger is
+two consecutive iterations less than 1 us apart, which any hot compute loop
+also satisfies; firing it there would insert a 60 us sleep into real work.
+
+A conservative filter is "short body, no stores outside the current frame, no
+calls". This loop passes the first two and **fails the third**: its body is a
+`bl`. Xenia compiles functions independently, so a HIR pass cannot see that
+`82A46D70` is a nine-instruction leaf whose only stores are through the pointer
+it was handed. Restricting the filter to call-free loops is safe and would not
+catch this one.
+
+So T5 does not have a cheap codegen fix. What is left is the consumer side:
+`+0x40A8` is incremented by `82A4610C` (in `82A46098`) and `82A462E8` (in
+`82A46198`), and the open question is still which thread runs those and whether
+it is runnable while the spinner burns a core. At ~18.5 M calls/s the spinner is
+holding roughly one full host core. Apple's guidance on spin-waiting on an
+asymmetric core design is summarised in the local, uncommitted notes at
+`edge-benchmarks/apple_silicon_cpu_rules.md` (ch. 7); it supports treating this
+as worse than idling, at a magnitude Apple itself rates only medium.
+
+**Caveat on the scan.** The corpus is format version 1, so its header carries no
+config word and the capture settings cannot be read back from it; and it was
+written by a run the disk guard cut short. A function that only compiles later
+would be missing. The negative result -- no `db16cyc` in these two functions --
+is about functions that *are* present, and both are present in full.
