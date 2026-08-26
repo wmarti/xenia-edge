@@ -30,7 +30,7 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 
 DEFINE_int32(
-    zero_delay_spin_limit, 0,
+    zero_delay_spin_limit, 16,
     "Consecutive zero-timeout guest delays on one thread before the emulator "
     "stops yielding the timeslice and parks the thread for "
     "zero_delay_park_ns instead. 0 disables the escalation and keeps "
