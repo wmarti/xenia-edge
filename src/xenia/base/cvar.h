@@ -55,6 +55,9 @@ class IConfigVar : virtual public ICommandVar {
   virtual std::string config_value() const = 0;
   virtual std::string default_value() const = 0;
   virtual std::string commandline_value() const = 0;
+  // The serialized value currently observed by users of the CVar, after
+  // command-line, per-title and global-config precedence has been applied.
+  virtual std::string effective_value() const = 0;
   virtual void LoadConfigValue(const toml::node* result) = 0;
   virtual void LoadGameConfigValue(const toml::node* result) = 0;
   virtual void ClearGameConfigValue() = 0;
@@ -98,6 +101,7 @@ class ConfigVar : public CommandVar<T>, virtual public IConfigVar {
   std::string config_value() const override;
   std::string default_value() const override;
   std::string commandline_value() const override;
+  std::string effective_value() const override;
   const T& GetTypedConfigValue() const;
   const std::string& category() const override;
   const std::string& display_name() const override;
@@ -319,6 +323,10 @@ std::string ConfigVar<T>::commandline_value() const {
     return this->ToString(*this->commandline_value_);
   }
   return config_value();
+}
+template <class T>
+std::string ConfigVar<T>::effective_value() const {
+  return this->ToString(*this->current_value_);
 }
 template <class T>
 const T& ConfigVar<T>::GetTypedConfigValue() const {
