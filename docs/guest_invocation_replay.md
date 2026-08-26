@@ -25,8 +25,8 @@ memory or chronological execution state.
 
 Code and execution inputs remain separate:
 
-1. A `.jcorpus` supplies immutable guest code pages and captured function
-   extents.
+1. A `.jcorpus` supplies immutable guest code pages, captured function extents,
+   replay-relevant guest function metadata and successful-definition order.
 2. A versioned invocation artifact supplies provenance, entry and expected exit
    PPC state, initial data pages (including the complete host-protection-granule
    closure needed by replay) and expected dirty pages whose final bytes differ

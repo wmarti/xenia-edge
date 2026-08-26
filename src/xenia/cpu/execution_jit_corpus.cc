@@ -24,8 +24,7 @@ namespace cpu {
 namespace {
 
 constexpr uint32_t kKnownConfigFlags = JitCorpus::kConfigGuestScheduler;
-constexpr uint32_t kKnownFunctionFlags = 0;
-constexpr uint32_t kSupportedVersion = 2;
+constexpr uint32_t kSupportedVersion = 3;
 constexpr uint32_t kSupportedPageSize = 4096;
 constexpr size_t kHeaderSize = 4 * sizeof(uint32_t);
 
@@ -93,9 +92,16 @@ bool IsSupportedCodePageAddress(uint32_t address) {
 
 bool ValidateFunctionRecord(const JitCorpus::FunctionRecord& function,
                             std::string* error) {
-  if (function.flags & ~kKnownFunctionFlags) {
+  if (function.flags & ~JitCorpus::kKnownFunctionFlags) {
     if (error) {
       error->assign("function record contains unsupported flags");
+    }
+    return false;
+  }
+  JitCorpus::FunctionMetadata metadata;
+  if (!JitCorpus::DecodeFunctionFlags(function.flags, &metadata)) {
+    if (error) {
+      error->assign("function record contains invalid metadata");
     }
     return false;
   }
@@ -247,6 +253,12 @@ bool ExecutionJitCorpus::Decode(const uint8_t* data, size_t data_size,
     }
   }
 
+  std::vector<uint32_t> function_definition_order;
+  function_definition_order.reserve(functions.size());
+  for (const FunctionRecord& function : functions) {
+    function_definition_order.push_back(function.address);
+  }
+
   std::sort(functions.begin(), functions.end(),
             [](const FunctionRecord& left, const FunctionRecord& right) {
               return left.address < right.address;
@@ -288,6 +300,7 @@ bool ExecutionJitCorpus::Decode(const uint8_t* data, size_t data_size,
   decoded.version_ = version;
   decoded.config_flags_ = config_flags;
   decoded.functions_ = std::move(functions);
+  decoded.function_definition_order_ = std::move(function_definition_order);
   decoded.page_addresses_.reserve(pages.size());
   decoded.page_data_.reserve(pages.size() * JitCorpus::kPageSize);
   for (const PageRecord& page : pages) {

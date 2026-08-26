@@ -82,9 +82,11 @@ JitCorpusWriter::~JitCorpusWriter() {
   }
 }
 
-void JitCorpusWriter::RecordFunction(Memory* memory, uint32_t address,
-                                     uint32_t end_address,
+void JitCorpusWriter::RecordFunction(Memory* memory, const Function& function,
                                      uint32_t host_code_size) {
+  const uint32_t address = function.address();
+  const uint32_t end_address = function.end_address();
+  const uint32_t flags = JitCorpus::EncodeFunctionFlags(function);
   if (!address) {
     return;
   }
@@ -95,7 +97,7 @@ void JitCorpusWriter::RecordFunction(Memory* memory, uint32_t address,
   // emits start-4 when the first word it fetches is zero.
   if (!end_address || end_address < address) {
     std::lock_guard<std::mutex> lock(mutex_);
-    WriteFunctionRecord(address, end_address, host_code_size);
+    WriteFunctionRecord(address, end_address, host_code_size, flags);
     return;
   }
   const uint32_t last = end_address + 4;
@@ -126,17 +128,18 @@ void JitCorpusWriter::RecordFunction(Memory* memory, uint32_t address,
     ++page_count_;
   }
 
-  WriteFunctionRecord(address, end_address, host_code_size);
+  WriteFunctionRecord(address, end_address, host_code_size, flags);
 }
 
 void JitCorpusWriter::WriteFunctionRecord(uint32_t address,
                                           uint32_t end_address,
-                                          uint32_t host_code_size) {
+                                          uint32_t host_code_size,
+                                          uint32_t flags) {
   if (!file_) {
     return;
   }
   const uint32_t tag = JitCorpus::kTagFunction;
-  const uint32_t record[4] = {address, end_address, host_code_size, 0};
+  const uint32_t record[4] = {address, end_address, host_code_size, flags};
   if (fwrite(&tag, sizeof(tag), 1, file_) != 1 ||
       fwrite(record, sizeof(record), 1, file_) != 1) {
     return;

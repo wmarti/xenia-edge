@@ -52,12 +52,19 @@ void AppendPage(std::vector<uint8_t>* data, uint32_t address, uint8_t seed) {
 }
 
 void AppendFunction(std::vector<uint8_t>* data, uint32_t address,
-                    uint32_t end_address) {
+                    uint32_t end_address, uint32_t flags = 0) {
   AppendU32(data, JitCorpus::kTagFunction);
   AppendU32(data, address);
   AppendU32(data, end_address);
   AppendU32(data, 64);
-  AppendU32(data, 0);
+  AppendU32(data, flags);
+}
+
+uint32_t FunctionFlags(Function::Behavior behavior,
+                       SaveRestoreType saverest_type, bool is_restore,
+                       uint8_t saverest_index) {
+  return JitCorpus::EncodeFunctionFlags(behavior, saverest_type, is_restore,
+                                        saverest_index);
 }
 
 class StubGuestFunction final : public GuestFunction {
@@ -105,11 +112,17 @@ TEST_CASE("exact JIT corpus module exposes only recorded function entries",
   AppendPage(&encoded, 0x82000000, 0x11);
   AppendPage(&encoded, 0x82001000, 0x33);
   AppendPage(&encoded, 0x83000000, 0x22);
-  AppendFunction(&encoded, 0x83000010, 0x8300001C);
-  AppendFunction(&encoded, 0x82000000, 0x82000004);
+  AppendFunction(&encoded, 0x83000010, 0x8300001C,
+                 FunctionFlags(Function::Behavior::kProlog,
+                               SaveRestoreType::FPR, false, 31));
+  AppendFunction(&encoded, 0x82000000, 0x82000004,
+                 FunctionFlags(Function::Behavior::kEpilogReturn,
+                               SaveRestoreType::GPR, true, 14));
 
   ExecutionJitCorpus corpus;
   REQUIRE(ExecutionJitCorpus::Decode(encoded, &corpus));
+  REQUIRE(corpus.function_definition_order() ==
+          std::vector<uint32_t>{0x83000010, 0x82000000});
 
   Memory memory;
   auto backend = std::make_unique<StubBackend>();
@@ -148,7 +161,22 @@ TEST_CASE("exact JIT corpus module exposes only recorded function entries",
           Symbol::Status::kNew);
   REQUIRE(function);
   REQUIRE(function->end_address() == 0x82000004);
+  REQUIRE(function->behavior() == Function::Behavior::kEpilogReturn);
+  REQUIRE(function->SaverestType() == SaveRestoreType::GPR);
+  REQUIRE(function->IsRestore());
+  REQUIRE(function->SaverestIndex() == 14);
   REQUIRE(module_ptr->HasExactExtent(*function));
+
+  Function* save_function = nullptr;
+  REQUIRE(module_ptr->DeclareFunction(0x83000010, &save_function) ==
+          Symbol::Status::kNew);
+  REQUIRE(save_function);
+  REQUIRE(save_function->end_address() == 0x8300001C);
+  REQUIRE(save_function->behavior() == Function::Behavior::kProlog);
+  REQUIRE(save_function->SaverestType() == SaveRestoreType::FPR);
+  REQUIRE(save_function->IsSave());
+  REQUIRE(save_function->SaverestIndex() == 31);
+  save_function->set_status(Symbol::Status::kDeclared);
 
   function->set_status(Symbol::Status::kDeclared);
   function->set_end_address(0x82000008);

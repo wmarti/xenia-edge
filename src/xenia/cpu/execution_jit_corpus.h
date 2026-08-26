@@ -67,6 +67,14 @@ class ExecutionJitCorpus {
   const std::vector<uint8_t>& page_data() const { return page_data_; }
   const std::vector<FunctionRecord>& functions() const { return functions_; }
 
+  // Entry addresses in the order their successful definitions were serialized
+  // by the capture. This remains separate from functions(), whose address sort
+  // is required for exact lookup. A runner uses this order to reproduce which
+  // callees were already translated when each caller reached the frontend.
+  const std::vector<uint32_t>& function_definition_order() const {
+    return function_definition_order_;
+  }
+
   const uint8_t* FindPageData(uint32_t page_address) const;
   const FunctionRecord* FindFunction(uint32_t entry_address) const;
 
@@ -74,6 +82,7 @@ class ExecutionJitCorpus {
   std::vector<uint32_t> page_addresses_;
   std::vector<uint8_t> page_data_;
   std::vector<FunctionRecord> functions_;
+  std::vector<uint32_t> function_definition_order_;
   uint32_t version_ = 0;
   uint32_t config_flags_ = 0;
 };

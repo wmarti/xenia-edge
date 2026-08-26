@@ -17,6 +17,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "xenia/cpu/function.h"
+
 namespace xe {
 class Memory;
 }  // namespace xe
@@ -46,7 +48,7 @@ class JitCorpus {
  public:
   // 'XJC1' -- bump kVersion on any layout change.
   static constexpr uint32_t kMagic = 0x3143584Au;
-  static constexpr uint32_t kVersion = 2;
+  static constexpr uint32_t kVersion = 3;
   static constexpr uint32_t kPageSize = 0x1000u;
 
   // Codegen-affecting settings latched at capture, carried in the header's
@@ -57,6 +59,37 @@ class JitCorpus {
   // default (true) made 13,323 of 13,564 functions differ from their own
   // capture and inflated the total by 3.50%.
   static constexpr uint32_t kConfigGuestScheduler = 1u << 0;
+
+  // FunctionRecord::flags stores the guest Function state that affects how
+  // the frontend scans callers and how the backend emits calls to XEX
+  // save/restore helpers. Values outside this mask are reserved.
+  static constexpr uint32_t kFunctionBehaviorShift = 0;
+  static constexpr uint32_t kFunctionBehaviorMask = 0x7u;
+  static constexpr uint32_t kFunctionSaverestTypeShift = 3;
+  static constexpr uint32_t kFunctionSaverestTypeMask = 0x3u << 3;
+  static constexpr uint32_t kFunctionSaverestRestore = 1u << 5;
+  static constexpr uint32_t kFunctionSaverestIndexShift = 8;
+  static constexpr uint32_t kFunctionSaverestIndexMask = 0xFFu << 8;
+  static constexpr uint32_t kKnownFunctionFlags =
+      kFunctionBehaviorMask | kFunctionSaverestTypeMask |
+      kFunctionSaverestRestore | kFunctionSaverestIndexMask;
+
+  struct FunctionMetadata {
+    Function::Behavior behavior = Function::Behavior::kDefault;
+    SaveRestoreType saverest_type = SaveRestoreType::NONE;
+    bool is_restore = false;
+    uint8_t saverest_index = 0;
+  };
+
+  // Encoding preserves valid observable replay metadata. The strict execution
+  // decoder rejects illegal combinations, so a bad capture fails closed
+  // instead of silently accepting a noncanonical successfully defined
+  // function.
+  static uint32_t EncodeFunctionFlags(const Function& function);
+  static uint32_t EncodeFunctionFlags(Function::Behavior behavior,
+                                      SaveRestoreType saverest_type,
+                                      bool is_restore, uint8_t saverest_index);
+  static bool DecodeFunctionFlags(uint32_t flags, FunctionMetadata* metadata);
 
   // A guest function that reached the backend, and what it emitted.
   struct FunctionRecord {
@@ -93,9 +126,9 @@ class JitCorpus {
   // True when the file ended mid-record, i.e. capture was killed.
   bool truncated() const { return truncated_; }
 
-  // The codegen settings this corpus was captured under. Only v2 corpora
-  // recorded them; a v1 capture is readable but its configuration is
-  // unknown, and a replay must not pretend otherwise.
+  // The codegen settings this corpus was captured under. V2 and later corpora
+  // record them; a v1 capture is readable but its configuration is unknown,
+  // and a replay must not pretend otherwise.
   bool config_known() const { return version_ >= 2; }
   uint32_t config_flags() const { return config_flags_; }
   bool captured_with_guest_scheduler() const {
@@ -125,7 +158,7 @@ class JitCorpusWriter {
   // Pages that are not readable guest memory are skipped rather than faulted
   // on, so a partially mapped range degrades to a function the replay reports
   // as failed instead of crashing the capture.
-  void RecordFunction(Memory* memory, uint32_t address, uint32_t end_address,
+  void RecordFunction(Memory* memory, const Function& function,
                       uint32_t host_code_size);
 
   uint32_t function_count() const { return function_count_; }
@@ -136,7 +169,7 @@ class JitCorpusWriter {
 
   // Caller must hold mutex_.
   void WriteFunctionRecord(uint32_t address, uint32_t end_address,
-                           uint32_t host_code_size);
+                           uint32_t host_code_size, uint32_t flags);
 
   std::mutex mutex_;
   FILE* file_ = nullptr;

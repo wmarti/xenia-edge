@@ -62,6 +62,13 @@ void AppendFunction(std::vector<uint8_t>* data, uint32_t address,
   AppendU32(data, flags);
 }
 
+uint32_t FunctionFlags(Function::Behavior behavior,
+                       SaveRestoreType saverest_type, bool is_restore,
+                       uint8_t saverest_index) {
+  return JitCorpus::EncodeFunctionFlags(behavior, saverest_type, is_restore,
+                                        saverest_index);
+}
+
 std::vector<uint8_t> MakeSpanningCorpus() {
   std::vector<uint8_t> data = MakeHeader();
   // Streaming capture order need not be address order.
@@ -112,6 +119,8 @@ TEST_CASE("execution JIT corpus decodes exact pages, extents and entries",
   REQUIRE(function);
   REQUIRE(function->end_address == 0x82001004);
   REQUIRE_FALSE(corpus.FindFunction(0x82001000));
+  REQUIRE(corpus.function_definition_order() ==
+          std::vector<uint32_t>{0x82000FFC});
 
   ExecutionJitCorpus boundary_corpus;
   REQUIRE(ExecutionJitCorpus::Decode(
@@ -120,6 +129,42 @@ TEST_CASE("execution JIT corpus decodes exact pages, extents and entries",
   REQUIRE(ExecutionJitCorpus::Decode(
       MakeSingleFunctionCorpus(0x9FFFE000, 0x9FFFEFF8, 0x9FFFEFFC),
       &boundary_corpus));
+}
+
+TEST_CASE("execution JIT corpus preserves definition order and metadata",
+          "[execution-jit-corpus]") {
+  std::vector<uint8_t> encoded = MakeHeader();
+  AppendPage(&encoded, 0x82000000, 0x11);
+  AppendPage(&encoded, 0x83000000, 0x22);
+  AppendFunction(&encoded, 0x83000010, 0x8300001C, 64,
+                 FunctionFlags(Function::Behavior::kProlog,
+                               SaveRestoreType::FPR, false, 31));
+  AppendFunction(&encoded, 0x82000000, 0x82000004, 64,
+                 FunctionFlags(Function::Behavior::kEpilogReturn,
+                               SaveRestoreType::GPR, true, 14));
+
+  ExecutionJitCorpus corpus;
+  REQUIRE(ExecutionJitCorpus::Decode(encoded, &corpus));
+  REQUIRE(corpus.function_definition_order() ==
+          std::vector<uint32_t>{0x83000010, 0x82000000});
+  REQUIRE(corpus.functions().size() == 2);
+  REQUIRE(corpus.functions()[0].address == 0x82000000);
+  REQUIRE(corpus.functions()[1].address == 0x83000010);
+
+  JitCorpus::FunctionMetadata metadata;
+  REQUIRE(JitCorpus::DecodeFunctionFlags(corpus.FindFunction(0x83000010)->flags,
+                                         &metadata));
+  REQUIRE(metadata.behavior == Function::Behavior::kProlog);
+  REQUIRE(metadata.saverest_type == SaveRestoreType::FPR);
+  REQUIRE_FALSE(metadata.is_restore);
+  REQUIRE(metadata.saverest_index == 31);
+
+  REQUIRE(JitCorpus::DecodeFunctionFlags(corpus.FindFunction(0x82000000)->flags,
+                                         &metadata));
+  REQUIRE(metadata.behavior == Function::Behavior::kEpilogReturn);
+  REQUIRE(metadata.saverest_type == SaveRestoreType::GPR);
+  REQUIRE(metadata.is_restore);
+  REQUIRE(metadata.saverest_index == 14);
 }
 
 TEST_CASE(
@@ -160,6 +205,10 @@ TEST_CASE("execution JIT corpus rejects unsupported versions and flags",
   RequireDecodeFailure(malformed);
 
   malformed = MakeSpanningCorpus();
+  SetU32(&malformed, 4, 2);
+  RequireDecodeFailure(malformed);
+
+  malformed = MakeSpanningCorpus();
   SetU32(&malformed, 4, JitCorpus::kVersion + 1);
   RequireDecodeFailure(malformed);
 
@@ -167,7 +216,55 @@ TEST_CASE("execution JIT corpus rejects unsupported versions and flags",
   SetU32(&malformed, 12, 1u << 31);
   RequireDecodeFailure(malformed);
 
-  malformed = MakeSingleFunctionCorpus(0x82000000, 0x82000000, 0x82000004, 1);
+  malformed =
+      MakeSingleFunctionCorpus(0x82000000, 0x82000000, 0x82000004, 1u << 6);
+  RequireDecodeFailure(malformed);
+
+  // Builtins and externs are not guest JIT definitions and cannot be replayed.
+  malformed =
+      MakeSingleFunctionCorpus(0x82000000, 0x82000000, 0x82000004,
+                               FunctionFlags(Function::Behavior::kBuiltin,
+                                             SaveRestoreType::NONE, false, 0));
+  RequireDecodeFailure(malformed);
+
+  // No-save/restore metadata must be entirely canonical.
+  malformed =
+      MakeSingleFunctionCorpus(0x82000000, 0x82000000, 0x82000004,
+                               FunctionFlags(Function::Behavior::kDefault,
+                                             SaveRestoreType::NONE, true, 0));
+  RequireDecodeFailure(malformed);
+  malformed =
+      MakeSingleFunctionCorpus(0x82000000, 0x82000000, 0x82000004,
+                               FunctionFlags(Function::Behavior::kDefault,
+                                             SaveRestoreType::NONE, false, 14));
+  RequireDecodeFailure(malformed);
+
+  // Save helpers are prologs; GPR restores return, while FPR and VMX restores
+  // are epilogs. Register indices must be in the XEX helper ranges.
+  malformed =
+      MakeSingleFunctionCorpus(0x82000000, 0x82000000, 0x82000004,
+                               FunctionFlags(Function::Behavior::kProlog,
+                                             SaveRestoreType::GPR, true, 14));
+  RequireDecodeFailure(malformed);
+  malformed =
+      MakeSingleFunctionCorpus(0x82000000, 0x82000000, 0x82000004,
+                               FunctionFlags(Function::Behavior::kEpilog,
+                                             SaveRestoreType::GPR, true, 14));
+  RequireDecodeFailure(malformed);
+  malformed =
+      MakeSingleFunctionCorpus(0x82000000, 0x82000000, 0x82000004,
+                               FunctionFlags(Function::Behavior::kEpilogReturn,
+                                             SaveRestoreType::FPR, true, 14));
+  RequireDecodeFailure(malformed);
+  malformed =
+      MakeSingleFunctionCorpus(0x82000000, 0x82000000, 0x82000004,
+                               FunctionFlags(Function::Behavior::kProlog,
+                                             SaveRestoreType::GPR, false, 13));
+  RequireDecodeFailure(malformed);
+  malformed =
+      MakeSingleFunctionCorpus(0x82000000, 0x82000000, 0x82000004,
+                               FunctionFlags(Function::Behavior::kProlog,
+                                             SaveRestoreType::VMX, false, 32));
   RequireDecodeFailure(malformed);
 
   malformed = MakeSpanningCorpus();

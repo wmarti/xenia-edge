@@ -703,7 +703,7 @@ bool Processor::DemandFunction(Function* function) {
       // Externs carry no emitted code, so they have nothing to replay.
       if (guest_function->machine_code()) {
         jit_corpus_writer_->RecordFunction(
-            memory_, guest_function->address(), guest_function->end_address(),
+            memory_, *guest_function,
             static_cast<uint32_t>(guest_function->machine_code_length()));
       }
     }
