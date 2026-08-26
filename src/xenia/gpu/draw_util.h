@@ -685,6 +685,21 @@ struct ResolveInfo {
   uint32_t copy_dest_extent_start;
   uint32_t copy_dest_extent_length;
 
+  // Optional decomposition of [copy_dest_extent_start,
+  // copy_dest_extent_start + copy_dest_extent_length) into per-tile-row-band
+  // spans of the tiled destination. The whole-rect extent is a bounding
+  // interval: tiled addresses grow monotonically with Y/32 then X/32 (see
+  // GetTiledAddressLowerBound2D), so for a rect narrower than the aligned
+  // pitch the interval also claims bytes between the bands that the resolve
+  // never writes. Each entry is an absolute [start, end) pair; the union of
+  // the spans covers every byte the resolve can write and is contained in
+  // the whole-rect interval. span_count == 0 means the decomposition is not
+  // available (3D/array destination, or more bands than the array holds) and
+  // the single interval above must be used.
+  static constexpr uint32_t kMaxDestExtentSpans = 48;
+  uint32_t copy_dest_extent_span_count;
+  std::pair<uint32_t, uint32_t> copy_dest_extent_spans[kMaxDestExtentSpans];
+
   // The clear shaders always write to a uint4 view of EDRAM.
   uint32_t rb_depth_clear;
   uint32_t rb_color_clear;
