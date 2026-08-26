@@ -1166,3 +1166,40 @@ share, and this campaign's rule is that a sampled share over-predicts reclaimabl
 CPU by ~2x. And the counts are attributed per function by coverage, which is
 exact, but the ~240 s window is taken from the earlier profiling run rather than
 re-measured here.
+
+## T5: sizing the false-positive surface of a shape-based spin detector
+
+If a pass injects the `DELAY_EXECUTION` escalation at back-edge targets of
+loops that "look like" spin-waits, the question is how much real code it also
+tags. Scanned the corpus for backward, non-call branches whose loop body is
+<=16 guest instructions with **no stores**:
+
+| | |
+| --- | --- |
+| such loops | 4,663 across 2,193 functions |
+| executed share of functions containing one | **47.53%** |
+| restricted to bodies containing a call (T5's shape) | 1,504 loops, 964 functions, 36.28% |
+
+So a static shape filter cannot carry the safety argument: functions holding a
+matching loop are nearly half of executed code (the T5 pair inflates this --
+but `82A23370` at 2.57% and `82A01A20` at 2.23% are real compute with
+storeless scan loops of their own). Safety has to come from the **runtime
+trigger**, and the corpus numbers say what it must survive:
+
+- The spinner does ~1.5 M polls per 80 ms wait. A trip threshold of ~1 M
+  consecutive sub-microsecond iterations costs the first ~5-10 ms of each wait
+  and then sleeps away the remaining ~90%.
+- A terminating scan loop that runs >1 M consecutive iterations without a
+  1 us gap is the pathological case: after tripping it would eat a sleep per
+  re-trip. The corpus cannot prove absence of such a loop, so the lever must
+  be default-off and the A/B at the docks -- which contains both the spinner
+  and those compute functions -- is the only honest gate.
+- The existing `db16cyc` re-release behaviour resets the budget after every
+  sleep, which for a 1 M threshold would re-spin ~5 ms per 60 us sleep and
+  reclaim ~1%. A sticky variant (refresh the tick after the sleep, keep the
+  count saturated) is required for the reclaim to survive the arithmetic.
+
+Design forced by this: separate counter state and threshold from the hinted
+`db16cyc` path (11 hinted functions must keep their tuned behaviour), an HIR
+flag on the injected `DELAY_EXECUTION` so the emitter can tell them apart, and
+a default-off cvar, same posture as the T1 zero-delay lever.
