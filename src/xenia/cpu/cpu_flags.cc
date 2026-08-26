@@ -27,6 +27,12 @@ DEFINE_bool(accurate_vmx_denormal_flush, false,
 DEFINE_bool(disassemble_functions, false,
             "Disassemble functions during generation.", "CPU");
 
+DEFINE_bool(count_physical_remap_hits, false,
+            "Count taken 0xE0000000+ physical-remap fixups in JIT-compiled "
+            "guest memory accesses, into a process-global read by the GPU "
+            "counters dump. Measurement only: adds code to the taken path.",
+            "CPU");
+
 DEFINE_bool(trace_function_coverage, false,
             "Count how many times each guest instruction executes and report "
             "the totals in the guestcoverage section of the profiler dump.",

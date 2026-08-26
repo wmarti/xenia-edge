@@ -326,6 +326,11 @@ inline bool NeedsPhysicalRemap() {
 // instructions are still laid down, three of them run. Neither the corpus
 // replay nor the executed-bytes ranking can see it, so it has to be scored by
 // a paired runtime A/B or not at all.
+// Taken-path counter for --count_physical_remap_hits. Plain read-modify-
+// write on purpose: concurrent guest threads can lose increments, which
+// understates a rate measurement but never adds a fence to the hot path.
+extern "C" volatile uint64_t xe_a64_physical_remap_hits;
+
 inline void ApplyPhysicalRemapW0(A64Emitter& e) {
   using namespace Xbyak_aarch64;
   Xbyak_aarch64::Label skip;
@@ -340,6 +345,15 @@ inline void ApplyPhysicalRemapW0(A64Emitter& e) {
   // four instead of three - on every guest memory address on this host.
   e.b_near(NE, skip);
   e.add(e.w0, e.w0, 1, 12);  // + 0x1000 via LSL #12
+  if (cvars::count_physical_remap_hits) {
+    // Measurement builds only. x16/x17 are sequence-local scratch here;
+    // the one-shot w16 call-target forward is never armed into a
+    // load/store sequence that is not its consumer.
+    e.mov(e.x16, reinterpret_cast<uint64_t>(&xe_a64_physical_remap_hits));
+    e.ldr(e.x17, ptr(e.x16));
+    e.add(e.x17, e.x17, 1);
+    e.str(e.x17, ptr(e.x16));
+  }
   e.L(skip);
 }
 

@@ -1659,3 +1659,19 @@ Elimination designs, assessed:
 (c) **Static value-range elision**: constants already handled; variable
     bases dominate and the doc's earlier warning stands (base+disp can
     straddle the boundary). Low ceiling, not pursued.
+
+## Remap-check elimination: closed. The guest really uses 0xE0000000+
+
+`--count_physical_remap_hits` (new, default off; racy by design) counted
+taken remap fixups at the docks, steady-state window t=100..140 s:
+**2,059,172 taken over 40 s = ~51,500/s, ~1,150 per present** (44.8
+presents/s, in state). GTA IV is continuously reading/writing physical
+allocations above 0xE0000000 -- GPU-visible buffers, as suspected.
+
+Design (b), PROT_NONE + fault fixup, is therefore dead: 51.5k faults/s at
+2-10 us each is 10-50% of a core. With (a) impossible on 16 KiB pages and
+(c) low-ceiling, **the 0.7-1.4% CPU remap tax has no viable cheap
+elimination and the target is closed.** Two mitigating notes for the
+record: taken fraction is ~0.01% of all checks (the branch is essentially
+perfectly predicted, so the true time cost sits at or below the /2
+discount), and the counter cvar remains as a diagnostic.

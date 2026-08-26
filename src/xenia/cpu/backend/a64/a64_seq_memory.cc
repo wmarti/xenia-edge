@@ -328,6 +328,8 @@ struct CACHE_CONTROL
 };
 EMITTER_OPCODE_TABLE(OPCODE_CACHE_CONTROL, CACHE_CONTROL);
 
+extern "C" volatile uint64_t xe_a64_physical_remap_hits = 0;
+
 template <typename T, bool swap>
 static void MMIOAwareStore(void* _ctx, unsigned int guestaddr, T value) {
   if (swap) {

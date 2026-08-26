@@ -92,6 +92,13 @@ DEFINE_int32(
     "multithreaded compilation.",
     "Metal");
 
+#if XE_ARCH_ARM64
+// Written by the a64 backend under --count_physical_remap_hits.
+// extern "C" so no cross-module header is needed; guarded because the
+// symbol only exists in ARM64 links.
+extern "C" volatile uint64_t xe_a64_physical_remap_hits;
+#endif  // XE_ARCH_ARM64
+
 namespace xe {
 namespace gpu {
 namespace metal {
@@ -1940,6 +1947,10 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                                              : "unknown",
               static_cast<unsigned long long>(command_buffer_kind_counts_[i]));
         }
+#if XE_ARCH_ARM64
+        fprintf(cf, "physical_remap_hits %llu\n",
+                static_cast<unsigned long long>(xe_a64_physical_remap_hits));
+#endif  // XE_ARCH_ARM64
         fprintf(cf, "command_buffers_total %llu\n",
                 static_cast<unsigned long long>(total));
         fprintf(cf, "render_passes_total %llu\n",
