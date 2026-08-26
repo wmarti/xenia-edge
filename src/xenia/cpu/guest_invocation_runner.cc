@@ -476,7 +476,8 @@ bool GuestInvocationRunner::CommitAndLoadPages(std::string* error) {
   for (const auto& native_page_entry : native_pages) {
     const NativeHeapPage& native_page = native_page_entry.second;
     if (!native_page.heap->AllocFixed(
-            native_page.address, native_page.size, 0, kMemoryAllocationCommit,
+            native_page.address, native_page.size, 0,
+            kMemoryAllocationReserve | kMemoryAllocationCommit,
             kMemoryProtectRead | kMemoryProtectWrite)) {
       return Fail(error, "heap-native replay page commit failed");
     }
