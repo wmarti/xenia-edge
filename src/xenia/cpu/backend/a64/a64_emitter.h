@@ -150,6 +150,18 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     return flags_zero_armed_reg_ == gpr_reg && flags_zero_armed_is64_ == is64 &&
            gpr_reg >= 0 && flags_zero_armed_cond_ == Xbyak_aarch64::NE;
   }
+  // One-shot handoff for two-instruction fusions: a sequence that also
+  // emitted its single-use consumer marks that consumer, and the consumer's
+  // own sequence emits nothing. Cleared on read.
+  void MarkFusedSkip(const hir::Instr* instr) { fused_skip_instr_ = instr; }
+  bool ConsumeFusedSkip(const hir::Instr* instr) {
+    if (fused_skip_instr_ == instr) {
+      fused_skip_instr_ = nullptr;
+      return true;
+    }
+    return false;
+  }
+
   void ResetFlagsZeroTest() {
     flags_zero_fresh_reg_ = flags_zero_armed_reg_ = -1;
     w16_holds_fresh_ = w16_holds_armed_ = nullptr;
@@ -385,6 +397,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   Xbyak_aarch64::Cond flags_zero_fresh_cond_ = Xbyak_aarch64::NE;
   Xbyak_aarch64::Cond flags_zero_armed_cond_ = Xbyak_aarch64::NE;
   bool flags_zero_fresh_is64_ = false;
+  const hir::Instr* fused_skip_instr_ = nullptr;
   int flags_zero_armed_reg_ = -1;
   bool flags_zero_armed_is64_ = false;
   const hir::Value* w16_holds_fresh_ = nullptr;

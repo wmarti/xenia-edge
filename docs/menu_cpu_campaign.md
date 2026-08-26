@@ -78,7 +78,7 @@ predate two instrument fixes and their denominators are wrong.
 | T4 | Redundant guest address computation (`guest_828BF420`, `guest_82A46D70`) | **rejected** -- under the noise floor once repriced | 13.90% of executed memory operands, but **~0.38% CPU after discount** vs a 0.28% floor; 94% of it in two functions |
 | T5 | Those two functions are a **guest spin-wait**: `828BF420` loops calling `82A46D70` until two counters differ by <2. 18.2% of on-core time at the docks | **open, top target** -- counters identified as guest-written (submitted/completed); the spinner never yields the host thread | 15.7-18.2% of on-core at the docks (three published values, only the low end reproducible from disk -- see the 2026-08-26 corrections); ~26 guest threads oversubscribing ~12 host cores |
 | B1 | `PACK_D3DCOLOR` returned 0xFFFFFFFF always | fixed, guard proven to fail on the bug | correctness |
-| T6 | rlwinm hot path: `lsl`+`ands #0xFFFFFFFF` -> W-form `lsl` (a W write zeroes the upper half; the `ands` flags are dead at these sites) | **reopened** by the 2026-08-26 adversarial review -- an earlier same-day rejection double-applied the 2x discount | priced **0.46-0.55% CPU**, 1.6-2.0x the floor; prove via corpus-replay exact delta + frame-capped CPU A/B |
+| T6 | rlwinm hot path: `lsl`+`ands #0xFFFFFFFF` -> W-form `lsl` (a W write zeroes the upper half; the `ands` flags are dead at these sites) | **reopened** by the 2026-08-26 adversarial review -- an earlier same-day rejection double-applied the 2x discount | priced **0.46-0.55% CPU**, 1.6-2.0x the floor; **implemented + statically verified** (169,048/169,048 semantics; replay -13,921 laid-down stable instrs; disasm-verified 2->1 rewrite); frame-capped CPU A/B pending |
 
 ### Next up, in order
 
@@ -1437,3 +1437,36 @@ throughput cost and no effect anywhere else tested. Still default-off. The
 remaining step before proposing default-on is a Reach check (its menu has the
 kernel-side zero-delay spin; the interaction should be measured, not
 presumed).
+
+## T6 implemented: shl+and-0xFFFFFFFF fuses to one W-form lsl
+
+The backend now recognizes `SHL_I64(v, const n, 0<n<32)` whose single use is
+an immediately following `AND_I64(..., 0xFFFFFFFF)` and emits one W-form
+`lsl wD, wS, #n` instead of the two X-form instructions: an AArch64 W-register
+write zeroes the upper 32 bits, and a left shift cannot move bits downward, so
+the mask is implied. The AND is skipped through a one-shot fusion handoff on
+the emitter (`MarkFusedSkip`/`ConsumeFusedSkip`); the plain `lsl` sets no
+flags where the old path's `ands` did, which is safe here because the backend
+never carries NZCV between HIR instructions -- every comparison re-tests its
+operand.
+
+Evidence, in gate order:
+
+- **Semantics: 169,048/169,048 pass, 0 fail** (36 s, prebuilt corpus via
+  `--test_bin_path`). Note the local baseline is now cleaner than the
+  documented edge profile (4 mcrf fails + 1 SIGBUS): the CR-observability
+  commits fixed those, so the expected profile for future gates is 0/0.
+- **Corpus replay exact delta** (docks corpus, 13,564 functions): stable
+  emitted instructions **9,018,217 -> 9,004,296 = -13,921 laid-down
+  (-0.154%)**, host bytes -55,732. Laid-down, not executed -- the executed
+  share is what the 0.46-0.55% pricing estimated and what the A/B must show.
+- **Replay disasm spot-check** (`82160700`, the largest shrinker, -960 B):
+  address-normalized diff against the unfused build decomposes into **242
+  exact `lsl xA,xB,#n; ands xA,xA,#0xffffffff` -> `lsl wA,wB,#n` rewrites**
+  (shift amount, source, and destination all preserved), 281 host-address
+  mov/movk chains that differ only by link address, and the summary table.
+  Zero unexplained codegen hunks.
+
+Evidence it lacks: a runtime CPU measurement. Next: frame-capped CPU A/B
+(Halo 3 menu, CPU is the metric) of this commit's app against `c4190ee4e`,
+with docks throughput as veto only per the standing rule for sub-1% codegen.
