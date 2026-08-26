@@ -323,6 +323,10 @@ class Processor {
   // later offline codegen replay.
   std::unique_ptr<JitCorpusWriter> jit_corpus_writer_;
 
+  // Opt-in capture ordering lock. Recursive because defining a guest function
+  // may synchronously demand another function on the same host thread.
+  std::recursive_mutex guest_function_definition_mutex_;
+
   std::unique_ptr<ppc::PPCFrontend> frontend_;
   std::unique_ptr<backend::Backend> backend_;
   ExportResolver* export_resolver_ = nullptr;

@@ -84,6 +84,12 @@ DEFINE_int32(
     "CPU");
 DEFINE_bool(break_on_start, false, "Break into the debugger on startup.",
             "CPU");
+DEFINE_bool(
+    serialize_guest_function_definitions, false,
+    "Serialize guest function definition and publication for deterministic "
+    "JIT capture. Set before guest translation starts and do not change while "
+    "definitions are in flight.",
+    "CPU");
 
 namespace xe {
 namespace kernel {
@@ -665,6 +671,17 @@ Function* Processor::LookupFunction(Module* module, uint32_t address) {
 }
 
 bool Processor::DemandFunction(Function* function) {
+  // Acquire before claiming kDefining so another translation can't make a
+  // callee's machine_code visible partway through this translation. A
+  // recursive mutex permits a definition triggered synchronously by the
+  // current definition; the control must not be toggled while definitions are
+  // in flight.
+  std::unique_lock<std::recursive_mutex> definition_lock;
+  if (cvars::serialize_guest_function_definitions) {
+    definition_lock = std::unique_lock<std::recursive_mutex>(
+        guest_function_definition_mutex_);
+  }
+
   // Lock function for generation. If it's already being generated
   // by another thread this will block and return DECLARED.
   auto module = function->module();

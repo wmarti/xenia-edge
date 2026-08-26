@@ -20,6 +20,11 @@
 DEFINE_bool(inline_mmio_access, true, "Inline constant MMIO loads and stores.",
             "CPU");
 
+DEFINE_bool(fold_readonly_guest_memory_loads, true,
+            "Fold constant-address loads from readonly guest memory during "
+            "JIT compilation.",
+            "CPU");
+
 DEFINE_bool(permit_float_constant_evaluation, false,
             "Allow float constant evaluation, may produce incorrect results "
             "and break games math",
@@ -272,7 +277,7 @@ bool ConstantPropagationPass::Run(HIRBuilder* builder, bool& result) {
               i->src1.offset = reinterpret_cast<uint64_t>(mmio_range);
               i->src2.offset = address;
               result = true;
-            } else {
+            } else if (cvars::fold_readonly_guest_memory_loads) {
               auto heap = memory->LookupHeap(address);
               uint32_t protect;
               if (heap && heap->QueryProtect(address, &protect) &&

@@ -26,6 +26,11 @@ DECLARE_uint32(cpu_trace_mask);
 
 DECLARE_bool(validate_hir);
 
+// Deterministic capture / replay compilation controls. Their defaults preserve
+// the normal live-title JIT behavior.
+DECLARE_bool(serialize_guest_function_definitions);
+DECLARE_bool(fold_readonly_guest_memory_loads);
+
 DECLARE_uint64(pvr);
 
 // Breakpoints:
