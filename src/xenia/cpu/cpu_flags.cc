@@ -27,6 +27,11 @@ DEFINE_bool(accurate_vmx_denormal_flush, false,
 DEFINE_bool(disassemble_functions, false,
             "Disassemble functions during generation.", "CPU");
 
+DEFINE_bool(no_round_to_single, false,
+            "Not for users, breaks games. Skip rounding double values to "
+            "single precision and back",
+            "CPU");
+
 DEFINE_bool(count_physical_remap_hits, false,
             "Count taken 0xE0000000+ physical-remap fixups in JIT-compiled "
             "guest memory accesses, into a process-global read by the GPU "

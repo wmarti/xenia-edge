@@ -1763,3 +1763,14 @@ Priced ceiling if (c) recovered ~4 of 13-16 I/exec across both call
 forms: ~3-4% of executed host instructions, ~0.6-0.8% CPU by the standing
 conversion. Next step is (a) -- measurement before mechanism, per the
 campaign's standing lesson that sampled shares over-predict 2x.
+
+**T7 adversarial review (codex/gpt-5.6-sol, 483 KB transcript): one real
+defect, fixed.** Claim 1 (the math): DEFECT -- `--no_round_to_single`
+(an x64 debug cvar, "not for users, breaks games") turns TO_SINGLE into an
+identity, so a finite double denormal passes through unrounded and the fold
+would wrongly report 0. Fixed by gating the TO_SINGLE acceptance on
+`!cvars::no_round_to_single` (the cvar moved to shared cpu_flags so the
+backend-agnostic pass can see it; a64 always rounds and never hits it).
+Claims 2 (dataflow/pass-ordering) and 3 (other FPR producers): no defect
+found. The lfs flag, the SELECT recursion, and the constant rule survived
+attack unchanged.

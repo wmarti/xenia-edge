@@ -46,10 +46,7 @@ DEFINE_bool(use_fast_dot_product, false,
             "all infinite results to QNaN.",
             "CPU");
 
-DEFINE_bool(no_round_to_single, false,
-            "Not for users, breaks games. Skip rounding double values to "
-            "single precision and back",
-            "CPU");
+DECLARE_bool(no_round_to_single);
 DEFINE_bool(inline_loadclock, false,
             "Directly read cached guest clock without calling the LoadClock "
             "method (it gets repeatedly updated by calls from other threads)",
