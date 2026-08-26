@@ -1,5 +1,8 @@
 add_library(xenia-base STATIC)
 xe_platform_sources(xenia-base ${CMAKE_CURRENT_SOURCE_DIR})
+target_sources(xenia-base PRIVATE
+  "${PROJECT_SOURCE_DIR}/third_party/crypto/sha256.cpp"
+)
 # Exclude console_app_main and main_init files
 file(GLOB _base_exclude
   "${CMAKE_CURRENT_SOURCE_DIR}/console_app_main_*.cc"

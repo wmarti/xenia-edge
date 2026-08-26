@@ -21,7 +21,6 @@
 #include "third_party/crypto/des/des.h"
 #include "third_party/crypto/des/des3.h"
 #include "third_party/crypto/des/descbc.h"
-#include "third_party/crypto/sha256.cpp"
 #include "third_party/crypto/sha256.h"
 #include "xenia/kernel/xboxkrnl/xecrypt_rsa.h"
 
