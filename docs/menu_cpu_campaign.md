@@ -1372,3 +1372,37 @@ hard gate: **any site other than `828BF474` sleeping during the docks run
 fails the change**. Its target ranking: T6 first (best CPU-per-risk), the
 texture-invalidation policy second (largest throughput mechanism), and
 dynamic repricing of the remap check third.
+
+## T5 lever, second A/B: -14.91% CPU, no throughput cost, one impostor caught
+
+Same protocol, binary `87c437165` with the site-keyed escalation. Three
+complete pairs this time:
+
+| pair | off CPU | on CPU | dCPU | off swaps | on swaps | dswaps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 416.63 | 360.19 | -13.55% | 45.12 | 42.75 | -5.26% |
+| 2 | 430.32 | 363.25 | -15.59% | 32.63 | 37.84 | +15.97% |
+| 3 | 432.91 | 365.35 | -15.61% | 36.56 | 36.44 | -0.32% |
+
+- **CPU -14.91% mean, all pairs agree**; the lever-on legs sit within 2.6
+  points of each other while the off legs swing 16.
+- **Throughput: mixed signs, means 38.10 -> 39.01.** No consistent cost; the
+  first run's -15.9% pair does not reproduce under the site-keyed fix. Not a
+  throughput win claim either -- within-config variance this session was far
+  above the documented 7%.
+- **Site gate: one impostor.** The per-episode log names exactly two loops
+  across all three lever-on legs: `828BF474` (1,577 / 6,430 / 6,373
+  episodes -- the target) and `82A05838` (9 / 9 / 8 -- deterministic). The
+  latter decodes to a byte-wise parse loop advancing a cursor; it was doing
+  real work and got slept for it. `2e5513a9f` rejects loops containing an
+  induction variable (a guest register self-update through its context
+  slot), which the replay shows removes the scanner's injections while
+  keeping the target's, and shrinks the corpus-wide injection footprint by
+  roughly a third.
+
+**Standing: the lever remains default-off.** Adoption needs (1) a
+confirmation A/B with the induction filter showing a clean site log, and
+(2) a Halo-state CPU check, since both Halo titles idle differently and the
+lever is generic. The CPU reclaim at the docks is the largest this campaign
+has measured at this state; the throughput question that killed the first
+run is answered as "no consistent effect".
