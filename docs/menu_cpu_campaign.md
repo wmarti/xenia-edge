@@ -1777,6 +1777,15 @@ Claims 2 (dataflow/pass-ordering) and 3 (other FPR producers): no defect
 found. The lfs flag, the SELECT recursion, and the constant rule survived
 attack unchanged.
 
+**T7 recognizer widened with NEG/ABS pass-through (null on the docks
+corpus).** fneg/fabs/fnabs are sign-bit-only by PPC semantics and
+denormality lives entirely in exponent+mantissa, so the proof passes
+through OPCODE_NEG/OPCODE_ABS in both directions. 169,048/169,048; corpus
+replay 10,470,877 laid-down vs 10,470,871 after the original fold -- a +6
+wobble at the 0.00006% level, i.e. zero fneg-fed quirk sites at the docks.
+Kept: compile-time-only recursion, no runtime cost where it does not fire,
+and the docks corpus is not evidence about other titles' FPU idiom.
+
 ## T8 measured: the indirection walk is 94.66% of executed symbol-call dispatches
 
 Instrumented per the plan's option (a): `--count_call_paths` (default off)
