@@ -238,6 +238,18 @@ DEFINE_bool(
     "reading back specific pixel values (e.g., for gamma detection).",
     "GPU");
 
+DEFINE_bool(
+    precise_resolve_invalidation, false,
+    "Invalidate cached textures against the per-tile-row-band spans a resolve "
+    "actually writes instead of its whole bounding interval. The bounding "
+    "interval of a tiled destination also covers bytes between the bands when "
+    "the resolve rect is narrower than the aligned surface pitch, so textures "
+    "in those bytes are invalidated and re-uploaded without their data ever "
+    "changing. Spans are computed with the same tiled-address bounds as the "
+    "interval itself; 3D/array destinations and resolution-scaled resolves "
+    "keep the whole-interval path.",
+    "GPU");
+
 DEFINE_bool(readback_resolve_sync, false,
             "Stall the GPU after each readback_resolve copy so guest RAM is "
             "coherent in the same frame, instead of copying asynchronously.\n"

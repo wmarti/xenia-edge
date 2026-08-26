@@ -1207,6 +1207,7 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
   info_out.copy_dest_coordinate_info.height_aligned_div_32 =
       copy_dest_height_aligned >> 5;
   const FormatInfo& dest_format_info = *FormatInfo::Get(dest_format);
+  info_out.copy_dest_extent_span_count = 0;
   if (is_depth || dest_format_info.type == FormatType::kResolvable) {
     uint32_t bpp_log2 = xe::log2_floor(dest_format_info.bits_per_pixel >> 3);
     uint32_t dest_base_relative_x_mask =
@@ -1253,6 +1254,59 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
           rb_copy_dest_base +
           texture_util::GetTiledAddressUpperBound2D(
               uint32_t(x1), uint32_t(y1), copy_dest_pitch_aligned, bpp_log2);
+      // Per-band decomposition of the extent. Tiled addressing is
+      // independent only within square "portions" -- 32x32 blocks at 4+ bytes
+      // per block, 64x64 at 2, 128x128 at 1 (see
+      // GetTiledAddressUpperBound2D) -- and portion base addresses grow
+      // monotonically portion-row-major. Bands are therefore one portion
+      // tall, and columns are rounded out to portion boundaries, so each
+      // band span bounds every byte its portion rows can address while
+      // excluding whole portion rows the rect never reaches.
+      {
+        const uint32_t portion_log2 =
+            bpp_log2 >= 2 ? 5 : (bpp_log2 == 1 ? 6 : 7);
+        const uint32_t portion = UINT32_C(1) << portion_log2;
+        const uint32_t x_lo = uint32_t(x0) & ~(portion - 1);
+        const uint32_t x_hi = xe::align(uint32_t(x1), portion);
+        const uint32_t band_top_first = uint32_t(y0) & ~(portion - 1);
+        const uint32_t band_count =
+            (uint32_t(y1) - band_top_first + portion - 1) >> portion_log2;
+        if (band_count && band_count <= ResolveInfo::kMaxDestExtentSpans) {
+          uint32_t count = 0;
+          for (uint32_t band = 0; band < band_count; ++band) {
+            const uint32_t top = band_top_first + band * portion;
+            const uint32_t bottom =
+                std::min(xe::align(uint32_t(y1), portion), top + portion);
+            uint32_t span_start =
+                rb_copy_dest_base +
+                texture_util::GetTiledAddressLowerBound2D(
+                    x_lo, top, copy_dest_pitch_aligned, bpp_log2);
+            uint32_t span_end =
+                rb_copy_dest_base +
+                texture_util::GetTiledAddressUpperBound2D(
+                    x_hi, bottom, copy_dest_pitch_aligned, bpp_log2);
+            // The portion-rounded corners can address past the whole-rect
+            // interval's fixed slack for 1- and 2-byte blocks. Clamp: the
+            // written bytes are inside the interval by the interval's own
+            // invariant, so clamping cannot uncover any of them.
+            span_start = std::max(span_start, copy_dest_extent_start);
+            span_end = std::min(span_end, copy_dest_extent_end);
+            if (span_start >= span_end) {
+              continue;
+            }
+            if (count &&
+                span_start <=
+                    info_out.copy_dest_extent_spans[count - 1].second) {
+              info_out.copy_dest_extent_spans[count - 1].second = std::max(
+                  info_out.copy_dest_extent_spans[count - 1].second, span_end);
+            } else {
+              info_out.copy_dest_extent_spans[count] = {span_start, span_end};
+              ++count;
+            }
+          }
+          info_out.copy_dest_extent_span_count = count;
+        }
+      }
     }
   } else {
     XELOGE("Tried to resolve to format {}, which is not a ColorFormat",

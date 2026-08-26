@@ -1557,3 +1557,34 @@ measured after the flip decision per the user's instruction ("you should
 have way more than enough data"); untested titles rely on the runtime
 trigger's narrowness (100k consecutive sub-microsecond iterations,
 site-keyed validation) rather than per-title measurement.
+
+## T3 slice 1: precise resolve invalidation, implemented and proven offline
+
+`--precise_resolve_invalidation` (default **off**): instead of invalidating
+every texture overlapping a resolve's whole bounding interval, the Metal
+resolve path invalidates the per-band spans the resolve can actually write.
+`GetResolveInfo` decomposes the 2D destination extent into portion-height
+bands (32 blocks at 4+ bytes per block, 64 at 2, 128 at 1 -- tiled
+addressing is only independent within those square portions, per
+`GetTiledAddressUpperBound2D`), columns rounded out to portion boundaries,
+each span clamped to the whole-rect interval. 3D/array destinations,
+resolution-scaled resolves, and >48-band rects keep the old single-interval
+path, as do D3D12/Vulkan entirely.
+
+Evidence it HAS: a 50-case invariant test against the real tiled-address
+functions (`bench-work/t3-span-invariant-test.cc`, linked against
+libxenia-gpu) proving, for bytes-per-block 1..16 and ten rect shapes
+including the degenerate ones: (1) every byte of every texel in the rect
+lies inside a span -- nothing a resolve writes can escape invalidation; and
+(2) the span union is contained in the old interval -- the lever can only
+shrink the invalidated set, never grow it. Partial-pitch rects shrink to
+2.6-52% of the interval; full-pitch rects produce exactly one span equal to
+the old interval. The test also caught two real design errors on the way:
+a 32-row band decomposition is unsound for 1-2 byte blocks (portion
+interleaving), and unclamped portion-rounded spans overshoot the interval.
+
+Evidence it LACKS: everything runtime. Before this cvar is ever enabled:
+(1) `fire_watches_gpu_*` counters at the docks, on vs off -- the doc's
+46.5%-GPU-origin churn share predicts a large drop; (2) the compressed
+window-id screenshot gate against the unmodified build -- this is exactly
+the twice-burned change class; (3) docks throughput. Next tick.

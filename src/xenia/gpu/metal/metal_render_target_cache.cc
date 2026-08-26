@@ -3600,10 +3600,25 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
     written_length = resolve_info.copy_dest_extent_length;
 
     // Marks the range GPU-written in shared memory too, which invalidates the
-    // textures overlapping it so they reload the resolved data.
+    // textures overlapping it so they reload the resolved data. With
+    // precise_resolve_invalidation, mark the per-band spans the resolve can
+    // actually write rather than the whole bounding interval, so textures
+    // living between the bands are neither invalidated nor marked as holding
+    // GPU-written data. Scaled resolves keep the interval path: their
+    // scaled-page bookkeeping in MarkRangeAsResolved is range-based.
     if (auto* tex_cache = command_processor_.texture_cache()) {
-      tex_cache->MarkRangeAsResolved(written_address, written_length,
-                                     draw_resolution_scaled);
+      uint32_t span_count = resolve_info.copy_dest_extent_span_count;
+      if (cvars::precise_resolve_invalidation && !draw_resolution_scaled &&
+          span_count > 0) {
+        for (uint32_t i = 0; i < span_count; ++i) {
+          const auto& span = resolve_info.copy_dest_extent_spans[i];
+          tex_cache->MarkRangeAsResolved(span.first, span.second - span.first,
+                                         false);
+        }
+      } else {
+        tex_cache->MarkRangeAsResolved(written_address, written_length,
+                                       draw_resolution_scaled);
+      }
     }
 
     bool clear_depth = resolve_info.IsClearingDepth();
