@@ -38,6 +38,13 @@ DEFINE_bool(count_physical_remap_hits, false,
             "counters dump. Measurement only: adds code to the taken path.",
             "CPU");
 
+DEFINE_bool(count_call_paths, false,
+            "Count executed guest-call dispatches by path (direct, "
+            "indirection-table walk, register-indirect walk) into "
+            "process-globals read by the GPU counters dump. Measurement "
+            "only: adds code to every call site.",
+            "CPU");
+
 DEFINE_bool(trace_function_coverage, false,
             "Count how many times each guest instruction executes and report "
             "the totals in the guestcoverage section of the profiler dump.",

@@ -97,6 +97,10 @@ DEFINE_int32(
 // extern "C" so no cross-module header is needed; guarded because the
 // symbol only exists in ARM64 links.
 extern "C" volatile uint64_t xe_a64_physical_remap_hits;
+// Written by the a64 backend under --count_call_paths.
+extern "C" volatile uint64_t xe_a64_call_direct_hits;
+extern "C" volatile uint64_t xe_a64_call_walk_hits;
+extern "C" volatile uint64_t xe_a64_call_indirect_hits;
 #endif  // XE_ARCH_ARM64
 
 namespace xe {
@@ -1950,6 +1954,12 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 #if XE_ARCH_ARM64
         fprintf(cf, "physical_remap_hits %llu\n",
                 static_cast<unsigned long long>(xe_a64_physical_remap_hits));
+        fprintf(cf, "call_direct_hits %llu\n",
+                static_cast<unsigned long long>(xe_a64_call_direct_hits));
+        fprintf(cf, "call_walk_hits %llu\n",
+                static_cast<unsigned long long>(xe_a64_call_walk_hits));
+        fprintf(cf, "call_indirect_hits %llu\n",
+                static_cast<unsigned long long>(xe_a64_call_indirect_hits));
 #endif  // XE_ARCH_ARM64
         fprintf(cf, "command_buffers_total %llu\n",
                 static_cast<unsigned long long>(total));
