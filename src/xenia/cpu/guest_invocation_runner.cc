@@ -416,6 +416,10 @@ GuestInvocationRunner::GuestInvocationRunner(
 
 GuestInvocationRunner::~GuestInvocationRunner() = default;
 
+const backend::Backend& GuestInvocationRunner::backend() const {
+  return *processor_->backend();
+}
+
 bool GuestInvocationRunner::Initialize(
     std::unique_ptr<backend::Backend> backend, std::string* error) {
   memory_ = std::make_unique<Memory>();

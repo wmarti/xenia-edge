@@ -19,6 +19,11 @@
 #include "xenia/base/string_buffer.h"
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/execution_jit_corpus.h"
+#include "xenia/cpu/guest_invocation_artifact.h"
+#include "xenia/cpu/guest_invocation_replay_cli.h"
+#include "xenia/cpu/guest_invocation_replay_config.h"
+#include "xenia/cpu/guest_invocation_runner.h"
 #include "xenia/cpu/jit_corpus.h"
 
 DECLARE_bool(guest_scheduler);
@@ -30,6 +35,7 @@ DECLARE_bool(guest_scheduler);
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <string_view>
 #include <unordered_set>
 
 #if XE_PLATFORM_MAC
@@ -67,6 +73,15 @@ DEFINE_bool(test_benchmark_warmed, false,
             "in-process. macOS only.",
             "CPU");
 DEFINE_transient_string(test_name, "", "Test suite name.", "General");
+
+DEFINE_path(guest_invocation_in, "",
+            "Execute one strictly verified guest invocation artifact against "
+            "the exact code corpus supplied by --jit_corpus_in.",
+            "CPU");
+DEFINE_uint64(guest_invocation_iterations, 0,
+              "Fixed number of reset-plus-call iterations for "
+              "--guest_invocation_in (1 through 10000000).",
+              "CPU");
 
 DEFINE_path(jit_corpus_in, "",
             "Recompile a guest code corpus captured by --jit_corpus_out and "
@@ -946,6 +961,139 @@ bool RunTests(const std::vector<std::string>& test_names) {
   return failed_count ? false : true;
 }
 
+namespace invocation {
+
+bool Reject(std::string_view stage, const std::string& reason) {
+  fprintf(stderr, "Guest invocation replay rejected during %.*s: %s\n",
+          static_cast<int>(stage.size()), stage.data(), reason.c_str());
+  fflush(stderr);
+  return false;
+}
+
+std::unique_ptr<backend::Backend> CreateHostBackend() {
+#if XE_ARCH_AMD64
+  if (cvars::cpu == "x64" || cvars::cpu == "any") {
+    return std::make_unique<backend::x64::X64Backend>();
+  }
+#elif XE_ARCH_ARM64
+  if (cvars::cpu == "a64" || cvars::cpu == "any") {
+    return std::make_unique<backend::a64::A64Backend>();
+  }
+#endif  // XE_ARCH
+  return nullptr;
+}
+
+bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
+  if (cvars::jit_corpus_in.empty()) {
+    return Reject("input validation",
+                  "--guest_invocation_in requires --jit_corpus_in");
+  }
+  if (!cvars::guest_invocation_iterations ||
+      cvars::guest_invocation_iterations >
+          GuestInvocationRunner::kMaxTimedInvocationCount) {
+    return Reject(
+        "input validation",
+        "--guest_invocation_iterations must be between 1 and 10000000");
+  }
+
+  GuestInvocationReplayFile artifact_file;
+  std::string error;
+  if (!ReadGuestInvocationReplayFile(
+          cvars::guest_invocation_in,
+          ppc::GuestInvocationArtifactCodec::kMaxArtifactSize, &artifact_file,
+          &error)) {
+    return Reject("artifact read", error);
+  }
+  ppc::GuestInvocationArtifact artifact;
+  if (!ppc::GuestInvocationArtifactCodec::Decode(artifact_file.bytes, &artifact,
+                                                 &error)) {
+    return Reject("artifact decode", error);
+  }
+  std::vector<uint8_t>().swap(artifact_file.bytes);
+  if (artifact.invocations.size() != 1) {
+    return Reject("artifact validation",
+                  "v1 benchmarking requires exactly one invocation");
+  }
+
+  GuestInvocationReplayFile corpus_file;
+  if (!ReadGuestInvocationReplayFile(cvars::jit_corpus_in,
+                                     ExecutionJitCorpus::kMaxCorpusSize,
+                                     &corpus_file, &error)) {
+    return Reject("corpus read", error);
+  }
+  ExecutionJitCorpus corpus;
+  if (!ExecutionJitCorpus::Decode(corpus_file.bytes, &corpus, &error)) {
+    return Reject("corpus decode", error);
+  }
+  std::vector<uint8_t>().swap(corpus_file.bytes);
+  if (corpus_file.sha256 != artifact.code_corpus_sha256) {
+    return Reject("corpus provenance",
+                  "corpus SHA-256 does not match the invocation artifact");
+  }
+
+  GuestInvocationReplaySha256 candidate_build_sha256 = {};
+  if (executable_path.empty() ||
+      !HashGuestInvocationReplayFile(executable_path, &candidate_build_sha256,
+                                     &error)) {
+    return Reject("candidate provenance",
+                  executable_path.empty()
+                      ? "candidate executable path is unavailable"
+                      : error);
+  }
+
+  std::unique_ptr<backend::Backend> backend = CreateHostBackend();
+  if (!backend) {
+    return Reject("backend selection",
+                  "no backend exists for this host and --cpu selection");
+  }
+  std::unique_ptr<GuestInvocationRunner> runner = GuestInvocationRunner::Create(
+      artifact.invocations.front(), corpus, std::move(backend), &error);
+  if (!runner) {
+    return Reject("runner initialization", error);
+  }
+
+  GuestInvocationReplayConfig replay_config;
+  if (!CaptureCurrentGuestInvocationReplayConfig(runner->backend(),
+                                                 &replay_config, &error)) {
+    return Reject("configuration capture", error);
+  }
+  if (!ValidateGuestInvocationReplayBenchmarkConfig(replay_config, &error)) {
+    return Reject("benchmark configuration", error);
+  }
+  GuestInvocationReplaySha256 replay_config_sha256 = {};
+  if (!HashGuestInvocationReplayConfig(replay_config, &replay_config_sha256,
+                                       &error)) {
+    return Reject("configuration hash", error);
+  }
+  if (replay_config_sha256 != artifact.replay_config_sha256) {
+    return Reject(
+        "configuration provenance",
+        "runtime replay configuration SHA-256 does not match the artifact");
+  }
+
+  if (!runner->WarmAndVerify(&error)) {
+    return Reject("warm verification", error);
+  }
+  GuestInvocationReplayMetrics metrics;
+  if (!runner->RunTimed(cvars::guest_invocation_iterations, &metrics, &error)) {
+    return Reject("timed or final verification", error);
+  }
+
+  GuestInvocationReplayBenchmarkProvenance provenance;
+  provenance.artifact_sha256 = artifact_file.sha256;
+  provenance.corpus_sha256 = corpus_file.sha256;
+  provenance.capture_build_sha256 = artifact.capture_build_sha256;
+  provenance.candidate_build_sha256 = candidate_build_sha256;
+  provenance.config_sha256 = replay_config_sha256;
+  const std::string marker =
+      FormatGuestInvocationReplayBenchmarkMarker(provenance, metrics);
+  fprintf(stdout, "%s\n", marker.c_str());
+  fflush(stdout);
+  return true;
+}
+
+}  // namespace invocation
+
 // Offline codegen replay: recompile the guest code a live run actually JIT'd
 // and report what the backend emitted for it.
 //
@@ -1554,6 +1702,12 @@ bool RunCorpusReplay() {
 }  // namespace corpus
 
 int main(const std::vector<std::string>& args) {
+  if (!cvars::guest_invocation_in.empty()) {
+    const std::filesystem::path executable_path =
+        args.empty() ? std::filesystem::path() : std::filesystem::path(args[0]);
+    return invocation::RunGuestInvocationReplay(executable_path) ? 0 : 1;
+  }
+
   std::vector<std::string> test_names;
   // Collect test names from all positional arguments.
   // argv[0] is the program name, skip it. Also skip --flag arguments

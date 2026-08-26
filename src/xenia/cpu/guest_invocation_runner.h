@@ -105,6 +105,7 @@ class GuestInvocationRunner {
                 std::string* error = nullptr);
 
   const GuestInvocationReplayPlan& plan() const { return plan_; }
+  const backend::Backend& backend() const;
 
  private:
   GuestInvocationRunner(const ppc::GuestFunctionInvocation& invocation,
