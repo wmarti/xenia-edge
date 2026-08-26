@@ -80,24 +80,38 @@ predate two instrument fixes and their denominators are wrong.
 | B1 | `PACK_D3DCOLOR` returned 0xFFFFFFFF always | fixed, guard proven to fail on the bug | correctness |
 | T6 | rlwinm hot path: `lsl`+`ands #0xFFFFFFFF` -> W-form `lsl` (a W write zeroes the upper half; the `ands` flags are dead at these sites) | **reopened** by the 2026-08-26 adversarial review -- an earlier same-day rejection double-applied the 2x discount | priced **0.46-0.55% CPU**, 1.6-2.0x the floor; **implemented + statically verified** (169,048/169,048 semantics; replay -13,921 laid-down stable instrs; disasm-verified 2->1 rewrite); runtime A/B null at Halo 3 menu (no regression); **closed, adopted** |
 | T7 | Denormal-quirk recomputation over provably-single doubles (lfs/stfs round trips) | **closed, adopted** -- fold + `VALUE_NEVER_F64_DENORMAL`; one adversarial-review defect (`--no_round_to_single`) found and fixed | **-3.34% laid-down, 2.47% of executed host instrs saved; 169,048/169,048; runtime guard clean (-0.25% Halo 3 menu pair)** |
-| T8 | Guest call machinery (~14.4% of executed host instrs sampled) | **measured** -- executed-path counters landed; walk dominates; design decision pending adversarial review of backpatch safety | **94.66% of executed symbol calls take the indirection walk (147.28M/s at the docks); direct path 5.16%; true register-indirect dispatch 3.31%. Refined prize ~1.9% executed instrs (~0.4-0.5% CPU), all of it in (c) backpatching** |
+| T8 | Guest call machinery (14.4% in the static emitted-byte model -- NOT executed host instrs, see review) | **reviewed, deprioritized behind T9** -- multiword live rewrite ruled unsafe (Arm DDI 0487 B2.2.5); single-BL gate redesign viable, >=7 instrs saved per patched dispatch, but higher-risk than T9 | **94.66% of executed symbol calls walk the table (nominal 147.28M/s, 144.51M/s timestamp-derived; racy lower bound); direct 5.16%; register-indirect 3.31%; corroborated by compile-order estimate 94.07%** |
+| T9 | SetReturnAddress + StoreLR same-constant rematerialization | **next up** (from the T8 review's ranking) | modeled ceiling **1.0395%** (static model); runtime unproven |
 
-### Next up, in order
+### Next up, in order (re-ranked 2026-08-26 per the T8 adversarial review)
 
-1. **T5 -- make the guest spinner yield.** `828BF420` spins on a
-   submitted/completed counter pair with no preemption injected
-   (`--guest_scheduler=false` is permanent, below), so a spinning guest thread
-   holds a host core against ~26 guest threads on ~12 cores and can starve the
-   very consumer it waits for. A narrow back-edge yield is a much smaller change
-   than the preempt-check pass and does not need the scheduler. Gate: CPU at the
-   docks AND throughput, three pairs, plus a screenshot -- it changes timing the
-   guest can observe.
-2. **T3 remnant, only with a frame-comparison gate and more than one tick.**
-   Evicting textures whose backing memory the guest has repurposed, and testing
-   resolve extents at texture granularity rather than range overlap. Both are
-   cache-policy changes of the exact kind this campaign has twice got wrong in
-   ways only a screenshot caught.
-3. **Nothing on T4.** Repriced below the noise floor; do not re-open.
+1. **T9 -- fuse SetReturnAddress with the adjacent same-constant StoreLR.**
+   The PPC frontend emits them as separate adjacent HIR ops
+   (`ppc_emit_control.cc:36`) and the backend materializes the same constant
+   twice (`a64_emitter.cc:1227`, `a64_sequences.cc:343`). Modeled ceiling
+   1.0395% (static emitted-byte model -- see the T8 correction below for what
+   that does and does not mean). The one-shot fusion machinery
+   (`a64_emitter.h:156`, the T6 pattern) already fits. Lower risk than any
+   code-patching work; do this first. Runtime benefit unproven until A/B'd.
+2. **Measurement repair before any CPU claim on call work**: per-thread or
+   thread-local counters (the racy globals are a lower bound), return-taken
+   counts for the possible-return check, disassembly of the actual counter
+   bump (the mov may expand to MOVZ/MOVK pairs), a real retired-instruction
+   denominator, and paired uninstrumented A/A then A/B. A normal present rate
+   alone does not prove the path mix was undistorted.
+3. **T8 option (c), redesigned around the single-BL gate** (see the review
+   section): fixed in-range `Call` sites only, patchpoint metadata in
+   `EmitFunctionInfo`, an aligned atomic `PatchInstruction32` (the existing
+   `PatchCode` memcpy is not guaranteed atomic), and a pending-site registry
+   with a mutex + acquire re-read of `machine_code()` drained after
+   `A64Function::Setup`. Option (b)'s placement-time fixup folds in here as
+   the pre-publication half; it is not worth standalone work (5.16% of
+   dispatches). CallIndirect is excluded -- a PIC is a separate project.
+4. **Secondary: prove ordinary LR returns** to drop the dynamic
+   possible-return check (modeled ceiling ~0.971%), but the longjmp warning
+   at `ppc_emit_control.cc:116` makes it less mechanically safe than T9.
+5. **Nothing on T4.** Repriced below the noise floor; do not re-open.
+   **T3 remnant** stays parked behind a frame-comparison gate.
 
 ### Standing configuration decisions
 
@@ -1838,3 +1852,60 @@ which is now the sole load-bearing question. Next step: adversarial review
 Arm ARM before any design work; if only a single-instruction patch is
 blessed, the site layout must be designed around that constraint from the
 start.
+
+## T8 adversarial review (codex): the record corrected, the walk confirmed, the rewrite redesigned
+
+Full report: `bench-work/t8-codex-scope.md`. Verdicts and what they change:
+
+**DEFECT -- "14.4% of executed host instructions" was the wrong noun.** The
+arithmetic reproduces (call-symbol 7.9359% + call_indirect 6.4981% =
+14.4340% of `coverage2.csv`'s totals), but the model charges every emitted
+inline byte whenever its guest PC executes (`a64_sequences.cc:5551` sampled
+delta x `processor.cc:387` executions) -- including instructions an internal
+branch skips. It is a static emitted-byte model, not retired instructions.
+Every corpus-ranking percentage in this document is that model; the standing
+~2x over-prediction discount exists precisely because of this. Correction of
+record for the T8 scoping section's headline and f0d2c35d5's commit message.
+
+**DEFECT confirmed -- the call_indirect 6.50% pool was the return check.**
+Most `blr` executions take the epilog branch (`a64_emitter.cc:1048`) before
+the walk; a three-instruction return-check floor would price ~1.46%, and the
+shared epilog itself sits outside sequence accounting entirely.
+
+**NO DEFECT (directional) -- the 94.66% walk share.** Independently
+corroborated by a compile-order estimate over the corpus (94.07% of ordinary
+symbol calls record caller before callee). Precision caveats of record: the
+counters are racy lower bounds; the harness window was actually 40.768s
+(timestamp-derived walk rate 144.51M/s, not 147.28M/s); the counter bump's
+mov can expand to MOVZ/MOVK pairs so overhead was a lower bound too; and a
+normal present rate does not prove the mix undistorted without a paired
+uninstrumented leg.
+
+**DEFECT -- rewriting the multiword walk in place is architecturally
+unsafe.** Arm DDI 0487 M.c B2.2.5 permits concurrent modification+execution
+only for B/BL/NOP-class single instructions; MOV/LDR/ADD/BR/BLR are not in
+the set, and a multiword rewrite would need every executor stopped or a full
+DC CVAU/DSB/IC IVAU/DSB + per-PE ISB rendezvous (a writer-side ISB does not
+broadcast). `pthread_jit_write_protect_np` is per-thread W^X, not a
+rendezvous (Apple JIT guide, via sosumi).
+
+**The safe (c) design, if T8 is ever picked back up:** emit every
+not-yet-direct call site as `ldr x0, [sp, RET_ADDR]; gate: bl slow_block`,
+where the per-site slow block does the existing walk and ends `br x9` (LR
+already correct from the gate's bl). Publishing a compiled callee patches
+exactly one aligned 32-bit word, `bl slow_block -> bl callee_or_veneer`,
+both encodings in the blessed set, target written and cache-maintained
+before the patch. Out-of-range targets stay on the slow path; the slow block
+stays valid forever. That saves >=7 executed instructions per patched
+dispatch (not the 4 the scoping note assumed -- the safe layout replaces at
+least nine source instructions with ldr+bl). Cost side: patchpoint metadata,
+an atomic aligned `PatchInstruction32` (the existing `PatchCode`
+memcpy at `code_cache_base.h:136` is not guaranteed atomic), and a
+mutex+acquire-re-read pending-site registry drained after
+`A64Function::Setup` to close the missed-wakeup window.
+
+**Re-ranking:** T9 (SetReturnAddress/StoreLR fusion, modeled 1.0395%,
+existing fusion machinery) first; measurement repair second; the (c)
+prototype third and only for fixed in-range Call sites, with (b) folded in
+as its placement half. The possible-return proof (~0.971% modeled) stays
+secondary because of the longjmp path at `ppc_emit_control.cc:116`.
