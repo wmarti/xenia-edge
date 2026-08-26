@@ -72,11 +72,11 @@ predate two instrument fixes and their denominators are wrong.
 
 | # | Target | State | Measured |
 | --- | --- | --- | --- |
-| T1 | Reach NETWORK_RECEIVE zero-delay yield trap (~27% of Reach menu CPU) | lever landed, default off (`--zero_delay_spin_limit`) | **-54.58% Reach menu, 3/3 pairs. Null on Halo 3 and GTA IV** -- title-specific, so it stays off |
+| T1 | Reach NETWORK_RECEIVE zero-delay yield trap (~27% of Reach menu CPU) | **adopted, default `zero_delay_spin_limit=16`** (2026-08-26, by the T5 precedent: huge where it acts, provably null elsewhere) | **-54.58% Reach menu 3/3 pairs; re-confirmed -51.56% on the current build; -39.36% Reach campaign, no livelock. Null on Halo 3 and GTA IV** |
 | T2 | `TimerQueue` spin_wait -> blocking_wait on POSIX (10.3% Halo 3 / 4.3% Reach) | landed | **-2.74%** |
 | T3 | Halo 3 host GPU submit/encode (53% aggregate, no single hot spot) | **closed for cheap fixes** -- four hypotheses killed with measurement; what is left is texture-cache policy, not submission mechanics | ~100 MiB/frame of real invalidation, 46.5% GPU-origin / 53.5% guest-origin |
 | T4 | Redundant guest address computation (`guest_828BF420`, `guest_82A46D70`) | **rejected** -- under the noise floor once repriced | 13.90% of executed memory operands, but **~0.38% CPU after discount** vs a 0.28% floor; 94% of it in two functions |
-| T5 | Those two functions are a **guest spin-wait**: `828BF420` loops calling `82A46D70` until two counters differ by <2. 18.2% of on-core time at the docks | **open, top target** -- counters identified as guest-written (submitted/completed); the spinner never yields the host thread | 15.7-18.2% of on-core at the docks (three published values, only the low end reproducible from disk -- see the 2026-08-26 corrections); ~26 guest threads oversubscribing ~12 host cores |
+| T5 | Guest spin-wait at `828BF420`/`82A46D70` (docks) | **closed, adopted** -- `spin_wait_yield_after=100000` default-on after four-state ledger | **-14% docks CPU x3 runs, no throughput cost; inert (zero escalations) on Halo 3 menu, Reach menu, Reach campaign** |
 | B1 | `PACK_D3DCOLOR` returned 0xFFFFFFFF always | fixed, guard proven to fail on the bug | correctness |
 | T6 | rlwinm hot path: `lsl`+`ands #0xFFFFFFFF` -> W-form `lsl` (a W write zeroes the upper half; the `ands` flags are dead at these sites) | **reopened** by the 2026-08-26 adversarial review -- an earlier same-day rejection double-applied the 2x discount | priced **0.46-0.55% CPU**, 1.6-2.0x the floor; **implemented + statically verified** (169,048/169,048 semantics; replay -13,921 laid-down stable instrs; disasm-verified 2->1 rewrite); runtime A/B null at Halo 3 menu (no regression); **closed, adopted** |
 
@@ -1675,3 +1675,22 @@ elimination and the target is closed.** Two mitigating notes for the
 record: taken fraction is ~0.01% of all checks (the branch is essentially
 perfectly predicted, so the true time cost sits at or below the /2
 discount), and the counter cvar remains as a diagnostic.
+
+## T1 adopted: zero_delay_spin_limit=16 by the T5 precedent
+
+The original verdict ("title-specific, so it stays off") predates the T5
+adoption logic: a lever that is large where it acts and provably null
+where it does not act is a default, not an option. T1's evidence now:
+
+- Reach menu, current build (both new levers in baseline): **-51.56% CPU**
+  (160.62 -> 77.81), presents pinned -- reproducing the historic -54.58%.
+- Reach campaign: **-39.36% CPU** (198.70 -> 120.50), swap guard -1.84%,
+  no livelock. The lever helps real gameplay, not just menu idle.
+- Halo 3 menu and GTA IV docks: null (doc's three-state matrix; Halo 3 has
+  no NETWORK_RECEIVE thread and a third of Reach's spin, docks pairs
+  disagree at -0.19%).
+
+Default flipped to 16 (this commit). Evidence it LACKS: any multiplayer /
+networking session -- the affected thread is Reach's netcode poll loop and
+the park is guest-observable timing; nothing here exercises live netplay.
+If networked play ever regresses, this default is the first suspect.
