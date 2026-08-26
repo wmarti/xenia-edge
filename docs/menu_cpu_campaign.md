@@ -1112,3 +1112,57 @@ config word and the capture settings cannot be read back from it; and it was
 written by a run the disk guard cut short. A function that only compiles later
 would be missing. The negative result -- no `db16cyc` in these two functions --
 is about functions that *are* present, and both are present in full.
+
+## T5 priced: the guest spins 1.5 million times per event it waits for
+
+The open question was which thread advances the counters and whether it is
+runnable. Coverage answers a more useful version of it -- how *often* they run
+at all. Over the same ~240 s window that recorded 4.455e9 polls:
+
+| address | role | executed instrs | share | ~executions |
+| --- | --- | ---: | ---: | ---: |
+| `828BF420` | the spin loop | 26,730,431,699 | 29.40% | 504,347,768 |
+| `82A46D70` | its callee, reads both counters | 40,095,556,257 | 44.11% | **4,455,061,806** |
+| `82A467D8` | producer, `submitted++` (`+0x40A0`) | 304,483 | 0.00% | **853** |
+| `82A46098` | consumer A, `completed++` (`+0x40A8`) | 103,600 | 0.00% | **1,644** |
+| `82A46198` | consumer B, `completed++` (`+0x40A8`) | 134,168 | 0.00% | **1,328** |
+
+**The spinner polls about 1.5 million times per consumer execution**
+(4,455,061,806 / 2,972). In rates over the window: it polls ~18.6 M times a
+second while the events it is waiting for occur ~12 times a second, and the
+producer submits ~3.6 times a second.
+
+So the mean wait is on the order of **80 ms**, and the guest spends it in a
+six-instruction loop. That is four to five orders of magnitude longer than a
+thread switch, which is the threshold Apple gives for when spinning is
+defensible at all (see the local notes at
+`edge-benchmarks/apple_silicon_cpu_rules.md`, ch. 7). This is not a short wait
+being handled reasonably; it is a long wait handled by burning a core.
+
+**Why this changes the economics.** Earlier the target was framed as 18.2% of
+on-core time that a yield might partially reclaim. These counts say the thread
+does essentially nothing else: 73.5% of all executed guest instructions are
+these two functions, and the useful work in between is 2,972 function calls.
+Sleeping between polls -- which is what the existing `DELAY_EXECUTION`
+escalation already does, at `db16cyc_sleep_ns` = 60 us -- would cut the poll
+count by roughly three orders of magnitude while adding at most 60 us of
+detection latency to an 80 ms wait. That is a ~0.07% latency cost for
+essentially all of the spin.
+
+**It also makes a conservative detector viable.** The objection to a shape-based
+spin detector was that its runtime trigger (two iterations under 1 us apart)
+also fires on hot compute loops. With the wait this long, the trigger can be far
+stricter -- thousands of consecutive iterations, over milliseconds, in a loop
+whose body performs no stores -- and still fire here within a fraction of one
+wait. The earlier objection assumed the escalation had to be sensitive. It does
+not.
+
+**What this still does not establish.** Nothing here shows the consumer is
+*starved*; it shows it is *infrequent*. A subsystem that genuinely completes ~12
+operations a second would produce these counts whether or not the host is
+holding it back, so the starvation hypothesis is neither confirmed nor
+eliminated. It also does not measure what a fix returns: the 18.2% is a sampled
+share, and this campaign's rule is that a sampled share over-predicts reclaimable
+CPU by ~2x. And the counts are attributed per function by coverage, which is
+exact, but the ~240 s window is taken from the earlier profiling run rather than
+re-measured here.
