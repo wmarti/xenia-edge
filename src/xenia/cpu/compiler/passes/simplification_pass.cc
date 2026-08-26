@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/compiler/passes/simplification_pass.h"
 
+#include "xenia/cpu/cpu_flags.h"
+
 #include "xenia/base/byte_order.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
@@ -1447,7 +1449,10 @@ static bool IsNeverF64Denormal(hir::Value* v, int depth) {
   }
   switch (def->GetOpcodeNum()) {
     case OPCODE_TO_SINGLE:
-      return true;
+      // --no_round_to_single turns TO_SINGLE into an identity (see
+      // x64_sequences.cc), so under it a double denormal passes through
+      // unrounded and the proof does not hold. Found by adversarial review.
+      return !cvars::no_round_to_single;
     case OPCODE_CONVERT:
       return def->src1.value && def->src1.value->type == FLOAT32_TYPE;
     case OPCODE_SELECT:
