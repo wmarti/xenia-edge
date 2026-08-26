@@ -1731,3 +1731,35 @@ T7 runtime guard: Halo 3 menu pair, pre-fold `2179519a2` vs `475253748`:
 **-0.25% CPU, swaps identical** -- no regression; the predicted ~0.5% is
 below the 10 s-window floor by design. T7 ships on its static evidence,
 same standing as T6.
+
+## T8 scoped: guest call machinery is ~14.4% of executed host instructions
+
+Fresh-capture ranking: `call - symbol` 7.94% at 15.79 I/exec,
+`call_indirect` 6.50% at 13.38, `set_return_address` 1.56% at 3.00. The
+mechanism, from `A64Emitter::Call` (a64_emitter.cc:811): a call site whose
+callee is already compiled at EMIT time gets the direct path (3-instr
+absolute-address materialization + blr + return-addr ldr); every other
+site -- the common case under lazy JIT, since callers compile before their
+callees -- walks the encoded indirection table on EVERY call forever:
+bias ldr, add, slot ldr, out-of-lined external-target check, blr. The
+table slot gets patched when the callee compiles, but the WALK never
+collapses to a direct branch.
+
+Design options, in rising ambition:
+(a) **Instrument first** (the remap-counter pattern): count executed
+    direct-path vs indirection-path calls at the docks to size the
+    recoverable share before touching the convention.
+(b) **Relative bl for compiled callees**: kGeneratedCodeSize is 256 MB
+    (code_cache_base.h:623) so +-128 MB `bl` does not universally reach,
+    and code is placed after emission -- needs a fixup pass at placement
+    plus an out-of-range fallback. Saves ~2-3 I/exec on the direct subset
+    only.
+(c) **Backpatch call sites** when a callee compiles (registry of pending
+    sites + icache flush): collapses the 5-6-instruction walk to bl/blr
+    for the dominant subset. The real prize, and the real risk: patching
+    live code pages on a multithreaded JIT under macOS W^X.
+
+Priced ceiling if (c) recovered ~4 of 13-16 I/exec across both call
+forms: ~3-4% of executed host instructions, ~0.6-0.8% CPU by the standing
+conversion. Next step is (a) -- measurement before mechanism, per the
+campaign's standing lesson that sampled shares over-predict 2x.
