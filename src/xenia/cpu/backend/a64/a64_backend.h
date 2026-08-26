@@ -149,10 +149,16 @@ struct A64BackendContext {
   unsigned int db16cyc_spins;
   uint64_t db16cyc_last_tick;
   // Pass-injected spin-wait state (see SpinWaitInjectionPass): iterations
-  // counted since the last reset, the timer reading at that reset, and
-  // whether the loop already escalated once (armed lowers the re-trip
-  // budget from --spin_wait_yield_after to kSpinWaitRetripIters).
+  // counted since the last reset, the guest address of the loop header being
+  // tracked, whether that site already escalated once (armed lowers the
+  // re-trip budget from --spin_wait_yield_after to kSpinWaitRetripIters),
+  // and the timer reading at the last reset. The counter is shared by every
+  // tagged site on the thread, so state transitions are keyed to the site:
+  // a trip from a site other than the tracked one restarts tracking cold
+  // instead of inheriting its budget -- a sleep can only be served to the
+  // loop that earned it.
   unsigned int spin_wait_spins;
+  unsigned int spin_wait_site;
   unsigned int spin_wait_armed;
   uint64_t spin_wait_reset_tick;
 };

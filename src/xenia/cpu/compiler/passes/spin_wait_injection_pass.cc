@@ -128,6 +128,17 @@ bool SpinWaitInjectionPass::Run(HIRBuilder* builder) {
           shape.has_indirect_branch) {
         continue;
       }
+      // The header's guest address identifies this site at runtime: the trip
+      // helper keys its state to it, so a sleep can only be served to the
+      // loop that earned it. Taken from the header block's first
+      // SOURCE_OFFSET, the same way the preempt pass names its safepoints.
+      uint32_t site = 0;
+      for (auto s = header->instr_head; s; s = s->next) {
+        if (s->opcode == &OPCODE_SOURCE_OFFSET_info) {
+          site = uint32_t(s->src1.offset);
+          break;
+        }
+      }
       // Tag the header: first non-fake instruction, falling through an
       // all-fake block exactly the way the preempt pass does.
       for (Block* b = header; b != nullptr; b = b->next) {
@@ -137,6 +148,7 @@ bool SpinWaitInjectionPass::Run(HIRBuilder* builder) {
         if (first) {
           if (first->GetOpcodeNum() != OPCODE_DELAY_EXECUTION) {
             Instr* delay = builder->DelayExecution(DELAY_EXECUTION_INJECTED);
+            delay->src1.offset = site;
             delay->MoveBefore(first);
           }
           tagged.insert(header);
