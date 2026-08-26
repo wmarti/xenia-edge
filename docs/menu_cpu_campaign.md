@@ -1531,3 +1531,29 @@ one Reach *campaign* spot check -- the known intermittent livelock
 ([guest_scheduler] class) is the one plausible bad interaction with a
 lever that sleeps spinning guest threads, and it should be seen surviving
 the lever once. Then the default flip is its own commit.
+
+## T5 CLOSED: spin-wait lever adopted, default 100000
+
+The Reach campaign gate passed (single pair, 10 s window, per the standing
+short-run rule): CPU -0.40% (205.05 -> 204.23), the swap-counter
+work-equality guard within tolerance (-1.68%), no livelock -- both legs
+reached the state and ran to completion -- and **zero escalation episodes**,
+the fourth state in a row where the lever provably never acts outside its
+target. Note for the record: the swaps column here is the guest swap
+counter, NOT fps -- the Metal HUD holds 30 throughout, and README's
+36.2-vs-29.9 example is the same mismatch; a 27.x reading at the campaign
+is normal and was misread once (by me) as dropped frames.
+
+Final ledger for `--spin_wait_yield_after=100000`:
+- GTA IV docks: **-13.95 / -14.91 / -14.31% CPU** across three 3-pair runs,
+  throughput no consistent effect, screenshot gate passed, site log =
+  `828BF474` only.
+- Halo 3 menu: inert (0 escalations), CPU null at 60 s windows.
+- Reach menu: inert (0 escalations), CPU null (10 s windows, 3 pairs).
+- Reach campaign: inert (0 escalations), CPU null, livelock survived.
+
+Default flipped in this commit. Evidence it LACKS: nothing further was
+measured after the flip decision per the user's instruction ("you should
+have way more than enough data"); untested titles rely on the runtime
+trigger's narrowness (100k consecutive sub-microsecond iterations,
+site-keyed validation) rather than per-title measurement.
