@@ -112,7 +112,14 @@ def run_once(app, game, script, storage, work, warmup, window, extra):
         if f1 > f0 and n1 > n0:
             swaps = (f1 - f0) / ((n1 - n0) / 1e9)
         else:
-            swaps = 0.0
+            # The counter is rewritten every 64 presents, so over a window of
+            # tens of seconds any healthy guest crosses several boundaries.
+            # Not advancing means the guest stalled, and a stalled leg is not a
+            # slow leg: it parks threads instead of running them, so its CPU
+            # reading is LOWER than a healthy one. Reported as a row it reads
+            # as a win. This is not a measurement -- refuse it.
+            return None, None, (f"present counter did not advance in {window}s "
+                                f"({f0} -> {f1}); guest stalled, leg discarded")
         return cpu, swaps, None
     finally:
         try:
@@ -174,6 +181,7 @@ def main():
 
     res = {refs[0][0]: [], refs[1][0]: []}
     aborted = None
+    discarded = []
     for n, idx in enumerate(order):
         name, app, extra = refs[idx]
         # Checked before every leg, not just at startup. GTA IV rewrites about
@@ -194,7 +202,8 @@ def main():
         cpu, swaps, err = run_once(app, a.game, a.script, a.storage,
                                    f"{a.work}-{idx}", a.warmup, a.window, extra)
         if err:
-            print(f"  leg {n+1} {name}: {err}", flush=True)
+            discarded.append((n + 1, name, err))
+            print(f"  leg {n+1} {name}: DISCARDED -- {err}", flush=True)
             continue
         res[name].append((cpu, swaps))
         print(f"  leg {n+1} {name:22} {cpu:7.2f}% CPU   {swaps:6.2f} swaps/s",
@@ -223,6 +232,11 @@ def main():
         for i in range(n):
             d = 100.0 * (vb[i][1] - va[i][1]) / va[i][1] if va[i][1] else 0.0
             print(f"  pair {i+1}: {va[i][1]:6.2f} vs {vb[i][1]:6.2f}   {d:+.2f}%")
+    if discarded:
+        print(f"\n*** {len(discarded)} leg(s) DISCARDED as stalled: "
+              + ", ".join(f"leg {l} ({nm})" for l, nm, _ in discarded)
+              + ". The pairs above are whatever survived, which is fewer than "
+              "were asked for. Repeat the A/B. ***")
     if aborted:
         leg, have = aborted
         print(f"\n*** INCOMPLETE: aborted before leg {leg} with {have:.1f} GB "
@@ -230,8 +244,8 @@ def main():
               f"asked for, and the volume was filling while they ran. Free "
               f"space and repeat the whole A/B; do not quote this. ***")
     if a.out:
-        json.dump({"results": res, "aborted": aborted}, open(a.out, "w"),
-                  indent=1)
+        json.dump({"results": res, "aborted": aborted,
+                   "discarded": discarded}, open(a.out, "w"), indent=1)
 
 
 if __name__ == "__main__":
