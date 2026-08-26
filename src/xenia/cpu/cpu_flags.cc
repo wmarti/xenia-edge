@@ -83,6 +83,29 @@ DEFINE_uint32(
     "rather than by eight.",
     "CPU");
 
+// Pass-injected spin-wait release, for guest wait loops that carry no db16cyc
+// hint. See SpinWaitInjectionPass and DELAY_EXECUTION in a64_seq_memory.cc.
+DEFINE_uint32(
+    spin_wait_yield_after, 0,
+    "After this many consecutive iterations of a pass-tagged spin-shaped "
+    "guest loop, release the core instead of polling. 0 disables the "
+    "injection pass entirely (default).\n"
+    "Unlike db16cyc_yield_after this must be set high -- on the order of a "
+    "million -- because the tagged loops are identified by shape, not by a "
+    "guest hint, and a terminating loop that trips it pays a sleep per "
+    "re-trip until it exits. The trip is validated against wall time: it "
+    "only escalates when the iterations averaged under spin_wait_max_iter_ns "
+    "each, i.e. the loop was doing nothing but polling.",
+    "CPU");
+
+DEFINE_uint32(
+    spin_wait_max_iter_ns, 1000,
+    "A spin_wait_yield_after trip only escalates when the counted iterations "
+    "averaged less than this many nanoseconds each. Iterations of a bare "
+    "poll loop are ~50-200ns; anything interleaving real work averages "
+    "over 1us and the count restarts instead of sleeping.",
+    "CPU");
+
 DEFINE_uint32(db16cyc_sleep_ns, 60000,
               "Nanoseconds to sleep when db16cyc_yield_after trips. A plain "
               "sched_yield is not enough: it returns immediately when other "

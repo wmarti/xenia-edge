@@ -68,6 +68,11 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   // Preemption safepoints for the guest scheduler. No-op when it is off.
   compiler_->AddPass(std::make_unique<passes::PreemptCheckInjectionPass>());
 
+  // Spin-wait tagging for guest wait loops with no db16cyc hint. No-op unless
+  // --spin_wait_yield_after is set. Runs on the same early CFG the preempt
+  // pass uses, before optimization passes reshape the blocks.
+  compiler_->AddPass(std::make_unique<passes::SpinWaitInjectionPass>());
+
   // Every PPC compare materializes all of CR0 and stores each bit, and most
   // functions read only one of them -- and read it as an SSA value, not out of
   // the context. Run before context promotion, while every condition read the

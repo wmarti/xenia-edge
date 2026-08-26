@@ -26,6 +26,13 @@ enum BranchFlags {
   BRANCH_UNLIKELY = (1 << 2),
 };
 
+enum DelayExecutionFlags {
+  // Injected by SpinWaitInjectionPass at the back-edge of a loop that looks
+  // like a spin-wait, as opposed to emitted for a guest db16cyc hint. The
+  // backends give the injected form a much higher escalation threshold.
+  DELAY_EXECUTION_INJECTED = (1 << 1),
+};
+
 enum RoundMode {
   // to zero/nearest/etc
   ROUND_TO_ZERO = 0,
