@@ -86,10 +86,10 @@ DEFINE_uint32(
 // Pass-injected spin-wait release, for guest wait loops that carry no db16cyc
 // hint. See SpinWaitInjectionPass and DELAY_EXECUTION in a64_seq_memory.cc.
 DEFINE_uint32(
-    spin_wait_yield_after, 0,
+    spin_wait_yield_after, 100000,
     "After this many consecutive iterations of a pass-tagged spin-shaped "
     "guest loop, release the core instead of polling. 0 disables the "
-    "injection pass entirely (default).\n"
+    "injection pass entirely.\n"
     "Unlike db16cyc_yield_after this must be set high -- on the order of a "
     "million -- because the tagged loops are identified by shape, not by a "
     "guest hint, and a terminating loop that trips it pays a sleep per "
