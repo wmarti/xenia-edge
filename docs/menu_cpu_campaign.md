@@ -79,6 +79,8 @@ predate two instrument fixes and their denominators are wrong.
 | T5 | Guest spin-wait at `828BF420`/`82A46D70` (docks) | **closed, adopted** -- `spin_wait_yield_after=100000` default-on after four-state ledger | **-14% docks CPU x3 runs, no throughput cost; inert (zero escalations) on Halo 3 menu, Reach menu, Reach campaign** |
 | B1 | `PACK_D3DCOLOR` returned 0xFFFFFFFF always | fixed, guard proven to fail on the bug | correctness |
 | T6 | rlwinm hot path: `lsl`+`ands #0xFFFFFFFF` -> W-form `lsl` (a W write zeroes the upper half; the `ands` flags are dead at these sites) | **reopened** by the 2026-08-26 adversarial review -- an earlier same-day rejection double-applied the 2x discount | priced **0.46-0.55% CPU**, 1.6-2.0x the floor; **implemented + statically verified** (169,048/169,048 semantics; replay -13,921 laid-down stable instrs; disasm-verified 2->1 rewrite); runtime A/B null at Halo 3 menu (no regression); **closed, adopted** |
+| T7 | Denormal-quirk recomputation over provably-single doubles (lfs/stfs round trips) | **closed, adopted** -- fold + `VALUE_NEVER_F64_DENORMAL`; one adversarial-review defect (`--no_round_to_single`) found and fixed | **-3.34% laid-down, 2.47% of executed host instrs saved; 169,048/169,048; runtime guard clean (-0.25% Halo 3 menu pair)** |
+| T8 | Guest call machinery (~14.4% of executed host instrs sampled) | **measured** -- executed-path counters landed; walk dominates; design decision pending adversarial review of backpatch safety | **94.66% of executed symbol calls take the indirection walk (147.28M/s at the docks); direct path 5.16%; true register-indirect dispatch 3.31%. Refined prize ~1.9% executed instrs (~0.4-0.5% CPU), all of it in (c) backpatching** |
 
 ### Next up, in order
 
@@ -1774,3 +1776,56 @@ backend-agnostic pass can see it; a64 always rounds and never hits it).
 Claims 2 (dataflow/pass-ordering) and 3 (other FPR producers): no defect
 found. The lfs flag, the SELECT recursion, and the constant rule survived
 attack unchanged.
+
+## T8 measured: the indirection walk is 94.66% of executed symbol-call dispatches
+
+Instrumented per the plan's option (a): `--count_call_paths` (default off)
+emits a racy 4-instruction counter bump (the `xe_a64_physical_remap_hits`
+pattern) at the three dispatch paths in `A64Emitter::Call` / `CallIndirect`,
+dumped through `--gpu_counters_file`. Register safety: the Call bumps use
+x16/x17 before the walk arms w16 with the guest address; the CallIndirect
+bump runs after the target is normalized into w16 and uses x14/x17, which
+the walk overwrites anyway. One ~145s docks leg (`bench-work/callpath-rate/`,
+clone of the remap-rate harness), counters differenced over t=100..140s so
+JIT warmup is excluded:
+
+| path | delta over 40s | rate | share |
+| --- | --- | --- | --- |
+| direct (callee compiled at emit) | 332,046,056 | 8.30 M/s | 5.16% |
+| indirection walk (`Call`) | 5,891,215,256 | 147.28 M/s | 91.53% |
+| register-indirect walk (`CallIndirect`) | 213,336,036 | 5.33 M/s | 3.31% |
+
+Presents over the same window: 43.2/s, inside the docks' normal range, so
+the counter overhead (~0.65G instrs/s with the cvar on) did not distort the
+scene. `physical_remap_hits 0` confirms that cvar was off.
+
+What the split decides:
+
+- **Option (b) -- relative bl for emit-time-compiled callees -- is dead.**
+  The direct path is 5.16% of executed dispatches; optimizing it is
+  optimizing the exception. Under lazy JIT, callers compile before callees
+  and a call site emitted as a walk stays a walk forever -- exactly the
+  mechanism the scoping note predicted, now quantified.
+- **The `call_indirect` corpus share was a mirage of the return check.**
+  The corpus ranked call_indirect at 6.50% of executed host instructions,
+  nearly equal to call-symbol -- but true register-indirect dispatches are
+  29x rarer than symbol calls at runtime. The counter sits after the
+  possible-return epilog check, so the corpus share is dominated by `blr`
+  returns that never reach the table walk. No optimization target there.
+- **The whole T8 prize is option (c), and it reprices to ~0.4-0.5% CPU.**
+  Backpatching the 147.28M/s walk from ~6 executed instructions to ~2 saves
+  ~0.59G instrs/s against an implied ~30.9G instrs/s total (computed from
+  the corpus 7.94%-at-15.79-I/exec calibration and the measured symbol-call
+  rate): 1.90% of executed host instructions, ~0.4-0.5% CPU by the standing
+  conversion. Below the scoping note's 0.6-0.8% ceiling because the
+  register-indirect pool evaporated.
+
+Evidence this HAS: measured executed-dispatch rates at the docks over a
+warmup-excluded window, on the adopted-default build. Evidence it LACKS: a
+second scene (the split could differ at menus, though nothing rides on
+that), and any safety story for patching live code pages under MAP_JIT --
+which is now the sole load-bearing question. Next step: adversarial review
+(codex) of single-instruction B/BL concurrent-modification rules per the
+Arm ARM before any design work; if only a single-instruction patch is
+blessed, the site layout must be designed around that constraint from the
+start.

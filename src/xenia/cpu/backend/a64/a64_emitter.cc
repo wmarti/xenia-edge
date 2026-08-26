@@ -808,6 +808,24 @@ void A64Emitter::UnimplementedInstr(const hir::Instr* i) {
   DebugBreak();
 }
 
+// Executed-call-path counters for --count_call_paths. Plain racy
+// read-modify-write, the same trade as xe_a64_physical_remap_hits:
+// concurrent guest threads can lose increments, which understates a rate
+// measurement but never adds a fence to the dispatch path.
+extern "C" volatile uint64_t xe_a64_call_direct_hits = 0;
+extern "C" volatile uint64_t xe_a64_call_walk_hits = 0;
+extern "C" volatile uint64_t xe_a64_call_indirect_hits = 0;
+
+namespace {
+void EmitCallPathCount(A64Emitter& e, volatile uint64_t* counter,
+                       const XReg& addr_reg, const XReg& val_reg) {
+  e.mov(addr_reg, reinterpret_cast<uint64_t>(counter));
+  e.ldr(val_reg, ptr(addr_reg));
+  e.add(val_reg, val_reg, 1);
+  e.str(val_reg, ptr(addr_reg));
+}
+}  // namespace
+
 void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   assert_not_null(function);
   EnsureFpuFpcrModeForTransition();
@@ -818,6 +836,11 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   auto fn = static_cast<A64Function*>(function);
 
   if (fn->machine_code()) {
+    if (cvars::count_call_paths) {
+      // x16/x17 are dead here: the direct path materializes its target in
+      // x9, and the tail-call stack teardown re-sets x17 after this.
+      EmitCallPathCount(*this, &xe_a64_call_direct_hits, x16, x17);
+    }
     // Direct call — function is already compiled.
     mov(x9, reinterpret_cast<uint64_t>(fn->machine_code()));
     if (!(instr->flags & hir::CALL_TAIL)) {
@@ -841,6 +864,11 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   }
 
   if (code_cache_->has_indirection_table()) {
+    if (cvars::count_call_paths) {
+      // Before the guest address is armed into w16: both scratch registers
+      // are legitimately overwritten below.
+      EmitCallPathCount(*this, &xe_a64_call_walk_hits, x16, x17);
+    }
     // Must leave the guest address in w16 for the resolve thunk to read.
     mov(w16, function->address());
     if (!code_cache_->encoded_indirection()) {
@@ -1044,6 +1072,13 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
     // Must leave the guest address in w16 for the resolve thunk to read.
     if (target_w.getIdx() != w16.getIdx()) {
       mov(w16, target_w);
+    }
+    if (cvars::count_call_paths) {
+      // After the target is normalized into w16, x14/x17 cannot be the
+      // incoming target register: x14 is overwritten by the walk below and
+      // x17 only by the tail-call stack teardown. x0/x30 (possibly holding
+      // the hoisted return slots) are untouched.
+      EmitCallPathCount(*this, &xe_a64_call_indirect_hits, x14, x17);
     }
     if (!code_cache_->encoded_indirection()) {
       // Fast path: table mapped at host VA == guest addr; slot holds raw
