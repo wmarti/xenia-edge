@@ -935,7 +935,13 @@ bool RunCorpusReplay() {
   // capture under the default made 13,323 of 13,564 functions differ from their
   // own capture. Applied before the first compile, and reported, because a
   // silently mismatched replay still prints a confident total.
-  if (corpus->captured_with_guest_scheduler() != cvars::guest_scheduler) {
+  if (!corpus->config_known()) {
+    fprintf(stdout,
+            "  config     v1 corpus: capture configuration unknown; compiling "
+            "with this process's flags (--guest_scheduler=%s)\n",
+            cvars::guest_scheduler ? "true" : "false");
+  } else if (corpus->captured_with_guest_scheduler() !=
+             cvars::guest_scheduler) {
     fprintf(stdout,
             "  config     capture had --guest_scheduler=%s, this process has "
             "%s; using the capture's\n",

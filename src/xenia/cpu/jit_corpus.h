@@ -93,7 +93,10 @@ class JitCorpus {
   // True when the file ended mid-record, i.e. capture was killed.
   bool truncated() const { return truncated_; }
 
-  // The codegen settings this corpus was captured under.
+  // The codegen settings this corpus was captured under. Only v2 corpora
+  // recorded them; a v1 capture is readable but its configuration is
+  // unknown, and a replay must not pretend otherwise.
+  bool config_known() const { return version_ >= 2; }
   uint32_t config_flags() const { return config_flags_; }
   bool captured_with_guest_scheduler() const {
     return (config_flags_ & kConfigGuestScheduler) != 0;
@@ -104,6 +107,7 @@ class JitCorpus {
   std::vector<uint32_t> page_addresses_;
   std::vector<uint8_t> page_data_;
   uint32_t config_flags_ = 0;
+  uint32_t version_ = 0;
   bool truncated_ = false;
 };
 

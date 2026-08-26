@@ -157,14 +157,18 @@ std::unique_ptr<JitCorpus> JitCorpus::Read(const std::filesystem::path& path) {
     fclose(file);
     return nullptr;
   }
-  if (header[0] != kMagic || header[1] != kVersion || header[2] != kPageSize) {
-    XELOGE("JitCorpus: {} is not a v{} corpus with {}-byte pages",
+  // v1 is layout-identical (word 3 was written as zero) but did not record
+  // the capture configuration; accept it and let config_known() say so.
+  if (header[0] != kMagic || header[1] < 1 || header[1] > kVersion ||
+      header[2] != kPageSize) {
+    XELOGE("JitCorpus: {} is not a v1-v{} corpus with {}-byte pages",
            xe::path_to_utf8(path), kVersion, kPageSize);
     fclose(file);
     return nullptr;
   }
 
   auto corpus = std::make_unique<JitCorpus>();
+  corpus->version_ = header[1];
   corpus->config_flags_ = header[3];
   // Pages arrive in first-touch order; collect them with their data and sort at
   // the end so the replay can map contiguous runs in one allocation.
