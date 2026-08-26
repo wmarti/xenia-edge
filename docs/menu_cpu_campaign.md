@@ -76,8 +76,9 @@ predate two instrument fixes and their denominators are wrong.
 | T2 | `TimerQueue` spin_wait -> blocking_wait on POSIX (10.3% Halo 3 / 4.3% Reach) | landed | **-2.74%** |
 | T3 | Halo 3 host GPU submit/encode (53% aggregate, no single hot spot) | **closed for cheap fixes** -- four hypotheses killed with measurement; what is left is texture-cache policy, not submission mechanics | ~100 MiB/frame of real invalidation, 46.5% GPU-origin / 53.5% guest-origin |
 | T4 | Redundant guest address computation (`guest_828BF420`, `guest_82A46D70`) | **rejected** -- under the noise floor once repriced | 13.90% of executed memory operands, but **~0.38% CPU after discount** vs a 0.28% floor; 94% of it in two functions |
-| T5 | Those two functions are a **guest spin-wait**: `828BF420` loops calling `82A46D70` until two counters differ by <2. 18.2% of on-core time at the docks | **open, top target** -- counters identified as guest-written (submitted/completed); the spinner never yields the host thread | 18.2% of on-core at the docks; ~26 guest threads oversubscribing ~12 host cores |
+| T5 | Those two functions are a **guest spin-wait**: `828BF420` loops calling `82A46D70` until two counters differ by <2. 18.2% of on-core time at the docks | **open, top target** -- counters identified as guest-written (submitted/completed); the spinner never yields the host thread | 15.7-18.2% of on-core at the docks (three published values, only the low end reproducible from disk -- see the 2026-08-26 corrections); ~26 guest threads oversubscribing ~12 host cores |
 | B1 | `PACK_D3DCOLOR` returned 0xFFFFFFFF always | fixed, guard proven to fail on the bug | correctness |
+| T6 | rlwinm hot path: `lsl`+`ands #0xFFFFFFFF` -> W-form `lsl` (a W write zeroes the upper half; the `ands` flags are dead at these sites) | **reopened** by the 2026-08-26 adversarial review -- an earlier same-day rejection double-applied the 2x discount | priced **0.46-0.55% CPU**, 1.6-2.0x the floor; prove via corpus-replay exact delta + frame-capped CPU A/B |
 
 ### Next up, in order
 
@@ -1203,3 +1204,68 @@ Design forced by this: separate counter state and threshold from the hinted
 `db16cyc` path (11 hinted functions must keep their tuned behaviour), an HIR
 flag on the injected `DELAY_EXECUTION` so the emitter can tell them apart, and
 a default-off cvar, same posture as the T1 zero-delay lever.
+
+## Corrections from the 2026-08-26 adversarial review (Opus verifier)
+
+An independent pass over the pricing arithmetic, instructed to refute it,
+overturned one rejection, resolved a methodology defect, and found a record
+inconsistency. Each item below was verified against the tree before being
+recorded.
+
+**1. The rlwinm 2->1 rejection is reversed; it is a live candidate again.**
+Priced correctly it is **0.46-0.55% CPU, 1.6-2.0x the 0.28% floor**, not
+"below/near the floor" as this document briefly recorded. Three errors in the
+original arithmetic cancelled to a nearly right number attached to the wrong
+verdict: the guest-instruction denominator was too generous, the whole-program
+conversion was never applied, and the 2x discount was applied to a figure that
+was already time-denominated (see item 2). The verifier also confirmed the
+mechanics end-to-end: the `ands` wide-mask is dead for flags at rlwinm sites
+(the is64 recorded by `AND_I64` never matches the 32-bit compare that follows,
+so the compare-vs-zero fusion cannot fire there), meaning the saving applies at
+essentially all hot-path sites including `rlwinm.`; and
+`simplification_pass.cc:469-476` manufactures the same shl+and pattern
+independently of `InstrEmit_rlwinmx`, so the 8.81% opcode share *undercounts*
+the pattern.
+**Measurement path when attempted** (per item 4): price exactly with
+`rank_sequences.py` over the existing docks coverage capture, prove the
+instruction delta with the 169k corpus replay (zero measurement noise), and
+treat a docks CPU A/B as confirmatory only.
+
+**2. The 2x discount is scoped: instruction-derived estimates only.** The rule
+"a sampled on-core share over-predicts reclaimable CPU by ~2x" traces to a
+single calibration (`jit_bench_autonomy.md`): per-change *instruction-count*
+estimates landed at about half. That is an instruction->time correction. It
+must NOT be applied to a figure that is already denominated in sampled time --
+doing so subtracts the same physical effect twice. T4's headline 0.38% is such
+a double-discount (0.76% before it); T4 stays rejected anyway, on the better
+grounds this document already records -- 94% of the opportunity sits inside the
+spin pair, where making the *waiting* cheaper buys nothing.
+
+**3. The spin pair's sampled share exists in three versions: 15.7%, 15.8%, and
+18.2%.** The first two come from profiles that are on disk; the 18.2% comes
+from a profile that is not, and it is the one this document carried into every
+T5 estimate. Until re-measured, T5 pricing should quote **15.7-18.2%** and note
+that only the low end is reproducible from disk.
+
+**4. Sub-1% codegen changes cannot be adjudicated at the docks at all -- by
+either metric.** This document says both "JIT and backend work should be
+measured here" (most JIT surface) and "CPU cannot carry the claim here"
+(uncapped; throughput is the metric, floor ~7%). Both are true, which is the
+problem: a sub-1% codegen change clears neither bar at this state. Resolution,
+now standing policy: codegen changes are proven by corpus-replay **exact
+instruction deltas** (no measurement noise) plus a **CPU A/B at a frame-capped
+state**; the docks number is confirmatory, and only throughput can veto there.
+
+**5. The guest-call `bl` candidate was already retired by exact accounting, at
+0.10%.** This document's 0.9%-gross/0.45%-discounted estimate for replacing the
+64-bit constant materialisation was 4-9x too high: `jit_bench_autonomy.md`
+prices the wide-move-chain family at **0.10-0.11% exact** ("retired twice").
+The rejection stands, on those grounds. One record fix: the retirement's cited
+Apple objection (§2.8.2) reaches literal *pools* -- an island of data in code
+space -- and does not apply to `bl`, which is a branch immediate. The target is
+dead because it is worth 0.10%, not because of §2.8.2.
+
+The reopened candidate is tracked as **T6** in the status table: rlwinm hot
+path, `lsl`+`ands #0xFFFFFFFF` -> W-form `lsl`, priced 0.46-0.55% CPU by the
+corrected arithmetic, proof path = rank_sequences pricing + corpus-replay exact
+delta + frame-capped CPU A/B, docks throughput as veto only.
