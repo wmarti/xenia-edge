@@ -1726,3 +1726,8 @@ the 169k suite that exercises the fold itself -- suite operands come from
 context and stay unprovable, so the suite proves no-collateral-damage
 while the fold's own soundness rests on the 2^-149 >> 2^-1022 argument
 and the three construction sites.
+
+T7 runtime guard: Halo 3 menu pair, pre-fold `2179519a2` vs `475253748`:
+**-0.25% CPU, swaps identical** -- no regression; the predicted ~0.5% is
+below the 10 s-window floor by design. T7 ships on its static evidence,
+same standing as T6.
