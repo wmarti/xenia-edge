@@ -575,12 +575,15 @@ already shipped two rendering regressions that every counter called a win.
 
 ## Open defects found, not yet resolved
 
-- **`vector_nan_propagation_test.cc` fails 2 assertions in this tree.** It expects
-  `0xFFC00000` for `+inf + (-inf)`; our a64 returns `0x7FC00000`. These are the
-  x86 and ARM hardware default QNaNs respectively, so the test encodes SSE's
-  behaviour. Codex commit `2837d5436` (not in our tree) concluded ARM's is right
-  for PPC. Pre-existing, unrelated to this campaign, and genuinely ambiguous —
-  needs the Xenon VMX semantics settled before either side is changed.
+- ~~**`vector_nan_propagation_test.cc` fails 2 assertions in this tree.**~~
+  **Closed by upstream, in our favour.** It expected `0xFFC00000` (x86's negative
+  indefinite) for `+inf + (-inf)` while our a64 returns `0x7FC00000` (ARM's, and
+  PPC's, positive default QNaN). Upstream `d3094f5e6` "[X64] Return PPC's
+  positive default QNaN from the VMX float binops" changed the **x64 backend** to
+  match, and rewrote the test to expect `0x7FC00000`. So the a64 result was right
+  and the test was encoding SSE behaviour, as suspected. Arrived in the
+  2026-08-26 rebase. **Not yet re-run here** -- confirming it now passes on a64
+  needs a build, which has not been done since the rebase.
 
 ## Corrections taken from the verification workflow
 
