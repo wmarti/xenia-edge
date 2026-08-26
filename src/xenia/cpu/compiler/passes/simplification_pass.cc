@@ -1427,7 +1427,8 @@ bool SimplificationPass::SimplifyBasicArith(hir::HIRBuilder* builder) {
 // constant without denormal bits, a value the producer marked (lfs unpack),
 // a round-to-single result (its smallest nonzero magnitude, single denormal
 // 2^-149, is far above double's 2^-1022 normal floor), a conversion from a
-// 32-bit float, or a select between two such values. Finiteness is NOT
+// 32-bit float, a select between two such values, or a NEG/ABS of one
+// (sign-bit-only by PPC fneg/fabs semantics). Finiteness is NOT
 // implied and NOT needed: DENORMAL_QUIRK's finite arm only matters when the
 // denormal arm can hit.
 static bool IsNeverF64Denormal(hir::Value* v, int depth) {
@@ -1458,6 +1459,12 @@ static bool IsNeverF64Denormal(hir::Value* v, int depth) {
     case OPCODE_SELECT:
       return IsNeverF64Denormal(def->src2.value, depth - 1) &&
              IsNeverF64Denormal(def->src3.value, depth - 1);
+    case OPCODE_NEG:
+    case OPCODE_ABS:
+      // Sign-bit-only by PPC semantics (fneg/fabs/fnabs "alter bit 0"):
+      // denormality is a property of exponent and mantissa alone, so it
+      // survives both directions and the proof passes straight through.
+      return IsNeverF64Denormal(def->src1.value, depth - 1);
     default:
       return false;
   }
