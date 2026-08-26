@@ -1620,3 +1620,42 @@ hit ~19k -- the churn re-uploads the SAME keys, which also predicts the
 repurpose-eviction remnant (new keys, dead old ones) would not move this
 number. T3 stays closed for cheap fixes; next target is the GPT review's
 rank 3, dynamic repricing of the physical-remap check.
+
+## Physical-remap check repriced on post-T5 weights: 0.7-1.4% CPU, real
+
+Fresh capture at the docks on the current default build (lever on,
+`3425b31fa`): corpus2.bin + coverage2.csv, 347.6e9 executed guest
+instructions over the window, spinner pair still 52.8% of executed
+instructions (it spins at full speed between sleep episodes; the lever
+reclaims the *wait*, not the share). Non-spin (47.2%, 164.0e9):
+
+- Named loads/stores (lwz/stw/lfs/stfs) are **15.74% of executed non-spin
+  guest instructions** -- a lower bound; op-31 indexed forms (lwzx etc.,
+  17.95% bucket) add an unquantified amount.
+- Every non-constant access on a 16 KiB-granularity host retires the
+  3-instruction remap check (`lsr/cmp/b.ne`, the `add` only above
+  0xE0000000) AND loses the direct `[membase, W, UXTW]` addressing form to
+  an extra `mov` (`GuestMemDirectIndex` refuses remap hosts), so the real
+  per-access tax is ~4 instructions of the 8.64. Constant addresses already
+  fold the check at compile time (`ComputeMemoryAddressOffset`).
+- Price: >=4 x 15.74% / 6.1 host-per-guest = **>=10% of non-spin executed
+  host instructions**, x0.47 non-spin fraction x0.35-0.42 JIT share /2
+  discount (the check is well-predicted ALU, time share below instruction
+  share) = **~0.7-1.4% CPU at the docks**. 2.5-5x the floor.
+
+Elimination designs, assessed:
+(a) **Bake +0x1000 into the host mapping: impossible on this hardware.**
+    `MapViews` masks the 0xE view's target offset with the allocation
+    granularity (`memory.cc:433`, map_info target `0x...100001000`); 16 KiB
+    pages cannot alias at a 4 KiB offset. This is why the check exists.
+(b) **PROT_NONE the 0xE host range and drop every check.** An unchecked
+    0xE access then faults loudly instead of silently reading the wrong
+    page -- the catastrophic-silent failure mode becomes a crash, and a
+    fault handler could fix up stragglers. Viability turns entirely on how
+    often guest code actually touches >=0xE0000000 at runtime (360 titles
+    use physical allocs there for GPU-visible buffers; frequency unknown).
+    **Next step: instrument ApplyPhysicalRemapW0's taken path with a
+    per-context counter and measure the docks rate before any design work.**
+(c) **Static value-range elision**: constants already handled; variable
+    bases dominate and the doc's earlier warning stands (base+disp can
+    straddle the boundary). Low ceiling, not pursued.
