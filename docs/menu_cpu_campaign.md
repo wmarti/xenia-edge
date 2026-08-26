@@ -74,10 +74,38 @@ predate two instrument fixes and their denominators are wrong.
 | --- | --- | --- | --- |
 | T1 | Reach NETWORK_RECEIVE zero-delay yield trap (~27% of Reach menu CPU) | lever landed, default off (`--zero_delay_spin_limit`) | **-54.58% Reach menu, 3/3 pairs. Null on Halo 3 and GTA IV** -- title-specific, so it stays off |
 | T2 | `TimerQueue` spin_wait -> blocking_wait on POSIX (10.3% Halo 3 / 4.3% Reach) | landed | **-2.74%** |
-| T3 | Halo 3 host GPU submit/encode (53% aggregate, no single hot spot) | unblocked -- the present-rate question was resolved, no unpaced loop exists | not attempted |
-| T4 | Redundant guest address computation (`guest_828BF420`, `guest_82A46D70`) | sized, not attempted | 13.90% of executed memory operands, but **~0.38% CPU after discount** vs a 0.28% floor; 94% of it in two functions |
-| T5 | Those two functions are a **guest spin-wait**: `828BF420` loops calling `82A46D70` until two counters differ by <2. 18.2% of on-core time at the docks | open | not yet -- blocked on identifying what writes the counters |
+| T3 | Halo 3 host GPU submit/encode (53% aggregate, no single hot spot) | **closed for cheap fixes** -- four hypotheses killed with measurement; what is left is texture-cache policy, not submission mechanics | ~100 MiB/frame of real invalidation, 46.5% GPU-origin / 53.5% guest-origin |
+| T4 | Redundant guest address computation (`guest_828BF420`, `guest_82A46D70`) | **rejected** -- under the noise floor once repriced | 13.90% of executed memory operands, but **~0.38% CPU after discount** vs a 0.28% floor; 94% of it in two functions |
+| T5 | Those two functions are a **guest spin-wait**: `828BF420` loops calling `82A46D70` until two counters differ by <2. 18.2% of on-core time at the docks | **open, top target** -- counters identified as guest-written (submitted/completed); the spinner never yields the host thread | 18.2% of on-core at the docks; ~26 guest threads oversubscribing ~12 host cores |
 | B1 | `PACK_D3DCOLOR` returned 0xFFFFFFFF always | fixed, guard proven to fail on the bug | correctness |
+
+### Next up, in order
+
+1. **T5 -- make the guest spinner yield.** `828BF420` spins on a
+   submitted/completed counter pair with no preemption injected
+   (`--guest_scheduler=false` is permanent, below), so a spinning guest thread
+   holds a host core against ~26 guest threads on ~12 cores and can starve the
+   very consumer it waits for. A narrow back-edge yield is a much smaller change
+   than the preempt-check pass and does not need the scheduler. Gate: CPU at the
+   docks AND throughput, three pairs, plus a screenshot -- it changes timing the
+   guest can observe.
+2. **T3 remnant, only with a frame-comparison gate and more than one tick.**
+   Evicting textures whose backing memory the guest has repurposed, and testing
+   resolve extents at texture granularity rather than range overlap. Both are
+   cache-policy changes of the exact kind this campaign has twice got wrong in
+   ways only a screenshot caught.
+3. **Nothing on T4.** Repriced below the noise floor; do not re-open.
+
+### Standing configuration decisions
+
+- **`--guest_scheduler=false` is permanent on macOS, by user decision
+  (2026-08-26): "Keep guest scheduler OFF always, no need to test it for now.
+  It's borked on macOS."** Do not A/B it, do not propose flipping it, and do not
+  attribute a result to it. It is the baseline, not a variable. Any future
+  scheduling work has to live inside `gs=false`.
+- A leg whose present counter does not advance is discarded by `state_ab.py`
+  rather than averaged (`b817a829f`). A stalled guest parks its threads, so its
+  CPU reads LOWER than a healthy leg -- a stall looks like a win.
 
 ## T3's present-rate question, resolved: there is no unpaced present loop
 
@@ -574,6 +602,9 @@ already shipped two rendering regressions that every counter called a win.
   Static inventory workflow running over the 23 unmerged `origin/a64-fixes-on-edge`
   commits, the CNTVCT_EL0 profiler, `bc2f386ff` (signal-wake WaitMultiple), the
   instrument inventory, and menu architecture.
+- 2026-08-26: T3 closed for cheap fixes and T4 rejected; T5 promoted to top
+  target. `guest_scheduler` fixed OFF by decision, removing it as a variable.
+  `state_ab.py` now discards a stalled leg instead of reporting it as a row.
 
 ## Reach menu, paired A/B against upstream (2026-08-26)
 
