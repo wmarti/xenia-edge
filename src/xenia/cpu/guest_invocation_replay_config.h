@@ -34,6 +34,7 @@ enum GuestInvocationReplayBuildFeature : uint32_t {
   kGuestInvocationReplayBuildProfiling = 1u << 3,
   kGuestInvocationReplayBuildAssertionsDisabled = 1u << 4,
   kGuestInvocationReplayBuildRelease = 1u << 5,
+  kGuestInvocationReplayBuildLTO = 1u << 6,
 };
 
 constexpr uint32_t kGuestInvocationReplayKnownBuildFeatureMask =
@@ -42,7 +43,7 @@ constexpr uint32_t kGuestInvocationReplayKnownBuildFeatureMask =
     kGuestInvocationReplayBuildTraceFunctions |
     kGuestInvocationReplayBuildProfiling |
     kGuestInvocationReplayBuildAssertionsDisabled |
-    kGuestInvocationReplayBuildRelease;
+    kGuestInvocationReplayBuildRelease | kGuestInvocationReplayBuildLTO;
 
 enum class GuestInvocationReplayHostPlatform : uint32_t {
   kUnknown = 0,
@@ -56,6 +57,12 @@ enum class GuestInvocationReplayIndirectionMode : uint32_t {
   kUnknown = 0,
   kRawFixedAddress = 1,
   kEncoded = 2,
+};
+
+enum class GuestInvocationReplayCodeMappingMode : uint32_t {
+  kUnknown = 0,
+  kWritableExecutable = 1,
+  kSplitView = 2,
 };
 
 enum GuestInvocationReplayBackendCodegenFeature : uint32_t {
@@ -73,7 +80,7 @@ struct GuestInvocationReplayConfigEntry {
 // capability. Values use IConfigVar's locale-neutral effective serialization,
 // after command-line, per-title and global-config precedence has been applied.
 struct GuestInvocationReplayConfig {
-  static constexpr uint32_t kVersion = 1;
+  static constexpr uint32_t kVersion = 2;
   static constexpr uint32_t kGuestPageSize = 4096;
   static constexpr uint32_t kMaxHostProtectionPageSize = 65536;
   static constexpr uint32_t kMaxEntries = 128;
@@ -85,6 +92,8 @@ struct GuestInvocationReplayConfig {
       GuestInvocationReplayHostPlatform::kUnknown;
   GuestInvocationReplayIndirectionMode indirection_mode =
       GuestInvocationReplayIndirectionMode::kUnknown;
+  GuestInvocationReplayCodeMappingMode code_mapping_mode =
+      GuestInvocationReplayCodeMappingMode::kUnknown;
   uint32_t backend_codegen_features = 0;
   uint32_t host_protection_page_size = 0;
   uint64_t host_feature_flags = 0;

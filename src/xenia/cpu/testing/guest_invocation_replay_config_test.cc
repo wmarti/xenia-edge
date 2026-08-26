@@ -40,15 +40,17 @@ namespace {
 class ReplayConfigTestCodeCache final : public backend::CodeCache {
  public:
   ReplayConfigTestCodeCache(bool has_indirection_table,
-                            bool encoded_indirection)
+                            bool encoded_indirection, MappingMode mapping_mode)
       : has_indirection_table_(has_indirection_table),
-        encoded_indirection_(encoded_indirection) {}
+        encoded_indirection_(encoded_indirection),
+        mapping_mode_(mapping_mode) {}
 
   const std::filesystem::path& file_name() const override { return file_name_; }
   uintptr_t execute_base_address() const override { return 0; }
   size_t total_size() const override { return 0; }
   bool has_indirection_table() const override { return has_indirection_table_; }
   bool encoded_indirection() const override { return encoded_indirection_; }
+  MappingMode mapping_mode() const override { return mapping_mode_; }
   uint64_t placement_generation() const override { return 0; }
   GuestFunction* LookupFunction(uint64_t host_pc) override { return nullptr; }
   void* LookupUnwindInfo(uint64_t host_pc) override { return nullptr; }
@@ -61,6 +63,7 @@ class ReplayConfigTestCodeCache final : public backend::CodeCache {
   std::filesystem::path file_name_;
   bool has_indirection_table_;
   bool encoded_indirection_;
+  MappingMode mapping_mode_;
 };
 
 class NamedNullBackend final : public backend::NullBackend {
@@ -110,6 +113,8 @@ GuestInvocationReplayConfig MakeConfig(
   config.backend_name = backend_name;
   config.host_platform = host_platform;
   config.indirection_mode = GuestInvocationReplayIndirectionMode::kEncoded;
+  config.code_mapping_mode =
+      GuestInvocationReplayCodeMappingMode::kWritableExecutable;
   config.backend_codegen_features = 0;
   config.host_protection_page_size = 16384;
   config.host_feature_flags = 0x0102030405060708ull;
@@ -166,7 +171,8 @@ TEST_CASE("guest invocation replay config captures the effective environment",
   auto memory = std::make_unique<Memory>();
   REQUIRE(memory->Initialize());
   Processor processor(memory.get(), nullptr);
-  ReplayConfigTestCodeCache code_cache(true, true);
+  ReplayConfigTestCodeCache code_cache(
+      true, true, backend::CodeCache::MappingMode::kWritableExecutable);
   NamedNullBackend backend{std::string(kCurrentBackendName), &code_cache};
   REQUIRE(backend.Initialize(&processor));
   GuestInvocationReplayConfig config;
@@ -178,6 +184,8 @@ TEST_CASE("guest invocation replay config captures the effective environment",
   REQUIRE(config.host_platform == kCurrentHostPlatform);
   REQUIRE(config.indirection_mode ==
           GuestInvocationReplayIndirectionMode::kEncoded);
+  REQUIRE(config.code_mapping_mode ==
+          GuestInvocationReplayCodeMappingMode::kWritableExecutable);
   uint32_t expected_backend_codegen_features = 0;
   if (kCurrentBackendName == "x64" &&
       static_cast<uint32_t>(
@@ -202,7 +210,32 @@ TEST_CASE("guest invocation replay config captures the effective environment",
 #if defined(XE_BUILD_RELEASE) && XE_BUILD_RELEASE
   expected_build_features |= kGuestInvocationReplayBuildRelease;
 #endif
+#if defined(XE_BUILD_LTO) && XE_BUILD_LTO
+  expected_build_features |= kGuestInvocationReplayBuildLTO;
+#endif
   REQUIRE(config.build_features == expected_build_features);
+
+  ReplayConfigTestCodeCache split_code_cache(
+      true, true, backend::CodeCache::MappingMode::kSplitView);
+  NamedNullBackend split_backend{std::string(kCurrentBackendName),
+                                 &split_code_cache};
+  REQUIRE(split_backend.Initialize(&processor));
+  GuestInvocationReplayConfig split_config;
+  REQUIRE(CaptureCurrentGuestInvocationReplayConfig(split_backend,
+                                                    &split_config, &error));
+  REQUIRE(split_config.code_mapping_mode ==
+          GuestInvocationReplayCodeMappingMode::kSplitView);
+
+  ReplayConfigTestCodeCache unmapped_code_cache(
+      true, true, backend::CodeCache::MappingMode::kUninitialized);
+  NamedNullBackend unmapped_backend{std::string(kCurrentBackendName),
+                                    &unmapped_code_cache};
+  REQUIRE(unmapped_backend.Initialize(&processor));
+  split_config.backend_name = "prefilled";
+  REQUIRE_FALSE(CaptureCurrentGuestInvocationReplayConfig(
+      unmapped_backend, &split_config, &error));
+  REQUIRE(split_config == GuestInvocationReplayConfig{});
+  REQUIRE(error.find("initialized code mapping") != std::string::npos);
 
   const std::vector<std::string_view> names =
       GuestInvocationReplayConfigVariableNames(kCurrentBackendName,
@@ -256,6 +289,10 @@ TEST_CASE("guest invocation replay config has a strict canonical encoding",
   REQUIRE(first == second);
   REQUIRE(first.size() > 32);
   REQUIRE(std::string(first.cbegin(), first.cbegin() + 8) == "XEPPCRC1");
+  REQUIRE(first[8] == GuestInvocationReplayConfig::kVersion);
+  REQUIRE(first[9] == 0);
+  REQUIRE(first[10] == 0);
+  REQUIRE(first[11] == 0);
 
   std::array<uint8_t, 32> first_hash = {};
   std::array<uint8_t, 32> second_hash = {};
@@ -263,9 +300,9 @@ TEST_CASE("guest invocation replay config has a strict canonical encoding",
   REQUIRE(HashGuestInvocationReplayConfig(config, &second_hash, &error));
   REQUIRE(first_hash == second_hash);
   constexpr std::array<uint8_t, 32> kExpectedHash = {
-      0x57, 0xBE, 0x94, 0x9D, 0x0A, 0x8B, 0x20, 0x21, 0x49, 0x35, 0xF9,
-      0x54, 0x45, 0xEA, 0x86, 0x98, 0x26, 0xF4, 0x6C, 0x2D, 0x04, 0xDE,
-      0xED, 0xEF, 0x51, 0x66, 0xB7, 0xA5, 0xED, 0xDB, 0x17, 0x86,
+      0xDE, 0xDD, 0xD0, 0xA1, 0x76, 0x14, 0x74, 0x40, 0x07, 0x3F, 0xE8,
+      0x95, 0x2D, 0x73, 0x52, 0x2B, 0xE7, 0x8C, 0x61, 0xDC, 0x04, 0xC1,
+      0x9E, 0xFE, 0x68, 0xFF, 0xBF, 0x92, 0xB5, 0x81, 0x07, 0x82,
   };
   REQUIRE(first_hash == kExpectedHash);
 
@@ -281,6 +318,16 @@ TEST_CASE("guest invocation replay config has a strict canonical encoding",
   config = MakeConfig("a64");
   config.indirection_mode =
       GuestInvocationReplayIndirectionMode::kRawFixedAddress;
+  REQUIRE(HashGuestInvocationReplayConfig(config, &second_hash, &error));
+  REQUIRE(first_hash != second_hash);
+
+  config = MakeConfig("a64");
+  config.code_mapping_mode = GuestInvocationReplayCodeMappingMode::kSplitView;
+  REQUIRE(HashGuestInvocationReplayConfig(config, &second_hash, &error));
+  REQUIRE(first_hash != second_hash);
+
+  config = MakeConfig("a64");
+  config.build_features |= kGuestInvocationReplayBuildLTO;
   REQUIRE(HashGuestInvocationReplayConfig(config, &second_hash, &error));
   REQUIRE(first_hash != second_hash);
 
@@ -345,6 +392,10 @@ TEST_CASE("guest invocation replay config rejects schema and envelope drift",
   REQUIRE_FALSE(EncodeGuestInvocationReplayConfig(config, &encoded, &error));
 
   config = MakeConfig("a64");
+  config.code_mapping_mode = GuestInvocationReplayCodeMappingMode::kUnknown;
+  REQUIRE_FALSE(EncodeGuestInvocationReplayConfig(config, &encoded, &error));
+
+  config = MakeConfig("a64");
   config.backend_codegen_features = kGuestInvocationReplayX64MembaseLow32Zero;
   REQUIRE_FALSE(EncodeGuestInvocationReplayConfig(config, &encoded, &error));
 
@@ -356,7 +407,7 @@ TEST_CASE("guest invocation replay config rejects schema and envelope drift",
   REQUIRE_FALSE(EncodeGuestInvocationReplayConfig(config, &encoded, &error));
 }
 
-TEST_CASE("timed guest invocation replay requires a quiet fixed scheduler",
+TEST_CASE("timed guest invocation replay requires Apple A64 and fixed controls",
           "[guest-invocation-replay-config]") {
   std::string error;
   GuestInvocationReplayConfig config = MakeBenchmarkConfig("a64");
@@ -408,13 +459,13 @@ TEST_CASE("timed guest invocation replay requires a quiet fixed scheduler",
   REQUIRE_FALSE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));
 
   config = MakeBenchmarkConfig("x64");
-  REQUIRE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));
+  REQUIRE_FALSE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));
+  REQUIRE(error.find("a64 backend") != std::string::npos);
 
   config =
-      MakeBenchmarkConfig("x64", GuestInvocationReplayHostPlatform::kWindows);
-  REQUIRE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));
-  SetValue(&config, "instrument_call_times", "true");
+      MakeBenchmarkConfig("a64", GuestInvocationReplayHostPlatform::kGnuLinux);
   REQUIRE_FALSE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));
+  REQUIRE(error.find("Apple host") != std::string::npos);
 }
 
 }  // namespace xe::cpu::test

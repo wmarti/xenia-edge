@@ -7,6 +7,7 @@ xe_test_suite(xenia-cpu-tests ${CMAKE_CURRENT_SOURCE_DIR}
 if(TARGET xenia-cpu-tests)
   target_compile_definitions(xenia-cpu-tests PRIVATE
     $<$<CONFIG:Release>:XE_BUILD_RELEASE=1>
+    $<$<AND:$<CONFIG:Release>,$<BOOL:${XENIA_ENABLE_LTO}>>:XE_BUILD_LTO=1>
   )
 endif()
 if(XE_TARGET_X86_64 AND TARGET xenia-cpu-tests)

@@ -22,6 +22,12 @@ namespace backend {
 
 class CodeCache {
  public:
+  enum class MappingMode : uint8_t {
+    kUninitialized = 0,
+    kWritableExecutable,
+    kSplitView,
+  };
+
   CodeCache() = default;
   virtual ~CodeCache() = default;
 
@@ -30,6 +36,9 @@ class CodeCache {
   virtual size_t total_size() const = 0;
   virtual bool has_indirection_table() const = 0;
   virtual bool encoded_indirection() const = 0;
+  // The actual initialized generated-code mapping, not the CVar preference
+  // used when selecting it.
+  virtual MappingMode mapping_mode() const = 0;
   // Monotonically changes after each completed host or guest code placement.
   // This is intentionally updated only on the cold placement path so a
   // benchmark can prove that no lazy JIT work entered its timed region

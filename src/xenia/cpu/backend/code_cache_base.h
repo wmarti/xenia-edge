@@ -175,6 +175,15 @@ class CodeCacheBase : public CodeCache {
   // fixed allocation succeeded and slots hold raw 32-bit absolute addresses.
   bool encoded_indirection() const override { return encoded_indirection_; }
 
+  CodeCache::MappingMode mapping_mode() const override {
+    if (!generated_code_execute_base_ || !generated_code_write_base_) {
+      return CodeCache::MappingMode::kUninitialized;
+    }
+    return generated_code_execute_base_ == generated_code_write_base_
+               ? CodeCache::MappingMode::kWritableExecutable
+               : CodeCache::MappingMode::kSplitView;
+  }
+
   // Hint from the backend: if false, skip the fast-path attempt entirely
   // (trampolines couldn't land sub-4GB, so fast-mode slot encoding won't
   // fit them).  Must be set before Initialize.

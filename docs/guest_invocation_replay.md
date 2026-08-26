@@ -48,13 +48,15 @@ and backend-private storage are not portable execution state.
 
 Capture and replay use one shared, versioned configuration serializer. It
 fingerprints the selected host backend, host platform/ABI, runtime-selected
-code-cache indirection mode, backend codegen predicates derived from the actual
+code-cache indirection mode, the actual initialized writable-executable or
+split-view code mapping, backend codegen predicates derived from the actual
 guest-memory mapping, host protection-page size, detected host ISA feature
-mask, build configuration, JIT tracing/profiling features and an explicit
-allowlist of effective CVar values read by PPC translation, optimization,
-backend emission or generated-code runtime helpers. Effective values are read
-after command-line, per-title and global-config precedence; hashing only global
-or command-line values would silently miss a live title override.
+mask, Release and LTO build modes, JIT tracing/profiling features and an
+explicit allowlist of effective CVar values read by PPC translation,
+optimization, backend emission or generated-code runtime helpers. Effective
+values are read after command-line, per-title and global-config precedence;
+hashing only global or command-line values would silently miss a live title
+override.
 
 The allowlist is deliberately not a scan of every CPU-category option. Log and
 dump paths, disassembly output and compile-only reporting do not change a
@@ -62,15 +64,23 @@ warmed invocation and must not invalidate a replay. Conversely, a missing
 allowlisted CVar, unknown build-feature bit, unsupported backend or schema/order
 change fails closed. Changing the allowlist requires a serializer version bump.
 
-A timed v1 replay additionally requires `guest_scheduler=false`, an explicit
-CMake `Release` build with assertions disabled, no JIT tracing or profiling,
-no CPU trace or coverage counters, no call-path/remap counters, no debug
-optimization mode, no execution breakpoint and no recorded-MMIO-aware store
-specialization. It also disables early precompilation, compile-time reads from
-read-only guest memory and MMIO inlining, and requires serialized guest-function
-definition so code placement cannot race. The x64 backend additionally requires
-call-time instrumentation off on Windows. These are acceptance gates, not
-values copied from an artifact.
+A timed v1 replay is limited to the A64 backend on an Apple host. Configuration
+capture and serialization remain generic for cross-platform diagnostics, but
+other backend/host pairs are not benchmark inputs. Timed replay additionally
+requires `guest_scheduler=false`, an explicit CMake `Release` build with
+assertions disabled, no JIT tracing or profiling, no CPU trace or coverage
+counters, no call-path/remap counters, no debug optimization mode, no execution
+breakpoint and no recorded-MMIO-aware store specialization. It also disables
+early precompilation, compile-time reads from read-only guest memory and MMIO
+inlining, and requires serialized guest-function definition so code placement
+cannot race. These are acceptance gates, not values copied from an artifact.
+
+The current fingerprint distinguishes LTO from non-LTO binaries and the two
+runtime code-mapping layouts. It does not yet canonically identify the compiler,
+SDK or complete compile and link flags. Therefore externally supplied binaries
+and binaries produced by a different build tree are not accepted for v1 timing,
+even if their current replay-configuration hashes match. That restriction can
+be lifted only after those build-mode inputs have a canonical fingerprint.
 
 V1 intentionally canonicalizes these compile-time inputs: capture and replay
 must both use `enable_early_precompilation=false`,

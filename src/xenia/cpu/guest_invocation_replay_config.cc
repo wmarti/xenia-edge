@@ -196,6 +196,16 @@ bool ValidateConfig(const GuestInvocationReplayConfig& config,
       }
       return false;
   }
+  switch (config.code_mapping_mode) {
+    case GuestInvocationReplayCodeMappingMode::kWritableExecutable:
+    case GuestInvocationReplayCodeMappingMode::kSplitView:
+      break;
+    default:
+      if (error) {
+        error->assign("replay configuration code mapping mode is unsupported");
+      }
+      return false;
+  }
   const uint32_t known_backend_codegen_features =
       config.backend_name == "x64" ? kGuestInvocationReplayX64MembaseLow32Zero
                                    : 0;
@@ -352,6 +362,19 @@ bool CaptureCurrentGuestInvocationReplayConfig(
       code_cache->encoded_indirection()
           ? GuestInvocationReplayIndirectionMode::kEncoded
           : GuestInvocationReplayIndirectionMode::kRawFixedAddress;
+  switch (code_cache->mapping_mode()) {
+    case backend::CodeCache::MappingMode::kWritableExecutable:
+      config.code_mapping_mode =
+          GuestInvocationReplayCodeMappingMode::kWritableExecutable;
+      break;
+    case backend::CodeCache::MappingMode::kSplitView:
+      config.code_mapping_mode =
+          GuestInvocationReplayCodeMappingMode::kSplitView;
+      break;
+    default:
+      return Fail(output, nullptr, nullptr, error,
+                  "replay capture requires an initialized code mapping");
+  }
 
   const Processor* processor = backend.processor();
   if (!processor || !processor->memory() ||
@@ -383,6 +406,9 @@ bool CaptureCurrentGuestInvocationReplayConfig(
 #endif
 #if defined(XE_BUILD_RELEASE) && XE_BUILD_RELEASE
   config.build_features |= kGuestInvocationReplayBuildRelease;
+#endif
+#if defined(XE_BUILD_LTO) && XE_BUILD_LTO
+  config.build_features |= kGuestInvocationReplayBuildLTO;
 #endif
 
   if (!cvar::ConfigVars) {
@@ -436,6 +462,7 @@ bool EncodeGuestInvocationReplayConfig(
   AppendU32(&encoded, GuestInvocationReplayConfig::kVersion);
   AppendU32(&encoded, static_cast<uint32_t>(config.host_platform));
   AppendU32(&encoded, static_cast<uint32_t>(config.indirection_mode));
+  AppendU32(&encoded, static_cast<uint32_t>(config.code_mapping_mode));
   AppendU32(&encoded, config.backend_codegen_features);
   AppendU32(&encoded, config.host_protection_page_size);
   AppendU64(&encoded, config.host_feature_flags);
@@ -478,6 +505,18 @@ bool ValidateGuestInvocationReplayBenchmarkConfig(
     error->clear();
   }
   if (!ValidateConfig(config, error)) {
+    return false;
+  }
+  if (config.backend_name != "a64") {
+    if (error) {
+      error->assign("timed replay v1 requires the a64 backend");
+    }
+    return false;
+  }
+  if (config.host_platform != GuestInvocationReplayHostPlatform::kApple) {
+    if (error) {
+      error->assign("timed replay v1 requires an Apple host");
+    }
     return false;
   }
   constexpr uint32_t kInstrumentedBuildFeatures =
