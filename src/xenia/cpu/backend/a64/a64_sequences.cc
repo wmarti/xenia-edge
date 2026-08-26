@@ -1852,6 +1852,12 @@ struct AND_I32 : Sequence<AND_I32, I<OPCODE_AND, I32Op, I32Op, I32Op>> {
 };
 struct AND_I64 : Sequence<AND_I64, I<OPCODE_AND, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    if (e.ConsumeFusedSkip(i.instr)) {
+      // SHL_I64 already produced this value with a W-form lsl. No ANDS ran,
+      // so no flags are declared for the compare fusion; a later compare
+      // simply re-tests.
+      return;
+    }
     // See AND_I32: ANDS is free and feeds the compare-vs-zero fusion.
     if (i.src1.is_constant && i.src2.is_constant) {
       e.mov(i.dest,
@@ -2302,11 +2308,61 @@ struct SHL_I32 : Sequence<SHL_I32, I<OPCODE_SHL, I32Op, I32Op, I8Op>> {
   }
 };
 struct SHL_I64 : Sequence<SHL_I64, I<OPCODE_SHL, I64Op, I64Op, I8Op>> {
+  // rlwinm's hot path reaches the backend as shl + and #0xFFFFFFFF, two
+  // instructions for what one W-form lsl computes: a 32-bit register write
+  // zeroes the upper half, and a left shift cannot move bits downward, so
+  // ((x << n) & 0xFFFFFFFF) == W(lsl)(W(x), n) for n < 32. When the shifted
+  // value's only consumer is that mask, emit the single W-form lsl into the
+  // consumer's destination and skip the consumer. Executed rlwinm is 8.81%
+  // of non-spin guest instructions at the GTA IV docks, ~90% of it on this
+  // path.
+  static bool TryFuseMask32(A64Emitter& e, const EmitArgType& i) {
+    if (!i.src2.is_constant || i.src1.is_constant) {
+      return false;
+    }
+    const uint32_t n = static_cast<uint32_t>(i.src2.constant() & 0x3F);
+    if (n == 0 || n >= 32) {
+      return false;
+    }
+    const hir::Instr* next = i.instr->next;
+    if (!next || next->GetOpcodeNum() == hir::OPCODE_SOURCE_OFFSET) {
+      // A fused pair never spans a guest instruction boundary.
+      return false;
+    }
+    if (next->GetOpcodeNum() != hir::OPCODE_AND || !next->dest) {
+      return false;
+    }
+    // One side the shifted value, the other the 32-bit mask.
+    const hir::Value* other = nullptr;
+    if (next->src1.value == i.instr->dest) {
+      other = next->src2.value;
+    } else if (next->src2.value == i.instr->dest) {
+      other = next->src1.value;
+    }
+    if (!other || !other->IsConstant() ||
+        other->constant.u64 != 0xFFFFFFFFull) {
+      return false;
+    }
+    // The shifted 64-bit value must die at the mask.
+    const hir::Value* shifted = i.instr->dest;
+    if (!shifted->use_head || shifted->use_head->next != nullptr ||
+        shifted->use_head->instr != next) {
+      return false;
+    }
+    Xbyak_aarch64::WReg wdest(0);
+    A64Emitter::SetupReg(next->dest, wdest);
+    e.lsl(wdest, Xbyak_aarch64::WReg(i.src1.reg().getIdx()), n);
+    e.MarkFusedSkip(next);
+    return true;
+  }
+
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     if (i.src2.is_constant) {
       if (i.src1.is_constant) {
         e.mov(i.dest, static_cast<uint64_t>(i.src1.constant()
                                             << (i.src2.constant() & 0x3F)));
+      } else if (TryFuseMask32(e, i)) {
+        return;
       } else {
         e.lsl(i.dest, i.src1, static_cast<uint32_t>(i.src2.constant() & 0x3F));
       }
