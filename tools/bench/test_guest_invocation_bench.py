@@ -273,6 +273,11 @@ class RunnerTest(unittest.TestCase):
                 "/tmp/a", [
                     "--guest_invocation_iterations=1",
                     "--guest_scheduler=true",
+                    "--emit_mmio_aware_stores_for_recorded_exception_addresses=true",
+                    "--enable_early_precompilation=true",
+                    "--fold_readonly_guest_memory_loads=true",
+                    "--inline_mmio_access=true",
+                    "--serialize_guest_function_definitions=false",
                 ],
                 "/tmp/input.xinv", "/tmp/input.jcorpus", expected(),
                 10.0, 1)
@@ -284,6 +289,23 @@ class RunnerTest(unittest.TestCase):
         self.assertGreater(
             command.index("--guest_scheduler=false"),
             command.index("--guest_scheduler=true"))
+        self.assertGreater(
+            command.index(
+                "--emit_mmio_aware_stores_for_recorded_exception_addresses=false"),
+            command.index(
+                "--emit_mmio_aware_stores_for_recorded_exception_addresses=true"),
+        )
+        for fixed, user in (
+                ("--enable_early_precompilation=false",
+                 "--enable_early_precompilation=true"),
+                ("--fold_readonly_guest_memory_loads=false",
+                 "--fold_readonly_guest_memory_loads=true"),
+                ("--inline_mmio_access=false", "--inline_mmio_access=true"),
+                ("--serialize_guest_function_definitions=true",
+                 "--serialize_guest_function_definitions=false"),
+        ):
+            with self.subTest(fixed=fixed):
+                self.assertGreater(command.index(fixed), command.index(user))
         self.assertEqual(command[-3:], [
             "--guest_invocation_in=/tmp/input.xinv",
             "--jit_corpus_in=/tmp/input.jcorpus",

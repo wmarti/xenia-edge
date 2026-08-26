@@ -89,6 +89,11 @@ FIXED_RUNNER_FLAGS = (
     "--jit_corpus_allow_incomplete=false",
     "--count_call_paths=false",
     "--count_physical_remap_hits=false",
+    "--emit_mmio_aware_stores_for_recorded_exception_addresses=false",
+    "--enable_early_precompilation=false",
+    "--fold_readonly_guest_memory_loads=false",
+    "--inline_mmio_access=false",
+    "--serialize_guest_function_definitions=true",
     "--trace_function_coverage=false",
     "--cpu_trace_mask=0",
 )

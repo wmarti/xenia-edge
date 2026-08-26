@@ -4,6 +4,11 @@ xe_test_suite(xenia-cpu-tests ${CMAKE_CURRENT_SOURCE_DIR}
     xenia-apu xenia-base xenia-core xenia-cpu xenia-gpu
     xenia-hid-portal xenia-kernel xenia-ui xenia-patcher
 )
+if(TARGET xenia-cpu-tests)
+  target_compile_definitions(xenia-cpu-tests PRIVATE
+    $<$<CONFIG:Release>:XE_BUILD_RELEASE=1>
+  )
+endif()
 if(XE_TARGET_X86_64 AND TARGET xenia-cpu-tests)
   target_link_libraries(xenia-cpu-tests PRIVATE xenia-cpu-backend-x64)
 elseif(XE_TARGET_AARCH64 AND TARGET xenia-cpu-tests)

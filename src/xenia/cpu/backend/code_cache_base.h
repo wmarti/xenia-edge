@@ -167,11 +167,13 @@ class CodeCacheBase : public CodeCache {
     return true;
   }
 
-  bool has_indirection_table() { return indirection_table_base_ != nullptr; }
+  bool has_indirection_table() const override {
+    return indirection_table_base_ != nullptr;
+  }
 
   // True when slots hold encoded rel32 + tagged-external values, false when
   // fixed allocation succeeded and slots hold raw 32-bit absolute addresses.
-  bool encoded_indirection() const { return encoded_indirection_; }
+  bool encoded_indirection() const override { return encoded_indirection_; }
 
   // Hint from the backend: if false, skip the fast-path attempt entirely
   // (trampolines couldn't land sub-4GB, so fast-mode slot encoding won't

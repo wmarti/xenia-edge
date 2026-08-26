@@ -28,6 +28,8 @@ class CodeCache {
   virtual const std::filesystem::path& file_name() const = 0;
   virtual uintptr_t execute_base_address() const = 0;
   virtual size_t total_size() const = 0;
+  virtual bool has_indirection_table() const = 0;
+  virtual bool encoded_indirection() const = 0;
   // Monotonically changes after each completed host or guest code placement.
   // This is intentionally updated only on the cold placement path so a
   // benchmark can prove that no lazy JIT work entered its timed region
