@@ -1406,3 +1406,34 @@ confirmation A/B with the induction filter showing a clean site log, and
 lever is generic. The CPU reclaim at the docks is the largest this campaign
 has measured at this state; the throughput question that killed the first
 run is answered as "no consistent effect".
+
+## T5 lever, third and fourth A/Bs: gate clean, and provably inert on Halo 3
+
+**Docks confirmation with the induction filter** (binary `c4190ee4e`):
+
+| pair | off CPU | on CPU | dCPU | dswaps |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 419.03 | 363.13 | -13.34% | -11.91% |
+| 2 | 425.69 | 361.79 | -15.01% | +1.29% |
+| 3 | 426.41 | 364.29 | -14.57% | -2.54% |
+
+CPU **-14.31% mean, all pairs agree** -- the third consecutive A/B at this
+magnitude (-13.95, -14.91, -14.31 across three runs; every lever-on leg ever
+measured sits in 360-365% against off-legs at 415-433%). The site log is
+**clean**: `828BF474` only, in every lever-on leg (1,081 / 6,899 episodes and
+similar); the byte-scanner no longer appears. Throughput across all six
+filtered+unfiltered pairs: mean -0.46%, signs split 4:2 -- consistent with no
+effect at this noise level.
+
+**Halo 3 menu** (30 fps locked, CPU is the metric): -0.94% / +0.43% / +0.24%,
+mean **-0.09%, pairs disagree -- a null**, and mechanically explained:
+**zero escalation episodes** in any lever-on leg. No Halo 3 menu loop ever
+reaches 100k consecutive sub-microsecond iterations, so the lever does not
+act at all. Presents pinned at 29.95 in all six legs.
+
+**Standing after four A/Bs:** the lever does exactly one thing -- it puts the
+GTA IV docks spinner to sleep -- and does it for -14% CPU with no measurable
+throughput cost and no effect anywhere else tested. Still default-off. The
+remaining step before proposing default-on is a Reach check (its menu has the
+kernel-side zero-delay spin; the interaction should be measured, not
+presumed).
