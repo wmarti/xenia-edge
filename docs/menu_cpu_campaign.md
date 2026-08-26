@@ -1588,3 +1588,35 @@ Evidence it LACKS: everything runtime. Before this cvar is ever enabled:
 46.5%-GPU-origin churn share predicts a large drop; (2) the compressed
 window-id screenshot gate against the unmodified build -- this is exactly
 the twice-burned change class; (3) docks throughput. Next tick.
+
+## T3 slice 1 measured: correct, visually clean, and INEFFECTIVE at the docks
+
+The runtime gate (docks, 110 s legs, counters + window-id screenshot,
+`9a1030c9c` on vs off):
+
+| counter | off | on | delta |
+| --- | ---: | ---: | ---: |
+| upload_calls | 1,403,721 | 1,391,786 | -0.85% |
+| fire_watch_gpu_pages | 12,680,488 | 12,452,371 | -1.8% |
+| fire_watch_gpu_events | 163,190 | 163,846 | **+0.4%** |
+
+The events row is the verdict: with spans on, one resolve fires one
+FireWatches call per span, so events would multiply if resolves decomposed.
+They rose 0.4% -- **docks resolves average ~1.004 spans: they are full-pitch,
+the bounding interval was already tight, and there is nothing for the span
+decomposition to cut here.** Screenshot gate passes (scene-identical, no
+corruption), so the lever is correct -- just unproductive at this state.
+
+**This refutes "resolve extents wider than the data" as the docks churn
+mechanism.** The GPU half of the invalidation traffic is dense full-width
+resolves rewriting bytes that resident textures genuinely cover --
+render-target feedback, real data flow. Fixing THAT means keeping resolved
+data host-side rather than round-tripping guest memory, which is the
+architectural change the doc already put outside cheap-fix scope. The cvar
+stays default-off: proven harmless, potentially useful for titles with
+partial-screen resolves, not a campaign lever. Consistent with this,
+upload_distinct_keys held at ~1,300 across both legs while upload_max_repeats
+hit ~19k -- the churn re-uploads the SAME keys, which also predicts the
+repurpose-eviction remnant (new keys, dead old ones) would not move this
+number. T3 stays closed for cheap fixes; next target is the GPT review's
+rank 3, dynamic repricing of the physical-remap check.
