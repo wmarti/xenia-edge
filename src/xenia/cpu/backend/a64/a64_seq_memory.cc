@@ -72,9 +72,59 @@ static void SpinWaitRelease(void* ctx) {
   }
 }
 
+// After a pass-injected trip sleeps, this many further iterations re-trip it,
+// so a wait that outlives one sleep keeps sleeping instead of re-spinning the
+// full --spin_wait_yield_after budget. A wake that leads anywhere but straight
+// back into the loop leaves a gap the validation below rejects, which disarms.
+static constexpr uint32_t kSpinWaitRetripIters = 64;
+
+static uint64_t SpinWaitTimerFreq() {
+  static const uint64_t freq = [] {
+    uint64_t f;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    return f;
+  }();
+  return freq;
+}
+
+// Cold: reached once per --spin_wait_yield_after iterations of a tagged loop
+// (or per kSpinWaitRetripIters once armed). Validates that the counted
+// iterations were actually back-to-back polling before releasing the core; a
+// count that took longer than max_iter_ns per iteration means real work ran
+// in between, and the state resets instead.
+static void InjectedSpinWaitTrip(void* raw_context) {
+  auto* bctx = reinterpret_cast<A64BackendContext*>(
+      reinterpret_cast<char*>(raw_context) - sizeof(A64BackendContext));
+  uint64_t now;
+  asm volatile("mrs %0, cntvct_el0" : "=r"(now));
+  const uint64_t elapsed_ticks = now - bctx->spin_wait_reset_tick;
+  const uint64_t iters = bctx->spin_wait_armed ? kSpinWaitRetripIters
+                                               : cvars::spin_wait_yield_after;
+  const uint64_t budget_ticks = iters * uint64_t(cvars::spin_wait_max_iter_ns) *
+                                SpinWaitTimerFreq() / 1000000000ull;
+  if (elapsed_ticks <= budget_ticks) {
+    // Confirmed: nothing but polling since the last reset. Release the core.
+    SpinWaitRelease(raw_context);
+    bctx->spin_wait_armed = 1;
+    bctx->spin_wait_spins = cvars::spin_wait_yield_after - kSpinWaitRetripIters;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(now));
+    bctx->spin_wait_reset_tick = now;
+  } else {
+    // Real work ran inside the counted window -- either this is not a spin,
+    // or the wait ended and this is a later visit. Restart the count cold.
+    bctx->spin_wait_armed = 0;
+    bctx->spin_wait_spins = 0;
+    bctx->spin_wait_reset_tick = now;
+  }
+}
+
 struct DELAY_EXECUTION
     : Sequence<DELAY_EXECUTION, I<OPCODE_DELAY_EXECUTION, VoidOp>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    if (i.instr->flags & hir::DELAY_EXECUTION_INJECTED) {
+      EmitInjectedSpinCheck(e);
+      return;
+    }
     // db16cyc throttles a guest spin loop. yield is the literal translation
     // but NOPs on Cortex-X/A7xx, so the sled cost nothing; isb is the usual
     // stand-in - a pipeline flush with no guest-observable effect. Coalesce
@@ -148,6 +198,30 @@ struct DELAY_EXECUTION
     // Every path lands here, so the last instruction emitted is always the isb
     // the coalescing test above looks for.
     e.isb(Xbyak_aarch64::SY);
+  }
+
+  // Pass-injected form: count iterations, call the cold trip helper at the
+  // threshold. The fast path is six instructions and touches no timer; all
+  // validation, sleeping and state management lives in InjectedSpinWaitTrip.
+  // x16/x17 are the emitter's scratch registers.
+  static void EmitInjectedSpinCheck(A64Emitter& e) {
+    const uint32_t threshold = cvars::spin_wait_yield_after;
+    if (!threshold) {
+      // Pass is gated on the same cvar, but a stale corpus replay with
+      // different flags could still reach here; emit nothing.
+      return;
+    }
+    const int32_t spins_offset =
+        static_cast<int32_t>(offsetof(A64BackendContext, spin_wait_spins));
+    auto& not_yet = e.NewCachedLabel();
+    e.ldr(e.w16, ptr(e.GetBackendCtxReg(), spins_offset));
+    e.add(e.w16, e.w16, 1);
+    e.str(e.w16, ptr(e.GetBackendCtxReg(), spins_offset));
+    e.mov(e.w17, static_cast<uint64_t>(threshold));
+    e.cmp(e.w16, e.w17);
+    e.b(Xbyak_aarch64::LO, not_yet);
+    e.CallNativeSafe(reinterpret_cast<void*>(InjectedSpinWaitTrip));
+    e.L(not_yet);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_DELAY_EXECUTION, DELAY_EXECUTION);

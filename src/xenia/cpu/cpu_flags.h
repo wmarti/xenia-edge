@@ -41,5 +41,7 @@ DECLARE_path(jit_perf_map);
 DECLARE_uint32(db16cyc_yield_after);
 DECLARE_uint32(db16cyc_sleep_ns);
 DECLARE_uint32(db16cyc_consecutive_gap_ns);
+DECLARE_uint32(spin_wait_yield_after);
+DECLARE_uint32(spin_wait_max_iter_ns);
 
 #endif  // XENIA_CPU_CPU_FLAGS_H_

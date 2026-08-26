@@ -148,6 +148,13 @@ struct A64BackendContext {
   // is; see DELAY_EXECUTION in a64_seq_memory.cc.
   unsigned int db16cyc_spins;
   uint64_t db16cyc_last_tick;
+  // Pass-injected spin-wait state (see SpinWaitInjectionPass): iterations
+  // counted since the last reset, the timer reading at that reset, and
+  // whether the loop already escalated once (armed lowers the re-trip
+  // budget from --spin_wait_yield_after to kSpinWaitRetripIters).
+  unsigned int spin_wait_spins;
+  unsigned int spin_wait_armed;
+  uint64_t spin_wait_reset_tick;
 };
 
 // Default FPCR for FPU mode (round to nearest, no flush to zero).
