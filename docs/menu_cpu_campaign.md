@@ -1588,3 +1588,90 @@ Evidence it LACKS: everything runtime. Before this cvar is ever enabled:
 46.5%-GPU-origin churn share predicts a large drop; (2) the compressed
 window-id screenshot gate against the unmodified build -- this is exactly
 the twice-burned change class; (3) docks throughput. Next tick.
+
+## T3 slice 1 measured: correct, visually clean, and INEFFECTIVE at the docks
+
+The runtime gate (docks, 110 s legs, counters + window-id screenshot,
+`9a1030c9c` on vs off):
+
+| counter | off | on | delta |
+| --- | ---: | ---: | ---: |
+| upload_calls | 1,403,721 | 1,391,786 | -0.85% |
+| fire_watch_gpu_pages | 12,680,488 | 12,452,371 | -1.8% |
+| fire_watch_gpu_events | 163,190 | 163,846 | **+0.4%** |
+
+The events row is the verdict: with spans on, one resolve fires one
+FireWatches call per span, so events would multiply if resolves decomposed.
+They rose 0.4% -- **docks resolves average ~1.004 spans: they are full-pitch,
+the bounding interval was already tight, and there is nothing for the span
+decomposition to cut here.** Screenshot gate passes (scene-identical, no
+corruption), so the lever is correct -- just unproductive at this state.
+
+**This refutes "resolve extents wider than the data" as the docks churn
+mechanism.** The GPU half of the invalidation traffic is dense full-width
+resolves rewriting bytes that resident textures genuinely cover --
+render-target feedback, real data flow. Fixing THAT means keeping resolved
+data host-side rather than round-tripping guest memory, which is the
+architectural change the doc already put outside cheap-fix scope. The cvar
+stays default-off: proven harmless, potentially useful for titles with
+partial-screen resolves, not a campaign lever. Consistent with this,
+upload_distinct_keys held at ~1,300 across both legs while upload_max_repeats
+hit ~19k -- the churn re-uploads the SAME keys, which also predicts the
+repurpose-eviction remnant (new keys, dead old ones) would not move this
+number. T3 stays closed for cheap fixes; next target is the GPT review's
+rank 3, dynamic repricing of the physical-remap check.
+
+## Physical-remap check repriced on post-T5 weights: 0.7-1.4% CPU, real
+
+Fresh capture at the docks on the current default build (lever on,
+`3425b31fa`): corpus2.bin + coverage2.csv, 347.6e9 executed guest
+instructions over the window, spinner pair still 52.8% of executed
+instructions (it spins at full speed between sleep episodes; the lever
+reclaims the *wait*, not the share). Non-spin (47.2%, 164.0e9):
+
+- Named loads/stores (lwz/stw/lfs/stfs) are **15.74% of executed non-spin
+  guest instructions** -- a lower bound; op-31 indexed forms (lwzx etc.,
+  17.95% bucket) add an unquantified amount.
+- Every non-constant access on a 16 KiB-granularity host retires the
+  3-instruction remap check (`lsr/cmp/b.ne`, the `add` only above
+  0xE0000000) AND loses the direct `[membase, W, UXTW]` addressing form to
+  an extra `mov` (`GuestMemDirectIndex` refuses remap hosts), so the real
+  per-access tax is ~4 instructions of the 8.64. Constant addresses already
+  fold the check at compile time (`ComputeMemoryAddressOffset`).
+- Price: >=4 x 15.74% / 6.1 host-per-guest = **>=10% of non-spin executed
+  host instructions**, x0.47 non-spin fraction x0.35-0.42 JIT share /2
+  discount (the check is well-predicted ALU, time share below instruction
+  share) = **~0.7-1.4% CPU at the docks**. 2.5-5x the floor.
+
+Elimination designs, assessed:
+(a) **Bake +0x1000 into the host mapping: impossible on this hardware.**
+    `MapViews` masks the 0xE view's target offset with the allocation
+    granularity (`memory.cc:433`, map_info target `0x...100001000`); 16 KiB
+    pages cannot alias at a 4 KiB offset. This is why the check exists.
+(b) **PROT_NONE the 0xE host range and drop every check.** An unchecked
+    0xE access then faults loudly instead of silently reading the wrong
+    page -- the catastrophic-silent failure mode becomes a crash, and a
+    fault handler could fix up stragglers. Viability turns entirely on how
+    often guest code actually touches >=0xE0000000 at runtime (360 titles
+    use physical allocs there for GPU-visible buffers; frequency unknown).
+    **Next step: instrument ApplyPhysicalRemapW0's taken path with a
+    per-context counter and measure the docks rate before any design work.**
+(c) **Static value-range elision**: constants already handled; variable
+    bases dominate and the doc's earlier warning stands (base+disp can
+    straddle the boundary). Low ceiling, not pursued.
+
+## Remap-check elimination: closed. The guest really uses 0xE0000000+
+
+`--count_physical_remap_hits` (new, default off; racy by design) counted
+taken remap fixups at the docks, steady-state window t=100..140 s:
+**2,059,172 taken over 40 s = ~51,500/s, ~1,150 per present** (44.8
+presents/s, in state). GTA IV is continuously reading/writing physical
+allocations above 0xE0000000 -- GPU-visible buffers, as suspected.
+
+Design (b), PROT_NONE + fault fixup, is therefore dead: 51.5k faults/s at
+2-10 us each is 10-50% of a core. With (a) impossible on 16 KiB pages and
+(c) low-ceiling, **the 0.7-1.4% CPU remap tax has no viable cheap
+elimination and the target is closed.** Two mitigating notes for the
+record: taken fraction is ~0.01% of all checks (the branch is essentially
+perfectly predicted, so the true time cost sits at or below the /2
+discount), and the counter cvar remains as a diagnostic.
