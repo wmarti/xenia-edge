@@ -1301,3 +1301,74 @@ The instrument's own caveat: sequence tables count host instructions, and
 instruction share is not time share -- loads carry the cache misses, so their
 time share is likely above 46%, not below. Conversion to CPU% goes through the
 sampled guest-JIT share (~35-42%) as standing policy.
+
+## T5 lever, first measurement: the CPU cut is real, the throughput answer is not in
+
+GTA IV docks, `spin-off` vs `spin-100k` (`--spin_wait_yield_after=100000`),
+same binary `737456bd1`, `--guest_scheduler=false` both legs, 3 interleaved
+pairs attempted. The harness was killed externally during leg 6, so **two
+complete pairs** survive plus one unpaired off-leg; the JSON and paired
+summary were never written and the numbers below are computed from the leg
+lines.
+
+| | off CPU | on CPU | dCPU | off swaps | on swaps | dswaps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| pair 1 | 414.84 | 363.88 | **-12.28%** | 44.53 | 37.47 | -15.85% |
+| pair 2 | 429.68 | 362.56 | **-15.62%** | 39.62 | 41.58 | +4.95% |
+| unpaired off leg 5 | 426.69 | | | 37.92 | | |
+
+- **CPU: -13.95% mean, both pairs agree in sign**, and the on-legs are
+  remarkably stable (363.88 / 362.56) while the off-legs swing 15 points.
+- **Throughput: pairs disagree (-15.9% / +5.0%) -- not a result**, exactly as
+  the standing rule predicts for three pairs. Swaps drifted downward all
+  session regardless of config (44.5 -> 37.9 across the five legs), which is
+  the shape of thermal or accumulated-state drift, not of the lever.
+- **Visual gate: PASS.** Window-id screenshots of an off-leg and an on-leg
+  (`bench-work/spin-shots/`) render the same scene with no corruption. The
+  on-leg's frame-interval trace is visibly steadier, which is what reduced
+  core contention would look like, and is not evidence of anything by itself.
+
+**Verdict: the lever stays default-off, and is NOT cleared for adoption.**
+The CPU cut alone cannot carry the claim at this state, throughput is
+unresolved, and the external review below found real defects that have to be
+fixed before the next measurement.
+
+## The GPT review of the lever: three code defects and a false claim
+
+The independent review (gpt-5.6-sol, max reasoning; full text at
+`bench-work/gpt_review_out.md`) verified the campaign's numbers against the
+tree and then attacked the lever's implementation. Confirmed against the code:
+
+1. **Cross-loop sleep contamination, worse than the known scan-loop risk.**
+   `spin_wait_spins` accumulates across every tagged site on the thread, and
+   the armed re-trip budget of 64 can be satisfied by a *different* loop than
+   the one that armed it -- the victim of a sleep need not be the loop that
+   earned it. The pre-trip validation has the same hole in aggregate: with a
+   1M threshold the elapsed budget is a full second, so up to a second of
+   real work still "validates".
+2. **The first trip always rejects.** `spin_wait_reset_tick` initializes to
+   zero, so the first threshold crossing computes an elapsed time since boot
+   and resets; the first sleep costs two full thresholds, possibly spread
+   across sites.
+3. **Thresholds 1-63 underflow.** `threshold - 64` is unsigned; small values
+   wrap and re-trip on effectively every iteration.
+4. **"At most 60 us of added latency" is false.** The sleep is NanoSleep, and
+   this tree's own threading_posix.cc documents Darwin nanosleep oversleeping
+   by 100-500 us under load. Per-wakeup latency on a latency-critical tagged
+   site is up to ~500 us, which at tens of events per frame is milliseconds --
+   a candidate explanation for pair 1's throughput leg.
+
+Also from the review, on instruments: `rank_sequences` prices *laid-down*
+bytes, not retired instructions -- the physical-remap check lays down 4
+instructions but executes 3 on the common path, so the "4 of 8.64" framing in
+the earlier section overstates the remap's dynamic cost; and
+`weight_opcodes`'s uniform-within-function attribution could be replaced by a
+per-PC join since the coverage tables carry per-site counts.
+
+**Required for the next measurement, per the review:** per-site trip state
+(the armed sleep must be keyed to the site that earned it), an underflow
+guard, reset-tick initialization, per-site trip logging with guest PC, and a
+hard gate: **any site other than `828BF474` sleeping during the docks run
+fails the change**. Its target ranking: T6 first (best CPU-per-risk), the
+texture-invalidation policy second (largest throughput mechanism), and
+dynamic repricing of the remap check third.
