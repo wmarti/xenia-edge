@@ -39,7 +39,42 @@ struct LoopShape {
   bool has_memory_load = false;
   bool has_call = false;
   bool has_indirect_branch = false;
+  bool has_induction_variable = false;
 };
+
+// A loop that advances its own state each iteration is scanning, not
+// waiting. The shape in HIR is a guest register self-update through its
+// context slot: store_context(O, add(load_context(O), constant)). The first
+// live false positive -- a byte-wise parse loop, `addi r19,r19,1; lbz; bl;
+// cmpwi; bne` -- has exactly this chain for r19, while a true wait loop
+// recomputes its addresses from loop-invariant registers and never advances
+// anything.
+bool IsInductionStore(Instr* instr) {
+  if (instr->GetOpcodeNum() != OPCODE_STORE_CONTEXT) {
+    return false;
+  }
+  Value* stored = instr->src2.value;
+  if (!stored || !stored->def) {
+    return false;
+  }
+  Instr* def = stored->def;
+  if (def->GetOpcodeNum() != OPCODE_ADD && def->GetOpcodeNum() != OPCODE_SUB) {
+    return false;
+  }
+  // One operand constant, the other loaded from the same context offset.
+  Value* counted = nullptr;
+  if (def->src2.value && def->src2.value->IsConstant()) {
+    counted = def->src1.value;
+  } else if (def->src1.value && def->src1.value->IsConstant()) {
+    counted = def->src2.value;
+  }
+  if (!counted || !counted->def) {
+    return false;
+  }
+  Instr* load = counted->def;
+  return load->GetOpcodeNum() == OPCODE_LOAD_CONTEXT &&
+         load->src1.offset == instr->src1.offset;
+}
 
 LoopShape ScanLoop(Block* header, Block* latch) {
   LoopShape shape;
@@ -68,6 +103,11 @@ LoopShape ScanLoop(Block* header, Block* latch) {
         case OPCODE_CALL:
         case OPCODE_CALL_TRUE:
           shape.has_call = true;
+          break;
+        case OPCODE_STORE_CONTEXT:
+          if (IsInductionStore(instr)) {
+            shape.has_induction_variable = true;
+          }
           break;
         case OPCODE_CALL_INDIRECT:
         case OPCODE_CALL_INDIRECT_TRUE:
@@ -125,7 +165,7 @@ bool SpinWaitInjectionPass::Run(HIRBuilder* builder) {
       const uint32_t span = (shape.guest_hi - shape.guest_lo) / 4 + 1;
       if (span > kMaxBodyGuestInstrs || shape.has_memory_store ||
           !shape.has_memory_load || !shape.has_call ||
-          shape.has_indirect_branch) {
+          shape.has_indirect_branch || shape.has_induction_variable) {
         continue;
       }
       // The header's guest address identifies this site at runtime: the trip
