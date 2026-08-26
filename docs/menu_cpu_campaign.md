@@ -1269,3 +1269,35 @@ The reopened candidate is tracked as **T6** in the status table: rlwinm hot
 path, `lsl`+`ands #0xFFFFFFFF` -> W-form `lsl`, priced 0.46-0.55% CPU by the
 corrected arithmetic, proof path = rank_sequences pricing + corpus-replay exact
 delta + frame-capped CPU A/B, docks throughput as veto only.
+
+## Exact host-side accounting at the docks: even the sequence ranking is the spinner
+
+`rank_sequences.py` over the docks coverage (675.8e9 executed host
+instructions, exact per-site):
+
+| share | sequence | I/exec | executions |
+| ---: | --- | ---: | ---: |
+| 25.27% | `load_offset i32` (byte-swapped guest load) | 8.64 | 19.77e9 |
+| 10.97% | `call` (direct guest call) | 15.94 | 4.65e9 |
+| 8.99% | `call_indirect` | 13.06 | 4.65e9 |
+| 5.79% | `store_offset i32` | 7.97 | 4.91e9 |
+
+Read with the T5 counts in hand, the ranking mostly re-measures the spinner:
+the call families' 4.65e9 executions are the spinner's 4.455e9 calls plus
+change, and ~70% of the top load sequence's executions are the loop's own
+polls (~13.9e9 of 19.77e9). Two durable facts survive after subtracting it:
+
+- **A guest 32-bit load costs 8.64 host instructions**, a store ~7-8. Guest
+  memory access is ~46% of all executed host instructions; non-spin, still
+  ~7.5% for loads alone. The per-access physical-remap check (4 of those ~8.6
+  instructions) is the obvious component -- but this is a post-T5 target: on
+  today's capture, any per-access saving is measured mostly in cheaper
+  *waiting*.
+- **T6's pair does not appear in the top 15** (cutoff 1.14% = 7.7e9), which is
+  consistent with the 0.46-0.55% pricing and inconsistent with anything
+  larger. The reopened estimate survives its first exact-accounting contact.
+
+The instrument's own caveat: sequence tables count host instructions, and
+instruction share is not time share -- loads carry the cache misses, so their
+time share is likely above 46%, not below. Conversion to CPU% goes through the
+sampled guest-JIT share (~35-42%) as standing policy.
