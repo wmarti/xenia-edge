@@ -1502,3 +1502,32 @@ Adversarial cross-check (codex/gpt-5.6-sol, read-only): its brief was to
 break the fusion's three claims. It refuted the NZCV generalization (the
 correction above), and found **no defect** in the fusion guard itself (claim
 2) or in the W-form-lsl equivalence (claim 3).
+
+## T5 Reach-menu check: inert, and a measurement lesson
+
+Methodology note first: per the user's standing order (2026-08-26), menu
+A/Bs now run 10 s windows, single pair first, escalating only on a signal.
+The 0.28% noise floor was established at 60 s windows and does not transfer;
+at 10 s the Reach menu's OFF-legs alone span 161.0-171.9% CPU (~+/-6%
+drift -- the scene is not static). Sub-1% claims at menus are no longer
+adjudicable, and that trade is accepted.
+
+The check (binary `3425b31fa`, lever off vs `--spin_wait_yield_after=100000`,
+guest_scheduler=false both sides, 30 fps pinned throughout):
+
+- First pair read **+11.92%** (162.51 -> 181.89) -- alarming, and exactly the
+  shape the kernel-side zero-delay-spin interaction predicted. It did NOT
+  reproduce: confirmation pairs **+0.77% / -0.46%, mean +0.16%, pairs
+  disagree -- a null**. The 181.89 leg was window drift, matched by a later
+  OFF-leg at 171.88.
+- **Zero escalation episodes in every lever-on leg** (site log grepped per
+  leg). On the Reach menu the lever never acts; the only possible cost is
+  the injected counter fast path, which Halo 3's 60 s-window null already
+  bounded at ~0.
+
+**Verdict: the Reach-menu adoption gate passes.** The lever is docks -14%,
+Halo 3 inert, Reach menu inert. Remaining before flipping the default:
+one Reach *campaign* spot check -- the known intermittent livelock
+([guest_scheduler] class) is the one plausible bad interaction with a
+lever that sleeps spinning guest threads, and it should be seen surviving
+the lever once. Then the default flip is its own commit.
