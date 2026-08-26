@@ -78,7 +78,7 @@ predate two instrument fixes and their denominators are wrong.
 | T4 | Redundant guest address computation (`guest_828BF420`, `guest_82A46D70`) | **rejected** -- under the noise floor once repriced | 13.90% of executed memory operands, but **~0.38% CPU after discount** vs a 0.28% floor; 94% of it in two functions |
 | T5 | Those two functions are a **guest spin-wait**: `828BF420` loops calling `82A46D70` until two counters differ by <2. 18.2% of on-core time at the docks | **open, top target** -- counters identified as guest-written (submitted/completed); the spinner never yields the host thread | 15.7-18.2% of on-core at the docks (three published values, only the low end reproducible from disk -- see the 2026-08-26 corrections); ~26 guest threads oversubscribing ~12 host cores |
 | B1 | `PACK_D3DCOLOR` returned 0xFFFFFFFF always | fixed, guard proven to fail on the bug | correctness |
-| T6 | rlwinm hot path: `lsl`+`ands #0xFFFFFFFF` -> W-form `lsl` (a W write zeroes the upper half; the `ands` flags are dead at these sites) | **reopened** by the 2026-08-26 adversarial review -- an earlier same-day rejection double-applied the 2x discount | priced **0.46-0.55% CPU**, 1.6-2.0x the floor; **implemented + statically verified** (169,048/169,048 semantics; replay -13,921 laid-down stable instrs; disasm-verified 2->1 rewrite); frame-capped CPU A/B pending |
+| T6 | rlwinm hot path: `lsl`+`ands #0xFFFFFFFF` -> W-form `lsl` (a W write zeroes the upper half; the `ands` flags are dead at these sites) | **reopened** by the 2026-08-26 adversarial review -- an earlier same-day rejection double-applied the 2x discount | priced **0.46-0.55% CPU**, 1.6-2.0x the floor; **implemented + statically verified** (169,048/169,048 semantics; replay -13,921 laid-down stable instrs; disasm-verified 2->1 rewrite); runtime A/B null at Halo 3 menu (no regression); **closed, adopted** |
 
 ### Next up, in order
 
@@ -1446,9 +1446,20 @@ an immediately following `AND_I64(..., 0xFFFFFFFF)` and emits one W-form
 write zeroes the upper 32 bits, and a left shift cannot move bits downward, so
 the mask is implied. The AND is skipped through a one-shot fusion handoff on
 the emitter (`MarkFusedSkip`/`ConsumeFusedSkip`); the plain `lsl` sets no
-flags where the old path's `ands` did, which is safe here because the backend
-never carries NZCV between HIR instructions -- every comparison re-tests its
-operand.
+flags where the old path's `ands` did. The safety argument originally written
+here ("the backend never carries NZCV between HIR instructions") was WRONG --
+the codex cross-check found the deliberate one-shot NZCV fusion
+(`DeclareFlagsZeroTest` -> `ShiftFlagsZeroTest` -> `FlagsHoldZeroTest`): ANDS
+declares a zero-test that exactly the next sequence may consume, and
+`COMPARE_EQ/NE` against 0 then emits a bare `cset` with no `cmp`. The fusion
+is still safe, for the narrower reason the code comments state: skipping the
+AND only removes a *declaration*; the skipped sequence still passes through
+the one-shot shift so no armed state can go stale, the fused W-form `lsl`
+writes no flags, and every tracker consumer falls back to an explicit
+`cmp`/`tst` when nothing is armed. At `shl+and+cmp0` sites the counts are
+even (`lsl w`+`cmp`+`cset` vs `lsl`+`ands`+`cset`); everywhere else the
+fusion is one instruction ahead. The commit message of `3425b31fa` carries
+the wrong generalization; this paragraph is the correction of record.
 
 Evidence, in gate order:
 
@@ -1470,3 +1481,24 @@ Evidence, in gate order:
 Evidence it lacks: a runtime CPU measurement. Next: frame-capped CPU A/B
 (Halo 3 menu, CPU is the metric) of this commit's app against `c4190ee4e`,
 with docks throughput as veto only per the standing rule for sub-1% codegen.
+
+## T6 closed: runtime null at the capped state, adopted on static evidence
+
+The Halo 3 menu CPU A/B (base `c4190ee4e` vs fusion `3425b31fa`,
+guest_scheduler=false both sides) was killed at the user's request after 5 of
+6 legs -- future capped-state regression guards run `--runs 2`. What
+completed: base legs 83.58 / 83.86 / 82.97 (mean 83.47), fusion legs
+83.67 / 83.38 (mean 83.53); the two complete pairs read +0.11% and -0.57%,
+signs split. Presents pinned at 29.92-29.93 in all five legs. Verdict: **null
+at the 0.28% floor -- no regression**, which is all the A/B had to prove; the
+0.46-0.55% pricing was built from docks execution weights, and the Halo 3
+menu barely runs those rlwinm sites. T6 ships on its static evidence:
+strictly fewer emitted instructions (-13,921 laid down), 169,048/169,048
+semantics, and the disasm-verified rewrite. The docks CPU number cannot
+adjudicate a sub-1% codegen change (standing rule), so no docks run was
+spent on it.
+
+Adversarial cross-check (codex/gpt-5.6-sol, read-only): its brief was to
+break the fusion's three claims. It refuted the NZCV generalization (the
+correction above), and found **no defect** in the fusion guard itself (claim
+2) or in the W-form-lsl equivalence (claim 3).
