@@ -324,6 +324,23 @@ TEST_CASE("Guest execution decoders reject forged typed fields and counts",
   CHECK_FALSE(GuestExecutionSessionCodec::DecodeEventChunk(
       forged, &event_output, &error));
 
+  // Keep the envelope closure and hash internally consistent while making the
+  // final event repeat its predecessor's sequence.
+  forged = fixture.chunks[1];
+  {
+    const size_t footer_offset =
+        forged.size() - GuestExecutionSessionCodec::kEnvelopeFooterSize;
+    const size_t last_event_offset =
+        GuestExecutionSessionCodec::kEnvelopeHeaderSize +
+        3 * GuestExecutionSessionCodec::kEventRecordSize;
+    WriteU64(&forged, last_event_offset, 3);
+    WriteU64(&forged, 48, 3);
+    WriteU64(&forged, footer_offset + 48, 3);
+    RewritePayloadHash(&forged);
+  }
+  CHECK_FALSE(GuestExecutionSessionCodec::DecodeEventChunk(
+      forged, &event_output, &error));
+
   forged = fixture.chunks[1];
   WriteU32(&forged, GuestExecutionSessionCodec::kEnvelopeHeaderSize + 24,
            UINT32_MAX);
@@ -380,6 +397,100 @@ TEST_CASE("Guest execution validators reject ordering and substitution",
   CHECK_FALSE(
       GuestExecutionSessionCodec::EncodeEventChunk(events, &output, &error));
   CHECK(output.empty());
+
+  events = MakeEventChunk();
+  events.events.back().global_sequence =
+      events.events[events.events.size() - 2].global_sequence;
+  output = {1, 2, 3};
+  CHECK_FALSE(
+      GuestExecutionSessionCodec::EncodeEventChunk(events, &output, &error));
+  CHECK(output.empty());
+}
+
+TEST_CASE("Guest execution checkpoints close the exact preceding event prefix",
+          "[cpu]") {
+  SessionFixture fixture = MakeSessionFixture();
+  GuestExecutionSessionCheckpointChunk stale_checkpoint =
+      MakeCheckpointChunk(2, 2, 0x60);
+  GuestExecutionSessionCheckpointChunk final_checkpoint =
+      MakeCheckpointChunk(3, 4, 0x50);
+  std::vector<uint8_t> encoded_stale;
+  std::vector<uint8_t> encoded_final;
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      stale_checkpoint, &encoded_stale, &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_checkpoint, &encoded_final, &error));
+  fixture.chunks[2] = std::move(encoded_stale);
+  fixture.chunks.push_back(std::move(encoded_final));
+
+  fixture.manifest.chunks.clear();
+  fixture.manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                   fixture.chunks[0]));
+  fixture.manifest.chunks.push_back(ReferenceFor(
+      GuestExecutionSessionChunkKind::kEvents, 1, 1, 4, 4, fixture.chunks[1]));
+  fixture.manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 2, 2, 2, 1,
+                   fixture.chunks[2]));
+  fixture.manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 3, 4, 4, 1,
+                   fixture.chunks[3]));
+
+  std::vector<uint8_t> output = {1, 2, 3};
+  CHECK_FALSE(GuestExecutionSessionCodec::EncodeManifest(fixture.manifest,
+                                                         &output, &error));
+  CHECK(output.empty());
+  CHECK_FALSE(GuestExecutionSessionCodec::ValidateSession(
+      fixture.manifest, fixture.chunks, &error));
+}
+
+TEST_CASE("Guest execution payload digests bind one type and byte size",
+          "[cpu]") {
+  SessionFixture fixture = MakeSessionFixture();
+  GuestExecutionSessionEventChunk first_events;
+  first_events.session_epoch = fixture.events.session_epoch;
+  first_events.ordinal = 1;
+  first_events.events.assign(fixture.events.events.cbegin(),
+                             fixture.events.events.cbegin() + 2);
+  GuestExecutionSessionEventChunk second_events;
+  second_events.session_epoch = fixture.events.session_epoch;
+  second_events.ordinal = 2;
+  second_events.events.assign(fixture.events.events.cbegin() + 2,
+                              fixture.events.events.cend());
+  second_events.events.front().payload_sha256 =
+      first_events.events.back().payload_sha256;
+  GuestExecutionSessionCheckpointChunk final_checkpoint =
+      MakeCheckpointChunk(3, 4, 0x50);
+
+  std::vector<uint8_t> encoded_first;
+  std::vector<uint8_t> encoded_second;
+  std::vector<uint8_t> encoded_final;
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(first_events,
+                                                       &encoded_first, &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
+      second_events, &encoded_second, &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_checkpoint, &encoded_final, &error));
+  fixture.chunks[1] = std::move(encoded_first);
+  fixture.chunks[2] = std::move(encoded_second);
+  fixture.chunks.push_back(std::move(encoded_final));
+
+  fixture.manifest.chunks.clear();
+  fixture.manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                   fixture.chunks[0]));
+  fixture.manifest.chunks.push_back(ReferenceFor(
+      GuestExecutionSessionChunkKind::kEvents, 1, 1, 2, 2, fixture.chunks[1]));
+  fixture.manifest.chunks.push_back(ReferenceFor(
+      GuestExecutionSessionChunkKind::kEvents, 2, 3, 4, 2, fixture.chunks[2]));
+  fixture.manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 3, 4, 4, 1,
+                   fixture.chunks[3]));
+
+  CHECK_FALSE(GuestExecutionSessionCodec::ValidateSession(
+      fixture.manifest, fixture.chunks, &error));
 }
 
 TEST_CASE("Guest execution session rejects unsupported or rejected work",

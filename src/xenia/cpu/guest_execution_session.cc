@@ -505,7 +505,7 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
     } else {
       if (chunk.record_count != 1 ||
           chunk.first_event_sequence != chunk.last_event_sequence ||
-          chunk.first_event_sequence >= next_event_sequence ||
+          chunk.first_event_sequence != next_event_sequence - 1 ||
           (has_checkpoint &&
            chunk.first_event_sequence <= previous_checkpoint_sequence)) {
         return Fail(error, "manifest checkpoint order is invalid");
@@ -702,7 +702,9 @@ bool ValidateEventChunk(const GuestExecutionSessionEventChunk& chunk,
     return Fail(error, "event chunk record count is invalid");
   }
   uint64_t expected_sequence = chunk.events.front().global_sequence;
-  for (const GuestExecutionSessionEvent& event : chunk.events) {
+  for (size_t event_index = 0; event_index < chunk.events.size();
+       ++event_index) {
+    const GuestExecutionSessionEvent& event = chunk.events[event_index];
     if (event.global_sequence != expected_sequence ||
         !ValidateEvent(event, limits, error)) {
       if (event.global_sequence != expected_sequence) {
@@ -710,7 +712,7 @@ bool ValidateEventChunk(const GuestExecutionSessionEventChunk& chunk,
       }
       return false;
     }
-    if (event.global_sequence != chunk.events.back().global_sequence &&
+    if (event_index + 1 != chunk.events.size() &&
         !CheckedAdd(expected_sequence, 1, &expected_sequence)) {
       return Fail(error, "event chunk sequence overflows");
     }
@@ -743,6 +745,8 @@ bool IsKnownContentKind(GuestExecutionSessionContentKind kind) {
 }
 
 using ContentIdentity = std::pair<GuestExecutionSessionContentKind, uint64_t>;
+using EventPayloadIdentity =
+    std::pair<GuestExecutionSessionPayloadKind, uint64_t>;
 
 bool ValidateCheckpoint(
     const GuestExecutionSessionCheckpoint& checkpoint,
@@ -1483,6 +1487,7 @@ bool GuestExecutionSessionCodec::ValidateSession(
   uint64_t rejected_event_count = 0;
   uint64_t unsupported_event_count = 0;
   uint64_t supplied_chunk_bytes = 0;
+  std::map<GuestExecutionSessionSha256, EventPayloadIdentity> payload_catalog;
   std::map<GuestExecutionSessionSha256, ContentIdentity> content_catalog;
   std::map<GuestExecutionSessionSha256, uint64_t> state_catalog;
   bool saw_initial_checkpoint = false;
@@ -1519,6 +1524,17 @@ bool GuestExecutionSessionCodec::ValidateSession(
       }
 
       for (const GuestExecutionSessionEvent& event : chunk.events) {
+        if (event.payload_size) {
+          const EventPayloadIdentity identity = {event.payload_kind,
+                                                 event.payload_size};
+          const auto [it, inserted] =
+              payload_catalog.emplace(event.payload_sha256, identity);
+          if (!inserted && it->second != identity) {
+            return Fail(
+                error,
+                "event payload digest has conflicting type or byte size");
+          }
+        }
         if (event.thread_ordinal != kGuestExecutionSessionNoThread) {
           if (event.thread_ordinal >= manifest.participants.size()) {
             return Fail(error, "event names an unknown participant");
