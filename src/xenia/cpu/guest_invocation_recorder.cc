@@ -1161,6 +1161,9 @@ bool GuestInvocationRecorder::OnMemoryAccess(
            impl_->Reject(GuestInvocationRecorderRejection::kInvalidEvent,
                          "memory access has an invalid identity");
   }
+  if (!impl_->IsRecordingAttempt() && impl_->IsOwner(identity)) {
+    return true;
+  }
   const bool recording_owner =
       impl_->IsRecordingAttempt() && impl_->IsOwner(identity);
   if (!recording_owner) {

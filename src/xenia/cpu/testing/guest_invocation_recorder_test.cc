@@ -663,9 +663,11 @@ TEST_CASE("guest invocation recorder rejects dependencies and code mutation",
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
     DiscoveryAttempt(*recorder, {kDataPageA});
-    REQUIRE_FALSE(
+    REQUIRE(
         recorder->OnMemoryAccess(kOwner, kRootAddress + 0x200, 4,
                                  GuestInvocationRecorderMemoryAccess::kWrite));
+    REQUIRE_FALSE(recorder->OnFunctionEntry(kOwner, kRootAddress,
+                                            kRootEndAddress, MakeState(2)));
     RequireRejected(*recorder,
                     GuestInvocationRecorderRejection::kSelfModifyingCode,
                     kGuestInvocationDependencySelfModifyingCode);
@@ -770,7 +772,23 @@ TEST_CASE("guest invocation recorder rejects cross-thread closure writes",
         kOwner, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kRead));
     RequireRejected(*recorder, GuestInvocationRecorderRejection::kAccessLimit);
   }
-  SECTION("writes between attempts remain in the bounded watch set") {
+  SECTION(
+      "owner writes between attempts do not consume the active access budget") {
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.max_access_count = 2;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    DiscoveryAttempt(*recorder, {kDataPageB});
+    for (uint32_t i = 0; i < 32; ++i) {
+      REQUIRE(recorder->OnMemoryAccess(
+          kOwner, kDataPageB + i * 4, 4,
+          GuestInvocationRecorderMemoryAccess::kWrite));
+    }
+    DiscoveryAttempt(*recorder, {kDataPageB});
+    REQUIRE(recorder->state() ==
+            GuestInvocationRecorderState::kWaitingForFinalAttempt);
+  }
+  SECTION("cross-thread writes between attempts remain in the watch set") {
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
     DiscoveryAttempt(*recorder, {kDataPageB});
