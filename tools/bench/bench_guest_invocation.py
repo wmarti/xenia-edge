@@ -12,8 +12,8 @@ Four deterministic phases are collected: A/A and B/B controls, then the real
 comparison in both A/B and B/A execution order. By default a phase is invalid
 if its control noise or pair-mean drift exceeds 1%. The threshold is explicit
 through --max-control-noise-pct. A result is resolved only when both
-cross-orders agree in sign, every comparison pair has that sign, and both
-cross-order means clear the measured control and drift floor.
+cross-orders agree in sign and every comparison pair clears the measured
+control and drift floor in that sign.
 """
 
 import argparse
@@ -393,11 +393,13 @@ def analyze(samples, max_control_noise_pct):
     all_deltas = (
         ab["paired_b_vs_a_deltas_pct"] +
         ba["paired_b_vs_a_deltas_pct"])
-    clears_floor = (
+    cross_order_means_clear_floor = (
         abs(ab_mean) > effective_floor and abs(ba_mean) > effective_floor)
-    if all(delta < 0 for delta in all_deltas) and clears_floor:
+    if (all(delta < -effective_floor for delta in all_deltas) and
+            cross_order_means_clear_floor):
         verdict = "improvement"
-    elif all(delta > 0 for delta in all_deltas) and clears_floor:
+    elif (all(delta > effective_floor for delta in all_deltas) and
+          cross_order_means_clear_floor):
         verdict = "regression"
     else:
         verdict = "unresolved"
@@ -538,6 +540,10 @@ def main(argv=None):
             "a": file_sha256(args.exe_a),
             "b": file_sha256(args.exe_b),
         }
+        if executable_sha256["a"] == executable_sha256["b"]:
+            raise BenchmarkError(
+                "A and B executables have identical SHA-256 digests; "
+                "an optimization comparison requires distinct binaries")
         expected_common = {
             "artifact_sha256": artifact_sha256,
             "corpus_sha256": corpus_sha256,

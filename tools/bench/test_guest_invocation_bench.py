@@ -237,6 +237,26 @@ class RunnerTest(unittest.TestCase):
             self.assertIn("aliases benchmark input", stderr.getvalue())
             self.assertFalse(alias.exists())
 
+    def test_main_rejects_identical_candidate_binaries(self):
+        def fake_sha256(path):
+            if str(path) in ("missing-a", "missing-b"):
+                return SHA_D
+            return SHA_A
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+                pathlib.Path, "is_file", return_value=True), \
+                mock.patch.object(benchmark.os, "access", return_value=True), \
+                mock.patch.object(
+                    benchmark, "file_sha256", side_effect=fake_sha256), \
+                mock.patch.object(benchmark, "collect_phases") as collect, \
+                mock.patch("sys.stderr", stderr):
+            result = benchmark.main(self._main_args())
+
+        self.assertEqual(result, 2)
+        self.assertIn("identical SHA-256", stderr.getvalue())
+        collect.assert_not_called()
+
     def test_main_writes_successful_improvement_report(self):
         samples = phase_samples(
             aa=[(100.0, 100.0)] * 4,
@@ -496,6 +516,21 @@ class AnalysisTest(unittest.TestCase):
         )
         self.assertEqual(
             benchmark.analyze(samples, 1.0)["verdict"], "unresolved")
+
+    def test_outlier_cannot_pull_weak_pairs_past_noise_floor(self):
+        weak_a = 200.0 / (2.0 - 0.001)
+        weak_b = 200.0 - weak_a
+        strong_a = 200.0 / (2.0 - 0.08)
+        strong_b = 200.0 - strong_a
+        samples = phase_samples(
+            aa=[(100.0, 100.5), (100.0, 99.5)] * 2,
+            bb=[(100.0, 100.5), (100.0, 99.5)] * 2,
+            ab=[(weak_a, weak_b)] * 3 + [(strong_a, strong_b)],
+            ba=[(weak_b, weak_a)] * 3 + [(strong_b, strong_a)],
+        )
+        analysis = benchmark.analyze(samples, 1.0)
+        self.assertLess(analysis["mean_cross_order_b_vs_a_delta_pct"], -1.0)
+        self.assertEqual(analysis["verdict"], "unresolved")
 
 
 if __name__ == "__main__":
