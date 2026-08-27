@@ -35,9 +35,10 @@ enum class GuestExecutionContinuousCheckpointReferenceKind : uint32_t {
   kThreadState = 1,
 };
 
-// Content-addressed reference to one GuestPPCThreadCheckpointCodec blob. Resume
-// routing is deliberately not copied here: the authenticated decoded blob and
-// an independent exact-corpus binding remain the single source of those fields.
+// Content-addressed reference to one GuestPPCThreadCheckpointCodec blob. The
+// binding is an independent producer declaration: validation must match the
+// decoded blob to it and close its owning extent to captured code before a
+// replay may attach the state to a ThreadState.
 struct GuestExecutionContinuousCheckpointReference {
   GuestExecutionContinuousCheckpointReferenceKind kind =
       GuestExecutionContinuousCheckpointReferenceKind::kNone;
@@ -46,12 +47,13 @@ struct GuestExecutionContinuousCheckpointReference {
   uint64_t checkpoint_global_sequence = 0;
   uint64_t state_size = 0;
   GuestExecutionSessionSha256 state_sha256 = {};
+  ppc::GuestPPCThreadCheckpointBinding binding = {};
 
   bool operator==(const GuestExecutionContinuousCheckpointReference&) const =
       default;
 };
 
-// Version-3 control-tape identity for one globally ordered event. Actor is the
+// Version-4 control-tape identity for one globally ordered event. Actor is the
 // participant executing or publishing the transition; subject is the
 // participant affected by it. They may be equal, different, or canonically
 // absent independently. A checkpoint reference, when present, always belongs
@@ -72,16 +74,16 @@ struct GuestExecutionContinuousEventLimits {
   uint64_t maximum_records = 1ull << 20;
 };
 
-// A standalone, fixed-record version-3 control tape. Existing version-2
-// GuestExecutionSessionCodec artifacts remain decodable by their existing
-// codec for diagnostics, but are never accepted here as resumable v3 records.
+// A standalone, fixed-record version-4 control tape. Earlier 96-byte v3 tapes
+// and version-2 GuestExecutionSessionCodec artifacts remain distinguishable by
+// their own magic/version, but are never accepted here as resumable v4 records.
 // Every integer is little-endian; no C++ padding or native pointer is emitted.
 class GuestExecutionContinuousEventCodec {
  public:
-  static constexpr uint32_t kVersion = 3;
+  static constexpr uint32_t kVersion = 4;
   static constexpr uint32_t kHeaderSize = 64;
-  static constexpr uint32_t kRecordSize = 96;
-  static constexpr uint32_t kRecordReservedSize = 16;
+  static constexpr uint32_t kRecordSize = 128;
+  static constexpr uint32_t kRecordReservedSize = 8;
 
   // Records must be nonempty and globally contiguous. On failure, output is
   // cleared and error, when non-null, names the rejected invariant.
@@ -91,7 +93,7 @@ class GuestExecutionContinuousEventCodec {
 
   // Decodes through a temporary. On every failure, output is left unchanged,
   // including truncation, trailing data, allocation-independent wire errors,
-  // and a non-v3 header.
+  // and a non-v4 header.
   static bool Decode(const uint8_t* data, size_t data_size,
                      std::vector<GuestExecutionContinuousEvent>* output,
                      std::string* error = nullptr,

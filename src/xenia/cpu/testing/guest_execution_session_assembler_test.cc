@@ -383,6 +383,10 @@ GuestExecutionSessionAssemblerExternalEvent ScalarEvent(
     GuestExecutionSessionEventKind kind, uint64_t value) {
   GuestExecutionSessionAssemblerExternalEvent event;
   event.kind = kind;
+  if (kind == GuestExecutionSessionEventKind::kKernelExport ||
+      kind == GuestExecutionSessionEventKind::kExternOrBuiltin) {
+    event.guest_address = 0x82000080;
+  }
   event.payload_kind =
       GuestExecutionSessionPayloadKind::kLittleEndianUnsignedInteger;
   for (size_t i = 0; i < 8; ++i) {
@@ -1317,6 +1321,57 @@ TEST_CASE("session assembler rejects timeouts, limits and overflow",
     harness.RequireRejected(Rejection::kStopTailLimit);
   }
 
+  SECTION("aggregate event maximum bounds the stop tail") {
+    GuestExecutionSessionAssemblerConfig config = MakeConfig();
+    config.limits.maximum_event_count = 8;
+    config.bundle_limits.session.maximum_total_events = 8;
+    Harness harness(config);
+    harness.StartOutside({kA});
+    REQUIRE(harness.Enter(kA) == Action::kContinue);
+    ++harness.clock.now;
+    harness.RecordSegment(kA);
+    REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+    REQUIRE(harness.assembler->OnInstructionCoverage(kA, 1) ==
+            Action::kContinue);
+    REQUIRE(harness.assembler->OnInstructionCoverage(kA, 1) ==
+            Action::kContinue);
+    REQUIRE(harness.assembler->OnInstructionCoverage(kA, 1) ==
+            Action::kContinue);
+    REQUIRE(harness.assembler->OnInstructionCoverage(kA, 1) == Action::kReject);
+    harness.RequireRejected(Rejection::kHardLimit);
+    REQUIRE(harness.publisher.calls == 0);
+  }
+
+  SECTION("aggregate event maximum bounds the requested boundary") {
+    GuestExecutionSessionAssemblerConfig config =
+        MakeConfig(GuestExecutionSessionBoundaryKind::kGuestMarkerCount, 1);
+    config.boundary.marker_source = GuestExecutionSessionMarkerSource::kKernel;
+    config.boundary.marker_identity = 0x55;
+    config.limits.maximum_event_count = 5;
+    config.bundle_limits.session.maximum_total_events = 5;
+    Harness harness(config);
+    harness.StartOutside({kA});
+    REQUIRE(harness.Enter(kA) == Action::kContinue);
+    ++harness.clock.now;
+    harness.RecordSegment(kA);
+    REQUIRE(harness.assembler->OnGuestMarker(
+                kA, GuestExecutionSessionMarkerSource::kKernel, 0x55) ==
+            Action::kReject);
+    harness.RequireRejected(Rejection::kHardLimit);
+    REQUIRE(harness.publisher.calls == 0);
+  }
+
+  SECTION("aggregate checkpoint state maximum rejects the seed roster") {
+    GuestExecutionSessionAssemblerConfig config = MakeConfig();
+    config.bundle_limits.session.maximum_total_checkpoint_thread_states = 1;
+    Harness harness(config);
+    REQUIRE(harness.Create());
+    REQUIRE_FALSE(harness.SeedOnly({{kA, 0}}));
+    harness.RequireRejected(Rejection::kHardLimit);
+    REQUIRE(harness.publisher.calls == 0);
+    REQUIRE(harness.states.calls == 0);
+  }
+
   SECTION("stop tail instruction maximum rejects") {
     GuestExecutionSessionAssemblerConfig config = MakeConfig();
     config.maximum_stop_tail_guest_instruction_count = 4;
@@ -1408,6 +1463,7 @@ TEST_CASE("session assembler rejects timeouts, limits and overflow",
     REQUIRE(harness.Enter(kA) == Action::kContinue);
     GuestExecutionSessionAssemblerExternalEvent event;
     event.kind = GuestExecutionSessionEventKind::kExternOrBuiltin;
+    event.guest_address = 0x82000080;
     event.payload_kind = GuestExecutionSessionPayloadKind::kGuestBytes;
     event.payload = Bytes(16, 1);
     REQUIRE(harness.assembler->OnExternalEvent(kA, event) == Action::kReject);

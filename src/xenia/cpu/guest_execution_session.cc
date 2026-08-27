@@ -11,13 +11,17 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <new>
 #include <set>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
 #include "third_party/crypto/sha256.h"
+#include "xenia/cpu/guest_execution_continuous_event.h"
 
 namespace xe {
 namespace cpu {
@@ -92,6 +96,36 @@ bool IsNonzeroHash(const GuestExecutionSessionSha256& hash) {
 
 bool IsZeroHash(const GuestExecutionSessionSha256& hash) {
   return !IsNonzeroHash(hash);
+}
+
+bool IsAbsentIdentity(const GuestExecutionContinuousEventIdentity& identity) {
+  return identity.participant_ordinal == kGuestExecutionSessionNoThread &&
+         identity.guest_thread_id == 0;
+}
+
+bool IsCodeExtentCovered(
+    const std::vector<GuestExecutionSessionContentReference>& content,
+    uint32_t start_address, uint32_t end_address) {
+  uint64_t next_address = start_address;
+  const uint64_t end_exclusive = uint64_t(end_address) + 4;
+  for (const GuestExecutionSessionContentReference& reference : content) {
+    if (reference.kind != GuestExecutionSessionContentKind::kGuestCode) {
+      continue;
+    }
+    const uint64_t reference_end =
+        reference.guest_address + reference.byte_size;
+    if (reference_end <= next_address) {
+      continue;
+    }
+    if (reference.guest_address > next_address) {
+      return false;
+    }
+    next_address = reference_end;
+    if (next_address >= end_exclusive) {
+      return true;
+    }
+  }
+  return false;
 }
 
 class Writer {
@@ -435,6 +469,7 @@ bool IsKnownChunkKind(GuestExecutionSessionChunkKind kind) {
   switch (kind) {
     case GuestExecutionSessionChunkKind::kEvents:
     case GuestExecutionSessionChunkKind::kCheckpoint:
+    case GuestExecutionSessionChunkKind::kContinuousEvents:
       return true;
     default:
       return false;
@@ -548,6 +583,7 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
       total_segment_count > limits.maximum_segments ||
       !CheckedAdd(manifest.accepted_event_count, manifest.rejected_event_count,
                   &total_event_count) ||
+      total_event_count > limits.maximum_total_events ||
       total_event_count != manifest.last_event_sequence ||
       manifest.unsupported_event_count > manifest.rejected_event_count) {
     return Fail(error, "manifest coverage accounting is inconsistent");
@@ -644,8 +680,11 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
   }
 
   uint64_t next_event_sequence = manifest.first_event_sequence;
+  uint64_t next_continuous_event_sequence = manifest.first_event_sequence;
   uint64_t previous_checkpoint_sequence = 0;
   bool has_checkpoint = false;
+  bool has_continuous_events = false;
+  uint64_t total_checkpoint_thread_states = 0;
   uint64_t chunk_bytes = 0;
   for (size_t i = 0; i < manifest.chunks.size(); ++i) {
     const GuestExecutionSessionChunkReference& chunk = manifest.chunks[i];
@@ -653,9 +692,13 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
         !chunk.record_count || !IsNonzeroHash(chunk.encoded_sha256)) {
       return Fail(error, "manifest chunk reference is invalid");
     }
-    if (chunk.encoded_size <
-            GuestExecutionSessionCodec::kEnvelopeHeaderSize +
-                GuestExecutionSessionCodec::kEnvelopeFooterSize ||
+    const uint64_t minimum_encoded_size =
+        chunk.kind == GuestExecutionSessionChunkKind::kContinuousEvents
+            ? GuestExecutionContinuousEventCodec::kHeaderSize +
+                  GuestExecutionContinuousEventCodec::kRecordSize
+            : GuestExecutionSessionCodec::kEnvelopeHeaderSize +
+                  GuestExecutionSessionCodec::kEnvelopeFooterSize;
+    if (chunk.encoded_size < minimum_encoded_size ||
         chunk.encoded_size > limits.maximum_chunk_bytes ||
         !CheckedAdd(chunk_bytes, chunk.encoded_size, &chunk_bytes) ||
         chunk_bytes > limits.maximum_total_chunk_bytes) {
@@ -663,7 +706,8 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
     }
     if (chunk.kind == GuestExecutionSessionChunkKind::kEvents) {
       uint64_t expected_last = 0;
-      if (chunk.record_count > limits.maximum_events_per_chunk ||
+      if (has_continuous_events ||
+          chunk.record_count > limits.maximum_events_per_chunk ||
           chunk.first_event_sequence != next_event_sequence ||
           !CheckedAdd(chunk.first_event_sequence, chunk.record_count - 1,
                       &expected_last) ||
@@ -671,10 +715,31 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
           !CheckedAdd(chunk.last_event_sequence, 1, &next_event_sequence)) {
         return Fail(error, "manifest event chunks are not globally contiguous");
       }
+    } else if (chunk.kind ==
+               GuestExecutionSessionChunkKind::kContinuousEvents) {
+      uint64_t expected_last = 0;
+      if (i + 1 >= manifest.chunks.size() ||
+          chunk.record_count > limits.maximum_events_per_chunk ||
+          chunk.first_event_sequence != next_continuous_event_sequence ||
+          !CheckedAdd(chunk.first_event_sequence, chunk.record_count - 1,
+                      &expected_last) ||
+          chunk.last_event_sequence != expected_last ||
+          !CheckedAdd(chunk.last_event_sequence, 1,
+                      &next_continuous_event_sequence)) {
+        return Fail(
+            error, "manifest continuous event overlay is invalid or misplaced");
+      }
+      has_continuous_events = true;
     } else {
-      if (chunk.record_count != 1 ||
+      if (!CheckedAdd(total_checkpoint_thread_states,
+                      manifest.participants.size(),
+                      &total_checkpoint_thread_states) ||
+          total_checkpoint_thread_states >
+              limits.maximum_total_checkpoint_thread_states ||
+          chunk.record_count != 1 ||
           chunk.first_event_sequence != chunk.last_event_sequence ||
           chunk.first_event_sequence != next_event_sequence - 1 ||
+          (has_continuous_events && i + 1 != manifest.chunks.size()) ||
           (has_checkpoint &&
            chunk.first_event_sequence <= previous_checkpoint_sequence)) {
         return Fail(error, "manifest checkpoint order is invalid");
@@ -691,7 +756,10 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
       manifest.chunks.back().first_event_sequence !=
           manifest.last_event_sequence ||
       !has_checkpoint ||
-      next_event_sequence - 1 != manifest.last_event_sequence) {
+      next_event_sequence - 1 != manifest.last_event_sequence ||
+      (has_continuous_events &&
+       (next_continuous_event_sequence == 0 ||
+        next_continuous_event_sequence - 1 != manifest.last_event_sequence))) {
     return Fail(error,
                 "manifest lacks complete initial/final checkpoint coverage");
   }
@@ -920,10 +988,19 @@ bool ValidateEvent(const GuestExecutionSessionEvent& event,
     const bool address_event =
         event.kind == GuestExecutionSessionEventKind::kMmio ||
         event.kind == GuestExecutionSessionEventKind::kAtomicOrReservation;
+    const bool modeled_export =
+        event.kind == GuestExecutionSessionEventKind::kKernelExport ||
+        event.kind == GuestExecutionSessionEventKind::kExternOrBuiltin;
     if (address_event) {
       if (!ValidateGuestRange(event.guest_address, event.byte_count,
                               "addressed event", error)) {
         return false;
+      }
+    } else if (modeled_export) {
+      if (event.guest_address >= kGuestAddressSpaceSize ||
+          (event.guest_address & 3) || event.byte_count) {
+        return Fail(error,
+                    "modeled export event has no canonical guest address");
       }
     } else if (event.guest_address || event.byte_count) {
       return Fail(error, "non-addressed event contains a guest range");
@@ -1755,7 +1832,7 @@ bool GuestExecutionSessionCodec::DecodeCheckpointChunk(
 bool GuestExecutionSessionCodec::ValidateSession(
     const GuestExecutionSessionManifest& manifest,
     const std::vector<std::vector<uint8_t>>& encoded_chunks, std::string* error,
-    GuestExecutionSessionLimits limits) {
+    GuestExecutionSessionLimits limits) try {
   if (error) {
     error->clear();
   }
@@ -1817,6 +1894,24 @@ bool GuestExecutionSessionCodec::ValidateSession(
   bool saw_boundary_held = false;
   bool saw_initial_checkpoint = false;
   bool saw_final_checkpoint = false;
+  const bool manifest_has_continuous_events = std::any_of(
+      manifest.chunks.cbegin(), manifest.chunks.cend(),
+      [](const GuestExecutionSessionChunkReference& chunk) {
+        return chunk.kind == GuestExecutionSessionChunkKind::kContinuousEvents;
+      });
+  struct CanonicalEventIdentity {
+    uint64_t global_sequence;
+    GuestExecutionSessionEventKind kind;
+    GuestExecutionSessionEventDisposition disposition;
+    uint32_t thread_ordinal;
+    uint64_t guest_address;
+  };
+  std::vector<CanonicalEventIdentity> canonical_event_identities;
+  std::vector<GuestExecutionContinuousEvent> continuous_events;
+  std::map<std::pair<uint64_t, uint32_t>,
+           GuestExecutionSessionThreadStateReference>
+      checkpoint_thread_states;
+  std::vector<GuestExecutionSessionContentReference> initial_checkpoint_content;
 
   for (size_t i = 0; i < encoded_chunks.size(); ++i) {
     const GuestExecutionSessionChunkReference& reference = manifest.chunks[i];
@@ -1849,6 +1944,11 @@ bool GuestExecutionSessionCodec::ValidateSession(
       }
 
       for (const GuestExecutionSessionEvent& event : chunk.events) {
+        if (manifest_has_continuous_events) {
+          canonical_event_identities.push_back(
+              {event.global_sequence, event.kind, event.disposition,
+               event.thread_ordinal, event.guest_address});
+        }
         if (event.payload_size) {
           const EventPayloadIdentity identity = {event.payload_kind,
                                                  event.payload_size};
@@ -2048,6 +2148,37 @@ bool GuestExecutionSessionCodec::ValidateSession(
           ++unsupported_event_count;
         }
       }
+    } else if (reference.kind ==
+               GuestExecutionSessionChunkKind::kContinuousEvents) {
+      GuestExecutionContinuousEventLimits continuous_limits;
+      continuous_limits.maximum_encoded_bytes = limits.maximum_chunk_bytes;
+      continuous_limits.maximum_records = limits.maximum_events_per_chunk;
+      std::vector<GuestExecutionContinuousEvent> decoded_events;
+      if (!GuestExecutionContinuousEventCodec::Decode(
+              encoded, &decoded_events, error, continuous_limits) ||
+          !GuestExecutionContinuousEventCodec::ValidateParticipantBindings(
+              decoded_events, manifest.participants, error)) {
+        return false;
+      }
+      GuestExecutionSessionChunkReference derived;
+      derived.kind = GuestExecutionSessionChunkKind::kContinuousEvents;
+      derived.ordinal = reference.ordinal;
+      derived.first_event_sequence = decoded_events.front().global_sequence;
+      derived.last_event_sequence = decoded_events.back().global_sequence;
+      derived.record_count = static_cast<uint32_t>(decoded_events.size());
+      derived.encoded_size = encoded.size();
+      derived.encoded_sha256 = HashBytes(encoded);
+      if (derived != reference ||
+          (!continuous_events.empty() &&
+           decoded_events.front().global_sequence !=
+               continuous_events.back().global_sequence + 1)) {
+        return Fail(
+            error,
+            "continuous event overlay does not match its manifest reference");
+      }
+      continuous_events.insert(continuous_events.end(),
+                               std::make_move_iterator(decoded_events.begin()),
+                               std::make_move_iterator(decoded_events.end()));
     } else {
       GuestExecutionSessionCheckpointChunk chunk;
       if (!DecodeCheckpointChunk(encoded, &chunk, error, limits)) {
@@ -2092,6 +2223,19 @@ bool GuestExecutionSessionCodec::ValidateSession(
         if (!inserted && it->second != state.byte_size) {
           return Fail(error, "digest has conflicting canonical byte sizes");
         }
+        if (manifest_has_continuous_events &&
+            !checkpoint_thread_states
+                 .emplace(std::make_pair(chunk.checkpoint.global_sequence,
+                                         state.thread_ordinal),
+                          state)
+                 .second) {
+          return Fail(error,
+                      "checkpoint participant state identity is duplicated");
+        }
+      }
+      if (manifest_has_continuous_events &&
+          chunk.checkpoint.global_sequence == 0) {
+        initial_checkpoint_content = chunk.checkpoint.content;
       }
       for (const GuestExecutionSessionContentReference& content :
            chunk.checkpoint.content) {
@@ -2110,6 +2254,102 @@ bool GuestExecutionSessionCodec::ValidateSession(
       saw_initial_checkpoint |= chunk.checkpoint.global_sequence == 0;
       saw_final_checkpoint |=
           chunk.checkpoint.global_sequence == manifest.last_event_sequence;
+    }
+  }
+
+  if (!continuous_events.empty()) {
+    if (continuous_events.size() != canonical_event_identities.size()) {
+      return Fail(error,
+                  "continuous event overlay does not cover the canonical tape");
+    }
+    for (size_t event_index = 0; event_index < continuous_events.size();
+         ++event_index) {
+      const GuestExecutionContinuousEvent& continuous =
+          continuous_events[event_index];
+      const CanonicalEventIdentity& canonical =
+          canonical_event_identities[event_index];
+      if (continuous.kind != canonical.kind) {
+        return Fail(
+            error, "continuous event overlay kind differs from canonical tape");
+      }
+      if (canonical.thread_ordinal == kGuestExecutionSessionNoThread) {
+        if (!IsAbsentIdentity(continuous.actor)) {
+          return Fail(error,
+                      "continuous event overlay invents a canonical actor");
+        }
+      } else {
+        const GuestExecutionSessionParticipant& canonical_actor =
+            manifest.participants[canonical.thread_ordinal];
+        if (continuous.actor.participant_ordinal != canonical_actor.ordinal ||
+            continuous.actor.guest_thread_id !=
+                canonical_actor.guest_thread_id) {
+          return Fail(error,
+                      "continuous event overlay changes the canonical actor");
+        }
+      }
+      if (continuous.checkpoint.kind ==
+          GuestExecutionContinuousCheckpointReferenceKind::kThreadState) {
+        const auto state = checkpoint_thread_states.find(
+            std::make_pair(continuous.checkpoint.checkpoint_global_sequence,
+                           continuous.subject.participant_ordinal));
+        if (state == checkpoint_thread_states.end() ||
+            state->second.byte_size != continuous.checkpoint.state_size ||
+            state->second.sha256 != continuous.checkpoint.state_sha256) {
+          return Fail(error,
+                      "continuous event checkpoint reference is not closed");
+        }
+        const ppc::GuestPPCThreadCheckpointBinding& binding =
+            continuous.checkpoint.binding;
+        if (!IsCodeExtentCovered(initial_checkpoint_content,
+                                 binding.owning_function_address,
+                                 binding.owning_function_end_address)) {
+          return Fail(error,
+                      "continuous event checkpoint route is outside captured "
+                      "code");
+        }
+        if (binding.resume_kind ==
+            ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern) {
+          const uint64_t pending_sequence =
+              binding.pending_external_event_sequence;
+          if (pending_sequence < manifest.first_event_sequence ||
+              pending_sequence > manifest.last_event_sequence) {
+            return Fail(error,
+                        "continuous event pending extern is outside the tape");
+          }
+          const uint64_t pending_index =
+              pending_sequence - manifest.first_event_sequence;
+          if (pending_index >= canonical_event_identities.size()) {
+            return Fail(error,
+                        "continuous event pending extern is outside the tape");
+          }
+          const CanonicalEventIdentity& pending_canonical =
+              canonical_event_identities[static_cast<size_t>(pending_index)];
+          const GuestExecutionContinuousEvent& pending_continuous =
+              continuous_events[static_cast<size_t>(pending_index)];
+          const GuestExecutionContinuousEventIdentity pending_identity = {
+              binding.participant_ordinal, binding.guest_thread_id};
+          const bool modeled_extern =
+              pending_canonical.kind ==
+                  GuestExecutionSessionEventKind::kKernelExport ||
+              pending_canonical.kind ==
+                  GuestExecutionSessionEventKind::kExternOrBuiltin;
+          if (pending_canonical.global_sequence != pending_sequence ||
+              pending_continuous.global_sequence != pending_sequence ||
+              !modeled_extern ||
+              pending_canonical.disposition !=
+                  GuestExecutionSessionEventDisposition::kReplayCaptured ||
+              pending_canonical.guest_address !=
+                  binding.pending_export_guest_address ||
+              pending_canonical.thread_ordinal != binding.participant_ordinal ||
+              pending_continuous.actor != pending_identity ||
+              pending_continuous.subject != pending_identity) {
+            return Fail(
+                error,
+                "continuous event pending extern does not name the modeled "
+                "participant event");
+          }
+        }
+      }
     }
   }
 
@@ -2212,6 +2452,10 @@ bool GuestExecutionSessionCodec::ValidateSession(
       return Fail(error, "session boundary kind is unknown");
   }
   return true;
+} catch (const std::bad_alloc&) {
+  return Fail(error, "session validation allocation failed");
+} catch (const std::length_error&) {
+  return Fail(error, "session validation collection size is invalid");
 }
 
 }  // namespace cpu

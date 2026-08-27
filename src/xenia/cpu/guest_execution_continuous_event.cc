@@ -22,15 +22,15 @@ namespace cpu {
 namespace {
 
 constexpr std::array<uint8_t, 8> kMagic = {'X', 'E', 'G', 'C',
-                                           'E', 'V', '3', 0};
+                                           'E', 'V', '4', 0};
 constexpr uint32_t kKnownFlags = 0;
 
 static_assert(8 + 4 + 4 + 8 + 4 + 4 + 8 + 8 + 8 + 8 ==
               GuestExecutionContinuousEventCodec::kHeaderSize);
-static_assert(8 + 4 + 4 + 4 * 4 + 8 + 8 + 32 +
+static_assert(8 + 4 + 4 + 4 * 4 + 8 + 8 + 32 + 8 * 4 + 8 +
                   GuestExecutionContinuousEventCodec::kRecordReservedSize ==
               GuestExecutionContinuousEventCodec::kRecordSize);
-static_assert(GuestExecutionContinuousEventCodec::kRecordSize == 96);
+static_assert(GuestExecutionContinuousEventCodec::kRecordSize == 128);
 
 bool Fail(std::string* error, std::string_view message) {
   if (error) {
@@ -105,20 +105,48 @@ bool ValidateCheckpointReference(const GuestExecutionContinuousEvent& event,
   switch (checkpoint.kind) {
     case GuestExecutionContinuousCheckpointReferenceKind::kNone:
       if (checkpoint.checkpoint_global_sequence || checkpoint.state_size ||
-          !IsZeroHash(checkpoint.state_sha256)) {
+          !IsZeroHash(checkpoint.state_sha256) ||
+          checkpoint.binding != ppc::GuestPPCThreadCheckpointBinding{}) {
         return Fail(error,
-                    "event without a checkpoint has nonzero reference fields");
+                    "event without a checkpoint has noncanonical fields");
       }
       return true;
-    case GuestExecutionContinuousCheckpointReferenceKind::kThreadState:
+    case GuestExecutionContinuousCheckpointReferenceKind::kThreadState: {
       if (event.subject.participant_ordinal == kGuestExecutionSessionNoThread ||
           checkpoint.checkpoint_global_sequence > event.global_sequence ||
           checkpoint.state_size !=
               ppc::GuestPPCThreadCheckpointCodec::kEncodedSize ||
-          IsZeroHash(checkpoint.state_sha256)) {
+          IsZeroHash(checkpoint.state_sha256) ||
+          checkpoint.binding.participant_ordinal !=
+              event.subject.participant_ordinal ||
+          checkpoint.binding.guest_thread_id != event.subject.guest_thread_id ||
+          checkpoint.binding.pending_external_event_sequence >
+              checkpoint.checkpoint_global_sequence) {
         return Fail(error, "event checkpoint reference is invalid");
       }
+      ppc::GuestPPCThreadCheckpoint declared;
+      declared.participant_ordinal = checkpoint.binding.participant_ordinal;
+      declared.guest_thread_id = checkpoint.binding.guest_thread_id;
+      declared.resume_kind = checkpoint.binding.resume_kind;
+      declared.resume_pc = checkpoint.binding.resume_pc;
+      declared.owning_function_address =
+          checkpoint.binding.owning_function_address;
+      declared.owning_function_end_address =
+          checkpoint.binding.owning_function_end_address;
+      declared.outer_guest_return_address =
+          checkpoint.binding.outer_guest_return_address;
+      declared.pending_external_event_sequence =
+          checkpoint.binding.pending_external_event_sequence;
+      declared.pending_export_guest_address =
+          checkpoint.binding.pending_export_guest_address;
+      std::string binding_error;
+      if (!ppc::GuestPPCThreadCheckpointCodec::ValidateBinding(
+              declared, checkpoint.binding, &binding_error)) {
+        return Fail(error,
+                    "event checkpoint binding is invalid: " + binding_error);
+      }
       return true;
+    }
     default:
       return Fail(error, "event checkpoint reference kind is unknown");
   }
@@ -253,6 +281,17 @@ void WriteRecord(Writer* writer, const GuestExecutionContinuousEvent& event) {
   writer->WriteU64(event.checkpoint.state_size);
   writer->WriteBytes(event.checkpoint.state_sha256.data(),
                      event.checkpoint.state_sha256.size());
+  const ppc::GuestPPCThreadCheckpointBinding& binding =
+      event.checkpoint.binding;
+  writer->WriteU32(binding.participant_ordinal);
+  writer->WriteU32(binding.guest_thread_id);
+  writer->WriteU32(static_cast<uint32_t>(binding.resume_kind));
+  writer->WriteU32(binding.resume_pc);
+  writer->WriteU32(binding.owning_function_address);
+  writer->WriteU32(binding.owning_function_end_address);
+  writer->WriteU32(binding.outer_guest_return_address);
+  writer->WriteU32(binding.pending_export_guest_address);
+  writer->WriteU64(binding.pending_external_event_sequence);
   for (uint32_t i = 0;
        i < GuestExecutionContinuousEventCodec::kRecordReservedSize /
                sizeof(uint64_t);
@@ -264,6 +303,7 @@ void WriteRecord(Writer* writer, const GuestExecutionContinuousEvent& event) {
 bool ReadRecord(Reader* reader, GuestExecutionContinuousEvent* event) {
   uint32_t kind = 0;
   uint32_t checkpoint_kind = 0;
+  uint32_t resume_kind = 0;
   std::array<uint64_t, GuestExecutionContinuousEventCodec::kRecordReservedSize /
                            sizeof(uint64_t)>
       reserved = {};
@@ -276,7 +316,19 @@ bool ReadRecord(Reader* reader, GuestExecutionContinuousEvent* event) {
       !reader->ReadU64(&event->checkpoint.checkpoint_global_sequence) ||
       !reader->ReadU64(&event->checkpoint.state_size) ||
       !reader->ReadBytes(event->checkpoint.state_sha256.data(),
-                         event->checkpoint.state_sha256.size())) {
+                         event->checkpoint.state_sha256.size()) ||
+      !reader->ReadU32(&event->checkpoint.binding.participant_ordinal) ||
+      !reader->ReadU32(&event->checkpoint.binding.guest_thread_id) ||
+      !reader->ReadU32(&resume_kind) ||
+      !reader->ReadU32(&event->checkpoint.binding.resume_pc) ||
+      !reader->ReadU32(&event->checkpoint.binding.owning_function_address) ||
+      !reader->ReadU32(
+          &event->checkpoint.binding.owning_function_end_address) ||
+      !reader->ReadU32(&event->checkpoint.binding.outer_guest_return_address) ||
+      !reader->ReadU32(
+          &event->checkpoint.binding.pending_export_guest_address) ||
+      !reader->ReadU64(
+          &event->checkpoint.binding.pending_external_event_sequence)) {
     return false;
   }
   for (uint64_t& value : reserved) {
@@ -292,6 +344,8 @@ bool ReadRecord(Reader* reader, GuestExecutionContinuousEvent* event) {
   event->checkpoint.kind =
       static_cast<GuestExecutionContinuousCheckpointReferenceKind>(
           checkpoint_kind);
+  event->checkpoint.binding.resume_kind =
+      static_cast<ppc::GuestPPCThreadResumeKind>(resume_kind);
   return true;
 }
 
@@ -461,9 +515,8 @@ bool GuestExecutionContinuousEventCodec::ValidateParticipantBindings(
   if (error) {
     error->clear();
   }
-  uint64_t encoded_size = 0;
-  if (!ValidateRecords(records, {}, &encoded_size, error)) {
-    return false;
+  if (records.empty()) {
+    return Fail(error, "continuous event record set is empty");
   }
   if (participants.empty()) {
     return Fail(error, "continuous event participant catalog is empty");
@@ -481,7 +534,8 @@ bool GuestExecutionContinuousEventCodec::ValidateParticipantBindings(
     }
   }
   for (const GuestExecutionContinuousEvent& event : records) {
-    if (!BindIdentity(event.actor, participants, "actor", error) ||
+    if (!ValidateRecord(event, error) ||
+        !BindIdentity(event.actor, participants, "actor", error) ||
         !BindIdentity(event.subject, participants, "subject", error)) {
       return false;
     }
@@ -510,6 +564,9 @@ bool GuestExecutionContinuousEventCodec::DecodeAndValidateCheckpoint(
       event.subject.guest_thread_id != binding.guest_thread_id) {
     return Fail(error,
                 "continuous event checkpoint subject binding mismatches");
+  }
+  if (event.checkpoint.binding != binding) {
+    return Fail(error, "continuous event checkpoint route binding mismatches");
   }
   if (!data || data_size != event.checkpoint.state_size ||
       data_size != ppc::GuestPPCThreadCheckpointCodec::kEncodedSize) {

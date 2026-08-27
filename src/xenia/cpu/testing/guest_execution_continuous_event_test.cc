@@ -45,7 +45,9 @@ constexpr size_t kRecordSubjectThreadIdOffset = 28;
 constexpr size_t kRecordCheckpointSequenceOffset = 32;
 constexpr size_t kRecordCheckpointSizeOffset = 40;
 constexpr size_t kRecordCheckpointShaOffset = 48;
-constexpr size_t kRecordReservedOffset = 80;
+constexpr size_t kRecordBindingOffset = 80;
+constexpr size_t kRecordBindingResumeKindOffset = 88;
+constexpr size_t kRecordReservedOffset = 120;
 
 GuestExecutionContinuousEventIdentity Identity(uint32_t participant_ordinal,
                                                uint32_t guest_thread_id) {
@@ -157,6 +159,7 @@ Fixture MakeFixture() {
   reference.state_size = fixture.checkpoint_bytes.size();
   reference.state_sha256 = GuestExecutionSessionCodec::HashBytes(
       fixture.checkpoint_bytes.data(), fixture.checkpoint_bytes.size());
+  reference.binding = fixture.binding;
 
   GuestExecutionSessionParticipant participant;
   participant.ordinal = 0;
@@ -254,22 +257,22 @@ size_t RecordOffset(size_t record_index, size_t field_offset) {
 
 }  // namespace
 
-TEST_CASE("continuous event v3 round-trips actor and subject independently",
+TEST_CASE("continuous event v4 round-trips actor and subject independently",
           "[cpu][guest-execution]") {
   const Fixture fixture = MakeFixture();
   const std::vector<uint8_t> first = EncodeEvents(fixture.events);
   const std::vector<uint8_t> second = EncodeEvents(fixture.events);
 
-  REQUIRE(GuestExecutionContinuousEventCodec::kVersion == 3);
+  REQUIRE(GuestExecutionContinuousEventCodec::kVersion == 4);
   REQUIRE(GuestExecutionContinuousEventCodec::kHeaderSize == 64);
-  REQUIRE(GuestExecutionContinuousEventCodec::kRecordSize == 96);
+  REQUIRE(GuestExecutionContinuousEventCodec::kRecordSize == 128);
   REQUIRE(first == second);
-  REQUIRE(first.size() == 64 + fixture.events.size() * 96);
-  REQUIRE(ReadU32(first, kHeaderVersionOffset) == 3);
+  REQUIRE(first.size() == 64 + fixture.events.size() * 128);
+  REQUIRE(ReadU32(first, kHeaderVersionOffset) == 4);
   REQUIRE(ReadU32(first, kHeaderSizeOffset) == 64);
   REQUIRE(ReadU64(first, kHeaderEncodedSizeOffset) == first.size());
   REQUIRE(ReadU32(first, kHeaderFlagsOffset) == 0);
-  REQUIRE(ReadU32(first, kHeaderRecordSizeOffset) == 96);
+  REQUIRE(ReadU32(first, kHeaderRecordSizeOffset) == 128);
   REQUIRE(ReadU64(first, kHeaderRecordCountOffset) == fixture.events.size());
   REQUIRE(ReadU64(first, kHeaderFirstSequenceOffset) == 100);
   REQUIRE(ReadU64(first, kHeaderLastSequenceOffset) == 102);
@@ -287,6 +290,7 @@ TEST_CASE("continuous event v3 round-trips actor and subject independently",
           99);
   REQUIRE(ReadU64(first, RecordOffset(2, kRecordCheckpointSizeOffset)) ==
           ppc::GuestPPCThreadCheckpointCodec::kEncodedSize);
+  REQUIRE(ReadU32(first, RecordOffset(2, kRecordBindingOffset)) == 1);
 
   std::vector<GuestExecutionContinuousEvent> decoded;
   std::string error;
@@ -309,7 +313,7 @@ TEST_CASE("continuous event v3 round-trips actor and subject independently",
   REQUIRE(decoded == std::vector<GuestExecutionContinuousEvent>{edge});
 }
 
-TEST_CASE("continuous event v3 accepts every defined event kind",
+TEST_CASE("continuous event v4 accepts every defined event kind",
           "[cpu][guest-execution]") {
   const std::array<GuestExecutionSessionEventKind, 19> kinds = {
       GuestExecutionSessionEventKind::kSegmentBegin,
@@ -342,7 +346,7 @@ TEST_CASE("continuous event v3 accepts every defined event kind",
   REQUIRE(decoded == expected);
 }
 
-TEST_CASE("continuous event v3 is unambiguous with existing v2 event chunks",
+TEST_CASE("continuous event v4 rejects earlier event formats",
           "[cpu][guest-execution]") {
   GuestExecutionSessionEventChunk v2_chunk;
   v2_chunk.session_epoch = 0x1122334455667788ull;
@@ -361,18 +365,24 @@ TEST_CASE("continuous event v3 is unambiguous with existing v2 event chunks",
   REQUIRE(error.empty());
 
   const Fixture fixture = MakeFixture();
-  std::vector<GuestExecutionContinuousEvent> v3_output = fixture.events;
-  const auto original = v3_output;
+  std::vector<GuestExecutionContinuousEvent> v4_output = fixture.events;
+  const auto original = v4_output;
   REQUIRE_FALSE(
-      GuestExecutionContinuousEventCodec::Decode(v2_bytes, &v3_output, &error));
+      GuestExecutionContinuousEventCodec::Decode(v2_bytes, &v4_output, &error));
   REQUIRE_FALSE(error.empty());
-  REQUIRE(v3_output == original);
+  REQUIRE(v4_output == original);
 
   GuestExecutionSessionEventChunk v2_output;
   REQUIRE(GuestExecutionSessionCodec::DecodeEventChunk(v2_bytes, &v2_output,
                                                        &error));
   REQUIRE(error.empty());
   REQUIRE(v2_output == v2_chunk);
+
+  std::vector<uint8_t> v3_bytes = EncodeEvents(fixture.events);
+  v3_bytes[6] = '3';
+  WriteU32(&v3_bytes, kHeaderVersionOffset, 3);
+  WriteU32(&v3_bytes, kHeaderRecordSizeOffset, 96);
+  RequireDecodeFailure(v3_bytes);
 }
 
 TEST_CASE("continuous event checkpoint reference authenticates and binds state",
@@ -387,6 +397,23 @@ TEST_CASE("continuous event checkpoint reference authenticates and binds state",
   REQUIRE(decoded == fixture.checkpoint);
   REQUIRE(event.checkpoint.state_size ==
           ppc::GuestPPCThreadCheckpointCodec::kEncodedSize);
+
+  GuestExecutionContinuousEvent declared_route_mismatch = event;
+  declared_route_mismatch.checkpoint.binding.resume_pc += 4;
+  RequireCheckpointFailure(declared_route_mismatch, fixture.checkpoint_bytes,
+                           fixture.binding);
+
+  ppc::GuestPPCThreadCheckpoint alternate_checkpoint = fixture.checkpoint;
+  alternate_checkpoint.resume_pc += 4;
+  const ppc::GuestPPCThreadCheckpointBinding alternate_binding =
+      BindingFor(alternate_checkpoint);
+  const std::vector<uint8_t> alternate_bytes =
+      EncodeCheckpoint(alternate_checkpoint);
+  GuestExecutionContinuousEvent stale_declaration = event;
+  stale_declaration.checkpoint.state_sha256 =
+      GuestExecutionSessionCodec::HashBytes(alternate_bytes);
+  RequireCheckpointFailure(stale_declaration, alternate_bytes,
+                           alternate_binding);
 
   std::vector<uint8_t> malformed = fixture.checkpoint_bytes;
   malformed.back() ^= 1;
@@ -438,6 +465,7 @@ TEST_CASE("continuous event checkpoint rejects an out-of-order pending route",
   GuestExecutionContinuousEvent event = fixture.events.back();
   event.checkpoint.state_sha256 = GuestExecutionSessionCodec::HashBytes(
       fixture.checkpoint_bytes.data(), fixture.checkpoint_bytes.size());
+  event.checkpoint.binding = fixture.binding;
 
   ppc::GuestPPCThreadCheckpoint decoded;
   REQUIRE(GuestExecutionContinuousEventCodec::DecodeAndValidateCheckpoint(
@@ -456,6 +484,7 @@ TEST_CASE("continuous event checkpoint rejects an out-of-order pending route",
   fixture.checkpoint_bytes = EncodeCheckpoint(fixture.checkpoint);
   event.checkpoint.state_sha256 = GuestExecutionSessionCodec::HashBytes(
       fixture.checkpoint_bytes.data(), fixture.checkpoint_bytes.size());
+  event.checkpoint.binding = fixture.binding;
   RequireCheckpointFailure(event, fixture.checkpoint_bytes, fixture.binding);
 }
 
@@ -496,7 +525,7 @@ TEST_CASE("continuous event decode rejects forged headers and reserved bytes",
   malformed.front() ^= 1;
   RequireDecodeFailure(malformed);
 
-  for (uint32_t version : {0u, 2u, 4u, UINT32_MAX}) {
+  for (uint32_t version : {0u, 2u, 3u, UINT32_MAX}) {
     malformed = encoded;
     WriteU32(&malformed, kHeaderVersionOffset, version);
     RequireDecodeFailure(malformed);
@@ -517,7 +546,7 @@ TEST_CASE("continuous event decode rejects forged headers and reserved bytes",
     WriteU32(&malformed, kHeaderFlagsOffset, flags);
     RequireDecodeFailure(malformed);
   }
-  for (uint32_t size : {0u, 95u, 97u, UINT32_MAX}) {
+  for (uint32_t size : {0u, 127u, 129u, UINT32_MAX}) {
     malformed = encoded;
     WriteU32(&malformed, kHeaderRecordSizeOffset, size);
     RequireDecodeFailure(malformed);
@@ -659,8 +688,17 @@ TEST_CASE("continuous event codec enforces canonical checkpoint references",
   malformed_events = fixture.events;
   malformed_events.back().subject = {};
   RequireEncodeFailure(malformed_events);
+  malformed_events = fixture.events;
+  ++malformed_events.back().checkpoint.binding.resume_pc;
+  RequireEncodeFailure(malformed_events);
+  malformed_events = fixture.events;
+  malformed_events.front().checkpoint.binding.resume_pc = 0x82004000;
+  RequireEncodeFailure(malformed_events);
 
   std::vector<uint8_t> malformed = encoded;
+  WriteU32(&malformed, RecordOffset(0, kRecordBindingResumeKindOffset), 0);
+  RequireDecodeFailure(malformed);
+  malformed = encoded;
   WriteU64(&malformed, RecordOffset(0, kRecordCheckpointSequenceOffset), 1);
   RequireDecodeFailure(malformed);
   malformed = encoded;

@@ -16,6 +16,8 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
@@ -578,13 +580,31 @@ struct GuestExecutionSessionAssembler::Impl {
 
   bool AppendEventLocked(GuestExecutionSessionEvent event,
                          Participant* participant) {
-    if (next_event_sequence == std::numeric_limits<uint64_t>::max()) {
+    if (next_event_sequence == std::numeric_limits<uint64_t>::max() ||
+        next_event_sequence >
+            config.bundle_limits.session.maximum_total_events) {
       RejectLocked(Rejection::kHardLimit,
-                   "capture session event sequence overflows");
+                   "capture session aggregate event limit is exceeded");
       return false;
     }
     event.global_sequence = next_event_sequence;
-    pending_events.push_back(event);
+    try {
+      pending_events.push_back(event);
+    } catch (const std::bad_alloc&) {
+      state = State::kRejected;
+      rejection = Rejection::kHardLimit;
+      message.clear();
+      pending_events.clear();
+      encoded_chunks.clear();
+      blobs.clear();
+      encoded_chunk_bytes = 0;
+      blob_bytes = 0;
+      return false;
+    } catch (const std::length_error&) {
+      RejectLocked(Rejection::kHardLimit,
+                   "capture session event storage limit is exceeded");
+      return false;
+    }
     last_event_sequence = next_event_sequence;
     ++next_event_sequence;
     if (participant) {
@@ -1092,6 +1112,13 @@ GuestExecutionSessionAssembler::Create(
   }
   const GuestExecutionSessionLimits& session_limits =
       config.bundle_limits.session;
+  if (!session_limits.maximum_total_events ||
+      config.limits.maximum_event_count > session_limits.maximum_total_events ||
+      !session_limits.maximum_total_checkpoint_thread_states) {
+    Fail(error,
+         "capture session aggregate event/checkpoint limits are out of range");
+    return nullptr;
+  }
   uint64_t chunk_payload_bytes = 0;
   if (!config.maximum_events_per_chunk ||
       config.maximum_events_per_chunk >
@@ -1102,7 +1129,7 @@ GuestExecutionSessionAssembler::Create(
       chunk_payload_bytes + GuestExecutionSessionCodec::kEnvelopeHeaderSize +
               GuestExecutionSessionCodec::kEnvelopeFooterSize >
           session_limits.maximum_chunk_bytes) {
-    Fail(error, "capture session events per chunk is out of range");
+    Fail(error, "capture session events per chunk are out of range");
     return nullptr;
   }
   GuestExecutionReelConfig reel_config;
@@ -1142,6 +1169,14 @@ bool GuestExecutionSessionAssembler::SeedParticipants(
   if (seeds.empty() ||
       seeds.size() > impl_->config.bundle_limits.session.maximum_participants ||
       roster.rejection != GuestExecutionCaptureHostCallRosterRejection::kNone) {
+    return false;
+  }
+  if (seeds.size() > impl_->config.bundle_limits.session
+                             .maximum_total_checkpoint_thread_states /
+                         2) {
+    impl_->RejectLocked(
+        Rejection::kHardLimit,
+        "capture session checkpoint participant total exceeds its limit");
     return false;
   }
   for (size_t i = 0; i < seeds.size(); ++i) {
@@ -1223,6 +1258,14 @@ Action GuestExecutionSessionAssembler::OnParticipantLifecycle(
         return impl_->RejectLocked(
             Rejection::kHardLimit,
             "capture session participant count exceeds its limit");
+      }
+      if (impl_->participants.size() >=
+          impl_->config.bundle_limits.session
+                  .maximum_total_checkpoint_thread_states /
+              2) {
+        return impl_->RejectLocked(
+            Rejection::kHardLimit,
+            "capture session checkpoint participant total exceeds its limit");
       }
       Impl::Participant participant;
       participant.identity = identity;
@@ -2039,6 +2082,9 @@ Action GuestExecutionSessionAssembler::OnExternalEvent(
   const bool addressed =
       input.kind == GuestExecutionSessionEventKind::kMmio ||
       input.kind == GuestExecutionSessionEventKind::kAtomicOrReservation;
+  const bool modeled_export =
+      input.kind == GuestExecutionSessionEventKind::kKernelExport ||
+      input.kind == GuestExecutionSessionEventKind::kExternOrBuiltin;
   const bool payload_none =
       input.payload_kind == GuestExecutionSessionPayloadKind::kNone;
   const bool scalar_payload =
@@ -2058,8 +2104,12 @@ Action GuestExecutionSessionAssembler::OnExternalEvent(
        input.payload_kind != GuestExecutionSessionPayloadKind::kGuestBytes) ||
       (scalar_payload && payload_size != 1 && payload_size != 2 &&
        payload_size != 4 && payload_size != 8) ||
-      (addressed ? !ValidateGuestRange(input.guest_address, input.byte_count)
-                 : (input.guest_address || input.byte_count))) {
+      (addressed
+           ? !ValidateGuestRange(input.guest_address, input.byte_count)
+           : (modeled_export ? (!input.guest_address ||
+                                input.guest_address >= kGuestAddressSpaceSize ||
+                                (input.guest_address & 3) || input.byte_count)
+                             : (input.guest_address || input.byte_count)))) {
     return impl_->RejectLocked(Rejection::kInvalidCall,
                                "capture session external event is invalid");
   }

@@ -54,6 +54,7 @@ GuestExecutionSessionEventChunk MakeEventChunk() {
 
   GuestExecutionSessionEvent external =
       PlainEvent(2, GuestExecutionSessionEventKind::kKernelExport);
+  external.guest_address = 0x82000080;
   external.payload_kind =
       GuestExecutionSessionPayloadKind::kLittleEndianUnsignedInteger;
   external.payload_size = 8;
@@ -1010,6 +1011,7 @@ TEST_CASE("Guest execution session rejects unsupported or rejected work",
   rejected.kind = GuestExecutionSessionEventKind::kUnsupported;
   rejected.thread_ordinal = kGuestExecutionSessionNoThread;
   rejected.disposition = GuestExecutionSessionEventDisposition::kRejectSession;
+  rejected.guest_address = 0;
   rejected.payload_kind = GuestExecutionSessionPayloadKind::kNone;
   rejected.payload_size = 0;
   rejected.payload_sha256 = {};

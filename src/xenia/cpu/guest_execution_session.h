@@ -87,6 +87,11 @@ struct GuestExecutionSessionBoundaryPolicy {
 enum class GuestExecutionSessionChunkKind : uint32_t {
   kEvents = 2,
   kCheckpoint = 3,
+  // An auxiliary version-4 actor/subject/checkpoint control overlay. The
+  // canonical version-2 event chunks remain authoritative for payloads and
+  // dispositions; session validation requires both views to agree exactly on
+  // every global sequence and event kind.
+  kContinuousEvents = 4,
 };
 
 enum class GuestExecutionSessionEventKind : uint32_t {
@@ -329,6 +334,9 @@ struct GuestExecutionSessionLimits {
   uint32_t maximum_segments = 1u << 20;
   uint32_t maximum_chunks = 1u << 20;
   uint32_t maximum_events_per_chunk = 1u << 20;
+  // Bounds aggregate decoded collections, not merely each encoded chunk.
+  uint64_t maximum_total_events = 1u << 20;
+  uint64_t maximum_total_checkpoint_thread_states = 1u << 20;
   uint32_t maximum_checkpoint_thread_states = 4096;
   uint32_t maximum_checkpoint_content_references = 1u << 20;
 };

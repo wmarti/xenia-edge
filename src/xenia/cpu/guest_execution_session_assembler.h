@@ -179,6 +179,8 @@ struct GuestExecutionSessionAssemblerExternalEvent {
       GuestExecutionSessionEventKind::kKernelExport;
   GuestExecutionSessionEventDisposition disposition =
       GuestExecutionSessionEventDisposition::kReplayCaptured;
+  // Exact dispatch target for kernel/extern events, or range base for MMIO and
+  // atomic events. Kernel/extern targets are aligned and have byte_count zero.
   uint64_t guest_address = 0;
   uint64_t byte_count = 0;
   GuestExecutionSessionPayloadKind payload_kind =

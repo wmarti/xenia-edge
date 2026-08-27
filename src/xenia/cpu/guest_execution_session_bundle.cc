@@ -13,11 +13,14 @@
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <new>
 #include <set>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
 #include "xenia/base/platform.h"
+#include "xenia/cpu/guest_execution_continuous_event.h"
 
 #if XE_PLATFORM_MAC
 #include <fcntl.h>
@@ -90,9 +93,21 @@ std::string HexOrdinal(uint32_t ordinal) {
 
 std::filesystem::path ChunkFileName(
     const GuestExecutionSessionChunkReference& chunk) {
-  const std::string_view kind =
-      chunk.kind == GuestExecutionSessionChunkKind::kEvents ? "events"
-                                                            : "checkpoint";
+  std::string_view kind;
+  switch (chunk.kind) {
+    case GuestExecutionSessionChunkKind::kEvents:
+      kind = "events";
+      break;
+    case GuestExecutionSessionChunkKind::kCheckpoint:
+      kind = "checkpoint";
+      break;
+    case GuestExecutionSessionChunkKind::kContinuousEvents:
+      kind = "continuous";
+      break;
+    default:
+      kind = "unknown";
+      break;
+  }
   return std::string(kChunkPrefix) + HexOrdinal(chunk.ordinal) + "-" +
          std::string(kind) + "-" + HexDigest(chunk.encoded_sha256) +
          std::string(kChunkSuffix);
@@ -336,6 +351,9 @@ bool CollectRequiredBlobs(
           return false;
         }
       }
+    } else if (manifest.chunks[i].kind ==
+               GuestExecutionSessionChunkKind::kContinuousEvents) {
+      continue;
     } else {
       GuestExecutionSessionCheckpointChunk chunk;
       if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
@@ -370,6 +388,47 @@ struct ValidatedBundle {
   std::map<GuestExecutionSessionSha256, const GuestExecutionSessionContentBlob*>
       blobs;
 };
+
+bool ValidateContinuousCheckpointBlobs(
+    const GuestExecutionSessionBundle& bundle,
+    const GuestExecutionSessionBundleLimits& limits,
+    const ValidatedBundle& validated, std::string* error) {
+  GuestExecutionContinuousEventLimits continuous_limits;
+  continuous_limits.maximum_encoded_bytes = limits.session.maximum_chunk_bytes;
+  continuous_limits.maximum_records = limits.session.maximum_events_per_chunk;
+  for (size_t chunk_index = 0; chunk_index < bundle.chunks.size();
+       ++chunk_index) {
+    if (bundle.manifest.chunks[chunk_index].kind !=
+        GuestExecutionSessionChunkKind::kContinuousEvents) {
+      continue;
+    }
+    std::vector<GuestExecutionContinuousEvent> events;
+    if (!GuestExecutionContinuousEventCodec::Decode(
+            bundle.chunks[chunk_index], &events, error, continuous_limits)) {
+      return false;
+    }
+    for (const GuestExecutionContinuousEvent& event : events) {
+      if (event.checkpoint.kind !=
+          GuestExecutionContinuousCheckpointReferenceKind::kThreadState) {
+        continue;
+      }
+      const auto blob = validated.blobs.find(event.checkpoint.state_sha256);
+      if (blob == validated.blobs.end()) {
+        return Fail(error, "continuous event checkpoint blob is not present");
+      }
+      ppc::GuestPPCThreadCheckpoint checkpoint;
+      std::string checkpoint_error;
+      if (!GuestExecutionContinuousEventCodec::DecodeAndValidateCheckpoint(
+              event, blob->second->bytes, event.checkpoint.binding, &checkpoint,
+              &checkpoint_error)) {
+        return Fail(error,
+                    "continuous event checkpoint blob or subject is invalid: " +
+                        checkpoint_error);
+      }
+    }
+  }
+  return true;
+}
 
 bool ValidateBundle(const GuestExecutionSessionBundle& bundle,
                     const GuestExecutionSessionBundleLimits& limits,
@@ -420,6 +479,9 @@ bool ValidateBundle(const GuestExecutionSessionBundle& bundle,
          blob->second->bytes.size() != requirement.expected_size)) {
       return Fail(error, "session bundle blob reference is not satisfied");
     }
+  }
+  if (!ValidateContinuousCheckpointBlobs(bundle, limits, *output, error)) {
+    return false;
   }
 
   uint64_t total_bundle_bytes = output->manifest_bytes.size();
@@ -652,6 +714,10 @@ bool ReadBundleInternal(const std::filesystem::path& requested_directory,
       return Fail(error, "session bundle contains an unexpected file name");
     }
   }
+  ValidatedBundle validated;
+  if (!ValidateBundle(bundle, limits, &validated, error)) {
+    return false;
+  }
   *output = std::move(bundle);
   return true;
 }
@@ -664,14 +730,20 @@ bool ValidateGuestExecutionSessionBundle(
   if (error) {
     error->clear();
   }
-  ValidatedBundle validated;
-  return ValidateBundle(bundle, limits, &validated, error);
+  try {
+    ValidatedBundle validated;
+    return ValidateBundle(bundle, limits, &validated, error);
+  } catch (const std::bad_alloc&) {
+    return Fail(error, "session bundle validation allocation failed");
+  } catch (const std::length_error&) {
+    return Fail(error, "session bundle validation collection size is invalid");
+  }
 }
 
 bool WriteGuestExecutionSessionBundle(
     const std::filesystem::path& output_directory,
     const GuestExecutionSessionBundle& bundle, std::string* error,
-    GuestExecutionSessionBundleLimits limits) {
+    GuestExecutionSessionBundleLimits limits) try {
   if (error) {
     error->clear();
   }
@@ -756,6 +828,10 @@ bool WriteGuestExecutionSessionBundle(
   }
   staging_guard.Release();
   return SyncDirectory(resolved_output.parent_path(), error);
+} catch (const std::bad_alloc&) {
+  return Fail(error, "session bundle publication allocation failed");
+} catch (const std::length_error&) {
+  return Fail(error, "session bundle publication collection size is invalid");
 }
 
 bool ReadGuestExecutionSessionBundle(
@@ -769,7 +845,13 @@ bool ReadGuestExecutionSessionBundle(
   if (error) {
     error->clear();
   }
-  return ReadBundleInternal(bundle_directory, false, output, error, limits);
+  try {
+    return ReadBundleInternal(bundle_directory, false, output, error, limits);
+  } catch (const std::bad_alloc&) {
+    return Fail(error, "session bundle read allocation failed");
+  } catch (const std::length_error&) {
+    return Fail(error, "session bundle read collection size is invalid");
+  }
 }
 
 }  // namespace cpu

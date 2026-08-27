@@ -105,6 +105,7 @@ GuestExecutionSessionBundle MakeTapeBundle() {
   GuestExecutionSessionEvent external =
       Event(2, 0, GuestExecutionSessionEventKind::kKernelExport,
             GuestExecutionSessionEventDisposition::kReplayCaptured);
+  external.guest_address = 0x82000080;
   external.payload_kind =
       GuestExecutionSessionPayloadKind::kLittleEndianUnsignedInteger;
   external.payload_size = 8;
