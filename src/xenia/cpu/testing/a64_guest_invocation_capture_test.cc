@@ -953,6 +953,7 @@ TEST_CASE("A64_SESSION_INSTRUCTION_COVERAGE_COUNTS_EXECUTED_BLOCKS",
         builder.SourceOffset(kAddress + 12);
         StoreGPR(builder, 4, builder.LoadConstantUint64(1));
         builder.Return();
+        REQUIRE(builder.Finalize());
       },
       kAddress + 16);
 
