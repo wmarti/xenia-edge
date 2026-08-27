@@ -223,6 +223,22 @@ class MemoryCapturePageReader final
   Memory& memory_;
 };
 
+class ScopedCaptureSink final {
+ public:
+  ScopedCaptureSink(Processor& processor,
+                    GuestInvocationCaptureEventSink& capture_sink)
+      : processor_(processor) {
+    processor_.set_guest_invocation_capture_sink(&capture_sink);
+  }
+
+  ~ScopedCaptureSink() {
+    processor_.set_guest_invocation_capture_sink(nullptr);
+  }
+
+ private:
+  Processor& processor_;
+};
+
 ppc::GuestPPCRegisterState MakeRegisterState(uint64_t seed) {
   ppc::GuestPPCRegisterState state;
   for (size_t i = 0; i < state.gpr.size(); ++i) {
@@ -863,47 +879,61 @@ TEST_CASE("A64_CAPTURE_COORDINATOR_ACCEPTS_EMITTED_INVOCATION",
   ppc::GuestInvocationRecorderIdentity expected_owner = {};
   ppc::GuestPPCRegisterState final_input = {};
   ppc::GuestPPCRegisterState final_output = {};
-  processor->set_guest_invocation_capture_sink(coordinator.get());
-  test.Run(
-      [&](ppc::PPCContext* context) {
-        context->r[3] = 0x0303030303030303ull;
-        context->r[4] = data_address;
-        context->r[5] = 0x0505050505050505ull;
-        expected_owner = {reinterpret_cast<uintptr_t>(context),
-                          context->thread_id};
-      },
-      [&](ppc::PPCContext* context) {
-        REQUIRE(coordinator->status().recorder_state ==
-                ppc::GuestInvocationRecorderState::kWaitingForDiscoveryAttempt);
-        Function* function = processor->ResolveFunction(kRootAddress);
-        REQUIRE(function != nullptr);
+  const auto require_recorder_state =
+      [&](ppc::GuestInvocationRecorderState expected_state) {
+        const GuestInvocationCaptureStatus capture_status =
+            coordinator->status();
+        INFO("capture state = " << static_cast<uint32_t>(capture_status.state));
+        INFO("recorder rejection = "
+             << static_cast<uint32_t>(capture_status.rejection));
+        INFO("recorder rejection flags = "
+             << capture_status.rejected_dependency_flags);
+        INFO("capture diagnostic = " << capture_status.message);
+        REQUIRE(capture_status.recorder_state == expected_state);
+      };
+  {
+    ScopedCaptureSink capture_sink(*processor, *coordinator);
+    test.Run(
+        [&](ppc::PPCContext* context) {
+          context->r[3] = 0x0303030303030303ull;
+          context->r[4] = data_address;
+          context->r[5] = 0x0505050505050505ull;
+          expected_owner = {reinterpret_cast<uintptr_t>(context),
+                            context->thread_id};
+        },
+        [&](ppc::PPCContext* context) {
+          require_recorder_state(
+              ppc::GuestInvocationRecorderState::kWaitingForDiscoveryAttempt);
+          Function* function = processor->ResolveFunction(kRootAddress);
+          REQUIRE(function != nullptr);
 
-        context->r[4] = data_address;
-        REQUIRE(function->Call(context->thread_state,
-                               static_cast<uint32_t>(context->lr)));
-        REQUIRE(coordinator->status().recorder_state ==
-                ppc::GuestInvocationRecorderState::kWaitingForFinalAttempt);
+          context->r[4] = data_address;
+          REQUIRE(function->Call(context->thread_state,
+                                 static_cast<uint32_t>(context->lr)));
+          require_recorder_state(
+              ppc::GuestInvocationRecorderState::kWaitingForFinalAttempt);
 
-        std::memcpy(test.memory->TranslateVirtual(data_page),
-                    initial_page.data(), initial_page.size());
-        context->r[3] = 0x1313131313131313ull;
-        context->r[4] = data_address;
-        context->r[5] = 0x1515151515151515ull;
-        context->ctr = 0x1717171717171717ull;
-        context->v[7] = vec128i(0x21222324, 0x31323334, 0x41424344, 0x51525354);
-        final_input = ppc::CaptureGuestPPCRegisterState(*context);
-        clock.now = kCaptureEndTick;
-        REQUIRE(function->Call(context->thread_state,
-                               static_cast<uint32_t>(context->lr)));
-        final_output = ppc::CaptureGuestPPCRegisterState(*context);
-        REQUIRE(final_output.gpr[3] == kInitialWord);
-        REQUIRE(final_output.gpr[5] == kFinalWord);
+          std::memcpy(test.memory->TranslateVirtual(data_page),
+                      initial_page.data(), initial_page.size());
+          context->r[3] = 0x1313131313131313ull;
+          context->r[4] = data_address;
+          context->r[5] = 0x1515151515151515ull;
+          context->ctr = 0x1717171717171717ull;
+          context->v[7] =
+              vec128i(0x21222324, 0x31323334, 0x41424344, 0x51525354);
+          final_input = ppc::CaptureGuestPPCRegisterState(*context);
+          clock.now = kCaptureEndTick;
+          REQUIRE(function->Call(context->thread_state,
+                                 static_cast<uint32_t>(context->lr)));
+          final_output = ppc::CaptureGuestPPCRegisterState(*context);
+          REQUIRE(final_output.gpr[3] == kInitialWord);
+          REQUIRE(final_output.gpr[5] == kFinalWord);
 
-        REQUIRE(function->Call(context->thread_state,
-                               static_cast<uint32_t>(context->lr)));
-        REQUIRE(coordinator->Poll());
-      });
-  processor->set_guest_invocation_capture_sink(nullptr);
+          REQUIRE(function->Call(context->thread_state,
+                                 static_cast<uint32_t>(context->lr)));
+          REQUIRE(coordinator->Poll());
+        });
+  }
 
   REQUIRE(publication_count == 1);
   REQUIRE(published_result);
@@ -911,6 +941,10 @@ TEST_CASE("A64_CAPTURE_COORDINATOR_ACCEPTS_EMITTED_INVOCATION",
   REQUIRE(published_start_tick == kCaptureStartTick);
   REQUIRE(published_end_tick == kCaptureEndTick);
   const GuestInvocationCaptureStatus status = coordinator->status();
+  INFO("capture state = " << static_cast<uint32_t>(status.state));
+  INFO("recorder rejection = " << static_cast<uint32_t>(status.rejection));
+  INFO("recorder rejection flags = " << status.rejected_dependency_flags);
+  INFO("capture diagnostic = " << status.message);
   REQUIRE(status.state == GuestInvocationCaptureState::kPublished);
   REQUIRE(status.recorder_state ==
           ppc::GuestInvocationRecorderState::kComplete);

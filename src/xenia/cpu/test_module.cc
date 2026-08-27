@@ -14,6 +14,10 @@
 #include "xenia/base/reset_scope.h"
 #include "xenia/base/string.h"
 #include "xenia/cpu/compiler/compiler_passes.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/guest_invocation_capture.h"
+#endif
 #include "xenia/cpu/processor.h"
 
 namespace xe {
@@ -116,6 +120,15 @@ Symbol::Status TestModule::DeclareFunction(uint32_t address,
 
     status = Symbol::Status::kDefined;
     function->set_status(status);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    // TestModule assembles directly in DeclareFunction, bypassing the normal
+    // Processor::DemandFunction definition callback. Report the same
+    // successful-definition event only after assembly and status publication.
+    if (auto* capture = processor_->guest_invocation_capture_sink()) {
+      capture->OnFunctionDefined(function->address(), function->end_address());
+    }
+#endif
   }
   return status;
 }
