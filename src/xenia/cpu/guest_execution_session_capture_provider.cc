@@ -136,7 +136,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
 
     bool VisitThreadState(const ThreadState& thread_state) noexcept override {
       try {
-        const ppc::PPCContext* context = thread_state.context();
+        ppc::PPCContext* context = thread_state.context();
         if (!context || !thread_state.guest_execution_capture_instance_id() ||
             !thread_state.thread_id() ||
             context->thread_id != thread_state.thread_id()) {
