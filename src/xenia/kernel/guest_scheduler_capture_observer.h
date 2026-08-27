@@ -100,6 +100,21 @@ enum GuestSchedulerCaptureEventFlags : uint16_t {
 
 constexpr size_t kGuestSchedulerCaptureMaximumWaitHandles = 8;
 
+// Durable values carried by GuestSchedulerCaptureEvent::value for kBlock and
+// kReready. Keep these synchronized with XThread::CooperativeWaitKind.
+enum class GuestSchedulerCaptureWaitKind : uint8_t {
+  kNone = 0,
+  kSingle = 1,
+  kMultiAny = 2,
+  kMultiAll = 3,
+  kDelay = 4,
+  kFence = 5,
+  kIoOffload = 6,
+  kSpinBackoff = 7,
+  kIoCompletion = 8,
+  kSocketIo = 9,
+};
+
 enum GuestSchedulerCaptureWaitFlags : uint8_t {
   kGuestSchedulerCaptureWaitFlagGated = 1u << 0,
   kGuestSchedulerCaptureWaitFlagAlertable = 1u << 1,

@@ -78,6 +78,33 @@ moved. The diagnostic signal ring's signaler LR and host thread are not read
 under the scheduler lock because its inverse lock order would deadlock; they
 remain diagnostics rather than authenticated replay input.
 
+`RereadyBlocked` takes that decision snapshot once while it owns the scheduler
+lock. The epoch comparison, deadline and APC choice are derived from that same
+immutable value, and the event serializes the value unchanged. A signal racing
+after the snapshot therefore wakes a later scheduler pass; it cannot rewrite
+the epoch or cause attached to the decision already in progress.
+
+The durable wait-kind values are:
+
+| Value | Kind | Handles | Deadline |
+| ---: | --- | ---: | --- |
+| 1 | single object, including `SignalAndWait` | 1 | optional |
+| 2 | wait-any | 1-8 | optional |
+| 3 | wait-all | 1-8 | optional |
+| 4 | delay | 0 | required |
+| 5 | host fence | 0 | forbidden |
+| 6 | offloaded host call | 0 | forbidden |
+| 7 | spin backoff | 0 | forbidden |
+| 8 | I/O completion | 1 | optional |
+| 9 | socket I/O | 1 | optional |
+
+The I/O completion and socket identities are their real guest object handles;
+they do not invent signal epochs for polling-only sources. A socket wait event
+authenticates only the scheduler park and its real timeout. Socket result bytes,
+errors and host readiness are separate external inputs and remain fail-closed
+unless the session's external-event machinery captures them; this wait kind by
+itself does not make a socket call replayable.
+
 The canonical scheduler payload is version 2 and 192 bytes. Version 1's
 48-byte payload omitted exact PCs and wait causes, so the decoder recognizes it
 only to return the explicit `not deterministic-replayable` rejection. Capture
@@ -238,11 +265,16 @@ scheduler. It lives in the CPU suite because `xenia-kernel-tests` links only
 
 `guest_execution_session_assembler_test.cc` additionally round-trips version 2
 block and signal-reready provenance through the canonical bundle, exercises all
-13 replay-modeled kinds, and proves exact-PC, wait-epoch, participant, sequence
-and legacy-version failures reject closed.
+13 replay-modeled event kinds and all nine wait kinds, and proves malformed
+wait-kind combinations, exact-PC, wait-epoch, participant, sequence, high-bit
+kind aliases and legacy-version payloads reject closed.
 
-Not exercised by unit tests, because they need a title, fibers and a
-`KernelState`: every emission site inside the live scheduler, the rejection of
-attachment after a real `SwitchTo` or with a queued thread, the per-episode
-safepoint accounting in `PreemptCurrentFiber`, event delivery under the real
-`lock_`, and the shutdown drain of leftover fibers.
+`guest_scheduler_checkpoint_runtime_test.cc` runs scheduler-backed fibers
+through single, multi, delay, fence, offloaded-host-call, `SignalAndWait`, spin
+backoff, I/O completion and socket paths and checks their live `kBlock` records.
+It also forces a signal between the reready snapshot and cause selection and
+proves the published event retains the earlier snapshot and backstop cause.
+
+Still not exercised without a title: attachment rejection after a real
+`SwitchTo` or with a queued thread, per-episode safepoint accounting in
+`PreemptCurrentFiber`, and the shutdown drain of leftover title fibers.

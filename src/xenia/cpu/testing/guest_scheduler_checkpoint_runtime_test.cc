@@ -39,6 +39,9 @@
 #include "xenia/kernel/guest_scheduler_capture_observer.h"
 #include "xenia/kernel/kernel_flags.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xevent.h"
+#include "xenia/kernel/xiocompletion.h"
+#include "xenia/kernel/xsocket.h"
 #include "xenia/kernel/xthread.h"
 
 namespace xe {
@@ -184,6 +187,48 @@ class GuestSchedulerCheckpointRuntimeTestAccess final {
   static bool SchedulerSafepointPending(XThread* thread) {
     return thread->scheduler_links().scheduler_safepoint_requested.load(
         std::memory_order_acquire);
+  }
+};
+
+class GuestSchedulerCaptureWaitRuntimeTestAccess final {
+ public:
+  static void SetRereadyDecisionHook(
+      GuestScheduler& scheduler, GuestScheduler::RereadyDecisionTestHook hook,
+      void* context) {
+    scheduler.reready_decision_test_context_.store(context,
+                                                   std::memory_order_release);
+    scheduler.reready_decision_test_hook_.store(hook,
+                                                std::memory_order_release);
+  }
+
+  static bool IsBlocked(GuestScheduler& scheduler, XThread* thread) {
+    std::lock_guard<std::mutex> lock(scheduler.lock_);
+    return thread->scheduler_links().blocked;
+  }
+
+  static bool ArmRereadyDecisionHookAndForce(
+      GuestScheduler& scheduler, XThread* thread,
+      GuestScheduler::RereadyDecisionTestHook hook, void* context) {
+    int cpu_index = -1;
+    {
+      std::lock_guard<std::mutex> lock(scheduler.lock_);
+      if (!thread->scheduler_links().blocked) {
+        return false;
+      }
+      scheduler.reready_decision_test_context_.store(context,
+                                                     std::memory_order_release);
+      scheduler.reready_decision_test_hook_.store(hook,
+                                                  std::memory_order_release);
+      cpu_index = thread->scheduler_links().cpu;
+      auto& cpu = scheduler.cpus_[cpu_index];
+      cpu.next_force_repoll_ms = 0;
+      cpu.next_timed_repoll_ms = 0;
+      cpu.repoll_now.store(true, std::memory_order_relaxed);
+    }
+    if (scheduler.cpus_[cpu_index].ready_event) {
+      scheduler.cpus_[cpu_index].ready_event->Set();
+    }
+    return true;
   }
 };
 
@@ -440,6 +485,223 @@ struct FiberControl {
   std::condition_variable condition;
 };
 
+struct WaitInventoryControl {
+  bool WaitForCompletion(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return condition.wait_for(lock, timeout, [this]() {
+      return completed.load(std::memory_order_acquire);
+    });
+  }
+
+  void Complete() {
+    completed.store(true, std::memory_order_release);
+    condition.notify_all();
+  }
+
+  std::atomic<bool> completed{false};
+  bool single_wait_timed_out = false;
+  bool multi_any_timed_out = false;
+  bool multi_all_timed_out = false;
+  bool signal_and_wait_timed_out = false;
+  bool delay_completed = false;
+  bool io_completion_timed_out = false;
+  bool socket_initialized = false;
+  bool socket_bound = false;
+  bool socket_received = false;
+  std::mutex mutex;
+  std::condition_variable condition;
+};
+
+class WaitInventoryRuntimeThread final : public XThread {
+ public:
+  WaitInventoryRuntimeThread(KernelState* kernel_state,
+                             WaitInventoryControl* control)
+      : XThread(kernel_state, 64 * 1024, 0, kSafepointPc, 0, kCpu0CreationFlags,
+                true, false, kernel_state->GetSystemProcess()),
+        control_(control) {}
+
+  void Execute() override {
+    constexpr int64_t kRelativeTimeoutTicks = -50'000;
+    uint64_t timeout = static_cast<uint64_t>(kRelativeTimeoutTicks);
+
+    auto single = object_ref<XEvent>(new XEvent(kernel_state()));
+    single->Initialize(false, false);
+    control_->single_wait_timed_out =
+        single->Wait(0, 0, 0, &timeout) == X_STATUS_TIMEOUT;
+
+    auto multi_a = object_ref<XEvent>(new XEvent(kernel_state()));
+    auto multi_b = object_ref<XEvent>(new XEvent(kernel_state()));
+    multi_a->Initialize(false, false);
+    multi_b->Initialize(false, false);
+    XObject* multi_objects[] = {multi_a.get(), multi_b.get()};
+    timeout = static_cast<uint64_t>(kRelativeTimeoutTicks);
+    control_->multi_any_timed_out =
+        XObject::WaitMultiple(2, multi_objects, 1, 0, 0, 0, &timeout) ==
+        X_STATUS_TIMEOUT;
+    timeout = static_cast<uint64_t>(kRelativeTimeoutTicks);
+    control_->multi_all_timed_out =
+        XObject::WaitMultiple(2, multi_objects, 0, 0, 0, 0, &timeout) ==
+        X_STATUS_TIMEOUT;
+
+    auto signal = object_ref<XEvent>(new XEvent(kernel_state()));
+    auto signal_wait = object_ref<XEvent>(new XEvent(kernel_state()));
+    signal->Initialize(false, false);
+    signal_wait->Initialize(false, false);
+    timeout = static_cast<uint64_t>(kRelativeTimeoutTicks);
+    control_->signal_and_wait_timed_out =
+        XObject::SignalAndWait(signal.get(), signal_wait.get(), 0, 0, 0,
+                               &timeout) == X_STATUS_TIMEOUT;
+
+    control_->delay_completed =
+        Delay(0, 0, static_cast<uint64_t>(kRelativeTimeoutTicks)) ==
+        X_STATUS_SUCCESS;
+    GuestScheduler::SpinYield(1ms);
+
+    xe::threading::Fence fence;
+    std::thread fence_signaler([&fence]() {
+      std::this_thread::sleep_for(5ms);
+      fence.Signal();
+    });
+    GuestScheduler::WaitOnFence(fence);
+    fence_signaler.join();
+
+    std::atomic<bool> release_io{false};
+    std::thread io_releaser([&release_io]() {
+      std::this_thread::sleep_for(5ms);
+      release_io.store(true, std::memory_order_release);
+    });
+    kernel_state()->guest_scheduler()->RunBlockingHostCall([&release_io]() {
+      while (!release_io.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+    });
+    io_releaser.join();
+
+    auto completion =
+        object_ref<XIOCompletion>(new XIOCompletion(kernel_state()));
+    XIOCompletion::IONotification notification = {};
+    control_->io_completion_timed_out =
+        !completion->WaitForNotification(5, &notification);
+
+    auto socket = object_ref<XSocket>(new XSocket(kernel_state()));
+    control_->socket_initialized =
+        socket->Initialize(XSocket::X_AF_INET, XSocket::X_SOCK_DGRAM,
+                           XSocket::X_IPPROTO_UDP) == X_STATUS_SUCCESS;
+    if (control_->socket_initialized) {
+      N_XSOCKADDR_IN bind_address = {};
+      bind_address.sin_family = XSocket::X_AF_INET;
+      bind_address.sin_port = 0;
+      bind_address.sin_addr = 0;
+      control_->socket_bound =
+          socket->Bind(&bind_address, sizeof(bind_address)) == X_STATUS_SUCCESS;
+      if (control_->socket_bound) {
+        const uint16_t port = socket->bound_port();
+        std::thread sender([port]() {
+          std::this_thread::sleep_for(5ms);
+          asio::io_context context;
+          asio::ip::udp::socket host_socket(context);
+          asio::error_code error;
+          host_socket.open(asio::ip::udp::v4(), error);
+          if (!error) {
+            const uint8_t byte = 0x5A;
+            host_socket.send_to(
+                asio::buffer(&byte, sizeof(byte)),
+                asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), port),
+                0, error);
+          }
+        });
+        uint8_t byte = 0;
+        N_XSOCKADDR_IN source = {};
+        uint32_t source_size = sizeof(source);
+        control_->socket_received =
+            socket->RecvFrom(&byte, 1, 0, &source, &source_size) == 1;
+        sender.join();
+      }
+    }
+
+    control_->Complete();
+    Exit(0);
+  }
+
+ private:
+  WaitInventoryControl* control_;
+};
+
+struct RereadyRaceControl {
+  static void Hook(void* opaque, XThread* thread,
+                   const GuestSchedulerCaptureWaitState& wait) {
+    auto* control = static_cast<RereadyRaceControl*>(opaque);
+    bool unclaimed = false;
+    if (thread != control->thread ||
+        !control->claimed.compare_exchange_strong(unclaimed, true)) {
+      return;
+    }
+    control->decision_wait = wait;
+    control->entered.store(true, std::memory_order_release);
+    control->condition.notify_all();
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (control->event->cooperative_signal_epoch() ==
+               wait.observed_wait_epoch &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    control->signal_observed.store(
+        control->event->cooperative_signal_epoch() != wait.observed_wait_epoch,
+        std::memory_order_release);
+  }
+
+  bool WaitForHook(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return condition.wait_for(lock, timeout, [this]() {
+      return entered.load(std::memory_order_acquire);
+    });
+  }
+
+  XThread* thread = nullptr;
+  XEvent* event = nullptr;
+  GuestSchedulerCaptureWaitState decision_wait;
+  std::atomic<bool> claimed{false};
+  std::atomic<bool> entered{false};
+  std::atomic<bool> signal_observed{false};
+  std::mutex mutex;
+  std::condition_variable condition;
+};
+
+struct RereadyWaitControl {
+  bool WaitForCompletion(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return condition.wait_for(lock, timeout, [this]() { return completed; });
+  }
+
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool completed = false;
+};
+
+class RereadyWaitRuntimeThread final : public XThread {
+ public:
+  RereadyWaitRuntimeThread(KernelState* kernel_state,
+                           RereadyWaitControl* control, XEvent* event)
+      : XThread(kernel_state, 64 * 1024, 0, kSafepointPc, 0, kCpu0CreationFlags,
+                true, false, kernel_state->GetSystemProcess()),
+        control_(control),
+        event_(event) {}
+
+  void Execute() override {
+    event_->Wait(0, 0, 0, nullptr);
+    {
+      std::lock_guard<std::mutex> lock(control_->mutex);
+      control_->completed = true;
+    }
+    control_->condition.notify_all();
+    Exit(0);
+  }
+
+ private:
+  RereadyWaitControl* control_;
+  XEvent* event_;
+};
+
 class CheckpointRuntimeThread final : public XThread {
  public:
   CheckpointRuntimeThread(KernelState* kernel_state, FiberControl* control,
@@ -683,6 +945,164 @@ bool ContainsRestorableJitSafepoint(
                                   ResumeKind::kJitSafepoint &&
                               participant.restorable;
                      });
+}
+
+TEST_CASE("Guest scheduler capture inventories every cooperative block source",
+          "[guest_scheduler_capture_wait][runtime]") {
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(4096);
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  WaitInventoryControl control;
+  auto thread =
+      object_ref<WaitInventoryRuntimeThread>(new WaitInventoryRuntimeThread(
+          environment.emulator()->kernel_state(), &control));
+  thread->set_name("Scheduler wait inventory test");
+  REQUIRE(thread->Create() == X_STATUS_SUCCESS);
+  REQUIRE(control.WaitForCompletion(5s));
+  scheduler.Shutdown();
+
+  const auto snapshot = recorder->snapshot();
+  REQUIRE(snapshot.rejection == GuestSchedulerCaptureRecorderRejection::kNone);
+  std::array<size_t, 10> block_counts = {};
+  for (const GuestSchedulerCaptureEvent& event : snapshot.events) {
+    if (event.kind != GuestSchedulerCaptureEventKind::kBlock) {
+      continue;
+    }
+    REQUIRE(event.value < block_counts.size());
+    ++block_counts[event.value];
+    const auto wait_kind =
+        static_cast<GuestSchedulerCaptureWaitKind>(event.value);
+    switch (wait_kind) {
+      case GuestSchedulerCaptureWaitKind::kSingle:
+        REQUIRE(event.wait.handle_count == 1);
+        break;
+      case GuestSchedulerCaptureWaitKind::kMultiAny:
+      case GuestSchedulerCaptureWaitKind::kMultiAll:
+        REQUIRE(event.wait.handle_count == 2);
+        break;
+      case GuestSchedulerCaptureWaitKind::kDelay:
+        REQUIRE(event.wait.handle_count == 0);
+        REQUIRE(event.wait.deadline_ms != 0);
+        break;
+      case GuestSchedulerCaptureWaitKind::kFence:
+      case GuestSchedulerCaptureWaitKind::kIoOffload:
+      case GuestSchedulerCaptureWaitKind::kSpinBackoff:
+        REQUIRE(event.wait.handle_count == 0);
+        REQUIRE(event.wait.deadline_ms == 0);
+        break;
+      case GuestSchedulerCaptureWaitKind::kIoCompletion:
+        REQUIRE(event.wait.handle_count == 1);
+        REQUIRE(event.wait.deadline_ms != 0);
+        REQUIRE(event.wait.wait_epoch == 0);
+        REQUIRE(event.wait.observed_wait_epoch == 0);
+        break;
+      case GuestSchedulerCaptureWaitKind::kSocketIo:
+        REQUIRE(event.wait.handle_count == 1);
+        REQUIRE(event.wait.wait_epoch == 0);
+        REQUIRE(event.wait.observed_wait_epoch == 0);
+        break;
+      case GuestSchedulerCaptureWaitKind::kNone:
+      default:
+        FAIL("unexpected cooperative wait kind");
+    }
+  }
+
+  REQUIRE(block_counts[static_cast<uint8_t>(
+              GuestSchedulerCaptureWaitKind::kSingle)] >= 2);
+  for (uint8_t kind =
+           static_cast<uint8_t>(GuestSchedulerCaptureWaitKind::kMultiAny);
+       kind <= static_cast<uint8_t>(GuestSchedulerCaptureWaitKind::kSocketIo);
+       ++kind) {
+    REQUIRE(block_counts[kind] >= 1);
+  }
+  REQUIRE(control.single_wait_timed_out);
+  REQUIRE(control.multi_any_timed_out);
+  REQUIRE(control.multi_all_timed_out);
+  REQUIRE(control.signal_and_wait_timed_out);
+  REQUIRE(control.delay_completed);
+  REQUIRE(control.io_completion_timed_out);
+  REQUIRE(control.socket_initialized);
+  REQUIRE(control.socket_bound);
+  REQUIRE(control.socket_received);
+
+  thread->ReclaimExited();
+  thread->ReleaseHandle();
+  thread.reset();
+}
+
+TEST_CASE("Guest scheduler reready capture freezes decision-time provenance",
+          "[guest_scheduler_capture_wait][runtime]") {
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(256);
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  auto event =
+      object_ref<XEvent>(new XEvent(environment.emulator()->kernel_state()));
+  event->Initialize(false, false);
+  RereadyWaitControl wait_control;
+  auto thread =
+      object_ref<RereadyWaitRuntimeThread>(new RereadyWaitRuntimeThread(
+          environment.emulator()->kernel_state(), &wait_control, event.get()));
+  thread->set_name("Scheduler reready decision test");
+
+  RereadyRaceControl race;
+  race.thread = thread.get();
+  race.event = event.get();
+
+  REQUIRE(thread->Create() == X_STATUS_SUCCESS);
+  const auto blocked_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!GuestSchedulerCaptureWaitRuntimeTestAccess::IsBlocked(scheduler,
+                                                                thread.get()) &&
+         std::chrono::steady_clock::now() < blocked_deadline) {
+    std::this_thread::yield();
+  }
+  REQUIRE(GuestSchedulerCaptureWaitRuntimeTestAccess::IsBlocked(scheduler,
+                                                                thread.get()));
+  std::thread signaler([&race]() {
+    if (race.WaitForHook(2s)) {
+      race.event->Set(0, false);
+    }
+  });
+  const bool armed = GuestSchedulerCaptureWaitRuntimeTestAccess::
+      ArmRereadyDecisionHookAndForce(scheduler, thread.get(),
+                                     &RereadyRaceControl::Hook, &race);
+  const bool completed = armed && wait_control.WaitForCompletion(2s);
+  signaler.join();
+  GuestSchedulerCaptureWaitRuntimeTestAccess::SetRereadyDecisionHook(
+      scheduler, nullptr, nullptr);
+  scheduler.Shutdown();
+
+  REQUIRE(armed);
+  REQUIRE(completed);
+  REQUIRE(race.entered.load(std::memory_order_acquire));
+  REQUIRE(race.signal_observed.load(std::memory_order_acquire));
+  REQUIRE(event->cooperative_signal_epoch() !=
+          race.decision_wait.observed_wait_epoch);
+  const auto snapshot = recorder->snapshot();
+  REQUIRE(snapshot.rejection == GuestSchedulerCaptureRecorderRejection::kNone);
+  const auto reready = std::find_if(
+      snapshot.events.cbegin(), snapshot.events.cend(),
+      [&thread](const GuestSchedulerCaptureEvent& event_record) {
+        return event_record.kind == GuestSchedulerCaptureEventKind::kReready &&
+               event_record.guest_thread_id == thread->thread_id();
+      });
+  REQUIRE(reready != snapshot.events.cend());
+  REQUIRE(reready->reason == GuestSchedulerCaptureReason::kBackstop);
+  REQUIRE(reready->wait == race.decision_wait);
+  REQUIRE(reready->wait.wait_epoch == reready->wait.observed_wait_epoch);
+
+  thread->ReclaimExited();
+  thread->ReleaseHandle();
+  thread.reset();
+  event->ReleaseHandle();
+  event.reset();
 }
 
 void ThrowBeforeCheckpointSnapshot(void*) { throw std::bad_alloc(); }

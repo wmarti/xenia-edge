@@ -47,6 +47,30 @@ namespace kernel {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 using CaptureKind = GuestSchedulerCaptureEventKind;
 using CaptureReason = GuestSchedulerCaptureReason;
+using CaptureWaitKind = GuestSchedulerCaptureWaitKind;
+
+static_assert(static_cast<uint8_t>(XThread::CooperativeWaitKind::kNone) ==
+              static_cast<uint8_t>(CaptureWaitKind::kNone));
+static_assert(static_cast<uint8_t>(XThread::CooperativeWaitKind::kSingle) ==
+              static_cast<uint8_t>(CaptureWaitKind::kSingle));
+static_assert(static_cast<uint8_t>(XThread::CooperativeWaitKind::kMultiAny) ==
+              static_cast<uint8_t>(CaptureWaitKind::kMultiAny));
+static_assert(static_cast<uint8_t>(XThread::CooperativeWaitKind::kMultiAll) ==
+              static_cast<uint8_t>(CaptureWaitKind::kMultiAll));
+static_assert(static_cast<uint8_t>(XThread::CooperativeWaitKind::kDelay) ==
+              static_cast<uint8_t>(CaptureWaitKind::kDelay));
+static_assert(static_cast<uint8_t>(XThread::CooperativeWaitKind::kFence) ==
+              static_cast<uint8_t>(CaptureWaitKind::kFence));
+static_assert(static_cast<uint8_t>(XThread::CooperativeWaitKind::kIoOffload) ==
+              static_cast<uint8_t>(CaptureWaitKind::kIoOffload));
+static_assert(
+    static_cast<uint8_t>(XThread::CooperativeWaitKind::kSpinBackoff) ==
+    static_cast<uint8_t>(CaptureWaitKind::kSpinBackoff));
+static_assert(
+    static_cast<uint8_t>(XThread::CooperativeWaitKind::kIoCompletion) ==
+    static_cast<uint8_t>(CaptureWaitKind::kIoCompletion));
+static_assert(static_cast<uint8_t>(XThread::CooperativeWaitKind::kSocketIo) ==
+              static_cast<uint8_t>(CaptureWaitKind::kSocketIo));
 #endif
 
 // Logical CPU index of the host thread currently executing, or -1 on any
@@ -1882,7 +1906,16 @@ void GuestScheduler::SpinYield(std::chrono::milliseconds host_sleep) {
     if (host_sleep.count()) {
       // Parking rather than re-queueing, so a lone fiber idles instead of
       // spinning its dispatch thread at full speed.
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      self->set_cooperative_wait_shape(
+          XThread::CooperativeWaitKind::kSpinBackoff, nullptr, 0);
+#endif
       scheduler->BlockCurrentThread();
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      self->clear_cooperative_wait_shape();
+#endif
     } else {
       scheduler->YieldCurrentThread(false);
     }
@@ -2301,6 +2334,13 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
       XThread* next = links.ready_next;
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      const GuestSchedulerCaptureWaitState decision_wait =
+          CaptureWaitState(t, now_ms);
+      if (auto hook =
+              reready_decision_test_hook_.load(std::memory_order_acquire)) {
+        hook(reready_decision_test_context_.load(std::memory_order_acquire), t,
+             decision_wait);
+      }
       CaptureReason reready_reason =
           links.wait_gated ? CaptureReason::kBackstop : CaptureReason::kPolled;
 #endif
@@ -2311,6 +2351,16 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
         // can resolve.
         XObject* obj = t->cooperative_wait_object();
         bool may_have_resolved = false;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+        if (obj || links.wait_gate_count) {
+          may_have_resolved =
+              decision_wait.observed_wait_epoch != decision_wait.wait_epoch;
+        }
+        const bool deadline_expired =
+            decision_wait.deadline_ms &&
+            decision_wait.observed_uptime_ms >= decision_wait.deadline_ms;
+#else
         if (obj) {
           may_have_resolved =
               obj->cooperative_signal_epoch() != links.wait_epoch;
@@ -2318,9 +2368,21 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
           may_have_resolved =
               t->cooperative_wait_set_epoch() != links.wait_epoch;
         }
+#endif
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+        const bool user_apc_pending =
+            decision_wait.flags & kGuestSchedulerCaptureWaitFlagUserApcPending;
+#endif
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+        if (!may_have_resolved && !deadline_expired &&
+            !(links.wait_alertable && user_apc_pending)) {
+#else
         if (!may_have_resolved &&
             !(links.wait_deadline_ms && now_ms >= links.wait_deadline_ms) &&
             !(links.wait_alertable && t->HasPendingUserApc())) {
+#endif
           links.ready_next = nullptr;
           LinkTailLocked(kept_head, kept_tail, t);
           int prio = ClampPriority(t->priority());
@@ -2340,11 +2402,9 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
         // Same order as the test above, so the first satisfied gate is named.
-        reready_reason =
-            may_have_resolved ? CaptureReason::kSignalEpoch
-            : (links.wait_deadline_ms && now_ms >= links.wait_deadline_ms)
-                ? CaptureReason::kDeadline
-                : CaptureReason::kUserApc;
+        reready_reason = may_have_resolved  ? CaptureReason::kSignalEpoch
+                         : deadline_expired ? CaptureReason::kDeadline
+                                            : CaptureReason::kUserApc;
 #endif
       }
       links.blocked = false;
@@ -2362,12 +2422,10 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
       links.preempted = false;
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-      const GuestSchedulerCaptureWaitState capture_wait =
-          CaptureWaitState(t, now_ms);
       EmitCaptureLocked(CaptureKind::kReready, t, cpu_index, target,
                         reready_reason,
                         at_head ? kGuestSchedulerCaptureFlagAtHead : 0,
-                        links.wait_kind, 0, 0, &capture_wait);
+                        links.wait_kind, 0, 0, &decision_wait);
 #endif
       LinkReadyLocked(cpus_[target], t, at_head);
       if (target != cpu_index) {

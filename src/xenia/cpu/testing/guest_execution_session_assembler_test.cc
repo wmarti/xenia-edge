@@ -13,9 +13,11 @@
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -532,6 +534,69 @@ kernel::GuestSchedulerCaptureEvent BridgeSchedulerEvent(
       event.flags = kernel::kGuestSchedulerCaptureFlagGated;
       event.wait.flags = kernel::kGuestSchedulerCaptureWaitFlagGated;
     }
+  }
+  return event;
+}
+
+kernel::GuestSchedulerCaptureEvent BridgeBlockEvent(
+    uint64_t sequence, kernel::GuestSchedulerCaptureWaitKind wait_kind,
+    bool external_has_deadline = true) {
+  kernel::GuestSchedulerCaptureEvent event = BridgeSchedulerEvent(
+      sequence, kernel::GuestSchedulerCaptureEventKind::kBlock);
+  event.value = static_cast<uint8_t>(wait_kind);
+  event.wait = {};
+  event.wait.observed_uptime_ms = 50;
+  bool interruptible = true;
+  switch (wait_kind) {
+    case kernel::GuestSchedulerCaptureWaitKind::kSingle:
+      event.wait.handle_count = 1;
+      event.wait.handles[0] = 0x20;
+      event.flags = kernel::kGuestSchedulerCaptureFlagGated;
+      event.wait.flags = kernel::kGuestSchedulerCaptureWaitFlagGated;
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kMultiAny:
+    case kernel::GuestSchedulerCaptureWaitKind::kMultiAll:
+      event.wait.handle_count = 2;
+      event.wait.handles[0] = 0x20;
+      event.wait.handles[1] = 0x24;
+      event.flags = kernel::kGuestSchedulerCaptureFlagGated;
+      event.wait.flags = kernel::kGuestSchedulerCaptureWaitFlagGated;
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kDelay:
+      event.wait.deadline_ms = 100;
+      event.flags = kernel::kGuestSchedulerCaptureFlagGated |
+                    kernel::kGuestSchedulerCaptureFlagHasDeadline;
+      event.wait.flags = kernel::kGuestSchedulerCaptureWaitFlagGated;
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kFence:
+    case kernel::GuestSchedulerCaptureWaitKind::kIoOffload:
+      interruptible = false;
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kSpinBackoff:
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kIoCompletion:
+      event.wait.handle_count = 1;
+      event.wait.handles[0] = 0x30;
+      if (external_has_deadline) {
+        event.wait.deadline_ms = 100;
+        event.flags = kernel::kGuestSchedulerCaptureFlagHasDeadline;
+      }
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kSocketIo:
+      event.wait.handle_count = 1;
+      event.wait.handles[0] = 0x34;
+      if (external_has_deadline) {
+        event.wait.deadline_ms = 100;
+        event.flags = kernel::kGuestSchedulerCaptureFlagHasDeadline;
+      }
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kNone:
+    default:
+      break;
+  }
+  if (interruptible) {
+    event.flags |= kernel::kGuestSchedulerCaptureFlagInterruptible;
+    event.wait.flags |= kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
   }
   return event;
 }
@@ -2824,6 +2889,147 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
                 &harness.error) == Action::kReject);
     REQUIRE(harness.error.find("not recording") != std::string::npos);
   }
+}
+
+TEST_CASE("scheduler event bridge authenticates every cooperative wait kind",
+          "[guest-execution-session-capture-event-bridge]") {
+  Harness harness(MakeContinuousConfig());
+  REQUIRE(harness.Create());
+  harness.states.encode_thread_checkpoint = true;
+  harness.states.checkpoint_participants = {kA};
+  std::vector<GuestExecutionCaptureThreadStateLifecycleEvent> seeds;
+  GuestExecutionCaptureHostCallRosterSnapshot roster;
+  MakeSeeds({{kA, 1}}, &seeds, &roster);
+  REQUIRE(harness.assembler->SeedParticipants(seeds, roster));
+
+  GuestExecutionSessionCaptureSchedulerEventBridge bridge;
+  REQUIRE(bridge.BeginSession(*harness.assembler, BridgeCheckpoint(1), seeds,
+                              &harness.error));
+  REQUIRE(harness.assembler->Arm(&harness.error));
+  REQUIRE(harness.assembler->RequestStart(&harness.error));
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kContinue);
+
+  std::vector<kernel::GuestSchedulerCaptureEvent> expected;
+  uint64_t sequence = 100;
+  for (uint8_t value =
+           static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kSingle);
+       value <=
+       static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kSocketIo);
+       ++value) {
+    expected.push_back(BridgeBlockEvent(
+        sequence++, static_cast<kernel::GuestSchedulerCaptureWaitKind>(value)));
+  }
+  expected.push_back(BridgeBlockEvent(
+      sequence++, kernel::GuestSchedulerCaptureWaitKind::kIoCompletion, false));
+  expected.push_back(BridgeBlockEvent(
+      sequence++, kernel::GuestSchedulerCaptureWaitKind::kSocketIo, false));
+  for (const auto& event : expected) {
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, event,
+                                    &harness.error) == Action::kContinue);
+  }
+  REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kHold);
+  REQUIRE(bridge.SealSession(*harness.assembler, BridgeCheckpoint(2),
+                             &harness.error));
+  REQUIRE(harness.assembler->Publish(&harness.error));
+  GuestExecutionSessionBundle bundle = harness.publisher.bundles.front();
+  REQUIRE(bridge.FinalizeBundle(&bundle, expected.size(), &harness.error));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &harness.error));
+
+  std::array<std::vector<uint8_t>, 10> encoded_by_wait_kind;
+  std::array<bool, 10> decoded_wait_kind = {};
+  std::array<bool, 2> decoded_io_completion_deadline = {};
+  std::array<bool, 2> decoded_socket_deadline = {};
+  for (const GuestExecutionSessionContentBlob& blob : bundle.content_blobs) {
+    kernel::GuestSchedulerCaptureEvent decoded;
+    std::string decode_error;
+    if (!GuestExecutionSessionCaptureSchedulerEventBridge::
+            DecodeSchedulerEventPayload(blob.bytes, &decoded, &decode_error)) {
+      continue;
+    }
+    REQUIRE(decoded.kind == kernel::GuestSchedulerCaptureEventKind::kBlock);
+    REQUIRE(decoded.value < encoded_by_wait_kind.size());
+    if (!decoded_wait_kind[decoded.value]) {
+      encoded_by_wait_kind[decoded.value] = blob.bytes;
+    }
+    decoded_wait_kind[decoded.value] = true;
+    const auto expected_event = std::find_if(
+        expected.cbegin(), expected.cend(), [&decoded](const auto& candidate) {
+          return candidate.sequence == decoded.sequence;
+        });
+    REQUIRE(expected_event != expected.cend());
+    REQUIRE(decoded == *expected_event);
+    if (decoded.value ==
+        static_cast<uint8_t>(
+            kernel::GuestSchedulerCaptureWaitKind::kIoCompletion)) {
+      decoded_io_completion_deadline
+          [(decoded.flags & kernel::kGuestSchedulerCaptureFlagHasDeadline) !=
+           0] = true;
+    }
+    if (decoded.value ==
+        static_cast<uint8_t>(
+            kernel::GuestSchedulerCaptureWaitKind::kSocketIo)) {
+      decoded_socket_deadline[(decoded.flags &
+                               kernel::kGuestSchedulerCaptureFlagHasDeadline) !=
+                              0] = true;
+    }
+  }
+  for (uint8_t value =
+           static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kSingle);
+       value <=
+       static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kSocketIo);
+       ++value) {
+    REQUIRE(decoded_wait_kind[value]);
+  }
+  REQUIRE(decoded_io_completion_deadline[0]);
+  REQUIRE(decoded_io_completion_deadline[1]);
+  REQUIRE(decoded_socket_deadline[0]);
+  REQUIRE(decoded_socket_deadline[1]);
+
+  auto require_malformed =
+      [&](kernel::GuestSchedulerCaptureWaitKind wait_kind,
+          const std::function<void(std::vector<uint8_t>*)>& mutate) {
+        std::vector<uint8_t> payload =
+            encoded_by_wait_kind[static_cast<uint8_t>(wait_kind)];
+        mutate(&payload);
+        kernel::GuestSchedulerCaptureEvent ignored;
+        REQUIRE_FALSE(
+            GuestExecutionSessionCaptureSchedulerEventBridge::
+                DecodeSchedulerEventPayload(payload, &ignored, &harness.error));
+      };
+  require_malformed(kernel::GuestSchedulerCaptureWaitKind::kSingle,
+                    [](auto* payload) { (*payload)[60] = 0; });
+  require_malformed(kernel::GuestSchedulerCaptureWaitKind::kMultiAny,
+                    [](auto* payload) { (*payload)[60] = 0; });
+  require_malformed(kernel::GuestSchedulerCaptureWaitKind::kMultiAll,
+                    [](auto* payload) { (*payload)[60] = 0; });
+  require_malformed(
+      kernel::GuestSchedulerCaptureWaitKind::kDelay, [](auto* payload) {
+        std::fill(payload->begin() + 64, payload->begin() + 72, 0);
+      });
+  require_malformed(kernel::GuestSchedulerCaptureWaitKind::kFence,
+                    [](auto* payload) { (*payload)[64] = 1; });
+  require_malformed(kernel::GuestSchedulerCaptureWaitKind::kIoOffload,
+                    [](auto* payload) { (*payload)[64] = 1; });
+  require_malformed(kernel::GuestSchedulerCaptureWaitKind::kSpinBackoff,
+                    [](auto* payload) { (*payload)[64] = 1; });
+  require_malformed(kernel::GuestSchedulerCaptureWaitKind::kIoCompletion,
+                    [](auto* payload) { (*payload)[60] = 0; });
+  require_malformed(kernel::GuestSchedulerCaptureWaitKind::kSocketIo,
+                    [](auto* payload) { (*payload)[60] = 0; });
+
+  std::vector<uint8_t> high_bit_kind =
+      encoded_by_wait_kind[static_cast<uint8_t>(
+          kernel::GuestSchedulerCaptureWaitKind::kSingle)];
+  high_bit_kind[12] = 0x01;
+  high_bit_kind[13] = 0x01;
+  high_bit_kind[14] = 0;
+  high_bit_kind[15] = 0;
+  kernel::GuestSchedulerCaptureEvent ignored;
+  REQUIRE_FALSE(
+      GuestExecutionSessionCaptureSchedulerEventBridge::
+          DecodeSchedulerEventPayload(high_bit_kind, &ignored, &harness.error));
+  REQUIRE(harness.error.find("kind is out of range") != std::string::npos);
 }
 
 }  // namespace test

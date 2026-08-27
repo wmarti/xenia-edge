@@ -529,12 +529,15 @@ class XThread : public XObject, public cpu::Thread {
   // Why a fiber is parked, for the scheduler's no-progress report.
   enum class CooperativeWaitKind : uint8_t {
     kNone = 0,
-    kSingle,
-    kMultiAny,
-    kMultiAll,
-    kDelay,
-    kFence,
-    kIoOffload,
+    kSingle = 1,
+    kMultiAny = 2,
+    kMultiAll = 3,
+    kDelay = 4,
+    kFence = 5,
+    kIoOffload = 6,
+    kSpinBackoff = 7,
+    kIoCompletion = 8,
+    kSocketIo = 9,
   };
   // Records the wait shape for diagnostics. Extra handles beyond the array are
   // dropped; the count reported is the real one so truncation stays visible.

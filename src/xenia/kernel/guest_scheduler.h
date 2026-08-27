@@ -37,6 +37,7 @@ class XThread;
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 class GuestSchedulerCheckpointRuntimeTestAccess;
+class GuestSchedulerCaptureWaitRuntimeTestAccess;
 
 struct GuestSchedulerCheckpointJitRoute {
   XThread* thread = nullptr;
@@ -380,8 +381,12 @@ class GuestScheduler {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   friend class GuestSchedulerCheckpointRuntimeTestAccess;
+  friend class GuestSchedulerCaptureWaitRuntimeTestAccess;
 
   using CheckpointTestHook = void (*)(void* context);
+  using RereadyDecisionTestHook =
+      void (*)(void* context, XThread* thread,
+               const GuestSchedulerCaptureWaitState& wait);
 
   void AppendCheckpointListLocked(
       std::vector<GuestSchedulerCheckpointParticipant>& participants,
@@ -442,6 +447,11 @@ class GuestScheduler {
   std::atomic<bool> checkpoint_shutdown_requested_{false};
   std::condition_variable checkpoint_discard_condition_;
   size_t checkpoint_discard_pending_count_ = 0;
+
+  // Null outside deterministic tests. Invoked after the reready inputs have
+  // been snapshotted and before their wake reason is selected.
+  std::atomic<RereadyDecisionTestHook> reready_decision_test_hook_{nullptr};
+  std::atomic<void*> reready_decision_test_context_{nullptr};
 #endif
 
   KernelState* kernel_state_;

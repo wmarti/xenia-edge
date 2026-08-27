@@ -444,6 +444,12 @@ void XSocket::RunCooperatively(asio::error_code& ec, RetryMode mode,
     SetHostNonBlocking(true);
   }
   auto* scheduler = self->kernel_state()->guest_scheduler();
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  const uint32_t wait_handle_id = handle();
+  self->set_cooperative_wait_shape(XThread::CooperativeWaitKind::kSocketIo,
+                                   &wait_handle_id, 1);
+#endif
   while (true) {
     attempt();
     bool retry = ec == asio::error::would_block || ec == asio::error::try_again;
@@ -464,8 +470,17 @@ void XSocket::RunCooperatively(asio::error_code& ec, RetryMode mode,
       ec = asio::error::timed_out;
       break;
     }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    scheduler->BlockCurrentThread(deadline_ms);
+#else
     scheduler->BlockCurrentThread();
+#endif
   }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  self->clear_cooperative_wait_shape();
+#endif
   if (cooperative_io_depth_.fetch_sub(1) == 1) {
     SetHostNonBlocking(false);
   }

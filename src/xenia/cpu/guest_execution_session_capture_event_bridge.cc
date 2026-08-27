@@ -232,6 +232,8 @@ bool IsEmptyWaitState(const kernel::GuestSchedulerCaptureWaitState& wait) {
 
 bool ValidateWaitState(const CaptureEvent& event, std::string* error) {
   const auto& wait = event.wait;
+  const auto wait_kind =
+      static_cast<kernel::GuestSchedulerCaptureWaitKind>(event.value);
   if (wait.handle_count > kernel::kGuestSchedulerCaptureMaximumWaitHandles ||
       (wait.flags & ~kKnownWaitFlags) ||
       ((wait.flags & kernel::kGuestSchedulerCaptureWaitFlagUserApcPending) &&
@@ -240,6 +242,7 @@ bool ValidateWaitState(const CaptureEvent& event, std::string* error) {
   }
   uint32_t epochs_before = 0;
   uint32_t epochs_observed = 0;
+  bool has_signal_epochs = false;
   for (size_t index = 0;
        index < kernel::kGuestSchedulerCaptureMaximumWaitHandles; ++index) {
     if (index < wait.handle_count) {
@@ -252,36 +255,73 @@ bool ValidateWaitState(const CaptureEvent& event, std::string* error) {
     }
     epochs_before += wait.signal_epochs_before[index];
     epochs_observed += wait.signal_epochs_observed[index];
+    has_signal_epochs = has_signal_epochs || wait.signal_epochs_before[index] ||
+                        wait.signal_epochs_observed[index];
   }
   if (epochs_before != wait.wait_epoch ||
       epochs_observed != wait.observed_wait_epoch) {
     return Fail(error, "scheduler capture wait epochs are inconsistent");
   }
 
-  switch (event.value) {
-    case 1:
+  switch (wait_kind) {
+    case kernel::GuestSchedulerCaptureWaitKind::kSingle:
       if (wait.handle_count != 1) {
         return Fail(error, "scheduler single wait has no unique handle");
       }
       break;
-    case 2:
-    case 3:
+    case kernel::GuestSchedulerCaptureWaitKind::kMultiAny:
+    case kernel::GuestSchedulerCaptureWaitKind::kMultiAll:
       if (!wait.handle_count) {
         return Fail(error, "scheduler multi-wait has no handles");
       }
       break;
-    case 4:
-    case 5:
-    case 6:
+    case kernel::GuestSchedulerCaptureWaitKind::kDelay:
+    case kernel::GuestSchedulerCaptureWaitKind::kFence:
+    case kernel::GuestSchedulerCaptureWaitKind::kIoOffload:
+    case kernel::GuestSchedulerCaptureWaitKind::kSpinBackoff:
       if (wait.handle_count) {
         return Fail(error, "scheduler handle-free wait names an object");
       }
       break;
+    case kernel::GuestSchedulerCaptureWaitKind::kIoCompletion:
+    case kernel::GuestSchedulerCaptureWaitKind::kSocketIo:
+      if (wait.handle_count != 1) {
+        return Fail(error, "scheduler external wait has no unique handle");
+      }
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kNone:
     default:
       return Fail(error, "scheduler capture wait kind is invalid");
   }
 
+  if ((wait_kind == kernel::GuestSchedulerCaptureWaitKind::kDelay ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kFence ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kIoOffload ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kSpinBackoff ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kIoCompletion ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kSocketIo) &&
+      has_signal_epochs) {
+    return Fail(error, "scheduler non-object wait carries signal epochs");
+  }
+  if ((wait_kind == kernel::GuestSchedulerCaptureWaitKind::kFence ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kIoOffload ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kSpinBackoff) &&
+      wait.deadline_ms) {
+    return Fail(error, "scheduler untimed wait carries a deadline");
+  }
+  if (wait_kind == kernel::GuestSchedulerCaptureWaitKind::kDelay &&
+      !wait.deadline_ms) {
+    return Fail(error, "scheduler delay wait has no deadline");
+  }
   const bool gated = wait.flags & kernel::kGuestSchedulerCaptureWaitFlagGated;
+  if ((wait_kind == kernel::GuestSchedulerCaptureWaitKind::kFence ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kIoOffload ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kSpinBackoff ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kIoCompletion ||
+       wait_kind == kernel::GuestSchedulerCaptureWaitKind::kSocketIo) &&
+      gated) {
+    return Fail(error, "scheduler polling wait is incorrectly gated");
+  }
   if (event.kind == CaptureKind::kBlock) {
     const uint8_t expected_wait_flags =
         ((event.flags & kernel::kGuestSchedulerCaptureFlagGated)
@@ -976,8 +1016,12 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::
                   [](uint8_t value) { return value != 0; })) {
     return Fail(error, "scheduler event payload envelope is invalid");
   }
+  const uint32_t raw_kind = ReadU32(payload, 12);
+  if (raw_kind > std::numeric_limits<uint8_t>::max()) {
+    return Fail(error, "scheduler event payload kind is out of range");
+  }
   CaptureEvent decoded;
-  decoded.kind = static_cast<CaptureKind>(ReadU32(payload, 12));
+  decoded.kind = static_cast<CaptureKind>(raw_kind);
   decoded.sequence = ReadU64(payload, 16);
   decoded.capture_instance_id = ReadU64(payload, 24);
   decoded.guest_thread_id = ReadU32(payload, 32);
