@@ -70,6 +70,23 @@ enum class GuestSchedulerCheckpointBarrierRejection : uint8_t {
   kTimedOut,
 };
 
+enum class GuestSchedulerCheckpointRosterScope : uint8_t {
+  kNone,
+  // Threads currently owned by a scheduler CPU: running or linked in a ready,
+  // blocked or suspended queue. A created-suspended thread that has never been
+  // queued is deliberately absent and must be reconciled from the Processor
+  // ThreadState lifecycle roster by the checkpoint publisher.
+  kSchedulerOwned,
+};
+
+enum class GuestSchedulerCheckpointReleasePolicy : uint8_t {
+  kNone,
+  // A participant reported as running remains the exact boundary state in the
+  // final snapshot. Once its switch-out is confirmed, the scheduler makes it
+  // ready at the head of its CPU queue to resume the JIT safepoint.
+  kRunningSafepointsRequeueAtHead,
+};
+
 struct GuestSchedulerCheckpointBarrierSnapshot {
   uint64_t generation = 0;
   GuestSchedulerCheckpointBarrierRejection rejection =
@@ -78,6 +95,10 @@ struct GuestSchedulerCheckpointBarrierSnapshot {
   uint8_t quiesced_cpu_mask = 0;
   bool active = false;
   bool quiesced = false;
+  GuestSchedulerCheckpointRosterScope roster_scope =
+      GuestSchedulerCheckpointRosterScope::kNone;
+  GuestSchedulerCheckpointReleasePolicy release_policy =
+      GuestSchedulerCheckpointReleasePolicy::kNone;
   std::vector<GuestSchedulerCheckpointParticipant> participants;
 };
 
@@ -135,6 +156,10 @@ class GuestSchedulerCheckpointBarrier {
       GuestSchedulerCheckpointBarrierRejection::kNone;
   uint8_t dispatch_cpu_mask_ = 0;
   uint8_t quiesced_cpu_mask_ = 0;
+  uint64_t terminal_generation_ = 0;
+  GuestSchedulerCheckpointBarrierRejection terminal_rejection_ =
+      GuestSchedulerCheckpointBarrierRejection::kNone;
+  bool terminal_quiesced_ = false;
   std::vector<GuestSchedulerCheckpointParticipant> participants_;
   std::vector<ArrivalState> arrivals_;
 };

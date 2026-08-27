@@ -33,6 +33,10 @@ namespace kernel {
 class KernelState;
 class XObject;
 class XThread;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+class GuestSchedulerCheckpointRuntimeTestAccess;
+#endif
 
 // Cooperative, in-kernel scheduler for guest threads.
 //
@@ -316,6 +320,10 @@ class GuestScheduler {
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  friend class GuestSchedulerCheckpointRuntimeTestAccess;
+
+  using CheckpointTestHook = void (*)(void* context);
+
   void AppendCheckpointListLocked(
       std::vector<GuestSchedulerCheckpointParticipant>& participants,
       XThread* head, GuestSchedulerCheckpointParticipantState state) const;
@@ -345,6 +353,14 @@ class GuestScheduler {
   bool capture_dispatch_seen_ = false;
   bool capture_closed_ = false;
   bool capture_rejected_ = false;
+
+  // Set only after all dispatch host-thread handles have been published.
+  std::atomic<bool> checkpoint_dispatch_ready_{false};
+  // Null in production; deterministic gates for otherwise unreachable races.
+  std::atomic<CheckpointTestHook> checkpoint_arrival_test_hook_{nullptr};
+  std::atomic<void*> checkpoint_arrival_test_context_{nullptr};
+  std::atomic<CheckpointTestHook> checkpoint_startup_test_hook_{nullptr};
+  std::atomic<void*> checkpoint_startup_test_context_{nullptr};
 #endif
 
   KernelState* kernel_state_;

@@ -25,7 +25,9 @@ namespace {
 using Participant = GuestSchedulerCheckpointParticipant;
 using ParticipantState = GuestSchedulerCheckpointParticipantState;
 using Rejection = GuestSchedulerCheckpointBarrierRejection;
+using ReleasePolicy = GuestSchedulerCheckpointReleasePolicy;
 using ResumeKind = GuestSchedulerCheckpointResumeKind;
+using RosterScope = GuestSchedulerCheckpointRosterScope;
 
 Participant MakeParticipant(
     uint32_t thread_id, int cpu, ParticipantState state, uint32_t guest_pc = 0,
@@ -80,6 +82,9 @@ TEST_CASE("Scheduler checkpoint barrier holds running and preserves passive",
   REQUIRE(snapshot.rejection == Rejection::kNone);
   REQUIRE(snapshot.dispatch_cpu_mask == 0b11);
   REQUIRE(snapshot.quiesced_cpu_mask == 0b11);
+  REQUIRE(snapshot.roster_scope == RosterScope::kSchedulerOwned);
+  REQUIRE(snapshot.release_policy ==
+          ReleasePolicy::kRunningSafepointsRequeueAtHead);
 
   const auto& running_a = FindParticipant(snapshot, 0x101);
   REQUIRE(running_a.guest_pc == 0x82002000);
@@ -111,6 +116,9 @@ TEST_CASE("Scheduler checkpoint barrier holds running and preserves passive",
   REQUIRE(final_rejection == Rejection::kNone);
   REQUIRE_FALSE(final_snapshot.active);
   REQUIRE(final_snapshot.quiesced);
+  REQUIRE(final_snapshot.roster_scope == RosterScope::kSchedulerOwned);
+  REQUIRE(final_snapshot.release_policy ==
+          ReleasePolicy::kRunningSafepointsRequeueAtHead);
   REQUIRE(final_snapshot.participants == snapshot.participants);
   REQUIRE_FALSE(barrier.active());
 }
@@ -343,6 +351,37 @@ TEST_CASE("Scheduler checkpoint held fiber releases in either race order",
     REQUIRE_FALSE(held.discard_on_release());
     REQUIRE_FALSE(held.DiscardOnRelease());
   }
+}
+
+TEST_CASE("Scheduler checkpoint preserves a terminal cancellation diagnostic",
+          "[guest_scheduler_checkpoint]") {
+  GuestSchedulerCheckpointBarrier barrier;
+  const std::array participants = {
+      MakeParticipant(0x101, 0, ParticipantState::kRunning),
+  };
+  REQUIRE(barrier.Begin(0b1, participants));
+  const uint64_t generation = barrier.snapshot().generation;
+  barrier.Reject(Rejection::kCancelled);
+
+  GuestSchedulerCheckpointBarrierSnapshot first_snapshot;
+  Rejection first_rejection = Rejection::kNone;
+  REQUIRE(barrier.Finalize(generation, &first_snapshot, &first_rejection));
+  REQUIRE(first_rejection == Rejection::kCancelled);
+  REQUIRE_FALSE(first_snapshot.quiesced);
+
+  GuestSchedulerCheckpointBarrierSnapshot replayed_snapshot;
+  Rejection replayed_rejection = Rejection::kNone;
+  REQUIRE_FALSE(
+      barrier.Finalize(generation, &replayed_snapshot, &replayed_rejection));
+  REQUIRE(replayed_rejection == Rejection::kCancelled);
+  REQUIRE(replayed_snapshot.rejection == Rejection::kCancelled);
+  REQUIRE(replayed_snapshot.generation == generation);
+  REQUIRE(replayed_snapshot.participants == first_snapshot.participants);
+  REQUIRE_FALSE(replayed_snapshot.active);
+  REQUIRE_FALSE(replayed_snapshot.quiesced);
+  REQUIRE(replayed_snapshot.roster_scope == RosterScope::kSchedulerOwned);
+  REQUIRE(replayed_snapshot.release_policy ==
+          ReleasePolicy::kRunningSafepointsRequeueAtHead);
 }
 
 }  // namespace testing

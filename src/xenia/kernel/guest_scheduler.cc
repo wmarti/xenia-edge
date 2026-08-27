@@ -266,6 +266,7 @@ GuestScheduler::PauseForCheckpointBarrier(
     return GuestSchedulerCheckpointBarrierRejection::kCalledFromDispatchThread;
   }
   if (!started_.load(std::memory_order_acquire) ||
+      !checkpoint_dispatch_ready_.load(std::memory_order_acquire) ||
       shutting_down_.load(std::memory_order_acquire)) {
     return GuestSchedulerCheckpointBarrierRejection::kNotStarted;
   }
@@ -275,6 +276,7 @@ GuestScheduler::PauseForCheckpointBarrier(
   {
     std::lock_guard<std::mutex> lock(lock_);
     if (!started_.load(std::memory_order_acquire) ||
+        !checkpoint_dispatch_ready_.load(std::memory_order_acquire) ||
         shutting_down_.load(std::memory_order_acquire)) {
       return GuestSchedulerCheckpointBarrierRejection::kNotStarted;
     }
@@ -389,7 +391,15 @@ GuestScheduler::FinalizeCheckpointBarrierLocked(
     if (!held.thread) {
       continue;
     }
-    assert_true(held.state.RequestRelease(generation));
+    const bool release_requested = held.state.RequestRelease(generation);
+    assert_true(release_requested);
+    if (!release_requested) {
+      if (out_final_snapshot) {
+        out_final_snapshot->rejection =
+            GuestSchedulerCheckpointBarrierRejection::kInvalidTopology;
+      }
+      return GuestSchedulerCheckpointBarrierRejection::kInvalidTopology;
+    }
     RequeueReleasedCheckpointFiberLocked(cpu_index, generation);
   }
   return rejection;
@@ -495,6 +505,10 @@ bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
     }
     held.thread = thread;
   }
+  if (auto hook =
+          checkpoint_arrival_test_hook_.load(std::memory_order_acquire)) {
+    hook(checkpoint_arrival_test_context_.load(std::memory_order_acquire));
+  }
   YieldToScheduler();
   return true;
 }
@@ -546,7 +560,20 @@ void GuestScheduler::EnsureStarted() {
         xe::threading::Thread::Create(params, [this, i]() { RunLoop(i); });
     cpus_[i].host_thread->set_name(std::string("Guest CPU ") +
                                    std::to_string(i));
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    if (i == 0) {
+      if (auto hook =
+              checkpoint_startup_test_hook_.load(std::memory_order_acquire)) {
+        hook(checkpoint_startup_test_context_.load(std::memory_order_acquire));
+      }
+    }
+#endif
   }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  checkpoint_dispatch_ready_.store(true, std::memory_order_release);
+#endif
 }
 
 void GuestScheduler::Shutdown() {
@@ -990,7 +1017,11 @@ bool GuestScheduler::ForgetThread(XThread* thread) {
   RejectCheckpointTopologyChangeLocked();
   for (auto& held : checkpoint_held_) {
     if (held.thread == thread) {
-      assert_true(held.state.DiscardOnRelease());
+      const bool discard_requested = held.state.DiscardOnRelease();
+      assert_true(discard_requested);
+      if (!discard_requested) {
+        return false;
+      }
       break;
     }
   }
@@ -1227,7 +1258,14 @@ void GuestScheduler::SwitchTo(XThread* next) {
         checkpoint_barrier_.Reject(
             GuestSchedulerCheckpointBarrierRejection::kUnexpectedSwitchOut);
       }
-      assert_true(checkpoint_held.state.ConfirmSwitchOut());
+      const bool held_switch_out_confirmed =
+          checkpoint_held.state.ConfirmSwitchOut();
+      assert_true(held_switch_out_confirmed);
+      if (!held_switch_out_confirmed) {
+        checkpoint_barrier_.Reject(
+            GuestSchedulerCheckpointBarrierRejection::kUnexpectedSwitchOut);
+        checkpoint_generation = 0;
+      }
     }
     EmitCaptureLocked(CaptureKind::kSwitchOut, next, t_current_cpu, -1,
                       CaptureReason::kNone, 0, 0);

@@ -211,6 +211,17 @@ bool GuestSchedulerCheckpointBarrier::Finalize(
     return false;
   }
   if (!active_.load(std::memory_order_relaxed)) {
+    if (expected_generation == terminal_generation_ &&
+        terminal_rejection_ !=
+            GuestSchedulerCheckpointBarrierRejection::kNone) {
+      *out_rejection = terminal_rejection_;
+      if (out_final_snapshot) {
+        *out_final_snapshot = SnapshotLocked(terminal_quiesced_);
+        out_final_snapshot->active = false;
+        out_final_snapshot->rejection = terminal_rejection_;
+      }
+      return false;
+    }
     *out_rejection = GuestSchedulerCheckpointBarrierRejection::kNotActive;
     if (out_final_snapshot) {
       out_final_snapshot->rejection = *out_rejection;
@@ -231,6 +242,9 @@ bool GuestSchedulerCheckpointBarrier::Finalize(
     rejection_ = GuestSchedulerCheckpointBarrierRejection::kInvalidTopology;
   }
   *out_rejection = rejection_;
+  terminal_generation_ = generation_;
+  terminal_rejection_ = rejection_;
+  terminal_quiesced_ = quiesced;
   if (out_final_snapshot) {
     *out_final_snapshot = SnapshotLocked(quiesced);
     out_final_snapshot->active = false;
@@ -255,6 +269,9 @@ GuestSchedulerCheckpointBarrier::SnapshotLocked(bool final_quiesced) const {
   snapshot.quiesced_cpu_mask = quiesced_cpu_mask_;
   snapshot.active = active_.load(std::memory_order_relaxed);
   snapshot.quiesced = final_quiesced || (snapshot.active && IsQuiescedLocked());
+  snapshot.roster_scope = GuestSchedulerCheckpointRosterScope::kSchedulerOwned;
+  snapshot.release_policy =
+      GuestSchedulerCheckpointReleasePolicy::kRunningSafepointsRequeueAtHead;
   snapshot.participants = participants_;
   return snapshot;
 }
