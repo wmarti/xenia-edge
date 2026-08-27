@@ -24,7 +24,7 @@ namespace test {
 
 TEST_CASE("synthetic invocation fixture closes each supported host granule",
           "[guest-invocation-synthetic-fixture]") {
-  for (uint32_t host_page_size : {4096u, 16384u, 65536u}) {
+  for (uint32_t host_page_size : {4096u, 8192u, 16384u, 65536u}) {
     INFO("host page size " << host_page_size);
     SyntheticGuestInvocationFixture fixture;
     std::string error;
@@ -111,7 +111,7 @@ TEST_CASE("synthetic invocation fixture rejects unsupported host granules",
   fixture.host_page_size = 123;
   std::string error;
   REQUIRE_FALSE(
-      BuildSyntheticGuestInvocationFixture(8192, 1, &fixture, &error));
+      BuildSyntheticGuestInvocationFixture(8193, 1, &fixture, &error));
   REQUIRE(error == "synthetic fixture host page size is unsupported");
   REQUIRE(fixture.host_page_size == 0);
 
