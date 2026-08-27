@@ -10,6 +10,10 @@
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 
 #include <algorithm>
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include <limits>
+#endif
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -17,12 +21,21 @@
 #include "xenia/base/threading.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #include "xenia/cpu/backend/a64/a64_emitter.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
+#endif
 #include "xenia/cpu/backend/a64/a64_op.h"
 #include "xenia/cpu/backend/a64/a64_seq_util.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/hir/instr.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/guest_invocation_artifact.h"
+#include "xenia/cpu/guest_invocation_recorder.h"
+#endif
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/xex_module.h"
@@ -41,6 +54,57 @@ namespace backend {
 namespace a64 {
 
 volatile int anchor_memory = 0;
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+
+static void EmitGuestInvocationCaptureMemoryAccess(
+    A64Emitter& e, const I64Op& address, uint32_t size,
+    ppc::GuestInvocationRecorderMemoryAccess access) {
+  if (address.is_constant) {
+    e.mov(e.w1,
+          static_cast<uint64_t>(static_cast<uint32_t>(address.constant())));
+  } else {
+    e.mov(e.w1, WReg(address.reg().getIdx()));
+  }
+  e.mov(e.w2, static_cast<uint64_t>(size));
+  e.mov(e.w3, static_cast<uint64_t>(access));
+  e.CallNativeSafe(
+      reinterpret_cast<void*>(&CaptureGuestInvocationMemoryAccess));
+}
+
+template <typename OffsetOp>
+static void EmitGuestInvocationCaptureMemoryAccessOffset(
+    A64Emitter& e, const I64Op& base, const OffsetOp& offset, uint32_t size,
+    ppc::GuestInvocationRecorderMemoryAccess access) {
+  if (base.is_constant && offset.is_constant) {
+    const uint32_t address = static_cast<uint32_t>(base.constant()) +
+                             static_cast<uint32_t>(offset.constant());
+    e.mov(e.w1, static_cast<uint64_t>(address));
+  } else {
+    if (base.is_constant) {
+      e.mov(e.w0,
+            static_cast<uint64_t>(static_cast<uint32_t>(base.constant())));
+    } else {
+      e.mov(e.w0, WReg(base.reg().getIdx()));
+    }
+    AddGuestMemoryOffset(e, e.x0, offset);
+    e.mov(e.w1, e.w0);
+  }
+  e.mov(e.w2, static_cast<uint64_t>(size));
+  e.mov(e.w3, static_cast<uint64_t>(access));
+  e.CallNativeSafe(
+      reinterpret_cast<void*>(&CaptureGuestInvocationMemoryAccess));
+}
+
+static void EmitGuestInvocationCaptureUnsupportedDependency(
+    A64Emitter& e, uint32_t dependency_flags) {
+  e.mov(e.w1, static_cast<uint64_t>(dependency_flags));
+  e.CallNativeSafe(
+      reinterpret_cast<void*>(&CaptureGuestInvocationUnsupportedDependency));
+}
+
+#endif
 
 static bool IsPossibleMMIOInstruction(A64Emitter& e, const hir::Instr* i) {
   if (!cvars::emit_mmio_aware_stores_for_recorded_exception_addresses) {
@@ -372,6 +436,12 @@ static T MMIOAwareLoad(void* _ctx, unsigned int guestaddr) {
 // ============================================================================
 struct LOAD_I8 : Sequence<LOAD_I8, I<OPCODE_LOAD, I8Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(uint8_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     EmitGuestMemAccess(e, i.src1,
                        [&](const auto& adr) { e.ldrb(i.dest, adr); });
     if (IsTracingData()) {
@@ -384,6 +454,12 @@ struct LOAD_I8 : Sequence<LOAD_I8, I<OPCODE_LOAD, I8Op, I64Op>> {
 };
 struct LOAD_I16 : Sequence<LOAD_I16, I<OPCODE_LOAD, I16Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(uint16_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     EmitGuestMemAccess(e, i.src1,
                        [&](const auto& adr) { e.ldrh(i.dest, adr); });
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -399,6 +475,17 @@ struct LOAD_I16 : Sequence<LOAD_I16, I<OPCODE_LOAD, I16Op, I64Op>> {
 };
 struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    if (IsPossibleMMIOInstruction(e, i.instr)) {
+      EmitGuestInvocationCaptureUnsupportedDependency(
+          e, ppc::kGuestInvocationDependencyMmio);
+    } else {
+      EmitGuestInvocationCaptureMemoryAccess(
+          e, i.src1, sizeof(uint32_t),
+          ppc::GuestInvocationRecorderMemoryAccess::kRead);
+    }
+#endif
     if (IsPossibleMMIOInstruction(e, i.instr)) {
       void* mmio_fn = (void*)&MMIOAwareLoad<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -465,6 +552,12 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
 };
 struct LOAD_I64 : Sequence<LOAD_I64, I<OPCODE_LOAD, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(uint64_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     EmitGuestMemAccess(e, i.src1, [&](const auto& adr) { e.ldr(i.dest, adr); });
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev(i.dest, i.dest);
@@ -479,6 +572,12 @@ struct LOAD_I64 : Sequence<LOAD_I64, I<OPCODE_LOAD, I64Op, I64Op>> {
 };
 struct LOAD_F32 : Sequence<LOAD_F32, I<OPCODE_LOAD, F32Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(float),
+        ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     EmitGuestMemAccess(e, i.src1, [&](const auto& adr) {
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.ldr(e.w0, adr);
@@ -498,6 +597,12 @@ struct LOAD_F32 : Sequence<LOAD_F32, I<OPCODE_LOAD, F32Op, I64Op>> {
 };
 struct LOAD_F64 : Sequence<LOAD_F64, I<OPCODE_LOAD, F64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(double),
+        ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     EmitGuestMemAccess(e, i.src1, [&](const auto& adr) {
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.ldr(e.x0, adr);
@@ -517,6 +622,12 @@ struct LOAD_F64 : Sequence<LOAD_F64, I<OPCODE_LOAD, F64Op, I64Op>> {
 };
 struct LOAD_V128 : Sequence<LOAD_V128, I<OPCODE_LOAD, V128Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(vec128_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     EmitGuestMemAccess(e, i.src1, [&](const auto& adr) { e.ldr(i.dest, adr); });
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       // Reverse bytes within each 32-bit word (PPC BE -> ARM64 LE).
@@ -539,6 +650,12 @@ EMITTER_OPCODE_TABLE(OPCODE_LOAD, LOAD_I8, LOAD_I16, LOAD_I32, LOAD_I64,
 // ============================================================================
 struct STORE_I8 : Sequence<STORE_I8, I<OPCODE_STORE, VoidOp, I64Op, I8Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(uint8_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     EmitGuestMemAccess(e, i.src1, [&](const auto& adr) {
       if (i.src2.is_constant) {
         e.mov(e.w17, static_cast<uint64_t>(i.src2.constant() & 0xFF));
@@ -557,6 +674,12 @@ struct STORE_I8 : Sequence<STORE_I8, I<OPCODE_STORE, VoidOp, I64Op, I8Op>> {
 };
 struct STORE_I16 : Sequence<STORE_I16, I<OPCODE_STORE, VoidOp, I64Op, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(uint16_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     EmitGuestMemAccess(e, i.src1, [&](const auto& adr) {
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         if (i.src2.is_constant) {
@@ -586,6 +709,17 @@ struct STORE_I16 : Sequence<STORE_I16, I<OPCODE_STORE, VoidOp, I64Op, I16Op>> {
 };
 struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    if (IsPossibleMMIOInstruction(e, i.instr)) {
+      EmitGuestInvocationCaptureUnsupportedDependency(
+          e, ppc::kGuestInvocationDependencyMmio);
+    } else {
+      EmitGuestInvocationCaptureMemoryAccess(
+          e, i.src1, sizeof(uint32_t),
+          ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+    }
+#endif
     if (IsPossibleMMIOInstruction(e, i.instr)) {
       void* mmio_fn = (void*)&MMIOAwareStore<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -692,6 +826,12 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
 };
 struct STORE_I64 : Sequence<STORE_I64, I<OPCODE_STORE, VoidOp, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(uint64_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     EmitGuestMemAccess(e, i.src1, [&](const auto& adr) {
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         if (i.src2.is_constant) {
@@ -721,6 +861,12 @@ struct STORE_I64 : Sequence<STORE_I64, I<OPCODE_STORE, VoidOp, I64Op, I64Op>> {
 };
 struct STORE_F32 : Sequence<STORE_F32, I<OPCODE_STORE, VoidOp, I64Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(float),
+        ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     EmitGuestMemAccess(e, i.src1, [&](const auto& adr) {
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         if (i.src2.is_constant) {
@@ -751,6 +897,12 @@ struct STORE_F32 : Sequence<STORE_F32, I<OPCODE_STORE, VoidOp, I64Op, F32Op>> {
 };
 struct STORE_F64 : Sequence<STORE_F64, I<OPCODE_STORE, VoidOp, I64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(double),
+        ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     EmitGuestMemAccess(e, i.src1, [&](const auto& adr) {
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         if (i.src2.is_constant) {
@@ -782,6 +934,12 @@ struct STORE_F64 : Sequence<STORE_F64, I<OPCODE_STORE, VoidOp, I64Op, F64Op>> {
 struct STORE_V128
     : Sequence<STORE_V128, I<OPCODE_STORE, VoidOp, I64Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccess(
+        e, i.src1, sizeof(vec128_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     auto addr = ComputeMemoryAddress(e, i.src1);
 
     // Resolve the source into a Q register first: LoadV128Const/SrcVReg
@@ -811,6 +969,11 @@ EMITTER_OPCODE_TABLE(OPCODE_STORE, STORE_I8, STORE_I16, STORE_I32, STORE_I64,
 // ============================================================================
 struct LOAD_CLOCK : Sequence<LOAD_CLOCK, I<OPCODE_LOAD_CLOCK, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureUnsupportedDependency(
+        e, ppc::kGuestInvocationDependencyClockOrTimebase);
+#endif
     if (cvars::inline_loadclock) {
       // Read the cached guest tick count maintained by the other subsystems
       // that call Clock::QueryGuestTickCount (same tradeoff as the x64
@@ -865,6 +1028,12 @@ EMITTER_OPCODE_TABLE(OPCODE_LOAD_CLOCK, LOAD_CLOCK);
 struct LOAD_OFFSET_I8
     : Sequence<LOAD_OFFSET_I8, I<OPCODE_LOAD_OFFSET, I8Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccessOffset(
+        e, i.src1, i.src2, sizeof(uint8_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     EmitGuestMemAccessOffset(e, i.src1, i.src2,
                              [&](const auto& adr) { e.ldrb(i.dest, adr); });
     if (IsTracingData()) {
@@ -878,6 +1047,12 @@ struct LOAD_OFFSET_I8
 struct LOAD_OFFSET_I16
     : Sequence<LOAD_OFFSET_I16, I<OPCODE_LOAD_OFFSET, I16Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccessOffset(
+        e, i.src1, i.src2, sizeof(uint16_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     EmitGuestMemAccessOffset(e, i.src1, i.src2,
                              [&](const auto& adr) { e.ldrh(i.dest, adr); });
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -894,6 +1069,17 @@ struct LOAD_OFFSET_I16
 struct LOAD_OFFSET_I32
     : Sequence<LOAD_OFFSET_I32, I<OPCODE_LOAD_OFFSET, I32Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    if (IsPossibleMMIOInstruction(e, i.instr)) {
+      EmitGuestInvocationCaptureUnsupportedDependency(
+          e, ppc::kGuestInvocationDependencyMmio);
+    } else {
+      EmitGuestInvocationCaptureMemoryAccessOffset(
+          e, i.src1, i.src2, sizeof(uint32_t),
+          ppc::GuestInvocationRecorderMemoryAccess::kRead);
+    }
+#endif
     if (IsPossibleMMIOInstruction(e, i.instr)) {
       void* mmio_fn = (void*)&MMIOAwareLoad<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -978,6 +1164,12 @@ struct LOAD_OFFSET_I32
 struct LOAD_OFFSET_I64
     : Sequence<LOAD_OFFSET_I64, I<OPCODE_LOAD_OFFSET, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccessOffset(
+        e, i.src1, i.src2, sizeof(uint64_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     EmitGuestMemAccessOffset(e, i.src1, i.src2,
                              [&](const auto& adr) { e.ldr(i.dest, adr); });
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -998,6 +1190,12 @@ struct STORE_OFFSET_I8
     : Sequence<STORE_OFFSET_I8,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I8Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccessOffset(
+        e, i.src1, i.src2, sizeof(uint8_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     EmitGuestMemAccessOffset(e, i.src1, i.src2, [&](const auto& adr) {
       if (i.src3.is_constant) {
         e.mov(e.w17, static_cast<uint64_t>(i.src3.constant() & 0xFF));
@@ -1018,6 +1216,12 @@ struct STORE_OFFSET_I16
     : Sequence<STORE_OFFSET_I16,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccessOffset(
+        e, i.src1, i.src2, sizeof(uint16_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     EmitGuestMemAccessOffset(e, i.src1, i.src2, [&](const auto& adr) {
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         if (i.src3.is_constant) {
@@ -1049,6 +1253,17 @@ struct STORE_OFFSET_I32
     : Sequence<STORE_OFFSET_I32,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    if (IsPossibleMMIOInstruction(e, i.instr)) {
+      EmitGuestInvocationCaptureUnsupportedDependency(
+          e, ppc::kGuestInvocationDependencyMmio);
+    } else {
+      EmitGuestInvocationCaptureMemoryAccessOffset(
+          e, i.src1, i.src2, sizeof(uint32_t),
+          ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+    }
+#endif
     if (IsPossibleMMIOInstruction(e, i.instr)) {
       void* mmio_fn = (void*)&MMIOAwareStore<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -1174,6 +1389,12 @@ struct STORE_OFFSET_I64
     : Sequence<STORE_OFFSET_I64,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureMemoryAccessOffset(
+        e, i.src1, i.src2, sizeof(uint64_t),
+        ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     EmitGuestMemAccessOffset(e, i.src1, i.src2, [&](const auto& adr) {
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         if (i.src3.is_constant) {
@@ -1216,6 +1437,18 @@ struct MEMSET_I64
     assert_true(i.src2.is_constant);
     assert_true(i.src3.is_constant);
     assert_true(i.src2.constant() == 0);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    const uint64_t capture_length = i.src3.constant();
+    if (capture_length > std::numeric_limits<uint32_t>::max()) {
+      EmitGuestInvocationCaptureUnsupportedDependency(
+          e, ppc::kGuestInvocationDependencyUnsupportedMappingOrProtection);
+    } else if (capture_length) {
+      EmitGuestInvocationCaptureMemoryAccess(
+          e, i.src1, static_cast<uint32_t>(capture_length),
+          ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+    }
+#endif
     // memset(membase + guest_addr, 0, length)
     // Only used by dcbz/dcbz128: constant zero value, constant aligned size.
     auto addr = ComputeMemoryAddress(e, i.src1);
@@ -1271,6 +1504,11 @@ struct ATOMIC_COMPARE_EXCHANGE_I32
     : Sequence<ATOMIC_COMPARE_EXCHANGE_I32,
                I<OPCODE_ATOMIC_COMPARE_EXCHANGE, I8Op, I64Op, I32Op, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureUnsupportedDependency(
+        e, ppc::kGuestInvocationDependencyAtomicReservation);
+#endif
     // Compute full host address (ldxr/stxr need base-only [Xn] addressing).
     auto addr = ComputeMemoryAddress(e, i.src1);
     e.add(e.x4, e.GetMembaseReg(), addr);
@@ -1317,6 +1555,11 @@ struct ATOMIC_COMPARE_EXCHANGE_I64
     : Sequence<ATOMIC_COMPARE_EXCHANGE_I64,
                I<OPCODE_ATOMIC_COMPARE_EXCHANGE, I8Op, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureUnsupportedDependency(
+        e, ppc::kGuestInvocationDependencyAtomicReservation);
+#endif
     auto addr = ComputeMemoryAddress(e, i.src1);
     e.add(e.x4, e.GetMembaseReg(), addr);
     if (i.src2.is_constant) {
@@ -1364,6 +1607,11 @@ EMITTER_OPCODE_TABLE(OPCODE_ATOMIC_COMPARE_EXCHANGE,
 struct LOAD_MMIO_I32
     : Sequence<LOAD_MMIO_I32, I<OPCODE_LOAD_MMIO, I32Op, OffsetOp, OffsetOp>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureUnsupportedDependency(
+        e, ppc::kGuestInvocationDependencyMmio);
+#endif
     auto mmio_range = reinterpret_cast<MMIORange*>(i.src1.value);
     auto read_address = uint32_t(i.src2.value);
     // CallNativeSafe: thunk sets x0=PPCContext*, x1/x2/x3 pass through.
@@ -1381,6 +1629,11 @@ struct STORE_MMIO_I32
     : Sequence<STORE_MMIO_I32,
                I<OPCODE_STORE_MMIO, VoidOp, OffsetOp, OffsetOp, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureUnsupportedDependency(
+        e, ppc::kGuestInvocationDependencyMmio);
+#endif
     auto mmio_range = reinterpret_cast<MMIORange*>(i.src1.value);
     auto write_address = uint32_t(i.src2.value);
     // CallNativeSafe: thunk sets x0=PPCContext*, x1/x2/x3 pass through.
@@ -1460,6 +1713,11 @@ static void EmitTryAcquireReservation(A64Emitter& e,
 struct RESERVED_LOAD_I32
     : Sequence<RESERVED_LOAD_I32, I<OPCODE_RESERVED_LOAD, I32Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureUnsupportedDependency(
+        e, ppc::kGuestInvocationDependencyAtomicReservation);
+#endif
     const WReg guest_address = GuestAddressReg(e, i.src1, e.w12);
     auto addr = ComputeMemoryAddress(e, i.src1);
     EmitTryAcquireReservation(e, guest_address);
@@ -1473,6 +1731,11 @@ struct RESERVED_LOAD_I32
 struct RESERVED_LOAD_I64
     : Sequence<RESERVED_LOAD_I64, I<OPCODE_RESERVED_LOAD, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureUnsupportedDependency(
+        e, ppc::kGuestInvocationDependencyAtomicReservation);
+#endif
     const WReg guest_address = GuestAddressReg(e, i.src1, e.w12);
     auto addr = ComputeMemoryAddress(e, i.src1);
     EmitTryAcquireReservation(e, guest_address);
@@ -1582,6 +1845,11 @@ struct RESERVED_STORE_I32
     : Sequence<RESERVED_STORE_I32,
                I<OPCODE_RESERVED_STORE, I8Op, I64Op, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureUnsupportedDependency(
+        e, ppc::kGuestInvocationDependencyAtomicReservation);
+#endif
     const WReg guest_address = GuestAddressReg(e, i.src1, e.w12);
     auto addr = ComputeMemoryAddress(e, i.src1);
     e.add(e.x1, e.GetMembaseReg(), addr);
@@ -1598,6 +1866,11 @@ struct RESERVED_STORE_I64
     : Sequence<RESERVED_STORE_I64,
                I<OPCODE_RESERVED_STORE, I8Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitGuestInvocationCaptureUnsupportedDependency(
+        e, ppc::kGuestInvocationDependencyAtomicReservation);
+#endif
     const WReg guest_address = GuestAddressReg(e, i.src1, e.w12);
     auto addr = ComputeMemoryAddress(e, i.src1);
     e.add(e.x1, e.GetMembaseReg(), addr);

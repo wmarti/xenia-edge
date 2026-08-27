@@ -31,6 +31,9 @@ uint64_t CaptureGuestInvocationFunctionExit(void* raw_context,
 uint64_t CaptureGuestInvocationTailCall(void* raw_context,
                                         uint64_t from_address,
                                         uint64_t target_address);
+uint64_t CaptureGuestInvocationMemoryAccess(void* raw_context,
+                                            uint64_t logical_address,
+                                            uint64_t size, uint64_t access);
 uint64_t CaptureGuestInvocationUnsupportedDependency(void* raw_context,
                                                      uint64_t dependency_flags);
 uint64_t CaptureGuestInvocationUnwindOrLongjmp(void* raw_context);
