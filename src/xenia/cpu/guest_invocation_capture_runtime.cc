@@ -190,7 +190,18 @@ struct GuestInvocationCaptureRuntime::Impl {
 
     ExecutionJitCorpusBuilder corpus_builder(0);
     std::unordered_set<uint32_t> copied_code_pages;
+    for (const ppc::GuestInvocationPage& code_page : result.code_pages) {
+      if (!copied_code_pages.insert(code_page.guest_address).second) {
+        return Fail(error, "capture result contains a duplicate code page");
+      }
+      if (!corpus_builder.AddCodePage(code_page.guest_address,
+                                      code_page.data.data(),
+                                      code_page.data.size(), error)) {
+        return false;
+      }
+    }
     uint32_t root_definition_count = 0;
+    std::unordered_set<uint32_t> required_code_pages;
     for (const ppc::GuestInvocationRecorderFunction& dependency :
          result.translation_dependencies) {
       Function* function = processor.LookupFunction(dependency.address);
@@ -239,18 +250,12 @@ struct GuestInvocationCaptureRuntime::Impl {
                dependency.address & ~(uint64_t(JitCorpus::kPageSize) - 1);
            page < end_exclusive; page += JitCorpus::kPageSize) {
         const uint32_t page_address = static_cast<uint32_t>(page);
-        if (!copied_code_pages.insert(page_address).second) {
-          continue;
-        }
-        std::array<uint8_t, JitCorpus::kPageSize> page_bytes = {};
-        if (!page_reader.ReadPage(page_address, &page_bytes)) {
+        required_code_pages.insert(page_address);
+        if (!copied_code_pages.contains(page_address)) {
           return Fail(error,
-                      fmt::format("capture could not read code page {:08X}",
+                      fmt::format("capture result is missing immutable code "
+                                  "page {:08X}",
                                   page_address));
-        }
-        if (!corpus_builder.AddCodePage(page_address, page_bytes.data(),
-                                        page_bytes.size(), error)) {
-          return false;
         }
       }
 
@@ -268,6 +273,11 @@ struct GuestInvocationCaptureRuntime::Impl {
     if (root_definition_count != 1) {
       return Fail(error,
                   "capture translation closure does not contain one root");
+    }
+    if (required_code_pages.size() != copied_code_pages.size()) {
+      return Fail(error,
+                  "capture result contains code outside the translation "
+                  "closure");
     }
 
     std::vector<uint8_t> exact_corpus_bytes;

@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/guest_invocation_recorder.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -64,9 +65,18 @@ class FakePageReader final : public GuestInvocationRecorderPageReader {
     }
     const auto it = pages.find(page_address);
     if (it == pages.cend()) {
-      return false;
+      if (page_address < 0x80000000u || page_address >= 0xA0000000u) {
+        return false;
+      }
+      for (size_t i = 0; i < output->size(); ++i) {
+        (*output)[i] = static_cast<uint8_t>((page_address >> 12) + i * 17);
+      }
+      return true;
     }
     *output = it->second;
+    if (unstable_pages.contains(page_address)) {
+      pages[page_address][0] ^= 1;
+    }
     return true;
   }
 
@@ -79,6 +89,7 @@ class FakePageReader final : public GuestInvocationRecorderPageReader {
 
   std::map<uint32_t, std::array<uint8_t, 4096>> pages;
   std::set<uint32_t> failed_pages;
+  std::set<uint32_t> unstable_pages;
   std::vector<uint32_t> read_addresses;
   uint32_t read_count = 0;
   GuestInvocationRecorder* reentrant_recorder = nullptr;
@@ -175,6 +186,12 @@ void ConvergeOnPage(GuestInvocationRecorder& recorder,
           GuestInvocationRecorderState::kWaitingForFinalAttempt);
 }
 
+size_t ReadCountForPage(const FakePageReader& reader, uint32_t page_address) {
+  return static_cast<size_t>(std::count(reader.read_addresses.cbegin(),
+                                        reader.read_addresses.cend(),
+                                        page_address));
+}
+
 void RequireRejected(const GuestInvocationRecorder& recorder,
                      GuestInvocationRecorderRejection rejection,
                      uint32_t dependency_flags = 0) {
@@ -233,6 +250,13 @@ TEST_CASE("guest invocation recorder validates explicit selection and limits",
                                                   reader, clock, &error));
     REQUIRE(error.find("overflows") != std::string::npos);
   }
+  SECTION("definition code-page catalog must be bounded") {
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.max_code_page_count = 0;
+    REQUIRE_FALSE(GuestInvocationRecorder::Create(MakeSelection(), limits,
+                                                  reader, clock, &error));
+    REQUIRE_FALSE(error.empty());
+  }
 }
 
 TEST_CASE("guest invocation recorder converges and builds a complete result",
@@ -240,6 +264,10 @@ TEST_CASE("guest invocation recorder converges and builds a complete result",
   FakePageReader reader;
   reader.AddPage(kDataPageA, 0x10);
   reader.AddPage(kDataPageB, 0x20);
+  reader.AddPage(kRootAddress, 0x30);
+  reader.AddPage(kNestedAddress, 0x40);
+  reader.AddPage(kDeclaredOnlyAddress, 0x50);
+  reader.AddPage(kUnrelatedAddress, 0x60);
   FakeClock clock;
   std::unique_ptr<GuestInvocationRecorder> recorder =
       MakeRecorder(reader, clock, MakeLimits(), MakeSelection(2), false);
@@ -275,14 +303,15 @@ TEST_CASE("guest invocation recorder converges and builds a complete result",
   DiscoveryAttempt(*recorder, {kDataPageA, kDataPageB});
   REQUIRE(recorder->state() ==
           GuestInvocationRecorderState::kWaitingForFinalAttempt);
-  REQUIRE(reader.read_count == 0);
+  REQUIRE(ReadCountForPage(reader, kDataPageA) == 0);
+  REQUIRE(ReadCountForPage(reader, kDataPageB) == 0);
 
   const GuestPPCRegisterState final_input = MakeState(30);
   EnterRoot(*recorder, final_input);
   REQUIRE(recorder->state() ==
           GuestInvocationRecorderState::kRecordingFinalAttempt);
-  REQUIRE(
-      (reader.read_addresses == std::vector<uint32_t>{kDataPageA, kDataPageB}));
+  REQUIRE(ReadCountForPage(reader, kDataPageA) == 1);
+  REQUIRE(ReadCountForPage(reader, kDataPageB) == 1);
   Access(*recorder, kDataPageA);
   Access(*recorder, kDataPageB, GuestInvocationRecorderMemoryAccess::kWrite);
   reader.pages[kDataPageB][77] ^= 0xFF;
@@ -302,6 +331,13 @@ TEST_CASE("guest invocation recorder converges and builds a complete result",
                {kDeclaredOnlyAddress, kDeclaredOnlyEndAddress},
                {kNestedAddress, kNestedEndAddress},
                {kRootAddress, kRootEndAddress}}));
+  REQUIRE(result->code_pages.size() == 3);
+  REQUIRE(result->code_pages[0].guest_address == kRootAddress);
+  REQUIRE(result->code_pages[0].data == reader.pages[kRootAddress]);
+  REQUIRE(result->code_pages[1].guest_address == kNestedAddress);
+  REQUIRE(result->code_pages[1].data == reader.pages[kNestedAddress]);
+  REQUIRE(result->code_pages[2].guest_address == kDeclaredOnlyAddress);
+  REQUIRE(result->code_pages[2].data == reader.pages[kDeclaredOnlyAddress]);
   REQUIRE((result->entered_functions ==
            std::vector<GuestInvocationRecorderFunction>{
                {kRootAddress, kRootEndAddress},
@@ -321,7 +357,8 @@ TEST_CASE("guest invocation recorder converges and builds a complete result",
   REQUIRE(invocation.expected_dirty_pages.size() == 1);
   REQUIRE(invocation.expected_dirty_pages[0].guest_address == kDataPageB);
   REQUIRE(invocation.expected_dirty_pages[0].data == reader.pages[kDataPageB]);
-  REQUIRE(reader.read_count == 4);
+  REQUIRE(ReadCountForPage(reader, kDataPageA) == 2);
+  REQUIRE(ReadCountForPage(reader, kDataPageB) == 2);
 
   GuestInvocationArtifact artifact;
   artifact.capture_build_sha256.fill(1);
@@ -633,6 +670,33 @@ TEST_CASE("guest invocation recorder rejects dependencies and code mutation",
                     GuestInvocationRecorderRejection::kSelfModifyingCode,
                     kGuestInvocationDependencySelfModifyingCode);
   }
+  SECTION("a pre-occurrence guest code write is retained across an ABA") {
+    reader.AddPage(kRootAddress, 0x21);
+    const auto original = reader.pages[kRootAddress];
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock);
+    REQUIRE(
+        recorder->OnMemoryAccess(kOther, kRootAddress + 4, 4,
+                                 GuestInvocationRecorderMemoryAccess::kWrite));
+    reader.pages[kRootAddress][4] ^= 1;
+    reader.pages[kRootAddress] = original;
+    REQUIRE_FALSE(recorder->OnFunctionEntry(kOwner, kRootAddress,
+                                            kRootEndAddress, MakeState(2)));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kSelfModifyingCode,
+                    kGuestInvocationDependencySelfModifyingCode);
+  }
+  SECTION("an unreported pre-occurrence code mutation fails live validation") {
+    reader.AddPage(kRootAddress, 0x22);
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock);
+    reader.pages[kRootAddress][4] ^= 1;
+    REQUIRE_FALSE(recorder->OnFunctionEntry(kOwner, kRootAddress,
+                                            kRootEndAddress, MakeState(2)));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kSelfModifyingCode,
+                    kGuestInvocationDependencySelfModifyingCode);
+  }
   SECTION("later entered code intersects an earlier cross-thread write") {
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
@@ -760,6 +824,51 @@ TEST_CASE("guest invocation recorder fails closed on snapshot and page hazards",
     RequireRejected(*recorder,
                     GuestInvocationRecorderRejection::kPageReadFailure,
                     kGuestInvocationDependencyUnsupportedMappingOrProtection);
+  }
+  SECTION("unstable successful-definition bytes") {
+    FakePageReader unstable_reader;
+    unstable_reader.AddPage(kRootAddress, 3);
+    unstable_reader.unstable_pages.insert(kRootAddress);
+    std::unique_ptr<GuestInvocationRecorder> recorder = MakeRecorder(
+        unstable_reader, clock, MakeLimits(), MakeSelection(), false);
+    REQUIRE_FALSE(recorder->OnFunctionDefined(kRootAddress, kRootEndAddress));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kSelfModifyingCode,
+                    kGuestInvocationDependencySelfModifyingCode);
+  }
+  SECTION("successful definition page must be readable") {
+    FakePageReader failed_reader;
+    failed_reader.failed_pages.insert(kRootAddress);
+    std::unique_ptr<GuestInvocationRecorder> recorder = MakeRecorder(
+        failed_reader, clock, MakeLimits(), MakeSelection(), false);
+    REQUIRE_FALSE(recorder->OnFunctionDefined(kRootAddress, kRootEndAddress));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kPageReadFailure,
+                    kGuestInvocationDependencyUnsupportedMappingOrProtection);
+  }
+  SECTION("shared-page definitions keep one immutable version") {
+    constexpr uint32_t kSharedAddress = kRootAddress + 0x200;
+    constexpr uint32_t kSharedEndAddress = kSharedAddress + 0x3C;
+    reader.AddPage(kRootAddress, 4);
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, MakeLimits(), MakeSelection(), false);
+    REQUIRE(recorder->OnFunctionDependency(kRootAddress, kSharedAddress));
+    Define(*recorder, kSharedAddress, kSharedEndAddress);
+    reader.pages[kRootAddress][0] ^= 1;
+    REQUIRE_FALSE(recorder->OnFunctionDefined(kRootAddress, kRootEndAddress));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kSelfModifyingCode,
+                    kGuestInvocationDependencySelfModifyingCode);
+  }
+  SECTION("definition code pages have an independent hard bound") {
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.max_code_page_count = 1;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits, MakeSelection(), false);
+    REQUIRE_FALSE(
+        recorder->OnFunctionDefined(kRootAddress, kRootAddress + 0x1000));
+    RequireRejected(*recorder, GuestInvocationRecorderRejection::kPageLimit,
+                    kGuestInvocationDependencyPageDiscoveryOverflow);
   }
   SECTION("serialized callback stream cannot reenter through page reader") {
     std::unique_ptr<GuestInvocationRecorder> recorder =

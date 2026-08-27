@@ -108,6 +108,7 @@ std::unique_ptr<GuestInvocationCaptureCoordinator> MakeCoordinator(
                                                 std::move(handler), &error);
   REQUIRE(coordinator);
   REQUIRE(error.empty());
+  reader.pages[kRootAddress] = {};
   REQUIRE(coordinator->OnFunctionDefined(kRootAddress, kRootEndAddress));
   return coordinator;
 }

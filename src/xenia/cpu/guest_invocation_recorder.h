@@ -41,9 +41,14 @@ struct GuestInvocationRecorderSelection {
 };
 
 struct GuestInvocationRecorderLimits {
+  static constexpr uint32_t kMaximumCodePageCount = 65536;
+
   uint32_t max_attempts = 8;
   uint64_t max_duration_ticks = 1;
   uint32_t max_page_count = 8192;
+  // Separate from invocation data pages because definitions are cataloged
+  // before the selected translation closure is known.
+  uint32_t max_code_page_count = kMaximumCodePageCount;
   uint64_t max_access_count = 1'000'000;
   uint32_t max_call_depth = 256;
   uint64_t max_event_count = 2'000'000;
@@ -116,6 +121,10 @@ struct GuestInvocationRecorderResult {
   // were never entered and remains separate from the runtime call tree so an
   // exact-corpus builder can reproduce code placement.
   std::vector<GuestInvocationRecorderFunction> translation_dependencies;
+  // Immutable guest code pages sampled immediately after successful
+  // translation and before backend publication. Only pages required by the
+  // selected translation closure are retained, in address order.
+  std::vector<GuestInvocationPage> code_pages;
   std::vector<GuestInvocationRecorderFunction> entered_functions;
   std::vector<uint32_t> touched_page_addresses;
   uint32_t attempt_count = 0;

@@ -73,6 +73,12 @@ struct GuestInvocationRecorder::Impl {
     uint32_t definition_order = 0;
     bool defined = false;
     std::set<uint32_t> dependencies;
+    std::vector<uint32_t> code_page_addresses;
+  };
+
+  struct CodePageSnapshot {
+    std::array<uint8_t, kGuestPageSize> data = {};
+    uint64_t write_generation = 0;
   };
 
   struct CallFrame {
@@ -258,6 +264,31 @@ struct GuestInvocationRecorder::Impl {
     return true;
   }
 
+  bool ReadStableCodePage(uint32_t page_address,
+                          std::array<uint8_t, kGuestPageSize>* stable_page) {
+    std::array<uint8_t, kGuestPageSize> verification = {};
+    const bool first_read = page_reader.ReadPage(page_address, stable_page);
+    if (state == GuestInvocationRecorderState::kRejected) {
+      return false;
+    }
+    const bool second_read =
+        first_read && page_reader.ReadPage(page_address, &verification);
+    if (state == GuestInvocationRecorderState::kRejected) {
+      return false;
+    }
+    if (!first_read || !second_read) {
+      return Reject(GuestInvocationRecorderRejection::kPageReadFailure,
+                    "unable to read a guest code page",
+                    kGuestInvocationDependencyUnsupportedMappingOrProtection);
+    }
+    if (*stable_page != verification) {
+      return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+                    "guest code changed while it was sampled",
+                    kGuestInvocationDependencySelfModifyingCode);
+    }
+    return true;
+  }
+
   bool RegisterDefinition(uint32_t address, uint32_t end_address) {
     if (!IsValidFunctionExtent(address, end_address)) {
       return Reject(GuestInvocationRecorderRejection::kInvalidEvent,
@@ -271,11 +302,119 @@ struct GuestInvocationRecorder::Impl {
       return Reject(GuestInvocationRecorderRejection::kInvalidEvent,
                     "successful function definition was reported twice");
     }
+
+    const uint32_t first_page = address & ~(kGuestPageSize - 1);
+    const uint32_t last_page = end_address & ~(kGuestPageSize - 1);
+    const uint64_t page_count =
+        (uint64_t(last_page) - first_page) / kGuestPageSize + 1;
+    std::set<uint32_t> new_page_addresses;
+    for (uint64_t page = first_page; page <= last_page;
+         page += kGuestPageSize) {
+      const uint32_t page_address = static_cast<uint32_t>(page);
+      if (!definition_page_write_generations.contains(page_address)) {
+        new_page_addresses.insert(page_address);
+      }
+    }
+    if (definition_page_write_generations.size() > limits.max_code_page_count ||
+        new_page_addresses.size() >
+            limits.max_code_page_count -
+                definition_page_write_generations.size() ||
+        page_count > limits.max_code_page_count) {
+      return Reject(GuestInvocationRecorderRejection::kPageLimit,
+                    "definition code-page catalog exceeds the page limit",
+                    kGuestInvocationDependencyPageDiscoveryOverflow);
+    }
+
+    std::map<uint32_t, CodePageSnapshot> code_pages;
+    for (uint64_t page = first_page; page <= last_page;
+         page += kGuestPageSize) {
+      const uint32_t page_address = static_cast<uint32_t>(page);
+      CodePageSnapshot snapshot;
+      if (!ReadStableCodePage(page_address, &snapshot.data)) {
+        return false;
+      }
+      const auto generation =
+          definition_page_write_generations.find(page_address);
+      snapshot.write_generation =
+          generation == definition_page_write_generations.cend()
+              ? 0
+              : generation->second;
+      const auto existing = definition_code_pages.find(page_address);
+      if (existing != definition_code_pages.cend() &&
+          (existing->second.write_generation != snapshot.write_generation ||
+           existing->second.data != snapshot.data)) {
+        return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+                      "shared code page changed between successful definitions",
+                      kGuestInvocationDependencySelfModifyingCode);
+      }
+      code_pages.emplace(page_address, std::move(snapshot));
+    }
+    for (uint32_t page_address : new_page_addresses) {
+      definition_page_write_generations.emplace(page_address, 0);
+    }
+    definition->code_page_addresses.reserve(code_pages.size());
+    for (auto& [page_address, snapshot] : code_pages) {
+      definition->code_page_addresses.push_back(page_address);
+      definition_code_pages.emplace(page_address, std::move(snapshot));
+    }
     definition->defined = true;
     definition->end_address = end_address;
     definition->definition_order =
         static_cast<uint32_t>(definition_order.size());
     definition_order.push_back(address);
+    return true;
+  }
+
+  bool MergeDefinitionCodePages(const DefinitionRecord& definition) {
+    for (uint32_t page_address : definition.code_page_addresses) {
+      const auto immutable_page = definition_code_pages.find(page_address);
+      if (immutable_page == definition_code_pages.cend()) {
+        return Reject(
+            GuestInvocationRecorderRejection::kIncompleteTranslationClosure,
+            "successful definition is missing an immutable code page");
+      }
+      const CodePageSnapshot& snapshot = immutable_page->second;
+      const auto generation =
+          definition_page_write_generations.find(page_address);
+      if (generation == definition_page_write_generations.cend() ||
+          generation->second != snapshot.write_generation) {
+        return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+                      "guest code was written after successful translation",
+                      kGuestInvocationDependencySelfModifyingCode);
+      }
+      const auto existing = closure_code_pages.find(page_address);
+      if (existing != closure_code_pages.cend() &&
+          (existing->second.write_generation != snapshot.write_generation ||
+           existing->second.data != snapshot.data)) {
+        return Reject(
+            GuestInvocationRecorderRejection::kIncompleteTranslationClosure,
+            "immutable code-page catalog is inconsistent");
+      }
+      closure_code_pages.emplace(page_address, snapshot);
+    }
+    return true;
+  }
+
+  bool ValidateClosureCodePages() {
+    for (const auto& [page_address, snapshot] : closure_code_pages) {
+      const auto generation =
+          definition_page_write_generations.find(page_address);
+      if (generation == definition_page_write_generations.cend() ||
+          generation->second != snapshot.write_generation) {
+        return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+                      "guest code was written after successful translation",
+                      kGuestInvocationDependencySelfModifyingCode);
+      }
+      std::array<uint8_t, kGuestPageSize> current = {};
+      if (!ReadStableCodePage(page_address, &current)) {
+        return false;
+      }
+      if (current != snapshot.data) {
+        return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+                      "guest code changed after successful translation",
+                      kGuestInvocationDependencySelfModifyingCode);
+      }
+    }
     return true;
   }
 
@@ -324,12 +463,15 @@ struct GuestInvocationRecorder::Impl {
                   kGuestInvocationDependencyCrossThreadMutation);
         }
       }
+      if (!MergeDefinitionCodePages(definition->second)) {
+        return false;
+      }
       closure_functions.emplace(function_address,
                                 definition->second.end_address);
       pending.insert(pending.end(), definition->second.dependencies.cbegin(),
                      definition->second.dependencies.cend());
     }
-    return true;
+    return ValidateClosureCodePages();
   }
 
   bool ValidateReturnBoundary(uint32_t function_address,
@@ -427,6 +569,9 @@ struct GuestInvocationRecorder::Impl {
   }
 
   bool CompleteFinalAttempt(const GuestPPCRegisterState& exit_state) {
+    if (!ValidateClosureCodePages()) {
+      return false;
+    }
     std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> final_pages;
     if (!SnapshotKnownPages(&final_pages)) {
       return false;
@@ -490,6 +635,12 @@ struct GuestInvocationRecorder::Impl {
       return Reject(
           GuestInvocationRecorderRejection::kIncompleteTranslationClosure,
           "capture closure is missing a successful definition order entry");
+    }
+    for (const auto& [page_address, snapshot] : closure_code_pages) {
+      GuestInvocationPage code_page;
+      code_page.guest_address = page_address;
+      code_page.data = snapshot.data;
+      accepted.code_pages.push_back(std::move(code_page));
     }
     for (uint32_t address : entered_functions) {
       accepted.entered_functions.push_back(
@@ -687,6 +838,32 @@ struct GuestInvocationRecorder::Impl {
     return true;
   }
 
+  bool TrackDefinitionCodeWrite(uint32_t address, uint32_t size) {
+    if (!size) {
+      return Reject(GuestInvocationRecorderRejection::kInvalidEvent,
+                    "memory access has zero size");
+    }
+    const uint64_t last_byte = uint64_t(address) + size - 1;
+    if (last_byte > std::numeric_limits<uint32_t>::max()) {
+      return Reject(GuestInvocationRecorderRejection::kInvalidEvent,
+                    "memory access wraps the guest address space");
+    }
+    const uint32_t first_page = address & ~(kGuestPageSize - 1);
+    const uint32_t last_page =
+        static_cast<uint32_t>(last_byte) & ~(kGuestPageSize - 1);
+    auto page = definition_page_write_generations.lower_bound(first_page);
+    while (page != definition_page_write_generations.end() &&
+           page->first <= last_page) {
+      if (page->second == std::numeric_limits<uint64_t>::max()) {
+        return Reject(GuestInvocationRecorderRejection::kInvalidEvent,
+                      "definition code-page write generation overflowed");
+      }
+      ++page->second;
+      ++page;
+    }
+    return true;
+  }
+
   GuestInvocationRecorderSelection selection;
   GuestInvocationRecorderLimits limits;
   GuestInvocationRecorderPageReader& page_reader;
@@ -713,6 +890,9 @@ struct GuestInvocationRecorder::Impl {
   std::vector<CallFrame> call_stack;
   std::map<uint32_t, DefinitionRecord> definitions;
   std::vector<uint32_t> definition_order;
+  std::map<uint32_t, uint64_t> definition_page_write_generations;
+  std::map<uint32_t, CodePageSnapshot> definition_code_pages;
+  std::map<uint32_t, CodePageSnapshot> closure_code_pages;
   std::map<uint32_t, uint32_t> closure_functions;
   std::set<uint32_t> entered_functions;
   std::set<uint32_t> known_pages;
@@ -751,9 +931,11 @@ std::unique_ptr<GuestInvocationRecorder> GuestInvocationRecorder::Create(
     return fail("recorder selection owner must be fully specified or omitted");
   }
   if (limits.max_attempts < 3 || !limits.max_duration_ticks ||
-      !limits.max_page_count ||
+      !limits.max_page_count || !limits.max_code_page_count ||
       limits.max_page_count >
           GuestInvocationArtifactCodec::kMaxDataPagesPerInvocation ||
+      limits.max_code_page_count >
+          GuestInvocationRecorderLimits::kMaximumCodePageCount ||
       !limits.max_access_count || !limits.max_call_depth ||
       !limits.max_event_count || !limits.max_function_count ||
       selection.occurrence > limits.max_event_count) {
@@ -956,6 +1138,18 @@ bool GuestInvocationRecorder::OnMemoryAccess(
   if (impl_->state == GuestInvocationRecorderState::kComplete) {
     return true;
   }
+  if (!IsValidAccess(access)) {
+    if (!impl_->attempt_count) {
+      return true;
+    }
+    return impl_->BeginAccessEvent() &&
+           impl_->Reject(GuestInvocationRecorderRejection::kInvalidEvent,
+                         "memory access has an invalid access type");
+  }
+  if (HasWriteAccess(access) &&
+      !impl_->TrackDefinitionCodeWrite(address, size)) {
+    return false;
+  }
   if (!impl_->attempt_count) {
     return true;
   }
@@ -967,12 +1161,6 @@ bool GuestInvocationRecorder::OnMemoryAccess(
            impl_->Reject(GuestInvocationRecorderRejection::kInvalidEvent,
                          "memory access has an invalid identity");
   }
-  if (!IsValidAccess(access)) {
-    return impl_->BeginAccessEvent() &&
-           impl_->Reject(GuestInvocationRecorderRejection::kInvalidEvent,
-                         "memory access has an invalid access type");
-  }
-
   const bool recording_owner =
       impl_->IsRecordingAttempt() && impl_->IsOwner(identity);
   if (!recording_owner) {

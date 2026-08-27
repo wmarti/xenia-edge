@@ -1242,6 +1242,13 @@ TEST_CASE("A64_CAPTURE_COORDINATOR_ACCEPTS_EMITTED_INVOCATION",
   REQUIRE((result.translation_dependencies ==
            std::vector<ppc::GuestInvocationRecorderFunction>{
                {kRootAddress, kRootEndAddress}}));
+  REQUIRE(result.code_pages.size() == 1);
+  REQUIRE(result.code_pages[0].guest_address ==
+          (kRootAddress & ~(kPageSize - 1)));
+  REQUIRE(std::memcmp(
+              result.code_pages[0].data.data(),
+              test.memory->TranslateVirtual(kRootAddress & ~(kPageSize - 1)),
+              kPageSize) == 0);
   REQUIRE((result.entered_functions ==
            std::vector<ppc::GuestInvocationRecorderFunction>{
                {kRootAddress, kRootEndAddress}}));
@@ -1259,8 +1266,8 @@ TEST_CASE("A64_CAPTURE_COORDINATOR_ACCEPTS_EMITTED_INVOCATION",
   REQUIRE(invocation.expected_dirty_pages.size() == 1);
   REQUIRE(invocation.expected_dirty_pages[0].guest_address == data_page);
   REQUIRE(invocation.expected_dirty_pages[0].data == expected_dirty_page);
-  REQUIRE((page_reader.read_addresses ==
-           std::vector<uint32_t>{data_page, data_page}));
+  REQUIRE(std::count(page_reader.read_addresses.cbegin(),
+                     page_reader.read_addresses.cend(), data_page) == 2);
   REQUIRE(std::memcmp(test.memory->TranslateVirtual(data_page),
                       expected_dirty_page.data(),
                       expected_dirty_page.size()) == 0);
