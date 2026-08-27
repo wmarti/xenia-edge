@@ -1487,9 +1487,16 @@ bool GuestExecutionSessionCodec::ValidateSession(
   uint64_t rejected_event_count = 0;
   uint64_t unsupported_event_count = 0;
   uint64_t supplied_chunk_bytes = 0;
+  std::map<GuestExecutionSessionSha256, uint64_t> blob_size_catalog;
   std::map<GuestExecutionSessionSha256, EventPayloadIdentity> payload_catalog;
   std::map<GuestExecutionSessionSha256, ContentIdentity> content_catalog;
-  std::map<GuestExecutionSessionSha256, uint64_t> state_catalog;
+  struct ObservedParticipantRange {
+    bool has_event = false;
+    uint64_t first_event_sequence = 0;
+    uint64_t last_event_sequence = 0;
+  };
+  std::vector<ObservedParticipantRange> observed_participant_ranges(
+      manifest.participants.size());
   bool saw_initial_checkpoint = false;
   bool saw_final_checkpoint = false;
 
@@ -1534,6 +1541,11 @@ bool GuestExecutionSessionCodec::ValidateSession(
                 error,
                 "event payload digest has conflicting type or byte size");
           }
+          const auto [size_it, size_inserted] = blob_size_catalog.emplace(
+              event.payload_sha256, event.payload_size);
+          if (!size_inserted && size_it->second != event.payload_size) {
+            return Fail(error, "digest has conflicting canonical byte sizes");
+          }
         }
         if (event.thread_ordinal != kGuestExecutionSessionNoThread) {
           if (event.thread_ordinal >= manifest.participants.size()) {
@@ -1545,6 +1557,13 @@ bool GuestExecutionSessionCodec::ValidateSession(
               event.global_sequence > participant.last_event_sequence) {
             return Fail(error, "event lies outside its participant range");
           }
+          ObservedParticipantRange& observed =
+              observed_participant_ranges[event.thread_ordinal];
+          if (!observed.has_event) {
+            observed.has_event = true;
+            observed.first_event_sequence = event.global_sequence;
+          }
+          observed.last_event_sequence = event.global_sequence;
         }
 
         const auto start = segment_starts.find(event.global_sequence);
@@ -1618,13 +1637,18 @@ bool GuestExecutionSessionCodec::ValidateSession(
                       "initial checkpoint state differs from the manifest");
         }
         const auto [it, inserted] =
-            state_catalog.emplace(state.sha256, state.byte_size);
+            blob_size_catalog.emplace(state.sha256, state.byte_size);
         if (!inserted && it->second != state.byte_size) {
-          return Fail(error, "thread-state digest has conflicting byte sizes");
+          return Fail(error, "digest has conflicting canonical byte sizes");
         }
       }
       for (const GuestExecutionSessionContentReference& content :
            chunk.checkpoint.content) {
+        const auto [size_it, size_inserted] =
+            blob_size_catalog.emplace(content.sha256, content.byte_size);
+        if (!size_inserted && size_it->second != content.byte_size) {
+          return Fail(error, "digest has conflicting canonical byte sizes");
+        }
         const ContentIdentity identity = {content.kind, content.byte_size};
         const auto [it, inserted] =
             content_catalog.emplace(content.sha256, identity);
@@ -1643,6 +1667,17 @@ bool GuestExecutionSessionCodec::ValidateSession(
       !saw_final_checkpoint) {
     return Fail(error,
                 "session chunk closure or segment coverage is incomplete");
+  }
+  for (size_t i = 0; i < manifest.participants.size(); ++i) {
+    const GuestExecutionSessionParticipant& participant =
+        manifest.participants[i];
+    const ObservedParticipantRange& observed = observed_participant_ranges[i];
+    if (!observed.has_event ||
+        observed.first_event_sequence != participant.first_event_sequence ||
+        observed.last_event_sequence != participant.last_event_sequence) {
+      return Fail(error,
+                  "participant event range does not match the event stream");
+    }
   }
   if (accepted_event_count != manifest.accepted_event_count ||
       rejected_event_count != manifest.rejected_event_count ||

@@ -493,6 +493,68 @@ TEST_CASE("Guest execution payload digests bind one type and byte size",
       fixture.manifest, fixture.chunks, &error));
 }
 
+TEST_CASE("Guest execution participant ranges exactly match their events",
+          "[cpu]") {
+  SessionFixture fixture = MakeSessionFixture();
+  fixture.events.events[0] =
+      PlainEvent(1, GuestExecutionSessionEventKind::kInterrupt,
+                 kGuestExecutionSessionNoThread);
+  fixture.events.events[1] =
+      PlainEvent(2, GuestExecutionSessionEventKind::kSegmentBegin);
+  fixture.events.events[2] =
+      PlainEvent(3, GuestExecutionSessionEventKind::kSegmentEnd);
+  fixture.events.events[3] =
+      PlainEvent(4, GuestExecutionSessionEventKind::kInterrupt,
+                 kGuestExecutionSessionNoThread);
+  fixture.manifest.participants[0].first_event_sequence = 2;
+  fixture.manifest.participants[0].last_event_sequence = 3;
+  fixture.manifest.segments[0].first_event_sequence = 2;
+  fixture.manifest.segments[0].last_event_sequence = 3;
+
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
+      fixture.events, &fixture.chunks[1], &error));
+  fixture.manifest.chunks[1] = ReferenceFor(
+      GuestExecutionSessionChunkKind::kEvents, 1, 1, 4, 4, fixture.chunks[1]);
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(fixture.manifest,
+                                                      fixture.chunks, &error));
+
+  fixture.manifest.participants[0].first_event_sequence = 1;
+  CHECK_FALSE(GuestExecutionSessionCodec::ValidateSession(
+      fixture.manifest, fixture.chunks, &error));
+  fixture.manifest.participants[0].first_event_sequence = 2;
+  fixture.manifest.participants[0].last_event_sequence = 4;
+  CHECK_FALSE(GuestExecutionSessionCodec::ValidateSession(
+      fixture.manifest, fixture.chunks, &error));
+}
+
+TEST_CASE("Guest execution digest has one cross-namespace byte size", "[cpu]") {
+  SessionFixture fixture = MakeSessionFixture();
+  fixture.events.events[1].payload_sha256 =
+      fixture.initial_checkpoint.checkpoint.thread_states[0].sha256;
+
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
+      fixture.events, &fixture.chunks[1], &error));
+  fixture.manifest.chunks[1] = ReferenceFor(
+      GuestExecutionSessionChunkKind::kEvents, 1, 1, 4, 4, fixture.chunks[1]);
+  CHECK_FALSE(GuestExecutionSessionCodec::ValidateSession(
+      fixture.manifest, fixture.chunks, &error));
+
+  fixture = MakeSessionFixture();
+  fixture.initial_checkpoint.checkpoint.thread_states[0].sha256 =
+      fixture.initial_checkpoint.checkpoint.content[0].sha256;
+  fixture.manifest.participants[0].initial_state_sha256 =
+      fixture.initial_checkpoint.checkpoint.thread_states[0].sha256;
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      fixture.initial_checkpoint, &fixture.chunks[0], &error));
+  fixture.manifest.chunks[0] =
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                   fixture.chunks[0]);
+  CHECK_FALSE(GuestExecutionSessionCodec::ValidateSession(
+      fixture.manifest, fixture.chunks, &error));
+}
+
 TEST_CASE("Guest execution session rejects unsupported or rejected work",
           "[cpu]") {
   SessionFixture fixture = MakeSessionFixture();
