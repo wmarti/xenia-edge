@@ -198,11 +198,44 @@ bool GuestSchedulerCheckpointBarrier::WaitUntilQuiesced(
          IsQuiescedLocked();
 }
 
-bool GuestSchedulerCheckpointBarrier::Release() {
+bool GuestSchedulerCheckpointBarrier::Finalize(
+    uint64_t expected_generation,
+    GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot,
+    GuestSchedulerCheckpointBarrierRejection* out_rejection) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!active_.exchange(false, std::memory_order_acq_rel)) {
+  if (out_final_snapshot) {
+    *out_final_snapshot = {};
+    out_final_snapshot->generation = expected_generation;
+  }
+  if (!out_rejection) {
     return false;
   }
+  if (!active_.load(std::memory_order_relaxed)) {
+    *out_rejection = GuestSchedulerCheckpointBarrierRejection::kNotActive;
+    if (out_final_snapshot) {
+      out_final_snapshot->rejection = *out_rejection;
+    }
+    return false;
+  }
+  if (expected_generation != generation_) {
+    *out_rejection = GuestSchedulerCheckpointBarrierRejection::kStaleGeneration;
+    if (out_final_snapshot) {
+      out_final_snapshot->rejection = *out_rejection;
+    }
+    return false;
+  }
+
+  const bool quiesced = IsQuiescedLocked();
+  if (rejection_ == GuestSchedulerCheckpointBarrierRejection::kNone &&
+      !quiesced) {
+    rejection_ = GuestSchedulerCheckpointBarrierRejection::kInvalidTopology;
+  }
+  *out_rejection = rejection_;
+  if (out_final_snapshot) {
+    *out_final_snapshot = SnapshotLocked(quiesced);
+    out_final_snapshot->active = false;
+  }
+  active_.store(false, std::memory_order_release);
   condition_.notify_all();
   return true;
 }
@@ -210,13 +243,18 @@ bool GuestSchedulerCheckpointBarrier::Release() {
 GuestSchedulerCheckpointBarrierSnapshot
 GuestSchedulerCheckpointBarrier::snapshot() const {
   std::lock_guard<std::mutex> lock(mutex_);
+  return SnapshotLocked();
+}
+
+GuestSchedulerCheckpointBarrierSnapshot
+GuestSchedulerCheckpointBarrier::SnapshotLocked(bool final_quiesced) const {
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
   snapshot.generation = generation_;
   snapshot.rejection = rejection_;
   snapshot.dispatch_cpu_mask = dispatch_cpu_mask_;
   snapshot.quiesced_cpu_mask = quiesced_cpu_mask_;
   snapshot.active = active_.load(std::memory_order_relaxed);
-  snapshot.quiesced = snapshot.active && IsQuiescedLocked();
+  snapshot.quiesced = final_quiesced || (snapshot.active && IsQuiescedLocked());
   snapshot.participants = participants_;
   return snapshot;
 }
@@ -240,6 +278,63 @@ void GuestSchedulerCheckpointBarrier::NotifyIfTerminalLocked() {
       IsQuiescedLocked()) {
     condition_.notify_all();
   }
+}
+
+bool GuestSchedulerCheckpointHeldState::Arrive(uint64_t generation) {
+  if (!generation || phase_ != GuestSchedulerCheckpointHeldPhase::kEmpty) {
+    return false;
+  }
+  generation_ = generation;
+  phase_ = GuestSchedulerCheckpointHeldPhase::kArrived;
+  discard_on_release_ = false;
+  return true;
+}
+
+bool GuestSchedulerCheckpointHeldState::ConfirmSwitchOut() {
+  if (phase_ == GuestSchedulerCheckpointHeldPhase::kArrived) {
+    phase_ = GuestSchedulerCheckpointHeldPhase::kSwitchedOut;
+    return true;
+  }
+  if (phase_ == GuestSchedulerCheckpointHeldPhase::kReleasePending) {
+    phase_ = GuestSchedulerCheckpointHeldPhase::kReadyToRequeue;
+    return true;
+  }
+  return false;
+}
+
+bool GuestSchedulerCheckpointHeldState::RequestRelease(uint64_t generation) {
+  if (!generation || generation != generation_) {
+    return false;
+  }
+  if (phase_ == GuestSchedulerCheckpointHeldPhase::kArrived) {
+    phase_ = GuestSchedulerCheckpointHeldPhase::kReleasePending;
+    return true;
+  }
+  if (phase_ == GuestSchedulerCheckpointHeldPhase::kSwitchedOut) {
+    phase_ = GuestSchedulerCheckpointHeldPhase::kReadyToRequeue;
+    return true;
+  }
+  return phase_ == GuestSchedulerCheckpointHeldPhase::kReleasePending ||
+         phase_ == GuestSchedulerCheckpointHeldPhase::kReadyToRequeue;
+}
+
+bool GuestSchedulerCheckpointHeldState::DiscardOnRelease() {
+  if (phase_ == GuestSchedulerCheckpointHeldPhase::kEmpty) {
+    return false;
+  }
+  discard_on_release_ = true;
+  return true;
+}
+
+bool GuestSchedulerCheckpointHeldState::ConsumeReady(uint64_t generation) {
+  if (!generation || generation != generation_ ||
+      phase_ != GuestSchedulerCheckpointHeldPhase::kReadyToRequeue) {
+    return false;
+  }
+  generation_ = 0;
+  phase_ = GuestSchedulerCheckpointHeldPhase::kEmpty;
+  discard_on_release_ = false;
+  return true;
 }
 
 }  // namespace kernel

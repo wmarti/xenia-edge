@@ -54,6 +54,9 @@ struct GuestSchedulerCheckpointParticipant {
 enum class GuestSchedulerCheckpointBarrierRejection : uint8_t {
   kNone,
   kAlreadyActive,
+  kNotActive,
+  kStaleGeneration,
+  kReleasePending,
   kNotStarted,
   kCalledFromDispatchThread,
   kInvalidTopology,
@@ -63,6 +66,7 @@ enum class GuestSchedulerCheckpointBarrierRejection : uint8_t {
   kUnexpectedSwitchOut,
   kTopologyChanged,
   kShutdown,
+  kCancelled,
   kTimedOut,
 };
 
@@ -99,7 +103,15 @@ class GuestSchedulerCheckpointBarrier {
   bool AcknowledgeDispatchQuiesced(int cpu);
   void Reject(GuestSchedulerCheckpointBarrierRejection rejection);
   bool WaitUntilQuiesced(std::chrono::milliseconds timeout);
-  bool Release();
+
+  // Atomically validates the generation and final barrier state, snapshots it,
+  // and releases a matching generation. Returns true only when the supplied
+  // generation owned the active barrier and was released. A true result may
+  // still carry a rejection in out_rejection, in which case the checkpoint
+  // must be discarded. A stale generation never releases the active barrier.
+  bool Finalize(uint64_t expected_generation,
+                GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot,
+                GuestSchedulerCheckpointBarrierRejection* out_rejection);
 
   bool active() const { return active_.load(std::memory_order_acquire); }
   GuestSchedulerCheckpointBarrierSnapshot snapshot() const;
@@ -111,6 +123,8 @@ class GuestSchedulerCheckpointBarrier {
   };
 
   bool IsQuiescedLocked() const;
+  GuestSchedulerCheckpointBarrierSnapshot SnapshotLocked(
+      bool final_quiesced = false) const;
   void NotifyIfTerminalLocked();
 
   mutable std::mutex mutex_;
@@ -123,6 +137,40 @@ class GuestSchedulerCheckpointBarrier {
   uint8_t quiesced_cpu_mask_ = 0;
   std::vector<GuestSchedulerCheckpointParticipant> participants_;
   std::vector<ArrivalState> arrivals_;
+};
+
+enum class GuestSchedulerCheckpointHeldPhase : uint8_t {
+  kEmpty,
+  kArrived,
+  kSwitchedOut,
+  kReleasePending,
+  kReadyToRequeue,
+};
+
+// Scheduler-lock-protected two-phase ownership for a fiber that has reached a
+// checkpoint safepoint. Release may race before the fiber reaches the idle
+// dispatcher; in that ordering requeue is deferred until switch-out confirms
+// that the guest context and fiber stack are no longer running.
+class GuestSchedulerCheckpointHeldState {
+ public:
+  bool Arrive(uint64_t generation);
+  bool ConfirmSwitchOut();
+  bool RequestRelease(uint64_t generation);
+  bool DiscardOnRelease();
+  bool ConsumeReady(uint64_t generation);
+
+  uint64_t generation() const { return generation_; }
+  GuestSchedulerCheckpointHeldPhase phase() const { return phase_; }
+  bool discard_on_release() const { return discard_on_release_; }
+  bool empty() const {
+    return phase_ == GuestSchedulerCheckpointHeldPhase::kEmpty;
+  }
+
+ private:
+  uint64_t generation_ = 0;
+  GuestSchedulerCheckpointHeldPhase phase_ =
+      GuestSchedulerCheckpointHeldPhase::kEmpty;
+  bool discard_on_release_ = false;
 };
 
 }  // namespace kernel

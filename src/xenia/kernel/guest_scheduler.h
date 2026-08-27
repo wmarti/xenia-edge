@@ -168,14 +168,21 @@ class GuestScheduler {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   // Quiesces the dispatch CPUs without suspending their host threads. Running
   // guest fibers park at exact block-head JIT safepoints; ready, blocked and
-  // suspended fibers remain in place as passive snapshot subjects. Success
-  // is the checkpoint boundary: every earlier guest store is part of the
-  // baseline. The barrier stays active so callers can serialize that baseline
-  // and publish capture guards before ResumeFromCheckpointBarrier is called.
+  // suspended fibers remain in place as passive snapshot subjects. Success is
+  // a provisional checkpoint boundary, not acceptance: callers must serialize
+  // the baseline and roster, arm every writer and external adapter, then call
+  // FinalizeAndResumeCheckpointBarrier with the returned generation. That call
+  // atomically revalidates topology before releasing the fibers. A publisher
+  // must also reject every passive participant without a durable continuation.
   GuestSchedulerCheckpointBarrierRejection PauseForCheckpointBarrier(
       std::chrono::milliseconds timeout,
       GuestSchedulerCheckpointBarrierSnapshot* out_snapshot);
-  bool ResumeFromCheckpointBarrier();
+  GuestSchedulerCheckpointBarrierRejection FinalizeAndResumeCheckpointBarrier(
+      uint64_t generation,
+      GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot);
+  GuestSchedulerCheckpointBarrierRejection CancelCheckpointBarrier(
+      uint64_t generation,
+      GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot = nullptr);
 
   // Internal JIT-safepoint entry. Returns true when the checkpoint request
   // consumed this preemption, including when it deferred for the global lock.
@@ -312,6 +319,10 @@ class GuestScheduler {
   void AppendCheckpointListLocked(
       std::vector<GuestSchedulerCheckpointParticipant>& participants,
       XThread* head, GuestSchedulerCheckpointParticipantState state) const;
+  GuestSchedulerCheckpointBarrierRejection FinalizeCheckpointBarrierLocked(
+      uint64_t generation,
+      GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot);
+  void RequeueReleasedCheckpointFiberLocked(int cpu_index, uint64_t generation);
   void RejectCheckpointTopologyChangeLocked();
 
   // Assigns the next sequence and delivers under lock_, which the caller
@@ -366,7 +377,10 @@ class GuestScheduler {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   GuestSchedulerCheckpointBarrier checkpoint_barrier_;
-  XThread* checkpoint_held_[kMaxCpus] = {};
+  struct CheckpointHeldFiber {
+    XThread* thread = nullptr;
+    GuestSchedulerCheckpointHeldState state;
+  } checkpoint_held_[kMaxCpus];
 #endif
 
   // A fiber yielding while it holds the recursive global lock lets a

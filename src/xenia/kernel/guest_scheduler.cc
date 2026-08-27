@@ -13,6 +13,11 @@
 #include <string>
 #include <vector>
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include <utility>
+#endif
+
 #include "xenia/base/assert.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
@@ -254,6 +259,9 @@ GuestSchedulerCheckpointBarrierRejection
 GuestScheduler::PauseForCheckpointBarrier(
     std::chrono::milliseconds timeout,
     GuestSchedulerCheckpointBarrierSnapshot* out_snapshot) {
+  if (out_snapshot) {
+    *out_snapshot = {};
+  }
   if (t_current_cpu >= 0) {
     return GuestSchedulerCheckpointBarrierRejection::kCalledFromDispatchThread;
   }
@@ -263,10 +271,20 @@ GuestScheduler::PauseForCheckpointBarrier(
   }
 
   uint8_t dispatch_cpu_mask = 0;
+  uint64_t checkpoint_generation = 0;
   {
     std::lock_guard<std::mutex> lock(lock_);
+    if (!started_.load(std::memory_order_acquire) ||
+        shutting_down_.load(std::memory_order_acquire)) {
+      return GuestSchedulerCheckpointBarrierRejection::kNotStarted;
+    }
     if (checkpoint_barrier_.active()) {
       return GuestSchedulerCheckpointBarrierRejection::kAlreadyActive;
+    }
+    for (const auto& held : checkpoint_held_) {
+      if (held.thread || !held.state.empty()) {
+        return GuestSchedulerCheckpointBarrierRejection::kReleasePending;
+      }
     }
     std::vector<GuestSchedulerCheckpointParticipant> participants;
     for (int cpu_index = 0; cpu_index < kMaxCpus; ++cpu_index) {
@@ -303,6 +321,7 @@ GuestScheduler::PauseForCheckpointBarrier(
                  ? GuestSchedulerCheckpointBarrierRejection::kInvalidTopology
                  : snapshot.rejection;
     }
+    checkpoint_generation = checkpoint_barrier_.snapshot().generation;
     for (Cpu& cpu : cpus_) {
       if (cpu.current_thread) {
         cpu.current_thread->thread_state()->context()->preempt_requested = 1;
@@ -317,47 +336,127 @@ GuestScheduler::PauseForCheckpointBarrier(
   }
 
   if (!checkpoint_barrier_.WaitUntilQuiesced(timeout)) {
-    const auto snapshot = checkpoint_barrier_.snapshot();
+    GuestSchedulerCheckpointBarrierSnapshot final_snapshot;
+    const auto rejection = FinalizeAndResumeCheckpointBarrier(
+        checkpoint_generation, &final_snapshot);
     if (out_snapshot) {
-      *out_snapshot = snapshot;
+      *out_snapshot = std::move(final_snapshot);
     }
-    ResumeFromCheckpointBarrier();
-    return snapshot.rejection == GuestSchedulerCheckpointBarrierRejection::kNone
-               ? GuestSchedulerCheckpointBarrierRejection::kInvalidTopology
-               : snapshot.rejection;
+    return rejection;
+  }
+
+  const auto snapshot = checkpoint_barrier_.snapshot();
+  if (snapshot.generation != checkpoint_generation ||
+      snapshot.rejection != GuestSchedulerCheckpointBarrierRejection::kNone ||
+      !snapshot.active || !snapshot.quiesced) {
+    GuestSchedulerCheckpointBarrierSnapshot final_snapshot;
+    const auto rejection = FinalizeAndResumeCheckpointBarrier(
+        checkpoint_generation, &final_snapshot);
+    if (out_snapshot) {
+      *out_snapshot = std::move(final_snapshot);
+    }
+    return rejection;
   }
   if (out_snapshot) {
-    *out_snapshot = checkpoint_barrier_.snapshot();
+    *out_snapshot = snapshot;
   }
   return GuestSchedulerCheckpointBarrierRejection::kNone;
 }
 
-bool GuestScheduler::ResumeFromCheckpointBarrier() {
-  std::lock_guard<std::mutex> lock(lock_);
-  if (!checkpoint_barrier_.active()) {
-    return false;
+GuestSchedulerCheckpointBarrierRejection
+GuestScheduler::FinalizeCheckpointBarrierLocked(
+    uint64_t generation,
+    GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot) {
+  GuestSchedulerCheckpointBarrierRejection rejection =
+      GuestSchedulerCheckpointBarrierRejection::kInvalidTopology;
+  for (const auto& held : checkpoint_held_) {
+    if (!held.state.empty() && held.state.generation() != generation) {
+      if (out_final_snapshot) {
+        *out_final_snapshot = {};
+        out_final_snapshot->generation = generation;
+        out_final_snapshot->rejection =
+            GuestSchedulerCheckpointBarrierRejection::kStaleGeneration;
+      }
+      return GuestSchedulerCheckpointBarrierRejection::kStaleGeneration;
+    }
   }
-  checkpoint_barrier_.Release();
+  if (!checkpoint_barrier_.Finalize(generation, out_final_snapshot,
+                                    &rejection)) {
+    return rejection;
+  }
   for (int cpu_index = 0; cpu_index < kMaxCpus; ++cpu_index) {
-    XThread* thread = checkpoint_held_[cpu_index];
-    if (!thread) {
+    auto& held = checkpoint_held_[cpu_index];
+    if (!held.thread) {
       continue;
     }
-    checkpoint_held_[cpu_index] = nullptr;
-    auto& links = thread->scheduler_links();
-    assert_false(links.running || links.queued || links.blocked ||
-                 links.suspended);
-    links.queued = true;
-    links.cpu = cpu_index;
-    links.preempted = false;
-    LinkReadyLocked(cpus_[cpu_index], thread, true);
+    assert_true(held.state.RequestRelease(generation));
+    RequeueReleasedCheckpointFiberLocked(cpu_index, generation);
+  }
+  return rejection;
+}
+
+void GuestScheduler::RequeueReleasedCheckpointFiberLocked(int cpu_index,
+                                                          uint64_t generation) {
+  auto& held = checkpoint_held_[cpu_index];
+  if (!held.thread || held.state.phase() !=
+                          GuestSchedulerCheckpointHeldPhase::kReadyToRequeue) {
+    return;
+  }
+  XThread* thread = held.thread;
+  const bool discard = held.state.discard_on_release();
+  if (!held.state.ConsumeReady(generation)) {
+    return;
+  }
+  held.thread = nullptr;
+  if (discard) {
+    return;
+  }
+  auto& links = thread->scheduler_links();
+  assert_false(links.running || links.queued || links.blocked ||
+               links.suspended);
+  links.queued = true;
+  links.cpu = cpu_index;
+  links.preempted = false;
+  LinkReadyLocked(cpus_[cpu_index], thread, true);
+}
+
+GuestSchedulerCheckpointBarrierRejection
+GuestScheduler::FinalizeAndResumeCheckpointBarrier(
+    uint64_t generation,
+    GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot) {
+  GuestSchedulerCheckpointBarrierRejection rejection;
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    rejection = FinalizeCheckpointBarrierLocked(generation, out_final_snapshot);
   }
   for (Cpu& cpu : cpus_) {
     if (cpu.ready_event) {
       cpu.ready_event->Set();
     }
   }
-  return true;
+  return rejection;
+}
+
+GuestSchedulerCheckpointBarrierRejection
+GuestScheduler::CancelCheckpointBarrier(
+    uint64_t generation,
+    GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot) {
+  GuestSchedulerCheckpointBarrierRejection rejection;
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    const auto snapshot = checkpoint_barrier_.snapshot();
+    if (snapshot.active && snapshot.generation == generation) {
+      checkpoint_barrier_.Reject(
+          GuestSchedulerCheckpointBarrierRejection::kCancelled);
+    }
+    rejection = FinalizeCheckpointBarrierLocked(generation, out_final_snapshot);
+  }
+  for (Cpu& cpu : cpus_) {
+    if (cpu.ready_event) {
+      cpu.ready_event->Set();
+    }
+  }
+  return rejection;
 }
 
 bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
@@ -377,7 +476,8 @@ bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
     }
     if (cpu_index < 0 || cpu_index >= kMaxCpus ||
         cpus_[cpu_index].current_thread != thread ||
-        checkpoint_held_[cpu_index]) {
+        checkpoint_held_[cpu_index].thread ||
+        !checkpoint_held_[cpu_index].state.empty()) {
       checkpoint_barrier_.Reject(
           GuestSchedulerCheckpointBarrierRejection::kUnexpectedSafepoint);
       return true;
@@ -386,7 +486,14 @@ bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
                                                guest_pc)) {
       return true;
     }
-    checkpoint_held_[cpu_index] = thread;
+    const uint64_t generation = checkpoint_barrier_.snapshot().generation;
+    auto& held = checkpoint_held_[cpu_index];
+    if (!held.state.Arrive(generation)) {
+      checkpoint_barrier_.Reject(
+          GuestSchedulerCheckpointBarrierRejection::kUnexpectedSafepoint);
+      return true;
+    }
+    held.thread = thread;
   }
   YieldToScheduler();
   return true;
@@ -455,17 +562,18 @@ void GuestScheduler::Shutdown() {
   }
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-  if (checkpoint_barrier_.active()) {
-    checkpoint_barrier_.Reject(
-        GuestSchedulerCheckpointBarrierRejection::kShutdown);
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    shutting_down_.store(true);
+    const auto snapshot = checkpoint_barrier_.snapshot();
+    if (snapshot.active) {
+      checkpoint_barrier_.Reject(
+          GuestSchedulerCheckpointBarrierRejection::kShutdown);
+      FinalizeCheckpointBarrierLocked(snapshot.generation, nullptr);
+    }
   }
-#endif
+#else
   shutting_down_.store(true);
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-  if (checkpoint_barrier_.active()) {
-    ResumeFromCheckpointBarrier();
-  }
 #endif
   for (Cpu& cpu : cpus_) {
     if (cpu.ready_event) {
@@ -880,6 +988,12 @@ bool GuestScheduler::ForgetThread(XThread* thread) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   RejectCheckpointTopologyChangeLocked();
+  for (auto& held : checkpoint_held_) {
+    if (held.thread == thread) {
+      assert_true(held.state.DiscardOnRelease());
+      break;
+    }
+  }
 #endif
   auto& links = thread->scheduler_links();
   // A thread that ever ran has a live fiber stack and one a dispatch thread
@@ -1103,11 +1217,24 @@ void GuestScheduler::SwitchTo(XThread* next) {
     cpus_[t_current_cpu].current_thread = nullptr;
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-    if (checkpoint_held_[t_current_cpu] == next) {
-      checkpoint_barrier_.ConfirmSwitchOut(next->thread_id(), t_current_cpu);
+    auto& checkpoint_held = checkpoint_held_[t_current_cpu];
+    uint64_t checkpoint_generation = 0;
+    if (checkpoint_held.thread == next) {
+      checkpoint_generation = checkpoint_held.state.generation();
+      if (checkpoint_barrier_.active() &&
+          !checkpoint_barrier_.ConfirmSwitchOut(next->thread_id(),
+                                                t_current_cpu)) {
+        checkpoint_barrier_.Reject(
+            GuestSchedulerCheckpointBarrierRejection::kUnexpectedSwitchOut);
+      }
+      assert_true(checkpoint_held.state.ConfirmSwitchOut());
     }
     EmitCaptureLocked(CaptureKind::kSwitchOut, next, t_current_cpu, -1,
                       CaptureReason::kNone, 0, 0);
+    if (checkpoint_generation) {
+      RequeueReleasedCheckpointFiberLocked(t_current_cpu,
+                                           checkpoint_generation);
+    }
 #endif
   }
   XThread::SetCurrentThread(nullptr);

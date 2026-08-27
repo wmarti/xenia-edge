@@ -104,7 +104,14 @@ TEST_CASE("Scheduler checkpoint barrier holds running and preserves passive",
   REQUIRE(suspended.state == ParticipantState::kSuspended);
   REQUIRE_FALSE(suspended.restorable);
 
-  REQUIRE(barrier.Release());
+  GuestSchedulerCheckpointBarrierSnapshot final_snapshot;
+  Rejection final_rejection = Rejection::kInvalidTopology;
+  REQUIRE(
+      barrier.Finalize(snapshot.generation, &final_snapshot, &final_rejection));
+  REQUIRE(final_rejection == Rejection::kNone);
+  REQUIRE_FALSE(final_snapshot.active);
+  REQUIRE(final_snapshot.quiesced);
+  REQUIRE(final_snapshot.participants == snapshot.participants);
   REQUIRE_FALSE(barrier.active());
 }
 
@@ -125,7 +132,10 @@ TEST_CASE("Scheduler checkpoint barrier waits for switch-out and every CPU",
   REQUIRE_FALSE(snapshot.quiesced);
   REQUIRE(barrier.AcknowledgeDispatchQuiesced(1));
   REQUIRE(barrier.WaitUntilQuiesced(std::chrono::milliseconds(1)));
-  REQUIRE(barrier.Release());
+  snapshot = barrier.snapshot();
+  Rejection final_rejection = Rejection::kInvalidTopology;
+  REQUIRE(barrier.Finalize(snapshot.generation, nullptr, &final_rejection));
+  REQUIRE(final_rejection == Rejection::kNone);
 }
 
 TEST_CASE("Scheduler checkpoint barrier rejects invalid safepoints",
@@ -140,7 +150,10 @@ TEST_CASE("Scheduler checkpoint barrier rejects invalid safepoints",
   REQUIRE_FALSE(barrier.ArriveAtSafepoint(0x202, 1, 0x82002000));
   REQUIRE(barrier.snapshot().rejection == Rejection::kUnexpectedSafepoint);
   REQUIRE_FALSE(barrier.WaitUntilQuiesced(std::chrono::milliseconds(1)));
-  REQUIRE(barrier.Release());
+  const auto snapshot = barrier.snapshot();
+  Rejection final_rejection = Rejection::kNone;
+  REQUIRE(barrier.Finalize(snapshot.generation, nullptr, &final_rejection));
+  REQUIRE(final_rejection == Rejection::kUnexpectedSafepoint);
 }
 
 TEST_CASE("Scheduler checkpoint barrier rejects duplicate running CPUs",
@@ -172,8 +185,11 @@ TEST_CASE("Scheduler checkpoint barrier validates passive ownership and PC",
   };
   REQUIRE(barrier.Begin(0b1, running));
   REQUIRE_FALSE(barrier.ArriveAtSafepoint(0x202, 0, 0x82002002));
-  REQUIRE(barrier.snapshot().rejection == Rejection::kInvalidGuestPc);
-  REQUIRE(barrier.Release());
+  const auto snapshot = barrier.snapshot();
+  REQUIRE(snapshot.rejection == Rejection::kInvalidGuestPc);
+  Rejection final_rejection = Rejection::kNone;
+  REQUIRE(barrier.Finalize(snapshot.generation, nullptr, &final_rejection));
+  REQUIRE(final_rejection == Rejection::kInvalidGuestPc);
 }
 
 TEST_CASE("Scheduler checkpoint barrier timeout fails closed and can restart",
@@ -187,7 +203,9 @@ TEST_CASE("Scheduler checkpoint barrier timeout fails closed and can restart",
   auto snapshot = barrier.snapshot();
   REQUIRE(snapshot.rejection == Rejection::kTimedOut);
   const uint64_t first_generation = snapshot.generation;
-  REQUIRE(barrier.Release());
+  Rejection final_rejection = Rejection::kNone;
+  REQUIRE(barrier.Finalize(first_generation, nullptr, &final_rejection));
+  REQUIRE(final_rejection == Rejection::kTimedOut);
 
   const std::array passive = {
       MakeParticipant(0x202, 0, ParticipantState::kBlocked, 0x82001000,
@@ -199,7 +217,132 @@ TEST_CASE("Scheduler checkpoint barrier timeout fails closed and can restart",
   snapshot = barrier.snapshot();
   REQUIRE(snapshot.generation == first_generation + 1);
   REQUIRE(snapshot.rejection == Rejection::kNone);
-  REQUIRE(barrier.Release());
+  REQUIRE(barrier.Finalize(snapshot.generation, nullptr, &final_rejection));
+  REQUIRE(final_rejection == Rejection::kNone);
+}
+
+TEST_CASE("Scheduler checkpoint finalization rejects late topology changes",
+          "[guest_scheduler_checkpoint]") {
+  GuestSchedulerCheckpointBarrier barrier;
+  const std::array participants = {
+      MakeParticipant(0x101, 0, ParticipantState::kReady),
+  };
+  REQUIRE(barrier.Begin(0b1, participants));
+  REQUIRE(barrier.AcknowledgeDispatchQuiesced(0));
+  REQUIRE(barrier.WaitUntilQuiesced(std::chrono::milliseconds(1)));
+  const auto provisional = barrier.snapshot();
+  REQUIRE(provisional.rejection == Rejection::kNone);
+
+  // GuestScheduler calls Reject before a late MarkReady, new participant or
+  // other queue mutation while holding the same scheduler lock as finalize.
+  barrier.Reject(Rejection::kTopologyChanged);
+  GuestSchedulerCheckpointBarrierSnapshot final_snapshot;
+  Rejection final_rejection = Rejection::kNone;
+  REQUIRE(barrier.Finalize(provisional.generation, &final_snapshot,
+                           &final_rejection));
+  REQUIRE(final_rejection == Rejection::kTopologyChanged);
+  REQUIRE(final_snapshot.rejection == Rejection::kTopologyChanged);
+  REQUIRE(final_snapshot.generation == provisional.generation);
+  REQUIRE(final_snapshot.participants == provisional.participants);
+  REQUIRE_FALSE(final_snapshot.active);
+  REQUIRE(final_snapshot.quiesced);
+  REQUIRE_FALSE(barrier.active());
+}
+
+TEST_CASE("Scheduler checkpoint stale generation cannot release or snapshot",
+          "[guest_scheduler_checkpoint]") {
+  GuestSchedulerCheckpointBarrier barrier;
+  REQUIRE(barrier.Begin(0b1, {}));
+  REQUIRE(barrier.AcknowledgeDispatchQuiesced(0));
+  REQUIRE(barrier.WaitUntilQuiesced(std::chrono::milliseconds(1)));
+  const auto first = barrier.snapshot();
+  Rejection first_rejection = Rejection::kInvalidTopology;
+  REQUIRE(barrier.Finalize(first.generation, nullptr, &first_rejection));
+  REQUIRE(first_rejection == Rejection::kNone);
+
+  const std::array participants = {
+      MakeParticipant(0x101, 0, ParticipantState::kReady),
+  };
+  REQUIRE(barrier.Begin(0b1, participants));
+  REQUIRE(barrier.AcknowledgeDispatchQuiesced(0));
+  REQUIRE(barrier.WaitUntilQuiesced(std::chrono::milliseconds(1)));
+  const auto current = barrier.snapshot();
+  REQUIRE(current.generation == first.generation + 1);
+
+  GuestSchedulerCheckpointBarrierSnapshot stale_snapshot;
+  Rejection stale_rejection = Rejection::kNone;
+  REQUIRE_FALSE(
+      barrier.Finalize(first.generation, &stale_snapshot, &stale_rejection));
+  REQUIRE(stale_rejection == Rejection::kStaleGeneration);
+  REQUIRE(stale_snapshot.rejection == Rejection::kStaleGeneration);
+  REQUIRE(stale_snapshot.generation == first.generation);
+  REQUIRE(stale_snapshot.participants.empty());
+  REQUIRE_FALSE(stale_snapshot.active);
+  REQUIRE(barrier.active());
+  REQUIRE(barrier.snapshot().generation == current.generation);
+  REQUIRE(barrier.snapshot().participants == current.participants);
+
+  GuestSchedulerCheckpointBarrierSnapshot final_snapshot;
+  Rejection final_rejection = Rejection::kInvalidTopology;
+  REQUIRE(
+      barrier.Finalize(current.generation, &final_snapshot, &final_rejection));
+  REQUIRE(final_rejection == Rejection::kNone);
+  REQUIRE_FALSE(final_snapshot.active);
+}
+
+TEST_CASE("Scheduler checkpoint held fiber releases in either race order",
+          "[guest_scheduler_checkpoint]") {
+  SECTION("normal switch-out before release") {
+    GuestSchedulerCheckpointHeldState held;
+    REQUIRE(held.Arrive(7));
+    REQUIRE(held.phase() == GuestSchedulerCheckpointHeldPhase::kArrived);
+    REQUIRE(held.ConfirmSwitchOut());
+    REQUIRE(held.phase() == GuestSchedulerCheckpointHeldPhase::kSwitchedOut);
+    REQUIRE(held.RequestRelease(7));
+    REQUIRE(held.phase() == GuestSchedulerCheckpointHeldPhase::kReadyToRequeue);
+    REQUIRE(held.ConsumeReady(7));
+    REQUIRE(held.empty());
+    REQUIRE_FALSE(held.ConsumeReady(7));
+  }
+
+  SECTION("timeout release before fiber yield") {
+    GuestSchedulerCheckpointHeldState held;
+    REQUIRE(held.Arrive(8));
+    REQUIRE(held.RequestRelease(8));
+    REQUIRE(held.phase() == GuestSchedulerCheckpointHeldPhase::kReleasePending);
+    REQUIRE_FALSE(held.ConsumeReady(8));
+    REQUIRE(held.ConfirmSwitchOut());
+    REQUIRE(held.phase() == GuestSchedulerCheckpointHeldPhase::kReadyToRequeue);
+    REQUIRE(held.ConsumeReady(8));
+    REQUIRE(held.empty());
+  }
+
+  SECTION("shutdown release before fiber yield is generation bound") {
+    GuestSchedulerCheckpointHeldState held;
+    REQUIRE(held.Arrive(9));
+    REQUIRE_FALSE(held.RequestRelease(10));
+    REQUIRE(held.phase() == GuestSchedulerCheckpointHeldPhase::kArrived);
+    REQUIRE(held.RequestRelease(9));
+    REQUIRE(held.ConfirmSwitchOut());
+    REQUIRE_FALSE(held.ConsumeReady(10));
+    REQUIRE(held.ConsumeReady(9));
+    REQUIRE(held.empty());
+  }
+
+  SECTION("forgotten fiber is consumed without requeue") {
+    GuestSchedulerCheckpointHeldState held;
+    REQUIRE(held.Arrive(10));
+    REQUIRE(held.DiscardOnRelease());
+    REQUIRE(held.discard_on_release());
+    REQUIRE(held.RequestRelease(10));
+    REQUIRE(held.ConfirmSwitchOut());
+    REQUIRE(held.phase() == GuestSchedulerCheckpointHeldPhase::kReadyToRequeue);
+    REQUIRE(held.discard_on_release());
+    REQUIRE(held.ConsumeReady(10));
+    REQUIRE(held.empty());
+    REQUIRE_FALSE(held.discard_on_release());
+    REQUIRE_FALSE(held.DiscardOnRelease());
+  }
 }
 
 }  // namespace testing
