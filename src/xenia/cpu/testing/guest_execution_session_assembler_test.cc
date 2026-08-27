@@ -12,6 +12,7 @@
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include "third_party/catch/include/catch.hpp"
+#include "xenia/cpu/execution_jit_corpus.h"
 
 namespace xe {
 namespace cpu {
@@ -130,11 +132,22 @@ class FakeContentProvider final
     : public GuestExecutionSessionAssemblerContentProvider {
  public:
   FakeContentProvider() {
-    entries.push_back({GuestExecutionSessionContentKind::kGuestCode, 0x82000000,
-                       Bytes(0x100, 3)});
+    std::vector<uint8_t> code_page = Bytes(JitCorpus::kPageSize, 3);
+    entries.push_back(
+        {GuestExecutionSessionContentKind::kGuestCode, 0x82000000, code_page});
     entries.push_back(
         {GuestExecutionSessionContentKind::kGuestPage, 0x1000, Bytes(4096, 2)});
-    corpus = Bytes(128, 0x10);
+    ExecutionJitCorpusBuilder builder(JitCorpus::kConfigGuestScheduler);
+    ExecutionJitCorpus::FunctionRecord function = {0x82000000, 0x820000FC, 64,
+                                                   0};
+    std::string error;
+    if (!builder.AddCodePage(0x82000000, code_page.data(), code_page.size(),
+                             &error) ||
+        !builder.AddFunction(function, &error) ||
+        !builder.Encode(&corpus, &error)) {
+      throw std::runtime_error("failed to build test execution corpus: " +
+                               error);
+    }
   }
 
   bool CollectCheckpointContent(
@@ -801,6 +814,154 @@ TEST_CASE("session assembler records one manual window with nested calls",
   REQUIRE(harness.publisher.calls == 1);
 }
 
+TEST_CASE("session assembler publishes continuous zero-segment coverage",
+          "[guest-execution-session-assembler]") {
+  Harness harness(MakeContinuousConfig());
+  harness.StartOutside({kA});
+  REQUIRE(harness.Enter(kA) == Action::kContinue);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->OnInstructionCoverage(kA, 10) ==
+          Action::kContinue);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kHold);
+  REQUIRE(harness.state() == State::kPublishing);
+
+  const GuestExecutionSessionBundle& bundle = harness.PublishedBundle();
+  const GuestExecutionSessionManifest& manifest = bundle.manifest;
+  REQUIRE(manifest.segments.empty());
+  REQUIRE(manifest.accepted_segment_count == 0);
+  REQUIRE(manifest.stop_request_accepted_segment_count == 0);
+  REQUIRE(manifest.stop_request_guest_instruction_count == 10);
+  REQUIRE(manifest.accepted_event_count == 5);
+  REQUIRE(manifest.participants.size() == 1);
+  REQUIRE(manifest.participants[0].boundary_arrival_kind ==
+          GuestExecutionSessionBoundaryArrivalKind::kJitSafepoint);
+  REQUIRE(manifest.chunks.front().kind ==
+          GuestExecutionSessionChunkKind::kCheckpoint);
+  REQUIRE(manifest.chunks.front().first_event_sequence == 0);
+  REQUIRE(manifest.chunks[1].kind ==
+          GuestExecutionSessionChunkKind::kCodeCorpus);
+  REQUIRE(manifest.chunks.back().kind ==
+          GuestExecutionSessionChunkKind::kCheckpoint);
+  REQUIRE(manifest.chunks.back().first_event_sequence ==
+          manifest.last_event_sequence);
+  REQUIRE(harness.content.corpus_calls == 1);
+  GuestExecutionSessionCodeCorpusChunk corpus_reference;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCodeCorpusChunk(bundle.chunks[1],
+                                                            &corpus_reference));
+  REQUIRE(corpus_reference.code_corpus_sha256 ==
+          GuestExecutionSessionCodec::HashBytes(harness.content.corpus));
+
+  std::string validation_error;
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &validation_error));
+  REQUIRE(validation_error.empty());
+  std::vector<uint8_t> encoded_manifest;
+  REQUIRE(GuestExecutionSessionCodec::EncodeManifest(
+      manifest, &encoded_manifest, &validation_error));
+  GuestExecutionSessionManifest decoded_manifest;
+  REQUIRE(GuestExecutionSessionCodec::DecodeManifest(
+      encoded_manifest, &decoded_manifest, &validation_error));
+  REQUIRE(decoded_manifest == manifest);
+
+  for (size_t i = 0; i < manifest.chunks.size(); ++i) {
+    if (manifest.chunks[i].kind != GuestExecutionSessionChunkKind::kEvents) {
+      continue;
+    }
+    GuestExecutionSessionEventChunk events;
+    REQUIRE(GuestExecutionSessionCodec::DecodeEventChunk(bundle.chunks[i],
+                                                         &events));
+    for (const GuestExecutionSessionEvent& event : events.events) {
+      REQUIRE(event.kind != GuestExecutionSessionEventKind::kSegmentBegin);
+      REQUIRE(event.kind != GuestExecutionSessionEventKind::kSegmentEnd);
+    }
+  }
+}
+
+TEST_CASE("continuous session assembler rejects missing participant progress",
+          "[guest-execution-session-assembler]") {
+  SECTION("only coordinator boundary events") {
+    Harness harness(MakeContinuousConfig());
+    harness.StartOutside({kA});
+    REQUIRE(harness.assembler->RequestStop() == Action::kReject);
+    harness.RequireRejected(Rejection::kReelRejected);
+  }
+
+  SECTION("participant control events are not instruction progress") {
+    Harness harness(MakeContinuousConfig());
+    harness.StartOutside({kA});
+    REQUIRE(harness.Enter(kA) == Action::kContinue);
+    REQUIRE(harness.Leave(kA) == Action::kContinue);
+    REQUIRE(harness.assembler->RequestStop() == Action::kReject);
+    harness.RequireRejected(Rejection::kReelRejected);
+  }
+
+  SECTION("legacy segment callbacks are illegal") {
+    Harness harness(MakeContinuousConfig());
+    harness.StartOutside({kA});
+    REQUIRE(harness.Enter(kA) == Action::kContinue);
+    REQUIRE(harness.assembler->OnSegmentBegin(kA, 0x82000000, 0x820000FC) ==
+            Action::kReject);
+    harness.RequireRejected(Rejection::kInvalidCall);
+  }
+}
+
+TEST_CASE("continuous session publication requires exact code closure",
+          "[guest-execution-session-assembler]") {
+  auto reach_publication = [](Harness* harness) {
+    harness->StartOutside({kA});
+    REQUIRE(harness->Enter(kA) == Action::kContinue);
+    REQUIRE(harness->assembler->OnInstructionCoverage(kA, 10) ==
+            Action::kContinue);
+    REQUIRE(harness->assembler->RequestStop() == Action::kHold);
+    REQUIRE(harness->assembler->ArriveAtSafepoint(kA) == Action::kHold);
+    REQUIRE(harness->state() == State::kPublishing);
+  };
+
+  SECTION("initial checkpoint without guest code rejects") {
+    Harness harness(MakeContinuousConfig());
+    harness.content.entries.erase(
+        std::remove_if(
+            harness.content.entries.begin(), harness.content.entries.end(),
+            [](const GuestExecutionSessionAssemblerContent& entry) {
+              return entry.kind == GuestExecutionSessionContentKind::kGuestCode;
+            }),
+        harness.content.entries.end());
+    reach_publication(&harness);
+    REQUIRE_FALSE(harness.assembler->Publish(&harness.error));
+    harness.RequireRejected(Rejection::kEncodingFailure);
+  }
+
+  SECTION("corpus provider failure rejects") {
+    Harness harness(MakeContinuousConfig());
+    harness.content.corpus_fail = true;
+    reach_publication(&harness);
+    REQUIRE_FALSE(harness.assembler->Publish(&harness.error));
+    harness.RequireRejected(Rejection::kContentFailure);
+  }
+
+  SECTION("checkpoint code differing from the corpus rejects") {
+    Harness harness(MakeContinuousConfig());
+    for (GuestExecutionSessionAssemblerContent& entry :
+         harness.content.entries) {
+      if (entry.kind == GuestExecutionSessionContentKind::kGuestCode) {
+        entry.bytes[0] ^= 0x80;
+      }
+    }
+    reach_publication(&harness);
+    REQUIRE_FALSE(harness.assembler->Publish(&harness.error));
+    harness.RequireRejected(Rejection::kEncodingFailure);
+  }
+
+  SECTION("malformed corpus bytes reject before publication") {
+    Harness harness(MakeContinuousConfig());
+    harness.content.corpus = Bytes(128, 0x10);
+    reach_publication(&harness);
+    REQUIRE_FALSE(harness.assembler->Publish(&harness.error));
+    harness.RequireRejected(Rejection::kContentFailure);
+  }
+}
 TEST_CASE("session assembler holds three participants through mixed arrivals",
           "[guest-execution-session-assembler]") {
   Harness harness;

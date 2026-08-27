@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "third_party/catch/include/catch.hpp"
+#include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/guest_execution_continuous_event.h"
 
 namespace xe {
@@ -511,6 +512,141 @@ GuestExecutionSessionBundle MakePendingExternBundle(
   return bundle;
 }
 
+GuestExecutionSessionBundle MakeContinuousBundle(bool include_code = true,
+                                                 bool code_matches = true) {
+  GuestExecutionSessionBundle bundle;
+  const GuestExecutionSessionSha256 initial_state =
+      AddBlob(&bundle, Bytes(64, 0x10));
+  const GuestExecutionSessionSha256 final_state =
+      AddBlob(&bundle, Bytes(64, 0x20));
+  const std::vector<uint8_t> corpus_page = Bytes(JitCorpus::kPageSize, 0x30);
+  const std::vector<uint8_t> checkpoint_code =
+      code_matches ? corpus_page : Bytes(JitCorpus::kPageSize, 0x31);
+  GuestExecutionSessionSha256 code = {};
+  if (include_code) {
+    code = AddBlob(&bundle, checkpoint_code);
+  }
+  ExecutionJitCorpusBuilder builder(JitCorpus::kConfigGuestScheduler);
+  ExecutionJitCorpus::FunctionRecord function = {0x82000000, 0x820000FC, 64, 0};
+  std::vector<uint8_t> corpus_bytes;
+  std::string error;
+  REQUIRE(builder.AddCodePage(0x82000000, corpus_page.data(),
+                              corpus_page.size(), &error));
+  REQUIRE(builder.AddFunction(function, &error));
+  REQUIRE(builder.Encode(&corpus_bytes, &error));
+  const GuestExecutionSessionSha256 corpus =
+      AddBlob(&bundle, std::move(corpus_bytes));
+
+  constexpr uint64_t kEpoch = 0x123456789ABCDEF0ull;
+  GuestExecutionSessionCheckpointChunk initial;
+  initial.session_epoch = kEpoch;
+  initial.ordinal = 0;
+  initial.checkpoint.thread_states.push_back({0, 64, initial_state});
+  if (include_code) {
+    initial.checkpoint.content.push_back(
+        {GuestExecutionSessionContentKind::kGuestCode, 0x82000000,
+         JitCorpus::kPageSize, code});
+  }
+
+  GuestExecutionSessionCodeCorpusChunk code_corpus;
+  code_corpus.session_epoch = kEpoch;
+  code_corpus.ordinal = 1;
+  code_corpus.code_corpus_sha256 = corpus;
+
+  GuestExecutionSessionEventChunk events;
+  events.session_epoch = kEpoch;
+  events.ordinal = 2;
+  GuestExecutionSessionEvent begin;
+  begin.global_sequence = 1;
+  begin.thread_ordinal = 0;
+  begin.kind = GuestExecutionSessionEventKind::kOuterHostCallBegin;
+  begin.disposition =
+      GuestExecutionSessionEventDisposition::kValidateDeterministic;
+  events.events.push_back(begin);
+  GuestExecutionSessionEvent coverage = begin;
+  coverage.global_sequence = 2;
+  coverage.kind = GuestExecutionSessionEventKind::kInstructionCoverage;
+  coverage.guest_instruction_delta = 10;
+  events.events.push_back(coverage);
+  GuestExecutionSessionEvent request;
+  request.global_sequence = 3;
+  request.kind = GuestExecutionSessionEventKind::kBoundaryRequest;
+  events.events.push_back(request);
+  GuestExecutionSessionEvent arrival = begin;
+  arrival.global_sequence = 4;
+  arrival.kind = GuestExecutionSessionEventKind::kJitSafepointArrival;
+  events.events.push_back(arrival);
+  GuestExecutionSessionEvent held;
+  held.global_sequence = 5;
+  held.kind = GuestExecutionSessionEventKind::kBoundaryHeld;
+  events.events.push_back(held);
+
+  GuestExecutionSessionCheckpointChunk final_checkpoint;
+  final_checkpoint.session_epoch = kEpoch;
+  final_checkpoint.ordinal = 3;
+  final_checkpoint.checkpoint.global_sequence = 5;
+  final_checkpoint.checkpoint.thread_states.push_back({0, 64, final_state});
+  if (include_code) {
+    final_checkpoint.checkpoint.content = initial.checkpoint.content;
+  }
+
+  bundle.chunks.resize(4);
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      initial, &bundle.chunks[0], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCodeCorpusChunk(
+      code_corpus, &bundle.chunks[1], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
+      events, &bundle.chunks[2], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_checkpoint, &bundle.chunks[3], &error));
+
+  GuestExecutionSessionManifest& manifest = bundle.manifest;
+  manifest.session_epoch = kEpoch;
+  manifest.first_event_sequence = 1;
+  manifest.last_event_sequence = 5;
+  manifest.capture_start_tick = 100;
+  manifest.capture_end_tick = 500;
+  manifest.capture_tick_frequency = 1000000000;
+  manifest.capture_build_sha256 = IdentityDigest(0x10);
+  manifest.replay_config_sha256 = IdentityDigest(0x20);
+  manifest.title_identity_sha256 = IdentityDigest(0x30);
+  manifest.module_identity_sha256 = IdentityDigest(0x40);
+  manifest.accepted_event_count = 5;
+  manifest.stop_reason = GuestExecutionSessionStopReason::kManualRequest;
+  manifest.stop_request_event_sequence = 3;
+  manifest.stop_request_tick = 300;
+  manifest.stop_request_guest_instruction_count = 10;
+  manifest.maximum_stop_tail_event_count = 16;
+  manifest.maximum_stop_tail_guest_instruction_count = 64;
+  manifest.maximum_stop_tail_ticks = 1000;
+  GuestExecutionSessionParticipant participant;
+  participant.guest_thread_id = 7;
+  participant.capture_instance_id = 0x100;
+  participant.boundary_arrival_kind =
+      GuestExecutionSessionBoundaryArrivalKind::kJitSafepoint;
+  participant.first_event_sequence = 1;
+  participant.last_event_sequence = 4;
+  participant.held_after_event_sequence = 4;
+  participant.initial_state_size = 64;
+  participant.initial_state_sha256 = initial_state;
+  manifest.participants.push_back(participant);
+  manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                   bundle.chunks[0]));
+  manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCodeCorpus, 1, 0, 0, 1,
+                   bundle.chunks[1]));
+  manifest.chunks.push_back(ReferenceFor(
+      GuestExecutionSessionChunkKind::kEvents, 2, 1, 5, 5, bundle.chunks[2]));
+  manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 3, 5, 5, 1,
+                   bundle.chunks[3]));
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(manifest, bundle.chunks,
+                                                      &error));
+  std::reverse(bundle.content_blobs.begin(), bundle.content_blobs.end());
+  return bundle;
+}
+
 std::map<GuestExecutionSessionSha256, std::vector<uint8_t>> BlobMap(
     const GuestExecutionSessionBundle& bundle) {
   std::map<GuestExecutionSessionSha256, std::vector<uint8_t>> result;
@@ -552,6 +688,9 @@ std::filesystem::path ChunkName(
       break;
     case GuestExecutionSessionChunkKind::kContinuousEvents:
       kind = "continuous";
+      break;
+    case GuestExecutionSessionChunkKind::kCodeCorpus:
+      kind = "code-corpus";
       break;
     default:
       kind = "unknown";
@@ -767,6 +906,63 @@ TEST_CASE("session bundle closes a pending extern route to its exact event",
         static_cast<uint32_t>(second.size()), bundle.chunks[3]);
     CHECK_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
     CHECK_FALSE(error.empty());
+  }
+}
+
+TEST_CASE("continuous session bundle closes exact corpus code",
+          "[guest-execution-session-bundle]") {
+  std::string error;
+  GuestExecutionSessionBundle bundle = MakeContinuousBundle();
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+
+  SECTION("missing initial guest code rejects") {
+    bundle = MakeContinuousBundle(false);
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  }
+
+  SECTION("initial guest code differing from corpus rejects") {
+    bundle = MakeContinuousBundle(true, false);
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  }
+
+  SECTION("final guest code differing without a model rejects") {
+    const GuestExecutionSessionSha256 changed_code =
+        AddBlob(&bundle, Bytes(JitCorpus::kPageSize, 0x50));
+    GuestExecutionSessionCheckpointChunk final_checkpoint;
+    REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+        bundle.chunks.back(), &final_checkpoint, &error));
+    REQUIRE(final_checkpoint.checkpoint.content.size() == 1);
+    final_checkpoint.checkpoint.content[0].sha256 = changed_code;
+    REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+        final_checkpoint, &bundle.chunks.back(), &error));
+    bundle.manifest.chunks.back() = ReferenceFor(
+        GuestExecutionSessionChunkKind::kCheckpoint, final_checkpoint.ordinal,
+        final_checkpoint.checkpoint.global_sequence,
+        final_checkpoint.checkpoint.global_sequence, 1, bundle.chunks.back());
+    REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                        bundle.chunks, &error));
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  }
+
+  SECTION("final code page cannot be relabeled to bypass closure") {
+    const GuestExecutionSessionSha256 changed_code =
+        AddBlob(&bundle, Bytes(JitCorpus::kPageSize, 0x50));
+    GuestExecutionSessionCheckpointChunk final_checkpoint;
+    REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+        bundle.chunks.back(), &final_checkpoint, &error));
+    REQUIRE(final_checkpoint.checkpoint.content.size() == 1);
+    final_checkpoint.checkpoint.content[0].kind =
+        GuestExecutionSessionContentKind::kGuestPage;
+    final_checkpoint.checkpoint.content[0].sha256 = changed_code;
+    REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+        final_checkpoint, &bundle.chunks.back(), &error));
+    bundle.manifest.chunks.back() = ReferenceFor(
+        GuestExecutionSessionChunkKind::kCheckpoint, final_checkpoint.ordinal,
+        final_checkpoint.checkpoint.global_sequence,
+        final_checkpoint.checkpoint.global_sequence, 1, bundle.chunks.back());
+    REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                        bundle.chunks, &error));
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
   }
 }
 

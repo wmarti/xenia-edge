@@ -470,6 +470,7 @@ bool IsKnownChunkKind(GuestExecutionSessionChunkKind kind) {
     case GuestExecutionSessionChunkKind::kEvents:
     case GuestExecutionSessionChunkKind::kCheckpoint:
     case GuestExecutionSessionChunkKind::kContinuousEvents:
+    case GuestExecutionSessionChunkKind::kCodeCorpus:
       return true;
     default:
       return false;
@@ -685,6 +686,7 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
   bool has_checkpoint = false;
   bool has_continuous_events = false;
   uint64_t total_checkpoint_thread_states = 0;
+  uint32_t code_corpus_chunk_count = 0;
   uint64_t chunk_bytes = 0;
   for (size_t i = 0; i < manifest.chunks.size(); ++i) {
     const GuestExecutionSessionChunkReference& chunk = manifest.chunks[i];
@@ -707,6 +709,7 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
     if (chunk.kind == GuestExecutionSessionChunkKind::kEvents) {
       uint64_t expected_last = 0;
       if (has_continuous_events ||
+          (continuous_instruction_coverage && code_corpus_chunk_count != 1) ||
           chunk.record_count > limits.maximum_events_per_chunk ||
           chunk.first_event_sequence != next_event_sequence ||
           !CheckedAdd(chunk.first_event_sequence, chunk.record_count - 1,
@@ -718,7 +721,8 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
     } else if (chunk.kind ==
                GuestExecutionSessionChunkKind::kContinuousEvents) {
       uint64_t expected_last = 0;
-      if (i + 1 >= manifest.chunks.size() ||
+      if (i + 1 >= manifest.chunks.size() || next_event_sequence == 0 ||
+          next_event_sequence - 1 != manifest.last_event_sequence ||
           chunk.record_count > limits.maximum_events_per_chunk ||
           chunk.first_event_sequence != next_continuous_event_sequence ||
           !CheckedAdd(chunk.first_event_sequence, chunk.record_count - 1,
@@ -730,7 +734,7 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
             error, "manifest continuous event overlay is invalid or misplaced");
       }
       has_continuous_events = true;
-    } else {
+    } else if (chunk.kind == GuestExecutionSessionChunkKind::kCheckpoint) {
       if (!CheckedAdd(total_checkpoint_thread_states,
                       manifest.participants.size(),
                       &total_checkpoint_thread_states) ||
@@ -739,6 +743,7 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
           chunk.record_count != 1 ||
           chunk.first_event_sequence != chunk.last_event_sequence ||
           chunk.first_event_sequence != next_event_sequence - 1 ||
+          (i != 0 && i + 1 != manifest.chunks.size()) ||
           (has_continuous_events && i + 1 != manifest.chunks.size()) ||
           (has_checkpoint &&
            chunk.first_event_sequence <= previous_checkpoint_sequence)) {
@@ -746,6 +751,12 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
       }
       previous_checkpoint_sequence = chunk.first_event_sequence;
       has_checkpoint = true;
+    } else {
+      if (!continuous_instruction_coverage || i != 1 ||
+          chunk.record_count != 1 || chunk.first_event_sequence ||
+          chunk.last_event_sequence || ++code_corpus_chunk_count != 1) {
+        return Fail(error, "manifest session code corpus reference is invalid");
+      }
     }
   }
   if (manifest.chunks.front().kind !=
@@ -756,6 +767,7 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
       manifest.chunks.back().first_event_sequence !=
           manifest.last_event_sequence ||
       !has_checkpoint ||
+      code_corpus_chunk_count != (continuous_instruction_coverage ? 1u : 0u) ||
       next_event_sequence - 1 != manifest.last_event_sequence ||
       (has_continuous_events &&
        (next_continuous_event_sequence == 0 ||
@@ -1829,6 +1841,70 @@ bool GuestExecutionSessionCodec::DecodeCheckpointChunk(
   return true;
 }
 
+bool GuestExecutionSessionCodec::EncodeCodeCorpusChunk(
+    const GuestExecutionSessionCodeCorpusChunk& chunk,
+    std::vector<uint8_t>* output, std::string* error,
+    GuestExecutionSessionLimits limits) {
+  if (!output) {
+    return Fail(error, "code corpus chunk encoded output is null");
+  }
+  output->clear();
+  if (error) {
+    error->clear();
+  }
+  if (!chunk.session_epoch || !IsNonzeroHash(chunk.code_corpus_sha256)) {
+    return Fail(error, "code corpus chunk metadata is invalid");
+  }
+  Writer payload_writer(kCodeCorpusPayloadSize);
+  payload_writer.WriteBytes(chunk.code_corpus_sha256.data(),
+                            chunk.code_corpus_sha256.size());
+  EnvelopeMetadata metadata;
+  metadata.kind =
+      static_cast<uint32_t>(GuestExecutionSessionChunkKind::kCodeCorpus);
+  metadata.session_epoch = chunk.session_epoch;
+  metadata.ordinal = chunk.ordinal;
+  metadata.record_count = 1;
+  return EncodeEnvelope(metadata, payload_writer.TakeData(),
+                        limits.maximum_chunk_bytes, output, error);
+}
+
+bool GuestExecutionSessionCodec::DecodeCodeCorpusChunk(
+    const uint8_t* data, size_t data_size,
+    GuestExecutionSessionCodeCorpusChunk* output, std::string* error,
+    GuestExecutionSessionLimits limits) {
+  if (!output) {
+    return Fail(error, "code corpus chunk decoded output is null");
+  }
+  *output = {};
+  if (error) {
+    error->clear();
+  }
+  DecodedEnvelope envelope;
+  if (!DecodeEnvelope(
+          data, data_size,
+          static_cast<uint32_t>(GuestExecutionSessionChunkKind::kCodeCorpus),
+          limits.maximum_chunk_bytes, &envelope, error)) {
+    return false;
+  }
+  if (!envelope.metadata.session_epoch || envelope.metadata.record_count != 1 ||
+      envelope.metadata.first_event_sequence ||
+      envelope.metadata.last_event_sequence ||
+      envelope.payload_size != kCodeCorpusPayloadSize) {
+    return Fail(error, "code corpus envelope metadata is invalid");
+  }
+  GuestExecutionSessionCodeCorpusChunk chunk;
+  chunk.session_epoch = envelope.metadata.session_epoch;
+  chunk.ordinal = envelope.metadata.ordinal;
+  Reader reader(envelope.payload, envelope.payload_size);
+  if (!reader.ReadBytes(chunk.code_corpus_sha256.data(),
+                        chunk.code_corpus_sha256.size()) ||
+      reader.remaining() || !IsNonzeroHash(chunk.code_corpus_sha256)) {
+    return Fail(error, "code corpus payload is invalid");
+  }
+  *output = chunk;
+  return true;
+}
+
 bool GuestExecutionSessionCodec::ValidateSession(
     const GuestExecutionSessionManifest& manifest,
     const std::vector<std::vector<uint8_t>>& encoded_chunks, std::string* error,
@@ -1912,6 +1988,7 @@ bool GuestExecutionSessionCodec::ValidateSession(
            GuestExecutionSessionThreadStateReference>
       checkpoint_thread_states;
   std::vector<GuestExecutionSessionContentReference> initial_checkpoint_content;
+  bool saw_code_corpus = false;
 
   for (size_t i = 0; i < encoded_chunks.size(); ++i) {
     const GuestExecutionSessionChunkReference& reference = manifest.chunks[i];
@@ -2004,6 +2081,14 @@ bool GuestExecutionSessionCodec::ValidateSession(
                      !observed.outer_host_call_active) {
             return Fail(error,
                         "participant reaches a JIT arrival while outside");
+          }
+          if (continuous_instruction_coverage &&
+              event.kind ==
+                  GuestExecutionSessionEventKind::kInstructionCoverage &&
+              !observed.outer_host_call_active) {
+            return Fail(error,
+                        "continuous instruction coverage lies outside its "
+                        "participant outer guest call");
           }
           if (event.global_sequence > manifest.stop_request_event_sequence) {
             const bool jit_arrival =
@@ -2179,7 +2264,7 @@ bool GuestExecutionSessionCodec::ValidateSession(
       continuous_events.insert(continuous_events.end(),
                                std::make_move_iterator(decoded_events.begin()),
                                std::make_move_iterator(decoded_events.end()));
-    } else {
+    } else if (reference.kind == GuestExecutionSessionChunkKind::kCheckpoint) {
       GuestExecutionSessionCheckpointChunk chunk;
       if (!DecodeCheckpointChunk(encoded, &chunk, error, limits)) {
         return false;
@@ -2254,6 +2339,23 @@ bool GuestExecutionSessionCodec::ValidateSession(
       saw_initial_checkpoint |= chunk.checkpoint.global_sequence == 0;
       saw_final_checkpoint |=
           chunk.checkpoint.global_sequence == manifest.last_event_sequence;
+    } else {
+      GuestExecutionSessionCodeCorpusChunk chunk;
+      if (!DecodeCodeCorpusChunk(encoded, &chunk, error, limits)) {
+        return false;
+      }
+      GuestExecutionSessionChunkReference derived;
+      derived.kind = GuestExecutionSessionChunkKind::kCodeCorpus;
+      derived.ordinal = chunk.ordinal;
+      derived.record_count = 1;
+      derived.encoded_size = encoded.size();
+      derived.encoded_sha256 = HashBytes(encoded);
+      if (chunk.session_epoch != manifest.session_epoch ||
+          derived != reference || saw_code_corpus) {
+        return Fail(error,
+                    "code corpus chunk does not match its manifest reference");
+      }
+      saw_code_corpus = true;
     }
   }
 
@@ -2355,7 +2457,8 @@ bool GuestExecutionSessionCodec::ValidateSession(
 
   if (supplied_chunk_bytes != manifest_chunk_bytes || !segment_starts.empty() ||
       !segment_ends.empty() || !saw_initial_checkpoint ||
-      !saw_final_checkpoint) {
+      !saw_final_checkpoint ||
+      saw_code_corpus != continuous_instruction_coverage) {
     return Fail(error,
                 "session chunk closure or segment coverage is incomplete");
   }

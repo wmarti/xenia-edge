@@ -138,6 +138,7 @@ struct SessionFixture {
   GuestExecutionSessionEventChunk events;
   GuestExecutionSessionCheckpointChunk initial_checkpoint;
   GuestExecutionSessionCheckpointChunk final_checkpoint;
+  GuestExecutionSessionCodeCorpusChunk code_corpus;
   std::vector<std::vector<uint8_t>> chunks;
   std::vector<uint8_t> encoded_manifest;
 };
@@ -207,16 +208,68 @@ SessionFixture MakeSessionFixture() {
 }
 
 void ReplaceEventChunk(SessionFixture* fixture) {
+  const auto reference = std::find_if(
+      fixture->manifest.chunks.begin(), fixture->manifest.chunks.end(),
+      [](const GuestExecutionSessionChunkReference& chunk) {
+        return chunk.kind == GuestExecutionSessionChunkKind::kEvents;
+      });
+  REQUIRE(reference != fixture->manifest.chunks.end());
+  const size_t index =
+      static_cast<size_t>(reference - fixture->manifest.chunks.begin());
+  fixture->events.ordinal = static_cast<uint32_t>(index);
   std::string error;
   REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
-      fixture->events, &fixture->chunks[1], &error));
-  fixture->manifest.chunks[1] = ReferenceFor(
+      fixture->events, &fixture->chunks[index], &error));
+  fixture->manifest.chunks[index] = ReferenceFor(
       GuestExecutionSessionChunkKind::kEvents, fixture->events.ordinal,
       fixture->events.events.front().global_sequence,
       fixture->events.events.back().global_sequence,
-      static_cast<uint32_t>(fixture->events.events.size()), fixture->chunks[1]);
+      static_cast<uint32_t>(fixture->events.events.size()),
+      fixture->chunks[index]);
 }
 
+SessionFixture MakeContinuousSessionFixture() {
+  SessionFixture fixture = MakeSessionFixture();
+  fixture.events.events[0].kind =
+      GuestExecutionSessionEventKind::kOuterHostCallBegin;
+  fixture.events.events[5].kind =
+      GuestExecutionSessionEventKind::kOuterHostCallEnd;
+  fixture.manifest.accepted_segment_count = 0;
+  fixture.manifest.stop_request_accepted_segment_count = 0;
+  fixture.manifest.segments.clear();
+  fixture.code_corpus.session_epoch = fixture.manifest.session_epoch;
+  fixture.code_corpus.ordinal = 1;
+  fixture.code_corpus.code_corpus_sha256 = Digest(0x70);
+  fixture.events.ordinal = 2;
+  fixture.final_checkpoint.ordinal = 3;
+  std::string error;
+  std::vector<std::vector<uint8_t>> chunks(4);
+  chunks[0] = std::move(fixture.chunks[0]);
+  REQUIRE(GuestExecutionSessionCodec::EncodeCodeCorpusChunk(
+      fixture.code_corpus, &chunks[1], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(fixture.events,
+                                                       &chunks[2], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      fixture.final_checkpoint, &chunks[3], &error));
+  fixture.chunks = std::move(chunks);
+  fixture.manifest.chunks.clear();
+  fixture.manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                   fixture.chunks[0]));
+  fixture.manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCodeCorpus, 1, 0, 0, 1,
+                   fixture.chunks[1]));
+  fixture.manifest.chunks.push_back(ReferenceFor(
+      GuestExecutionSessionChunkKind::kEvents, 2, 1, 8, 8, fixture.chunks[2]));
+  fixture.manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 3, 8, 8, 1,
+                   fixture.chunks[3]));
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(fixture.manifest,
+                                                      fixture.chunks, &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeManifest(
+      fixture.manifest, &fixture.encoded_manifest, &error));
+  return fixture;
+}
 void ExtendHeldBoundary(SessionFixture* fixture,
                         GuestExecutionSessionEvent tail_event) {
   REQUIRE(fixture->events.events.back().kind ==
@@ -560,6 +613,133 @@ TEST_CASE("Guest execution session metadata round trips and binds all chunks",
                                                     fixture.chunks, &error));
 }
 
+TEST_CASE("Continuous session shape is inferred from canonical contents",
+          "[cpu]") {
+  std::string error;
+
+  SECTION("valid zero-segment coverage round trips") {
+    SessionFixture fixture = MakeContinuousSessionFixture();
+    GuestExecutionSessionManifest decoded;
+    REQUIRE(GuestExecutionSessionCodec::DecodeManifest(fixture.encoded_manifest,
+                                                       &decoded, &error));
+    REQUIRE(decoded == fixture.manifest);
+    REQUIRE(GuestExecutionSessionCodec::ValidateSession(decoded, fixture.chunks,
+                                                        &error));
+    GuestExecutionSessionCodeCorpusChunk decoded_corpus;
+    REQUIRE(GuestExecutionSessionCodec::DecodeCodeCorpusChunk(
+        fixture.chunks[1], &decoded_corpus, &error));
+    REQUIRE(decoded_corpus == fixture.code_corpus);
+  }
+
+  SECTION("continuous version 2 without a corpus chunk fails closed") {
+    SessionFixture fixture = MakeContinuousSessionFixture();
+    fixture.chunks.erase(fixture.chunks.begin() + 1);
+    fixture.manifest.chunks.erase(fixture.manifest.chunks.begin() + 1);
+    fixture.events.ordinal = 1;
+    fixture.final_checkpoint.ordinal = 2;
+    REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
+        fixture.events, &fixture.chunks[1], &error));
+    REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+        fixture.final_checkpoint, &fixture.chunks[2], &error));
+    fixture.manifest.chunks[1] = ReferenceFor(
+        GuestExecutionSessionChunkKind::kEvents, 1, 1, 8, 8, fixture.chunks[1]);
+    fixture.manifest.chunks[2] =
+        ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 2, 8, 8, 1,
+                     fixture.chunks[2]);
+    REQUIRE_FALSE(GuestExecutionSessionCodec::ValidateSession(
+        fixture.manifest, fixture.chunks, &error));
+  }
+
+  SECTION("coverage without an outer guest call rejects") {
+    SessionFixture fixture = MakeContinuousSessionFixture();
+    MakeEventCanonicalWithoutPayload(&fixture.events.events[0]);
+    fixture.events.events[0].kind =
+        GuestExecutionSessionEventKind::kSynchronization;
+    MakeEventCanonicalWithoutPayload(&fixture.events.events[5]);
+    fixture.events.events[5].kind =
+        GuestExecutionSessionEventKind::kSynchronization;
+    ReplaceEventChunk(&fixture);
+    REQUIRE_FALSE(GuestExecutionSessionCodec::ValidateSession(
+        fixture.manifest, fixture.chunks, &error));
+  }
+
+  SECTION("coverage before its outer guest call rejects") {
+    SessionFixture fixture = MakeContinuousSessionFixture();
+    MakeEventCanonicalWithoutPayload(&fixture.events.events[0]);
+    fixture.events.events[0].kind =
+        GuestExecutionSessionEventKind::kInstructionCoverage;
+    fixture.events.events[0].guest_instruction_delta = 10;
+    MakeEventCanonicalWithoutPayload(&fixture.events.events[3]);
+    fixture.events.events[3].kind =
+        GuestExecutionSessionEventKind::kOuterHostCallBegin;
+    ReplaceEventChunk(&fixture);
+    REQUIRE_FALSE(GuestExecutionSessionCodec::ValidateSession(
+        fixture.manifest, fixture.chunks, &error));
+  }
+
+  SECTION("coverage after its outer guest call rejects") {
+    SessionFixture fixture = MakeContinuousSessionFixture();
+    MakeEventCanonicalWithoutPayload(&fixture.events.events[3]);
+    fixture.events.events[3].kind =
+        GuestExecutionSessionEventKind::kOuterHostCallEnd;
+    MakeEventCanonicalWithoutPayload(&fixture.events.events[5]);
+    fixture.events.events[5].kind =
+        GuestExecutionSessionEventKind::kInstructionCoverage;
+    fixture.events.events[5].guest_instruction_delta = 10;
+    ReplaceEventChunk(&fixture);
+    REQUIRE_FALSE(GuestExecutionSessionCodec::ValidateSession(
+        fixture.manifest, fixture.chunks, &error));
+  }
+
+  SECTION("coverage in a seeded active outer guest call is valid") {
+    SessionFixture fixture = MakeContinuousSessionFixture();
+    fixture.manifest.participants[0].initial_outer_call_state =
+        GuestExecutionSessionInitialOuterCallState::kActive;
+    MakeEventCanonicalWithoutPayload(&fixture.events.events[0]);
+    fixture.events.events[0].kind =
+        GuestExecutionSessionEventKind::kSynchronization;
+    ReplaceEventChunk(&fixture);
+    REQUIRE(GuestExecutionSessionCodec::ValidateSession(
+        fixture.manifest, fixture.chunks, &error));
+  }
+
+  SECTION("participant events without timed instruction progress reject") {
+    SessionFixture fixture = MakeContinuousSessionFixture();
+    GuestExecutionSessionEvent& coverage = fixture.events.events[3];
+    coverage.kind = GuestExecutionSessionEventKind::kSynchronization;
+    coverage.guest_instruction_delta = 0;
+    fixture.manifest.stop_request_guest_instruction_count = 0;
+    ReplaceEventChunk(&fixture);
+    REQUIRE_FALSE(GuestExecutionSessionCodec::ValidateSession(
+        fixture.manifest, fixture.chunks, &error));
+  }
+
+  SECTION("segment control without a segment reference rejects") {
+    SessionFixture fixture = MakeContinuousSessionFixture();
+    fixture.events.events[0].kind =
+        GuestExecutionSessionEventKind::kSegmentBegin;
+    ReplaceEventChunk(&fixture);
+    REQUIRE_FALSE(GuestExecutionSessionCodec::ValidateSession(
+        fixture.manifest, fixture.chunks, &error));
+  }
+
+  SECTION("segment-count boundary is illegal without segments") {
+    SessionFixture fixture = MakeContinuousSessionFixture();
+    fixture.manifest.boundary.kind =
+        GuestExecutionSessionBoundaryKind::kSegmentCount;
+    fixture.manifest.boundary.value = 1;
+    fixture.manifest.stop_reason =
+        GuestExecutionSessionStopReason::kRequestedBoundary;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::ValidateSession(
+        fixture.manifest, fixture.chunks, &error));
+  }
+
+  SECTION("legacy segmented fixture remains valid") {
+    SessionFixture fixture = MakeSessionFixture();
+    REQUIRE(GuestExecutionSessionCodec::ValidateSession(
+        fixture.manifest, fixture.chunks, &error));
+  }
+}
 TEST_CASE("Guest execution boundary proofs round trip and validate", "[cpu]") {
   SECTION("manual stop between events") {
     CheckBoundaryFixtureValid(MakeSessionFixture());

@@ -21,6 +21,8 @@
 #include <string_view>
 #include <utility>
 
+#include "xenia/cpu/execution_jit_corpus.h"
+
 namespace xe {
 namespace cpu {
 
@@ -550,6 +552,23 @@ struct GuestExecutionSessionAssembler::Impl {
         checkpoint.global_sequence, 1, std::move(encoded));
   }
 
+  bool EncodeCodeCorpusChunkLocked(
+      const GuestExecutionSessionSha256& corpus_digest) {
+    GuestExecutionSessionCodeCorpusChunk chunk;
+    chunk.session_epoch = config.session_epoch;
+    chunk.ordinal = static_cast<uint32_t>(chunk_references.size());
+    chunk.code_corpus_sha256 = corpus_digest;
+    std::vector<uint8_t> encoded;
+    std::string error;
+    if (!GuestExecutionSessionCodec::EncodeCodeCorpusChunk(
+            chunk, &encoded, &error, config.bundle_limits.session)) {
+      RejectLocked(Rejection::kEncodingFailure, error);
+      return false;
+    }
+    return AddEncodedChunkLocked(GuestExecutionSessionChunkKind::kCodeCorpus, 0,
+                                 0, 1, std::move(encoded));
+  }
+
   bool CollectSessionCodeCorpusLocked(GuestExecutionSessionSha256* digest) {
     const State expected_state = state;
     std::vector<uint8_t> corpus;
@@ -560,6 +579,12 @@ struct GuestExecutionSessionAssembler::Impl {
       return false;
     }
     if (state != expected_state) {
+      return false;
+    }
+    ExecutionJitCorpus decoded_corpus;
+    if (!ExecutionJitCorpus::Decode(corpus, &decoded_corpus, &error)) {
+      RejectLocked(Rejection::kContentFailure,
+                   "capture session code corpus is invalid: " + error);
       return false;
     }
     uint64_t size = 0;
@@ -923,7 +948,9 @@ struct GuestExecutionSessionAssembler::Impl {
         !CollectContentLocked(true, &initial.content) ||
         !CollectContentLocked(false, &final_checkpoint.content) ||
         !CollectSessionCodeCorpusLocked(&corpus_digest) ||
-        !EncodeCheckpointChunkLocked(initial) || !EncodeEventChunksLocked() ||
+        !EncodeCheckpointChunkLocked(initial) ||
+        (segments.empty() && !EncodeCodeCorpusChunkLocked(corpus_digest)) ||
+        !EncodeEventChunksLocked() ||
         !EncodeCheckpointChunkLocked(final_checkpoint)) {
       return false;
     }
@@ -940,9 +967,8 @@ struct GuestExecutionSessionAssembler::Impl {
     pending_events.clear();
     std::string error;
     std::vector<uint8_t> manifest_bytes;
-    if (!GuestExecutionSessionCodec::ValidateSession(
-            bundle->manifest, bundle->chunks, &error,
-            config.bundle_limits.session) ||
+    if (!ValidateGuestExecutionSessionBundle(*bundle, &error,
+                                             config.bundle_limits) ||
         !GuestExecutionSessionCodec::EncodeManifest(
             bundle->manifest, &manifest_bytes, &error,
             config.bundle_limits.session)) {

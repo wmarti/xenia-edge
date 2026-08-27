@@ -92,6 +92,11 @@ enum class GuestExecutionSessionChunkKind : uint32_t {
   // dispositions; session validation requires both views to agree exactly on
   // every global sequence and event kind.
   kContinuousEvents = 4,
+  // A session-level reference to the exact execution JIT corpus blob. Version
+  // 2 continuous sessions require exactly one immediately after the initial
+  // checkpoint. Segmented version-2 sessions continue to bind their corpus
+  // through each segment reference and reject this extension.
+  kCodeCorpus = 5,
 };
 
 enum class GuestExecutionSessionEventKind : uint32_t {
@@ -322,6 +327,19 @@ struct GuestExecutionSessionCheckpointChunk {
   bool operator==(const GuestExecutionSessionCheckpointChunk&) const = default;
 };
 
+// The corpus bytes remain a separately stored content-addressed blob. This
+// envelope makes that blob part of the canonical continuous-session chunk
+// closure without changing the version-2 manifest wire layout. Readers that
+// predate this chunk kind reject it as unsupported; current readers reject a
+// zero-segment version-2 session that omits it.
+struct GuestExecutionSessionCodeCorpusChunk {
+  uint64_t session_epoch = 0;
+  uint32_t ordinal = 0;
+  GuestExecutionSessionSha256 code_corpus_sha256 = {};
+
+  bool operator==(const GuestExecutionSessionCodeCorpusChunk&) const = default;
+};
+
 // Decoder limits are caller-selectable so capture policy can be stricter than
 // the format maxima and tests can prove that limits reject rather than slice.
 struct GuestExecutionSessionLimits {
@@ -360,6 +378,7 @@ class GuestExecutionSessionCodec {
   static constexpr uint32_t kCheckpointPayloadHeaderSize = 16;
   static constexpr uint32_t kThreadStateReferenceSize = 48;
   static constexpr uint32_t kContentReferenceSize = 56;
+  static constexpr uint32_t kCodeCorpusPayloadSize = 32;
   static constexpr uint32_t kGuestPageSize = 4096;
 
   static GuestExecutionSessionSha256 HashBytes(const uint8_t* data,
@@ -412,6 +431,22 @@ class GuestExecutionSessionCodec {
       GuestExecutionSessionCheckpointChunk* output,
       std::string* error = nullptr, GuestExecutionSessionLimits limits = {}) {
     return DecodeCheckpointChunk(data.data(), data.size(), output, error,
+                                 limits);
+  }
+
+  static bool EncodeCodeCorpusChunk(
+      const GuestExecutionSessionCodeCorpusChunk& chunk,
+      std::vector<uint8_t>* output, std::string* error = nullptr,
+      GuestExecutionSessionLimits limits = {});
+  static bool DecodeCodeCorpusChunk(
+      const uint8_t* data, size_t data_size,
+      GuestExecutionSessionCodeCorpusChunk* output,
+      std::string* error = nullptr, GuestExecutionSessionLimits limits = {});
+  static bool DecodeCodeCorpusChunk(
+      const std::vector<uint8_t>& data,
+      GuestExecutionSessionCodeCorpusChunk* output,
+      std::string* error = nullptr, GuestExecutionSessionLimits limits = {}) {
+    return DecodeCodeCorpusChunk(data.data(), data.size(), output, error,
                                  limits);
   }
 

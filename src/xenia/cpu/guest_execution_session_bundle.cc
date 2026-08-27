@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "xenia/base/platform.h"
+#include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/guest_execution_continuous_event.h"
 
 #if XE_PLATFORM_MAC
@@ -103,6 +104,9 @@ std::filesystem::path ChunkFileName(
       break;
     case GuestExecutionSessionChunkKind::kContinuousEvents:
       kind = "continuous";
+      break;
+    case GuestExecutionSessionChunkKind::kCodeCorpus:
+      kind = "code-corpus";
       break;
     default:
       kind = "unknown";
@@ -354,7 +358,8 @@ bool CollectRequiredBlobs(
     } else if (manifest.chunks[i].kind ==
                GuestExecutionSessionChunkKind::kContinuousEvents) {
       continue;
-    } else {
+    } else if (manifest.chunks[i].kind ==
+               GuestExecutionSessionChunkKind::kCheckpoint) {
       GuestExecutionSessionCheckpointChunk chunk;
       if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
               chunks[i], &chunk, error, limits.session)) {
@@ -373,6 +378,14 @@ bool CollectRequiredBlobs(
                              requirements, error)) {
           return false;
         }
+      }
+    } else {
+      GuestExecutionSessionCodeCorpusChunk chunk;
+      if (!GuestExecutionSessionCodec::DecodeCodeCorpusChunk(
+              chunks[i], &chunk, error, limits.session) ||
+          !AddRequiredBlob(chunk.code_corpus_sha256, false, 0, requirements,
+                           error)) {
+        return false;
       }
     }
   }
@@ -430,6 +443,86 @@ bool ValidateContinuousCheckpointBlobs(
   return true;
 }
 
+bool ValidateContinuousCodeClosure(
+    const GuestExecutionSessionBundle& bundle,
+    const std::map<GuestExecutionSessionSha256,
+                   const GuestExecutionSessionContentBlob*>& blobs,
+    const GuestExecutionSessionLimits& limits, std::string* error) {
+  if (!bundle.manifest.segments.empty()) {
+    return true;
+  }
+
+  GuestExecutionSessionCheckpointChunk initial;
+  GuestExecutionSessionCheckpointChunk final_checkpoint;
+  GuestExecutionSessionCodeCorpusChunk corpus_reference;
+  if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
+          bundle.chunks.front(), &initial, error, limits) ||
+      !GuestExecutionSessionCodec::DecodeCodeCorpusChunk(
+          bundle.chunks[1], &corpus_reference, error, limits) ||
+      !GuestExecutionSessionCodec::DecodeCheckpointChunk(
+          bundle.chunks.back(), &final_checkpoint, error, limits)) {
+    return false;
+  }
+  const auto corpus_blob = blobs.find(corpus_reference.code_corpus_sha256);
+  if (corpus_blob == blobs.end()) {
+    return Fail(error, "continuous session code corpus blob is missing");
+  }
+  ExecutionJitCorpus corpus;
+  std::string corpus_error;
+  if (!ExecutionJitCorpus::Decode(corpus_blob->second->bytes, &corpus,
+                                  &corpus_error)) {
+    return Fail(error,
+                "continuous session code corpus is invalid: " + corpus_error);
+  }
+
+  std::map<uint64_t, GuestExecutionSessionContentReference> initial_code;
+  for (const GuestExecutionSessionContentReference& content :
+       initial.checkpoint.content) {
+    if (content.kind == GuestExecutionSessionContentKind::kGuestCode) {
+      initial_code.emplace(content.guest_address, content);
+    }
+  }
+  if (initial_code.empty() ||
+      initial_code.size() != corpus.page_addresses().size()) {
+    return Fail(error,
+                "continuous initial checkpoint does not close the exact code "
+                "corpus pages");
+  }
+  size_t page_index = 0;
+  for (const auto& [guest_address, content] : initial_code) {
+    const uint32_t corpus_page = corpus.page_addresses()[page_index++];
+    const auto code_blob = blobs.find(content.sha256);
+    const uint8_t* corpus_bytes = corpus.FindPageData(corpus_page);
+    if (guest_address != corpus_page ||
+        content.byte_size != JitCorpus::kPageSize || code_blob == blobs.end() ||
+        !corpus_bytes ||
+        !std::equal(code_blob->second->bytes.cbegin(),
+                    code_blob->second->bytes.cend(), corpus_bytes)) {
+      return Fail(error,
+                  "continuous initial guest code differs from its exact "
+                  "corpus");
+    }
+  }
+
+  // The final checkpoint is sparse. Any final code record therefore names a
+  // dirtied range, and must still match its initial corpus-bound page until a
+  // self-modifying-code event model is added.
+  for (const GuestExecutionSessionContentReference& content :
+       final_checkpoint.checkpoint.content) {
+    const auto initial_it = initial_code.find(content.guest_address);
+    if (content.kind != GuestExecutionSessionContentKind::kGuestCode &&
+        initial_it == initial_code.end()) {
+      continue;
+    }
+    if (initial_it == initial_code.end() || initial_it->second != content) {
+      return Fail(error,
+                  "continuous final guest code differs without an explicit "
+                  "code-mutation model");
+    }
+  }
+  return true;
+}
+
 bool ValidateBundle(const GuestExecutionSessionBundle& bundle,
                     const GuestExecutionSessionBundleLimits& limits,
                     ValidatedBundle* output, std::string* error) {
@@ -480,7 +573,9 @@ bool ValidateBundle(const GuestExecutionSessionBundle& bundle,
       return Fail(error, "session bundle blob reference is not satisfied");
     }
   }
-  if (!ValidateContinuousCheckpointBlobs(bundle, limits, *output, error)) {
+  if (!ValidateContinuousCheckpointBlobs(bundle, limits, *output, error) ||
+      !ValidateContinuousCodeClosure(bundle, output->blobs, limits.session,
+                                     error)) {
     return false;
   }
 
