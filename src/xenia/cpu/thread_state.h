@@ -12,8 +12,13 @@
 
 #include <cstdint>
 #include <string>
+#include <type_traits>
 #include <vector>
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/guest_execution_capture.h"
+#endif
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/memory.h"
@@ -42,6 +47,10 @@ class ThreadState {
   ThreadState(Processor* processor, uint32_t thread_id, uint32_t stack_base = 0,
               uint32_t pcr_address = 0);
   ~ThreadState();
+  ThreadState(const ThreadState&) = delete;
+  ThreadState& operator=(const ThreadState&) = delete;
+  ThreadState(ThreadState&&) = delete;
+  ThreadState& operator=(ThreadState&&) = delete;
 
   Processor* processor() const { return processor_; }
   Memory* memory() const { return memory_; }
@@ -55,6 +64,12 @@ class ThreadState {
   uint64_t guest_execution_capture_instance_id() const {
     return guest_execution_capture_instance_id_;
   }
+
+  // Every direct ThreadState owner must call this exactly once after all PPC
+  // context and owner metadata is initialized, and before exposing or running
+  // the thread. Destruction while still pending is valid for failed setup.
+  GuestExecutionCaptureThreadStateLifecycleDisposition
+  PublishGuestExecutionCaptureReady() noexcept;
 #endif
 
   static void Bind(ThreadState* thread_state);
@@ -64,6 +79,8 @@ class ThreadState {
   FunctionTraceState& function_trace_state() { return function_trace_state_; }
 
  private:
+  friend class Processor;
+
   Processor* processor_;
   Memory* memory_;
   void* backend_data_;
@@ -73,6 +90,10 @@ class ThreadState {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   uint64_t guest_execution_capture_instance_id_ = 0;
+  GuestExecutionCaptureThreadStateLifecycleState
+      guest_execution_capture_lifecycle_state_ =
+          GuestExecutionCaptureThreadStateLifecycleState::kPending;
+  ThreadState* guest_execution_capture_next_ = nullptr;
 #endif
 
   FunctionTraceState function_trace_state_;
@@ -80,6 +101,11 @@ class ThreadState {
   // NOTE: must be 64b aligned for SSE ops.
   ppc::PPCContext* context_;
 };
+
+static_assert(!std::is_copy_constructible_v<ThreadState>);
+static_assert(!std::is_copy_assignable_v<ThreadState>);
+static_assert(!std::is_move_constructible_v<ThreadState>);
+static_assert(!std::is_move_assignable_v<ThreadState>);
 
 }  // namespace cpu
 }  // namespace xe

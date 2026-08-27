@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace xe {
@@ -32,6 +33,63 @@ struct GuestExecutionCaptureParticipantIdentity {
 
   bool operator==(const GuestExecutionCaptureParticipantIdentity&) const =
       default;
+};
+
+enum class GuestExecutionCaptureThreadStateLifecycleState : uint8_t {
+  kPending,
+  kReady,
+  kDestroying,
+};
+
+struct GuestExecutionCaptureThreadStateLifecycleEvent {
+  GuestExecutionCaptureParticipantIdentity participant;
+  GuestExecutionCaptureThreadStateLifecycleState state =
+      GuestExecutionCaptureThreadStateLifecycleState::kPending;
+
+  bool operator==(const GuestExecutionCaptureThreadStateLifecycleEvent&) const =
+      default;
+};
+
+enum class GuestExecutionCaptureThreadStateLifecycleDisposition : uint8_t {
+  kAccept,
+  kReject,
+};
+
+enum class GuestExecutionCaptureThreadStateRegistryRejection : uint8_t {
+  kNone,
+  kObserverRejectedRuntimeEvent,
+  kInvalidReadyTransition,
+  kDuplicateRegistration,
+  kMissingRegistration,
+  kInvalidDestroyTransition,
+  kObserverCallbackReentry,
+};
+
+struct GuestExecutionCaptureThreadStateRegistrySnapshot {
+  GuestExecutionCaptureThreadStateRegistryRejection rejection =
+      GuestExecutionCaptureThreadStateRegistryRejection::kNone;
+  std::vector<GuestExecutionCaptureThreadStateLifecycleEvent> participants;
+
+  bool all_ready() const {
+    if (rejection != GuestExecutionCaptureThreadStateRegistryRejection::kNone) {
+      return false;
+    }
+    for (const auto& participant : participants) {
+      if (participant.state !=
+          GuestExecutionCaptureThreadStateLifecycleState::kReady) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
+
+enum class GuestExecutionCaptureThreadStateVisitResult : uint8_t {
+  kCompleted,
+  kStoppedByVisitor,
+  kParticipantNotReady,
+  kRegistryRejected,
+  kObserverCallbackReentry,
 };
 
 struct GuestExecutionCaptureHostCallToken {
@@ -80,14 +138,50 @@ struct GuestExecutionCaptureHostCallRosterSnapshot {
   std::vector<GuestExecutionCaptureActiveHostCall> active_calls;
 };
 
-// Capture-build-only observer for generic host-to-guest dispatches. Processor
-// registration is shared-owned by Processor. Implementations must serialize
+// Provides scoped access to ready ThreadState objects while Processor holds
+// the capture-only lifetime registry lock. Implementations must not retain the
+// reference or call back into Processor. Returning false stops the visit.
+class GuestExecutionCaptureThreadStateVisitor {
+ public:
+  virtual ~GuestExecutionCaptureThreadStateVisitor() = default;
+
+  virtual bool VisitThreadState(const ThreadState& thread_state) noexcept = 0;
+};
+
+// Capture-build-only observer for generic host-to-guest dispatches. Install one
+// continuous observer before title dispatch and arm/disarm capture internally;
+// Processor permanently rejects later attachment after the first dispatch.
+// Registration is shared-owned by Processor. Implementations must serialize
 // their own state, and callbacks must not retain the Function or ThreadState
 // references. The token is runtime-local pairing metadata, never a durable
 // session sequence.
 class GuestExecutionCaptureHostCallObserver {
  public:
   virtual ~GuestExecutionCaptureHostCallObserver() = default;
+
+  // Processor serializes lifecycle events with its ThreadState registry.
+  // Attachment first pre-validates that every existing lifetime is ready, then
+  // offers the entire kReady roster in one transaction. An implementation must
+  // either accept and commit the whole span, or reject it without changing its
+  // state. The span is callback-scoped and must not be retained. Runtime
+  // registration, publication and destruction produce individual kPending,
+  // kReady and kDestroying events respectively. No observer callback may call
+  // Processor or any capture-registry API. Implementations must not retain host
+  // references. A rejected seed prevents installation; a rejected runtime
+  // event is latched by Processor while the observer remains attached for
+  // active-call cleanup.
+  virtual GuestExecutionCaptureThreadStateLifecycleDisposition
+  OnThreadStateSeed(
+      std::span<
+          const GuestExecutionCaptureThreadStateLifecycleEvent>) noexcept {
+    return GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept;
+  }
+
+  virtual GuestExecutionCaptureThreadStateLifecycleDisposition
+  OnThreadStateLifecycle(
+      GuestExecutionCaptureThreadStateLifecycleEvent) noexcept {
+    return GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept;
+  }
 
   virtual GuestExecutionCaptureHostCallToken OnHostGuestCallBegin(
       const ThreadState& thread_state, const GuestFunction& function,
@@ -97,8 +191,9 @@ class GuestExecutionCaptureHostCallObserver {
       const GuestFunction& function,
       GuestExecutionCaptureHostCallOutcome outcome) noexcept = 0;
 
-  // Detachment is permitted only after every successfully begun call has
-  // ended. Processor retains the observer if a detach attempt races a call.
+  // Detachment is permitted only before the first generic host-to-guest
+  // dispatch. After that, Processor retains the observer through teardown;
+  // continuous capture arms and disarms within this permanent observer.
   virtual bool CanDetach() const noexcept = 0;
 };
 

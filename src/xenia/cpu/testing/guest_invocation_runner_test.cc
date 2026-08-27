@@ -18,12 +18,29 @@
 
 #include "xenia/base/memory.h"
 #include "xenia/base/platform.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/guest_execution_capture.h"
+#include "xenia/cpu/processor.h"
+#endif
 #include "xenia/cpu/testing/util.h"
 
 #include "third_party/catch/include/catch.hpp"
 
 namespace xe {
 namespace cpu {
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+class GuestInvocationRunnerTestAccess final {
+ public:
+  static GuestExecutionCaptureThreadStateRegistrySnapshot QueryParticipants(
+      const GuestInvocationRunner& runner) {
+    return runner.processor_->QueryGuestExecutionCaptureParticipants();
+  }
+};
+#endif
+
 namespace test {
 
 namespace {
@@ -530,6 +547,17 @@ TEST_CASE("guest invocation runner executes and verifies a real backend",
 #else
   REQUIRE(runner);
   REQUIRE(error.empty());
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  const GuestExecutionCaptureThreadStateRegistrySnapshot prewarm_snapshot =
+      GuestInvocationRunnerTestAccess::QueryParticipants(*runner);
+  REQUIRE(prewarm_snapshot.rejection ==
+          GuestExecutionCaptureThreadStateRegistryRejection::kNone);
+  REQUIRE(prewarm_snapshot.participants.size() == 1);
+  REQUIRE(prewarm_snapshot.all_ready());
+  REQUIRE(prewarm_snapshot.participants[0].participant.guest_thread_id ==
+          0x100u);
+#endif
   REQUIRE(runner->WarmAndVerify(&error));
   REQUIRE(error.empty());
 

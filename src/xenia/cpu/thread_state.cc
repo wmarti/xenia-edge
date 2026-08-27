@@ -142,9 +142,23 @@ ThreadState::ThreadState(Processor* processor, uint32_t thread_id,
   // we have way more than 32 vrs, but setting it to all ones seems closer to
   // correct than 0
   context_->vrsave = ~0u;
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Register only after the PPC and backend contexts are fully initialized so
+  // a locked visitor always sees a complete ThreadState.
+  processor_->RegisterGuestExecutionCaptureThreadState(*this);
+#endif
 }
 
 ThreadState::~ThreadState() {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Publish destruction before invalidating anything a locked capture visitor
+  // may inspect, but remain registered until all Processor-backed cleanup is
+  // complete so Processor teardown cannot race it.
+  processor_->BeginGuestExecutionCaptureThreadStateDestruction(*this);
+#endif
   if (backend_data_) {
     processor_->backend()->FreeThreadData(backend_data_);
   }
@@ -157,7 +171,19 @@ ThreadState::~ThreadState() {
     processor_->backend()->DeinitializeBackendContext(context_);
     FreeContext(reinterpret_cast<void*>(context_));
   }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  processor_->CompleteGuestExecutionCaptureThreadStateDestruction(*this);
+#endif
 }
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+GuestExecutionCaptureThreadStateLifecycleDisposition
+ThreadState::PublishGuestExecutionCaptureReady() noexcept {
+  return processor_->PublishGuestExecutionCaptureThreadStateReady(*this);
+}
+#endif
 
 void ThreadState::Bind(ThreadState* thread_state) {
   thread_state_ = thread_state;

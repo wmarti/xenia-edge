@@ -12,15 +12,18 @@
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "third_party/catch/include/catch.hpp"
 #include "xenia/cpu/backend/backend.h"
@@ -32,11 +35,34 @@
 
 namespace xe {
 namespace cpu {
+
+class GuestExecutionCaptureRegistryTestAccess final {
+ public:
+  static void SetThreadStateDestructionGateSignal(Processor& processor,
+                                                  std::atomic<bool>* signal) {
+    processor
+        .guest_execution_capture_thread_state_destruction_gate_test_signal_ =
+        signal;
+  }
+};
+
 namespace testing {
 namespace {
 
 class StubBackend final : public backend::Backend {
  public:
+  void* AllocThreadData() override { return this; }
+
+  void FreeThreadData(void* thread_data) override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (block_next_free_) {
+      block_next_free_ = false;
+      free_entered_ = true;
+      condition_.notify_all();
+      condition_.wait(lock, [&] { return release_free_; });
+    }
+  }
+
   void CommitExecutableRange(uint32_t guest_low, uint32_t guest_high) override {
   }
 
@@ -53,6 +79,32 @@ class StubBackend final : public backend::Backend {
                                         uint64_t current_pc) override {
     return current_pc;
   }
+
+  void BlockNextFree() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    block_next_free_ = true;
+    free_entered_ = false;
+    release_free_ = false;
+  }
+
+  bool WaitUntilFreeEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return free_entered_; });
+  }
+
+  void ReleaseFree() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_free_ = true;
+    condition_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool block_next_free_ = false;
+  bool free_entered_ = false;
+  bool release_free_ = false;
 };
 
 class CallbackGuestFunction final : public GuestFunction {
@@ -85,17 +137,31 @@ class CaptureTestEnvironment {
       throw std::runtime_error("test memory initialization failed");
     }
     processor = std::make_unique<Processor>(memory.get(), nullptr);
-    if (!processor->Setup(std::make_unique<StubBackend>())) {
+    std::unique_ptr<StubBackend> owned_backend =
+        std::make_unique<StubBackend>();
+    backend = owned_backend.get();
+    if (!processor->Setup(std::move(owned_backend))) {
       throw std::runtime_error("test processor initialization failed");
     }
   }
 
   std::unique_ptr<ThreadState> MakeThread(uint32_t guest_thread_id) {
+    std::unique_ptr<ThreadState> thread_state =
+        MakePendingThread(guest_thread_id);
+    if (thread_state->PublishGuestExecutionCaptureReady() !=
+        GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept) {
+      throw std::runtime_error("test ThreadState publication failed");
+    }
+    return thread_state;
+  }
+
+  std::unique_ptr<ThreadState> MakePendingThread(uint32_t guest_thread_id) {
     return std::make_unique<ThreadState>(processor.get(), guest_thread_id);
   }
 
   std::unique_ptr<Memory> memory;
   std::unique_ptr<Processor> processor;
+  StubBackend* backend = nullptr;
 };
 
 class ScopedHostCallObserver final {
@@ -261,7 +327,828 @@ class BlockingDetachObserver final
   mutable bool release_can_detach_ = false;
 };
 
+class RecordingLifecycleObserver final
+    : public GuestExecutionCaptureHostCallObserver {
+ public:
+  GuestExecutionCaptureThreadStateLifecycleDisposition OnThreadStateSeed(
+      std::span<const GuestExecutionCaptureThreadStateLifecycleEvent>
+          seed) noexcept override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++seed_call_count_;
+    if (reject_seed_ && reject_seed_index_ < seed.size()) {
+      reject_seed_ = false;
+      return GuestExecutionCaptureThreadStateLifecycleDisposition::kReject;
+    }
+    events_.insert(events_.end(), seed.begin(), seed.end());
+    return GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept;
+  }
+
+  GuestExecutionCaptureThreadStateLifecycleDisposition OnThreadStateLifecycle(
+      GuestExecutionCaptureThreadStateLifecycleEvent event) noexcept override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    events_.push_back(event);
+    const bool reject =
+        reject_next_lifecycle_ && reject_lifecycle_state_ == event.state;
+    if (reject) {
+      reject_next_lifecycle_ = false;
+    }
+    if (block_next_lifecycle_ && block_lifecycle_state_ == event.state) {
+      block_next_lifecycle_ = false;
+      lifecycle_entered_ = true;
+      condition_.notify_all();
+      condition_.wait(lock, [&] { return release_lifecycle_; });
+    }
+    return reject
+               ? GuestExecutionCaptureThreadStateLifecycleDisposition::kReject
+               : GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept;
+  }
+
+  GuestExecutionCaptureHostCallToken OnHostGuestCallBegin(
+      const ThreadState& thread_state, const GuestFunction& function,
+      uint32_t return_address) noexcept override {
+    return {};
+  }
+
+  bool OnHostGuestCallEnd(
+      GuestExecutionCaptureHostCallToken token, const ThreadState& thread_state,
+      const GuestFunction& function,
+      GuestExecutionCaptureHostCallOutcome outcome) noexcept override {
+    return false;
+  }
+
+  bool CanDetach() const noexcept override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (block_next_can_detach_) {
+      block_next_can_detach_ = false;
+      can_detach_entered_ = true;
+      condition_.notify_all();
+      condition_.wait(lock, [&] { return release_can_detach_; });
+    }
+    return true;
+  }
+
+  void RejectNextLifecycle(
+      GuestExecutionCaptureThreadStateLifecycleState state) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    reject_next_lifecycle_ = true;
+    reject_lifecycle_state_ = state;
+  }
+
+  void RejectSeedAt(size_t participant_index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    reject_seed_ = true;
+    reject_seed_index_ = participant_index;
+  }
+
+  void BlockNextLifecycle(
+      GuestExecutionCaptureThreadStateLifecycleState state) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    block_next_lifecycle_ = true;
+    block_lifecycle_state_ = state;
+    lifecycle_entered_ = false;
+    release_lifecycle_ = false;
+  }
+
+  bool WaitUntilLifecycleEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return lifecycle_entered_; });
+  }
+
+  void ReleaseLifecycle() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_lifecycle_ = true;
+    condition_.notify_all();
+  }
+
+  void BlockNextCanDetach() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    block_next_can_detach_ = true;
+    can_detach_entered_ = false;
+    release_can_detach_ = false;
+  }
+
+  bool WaitUntilCanDetachEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return can_detach_entered_; });
+  }
+
+  void ReleaseCanDetach() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_can_detach_ = true;
+    condition_.notify_all();
+  }
+
+  std::vector<GuestExecutionCaptureThreadStateLifecycleEvent> events() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return events_;
+  }
+
+  size_t seed_call_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return seed_call_count_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  mutable std::condition_variable condition_;
+  std::vector<GuestExecutionCaptureThreadStateLifecycleEvent> events_;
+  bool reject_seed_ = false;
+  size_t reject_seed_index_ = 0;
+  size_t seed_call_count_ = 0;
+  bool reject_next_lifecycle_ = false;
+  GuestExecutionCaptureThreadStateLifecycleState reject_lifecycle_state_ =
+      GuestExecutionCaptureThreadStateLifecycleState::kPending;
+  bool block_next_lifecycle_ = false;
+  GuestExecutionCaptureThreadStateLifecycleState block_lifecycle_state_ =
+      GuestExecutionCaptureThreadStateLifecycleState::kPending;
+  bool lifecycle_entered_ = false;
+  bool release_lifecycle_ = false;
+  mutable bool block_next_can_detach_ = false;
+  mutable bool can_detach_entered_ = false;
+  mutable bool release_can_detach_ = false;
+};
+
+class CollectingThreadStateVisitor final
+    : public GuestExecutionCaptureThreadStateVisitor {
+ public:
+  explicit CollectingThreadStateVisitor(bool stop_after_first = false)
+      : stop_after_first_(stop_after_first) {}
+
+  bool VisitThreadState(const ThreadState& thread_state) noexcept override {
+    participants_.push_back({
+        thread_state.guest_execution_capture_instance_id(),
+        thread_state.thread_id(),
+    });
+    contexts_valid_ &= thread_state.context() &&
+                       thread_state.context()->thread_state == &thread_state;
+    register_31_values_.push_back(thread_state.context()->r[31]);
+    return !(stop_after_first_ && participants_.size() == 1);
+  }
+
+  const std::vector<GuestExecutionCaptureParticipantIdentity>& participants()
+      const {
+    return participants_;
+  }
+  bool contexts_valid() const { return contexts_valid_; }
+  const std::vector<uint64_t>& register_31_values() const {
+    return register_31_values_;
+  }
+
+ private:
+  bool stop_after_first_ = false;
+  bool contexts_valid_ = true;
+  std::vector<GuestExecutionCaptureParticipantIdentity> participants_;
+  std::vector<uint64_t> register_31_values_;
+};
+
+class ReentrantObserver final : public GuestExecutionCaptureHostCallObserver {
+ public:
+  explicit ReentrantObserver(Processor& processor) : processor_(processor) {}
+
+  GuestExecutionCaptureThreadStateLifecycleDisposition OnThreadStateSeed(
+      std::span<const GuestExecutionCaptureThreadStateLifecycleEvent>
+          seed) noexcept override {
+    RecordReentry();
+    return GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept;
+  }
+
+  GuestExecutionCaptureThreadStateLifecycleDisposition OnThreadStateLifecycle(
+      GuestExecutionCaptureThreadStateLifecycleEvent event) noexcept override {
+    RecordReentry();
+    return GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept;
+  }
+
+  GuestExecutionCaptureHostCallToken OnHostGuestCallBegin(
+      const ThreadState& thread_state, const GuestFunction& function,
+      uint32_t return_address) noexcept override {
+    RecordReentry();
+    return {1};
+  }
+
+  bool OnHostGuestCallEnd(
+      GuestExecutionCaptureHostCallToken token, const ThreadState& thread_state,
+      const GuestFunction& function,
+      GuestExecutionCaptureHostCallOutcome outcome) noexcept override {
+    RecordReentry();
+    return token.value == 1;
+  }
+
+  bool CanDetach() const noexcept override {
+    RecordReentry();
+    return true;
+  }
+
+  std::vector<GuestExecutionCaptureThreadStateRegistryRejection> rejections()
+      const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return rejections_;
+  }
+
+ private:
+  void RecordReentry() const {
+    const GuestExecutionCaptureThreadStateRegistrySnapshot snapshot =
+        processor_.QueryGuestExecutionCaptureParticipants();
+    std::lock_guard<std::mutex> lock(mutex_);
+    rejections_.push_back(snapshot.rejection);
+  }
+
+  Processor& processor_;
+  mutable std::mutex mutex_;
+  mutable std::vector<GuestExecutionCaptureThreadStateRegistryRejection>
+      rejections_;
+};
+
+class ReentrantThreadStateVisitor final
+    : public GuestExecutionCaptureThreadStateVisitor {
+ public:
+  explicit ReentrantThreadStateVisitor(Processor& processor)
+      : processor_(processor) {}
+
+  bool VisitThreadState(const ThreadState& thread_state) noexcept override {
+    rejection_ = processor_.QueryGuestExecutionCaptureParticipants().rejection;
+    return true;
+  }
+
+  GuestExecutionCaptureThreadStateRegistryRejection rejection() const {
+    return rejection_;
+  }
+
+ private:
+  Processor& processor_;
+  GuestExecutionCaptureThreadStateRegistryRejection rejection_ =
+      GuestExecutionCaptureThreadStateRegistryRejection::kNone;
+};
+
+class BlockingThreadStateVisitor final
+    : public GuestExecutionCaptureThreadStateVisitor {
+ public:
+  bool VisitThreadState(const ThreadState& thread_state) noexcept override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    entered_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, [&] { return release_; });
+    context_valid_ = thread_state.context() &&
+                     thread_state.context()->thread_state == &thread_state;
+    return true;
+  }
+
+  bool WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return entered_; });
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_ = true;
+    condition_.notify_all();
+  }
+
+  bool context_valid() const { return context_valid_.load(); }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool entered_ = false;
+  bool release_ = false;
+  std::atomic<bool> context_valid_ = false;
+};
+
 }  // namespace
+
+TEST_CASE("Guest ThreadState registry rejects pending snapshots atomically",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto ready_thread = environment.MakeThread(0x101);
+  auto pending_thread = environment.MakePendingThread(0x202);
+  const GuestExecutionCaptureParticipantIdentity ready_identity = {
+      ready_thread->guest_execution_capture_instance_id(),
+      ready_thread->thread_id(),
+  };
+  const GuestExecutionCaptureParticipantIdentity pending_identity = {
+      pending_thread->guest_execution_capture_instance_id(),
+      pending_thread->thread_id(),
+  };
+  const GuestExecutionCaptureThreadStateRegistrySnapshot snapshot =
+      environment.processor->QueryGuestExecutionCaptureParticipants();
+  REQUIRE(snapshot.rejection ==
+          GuestExecutionCaptureThreadStateRegistryRejection::kNone);
+  REQUIRE_FALSE(snapshot.all_ready());
+  REQUIRE(snapshot.participants ==
+          std::vector<GuestExecutionCaptureThreadStateLifecycleEvent>{
+              {ready_identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kReady},
+              {pending_identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kPending},
+          });
+
+  auto observer = std::make_shared<RecordingLifecycleObserver>();
+  REQUIRE_FALSE(
+      environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+          observer));
+  REQUIRE(observer->seed_call_count() == 0);
+  REQUIRE(observer->events().empty());
+
+  CollectingThreadStateVisitor visitor;
+  REQUIRE(
+      environment.processor->VisitGuestExecutionCaptureThreadStates(visitor) ==
+      GuestExecutionCaptureThreadStateVisitResult::kParticipantNotReady);
+  REQUIRE(visitor.participants().empty());
+
+  pending_thread.reset();
+  REQUIRE(environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+      observer));
+  REQUIRE(observer->seed_call_count() == 1);
+  REQUIRE(observer->events() ==
+          std::vector<GuestExecutionCaptureThreadStateLifecycleEvent>{
+              {ready_identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kReady},
+          });
+  REQUIRE(environment.processor->DetachGuestExecutionCaptureHostCallObserver(
+      observer));
+  ready_thread.reset();
+}
+
+TEST_CASE("Guest host-call dispatch permanently closes observer attachment",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto thread_state = environment.MakeThread(0x212);
+  CallbackGuestFunction function(0x82000100, 0x8200011C,
+                                 [](ThreadState* call_thread_state,
+                                    uint32_t return_address) { return true; });
+
+  REQUIRE(function.Call(thread_state.get(), 0x82000200));
+
+  auto observer = std::make_shared<RecordingLifecycleObserver>();
+  REQUIRE_FALSE(
+      environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+          observer));
+  REQUIRE(observer->seed_call_count() == 0);
+  REQUIRE(observer->events().empty());
+}
+
+TEST_CASE("Guest host-call dispatch racing attachment fails closed",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto thread_state = environment.MakeThread(0x213);
+  auto observer = std::make_shared<RecordingLifecycleObserver>();
+  observer->BlockNextCanDetach();
+
+  bool attach_result = true;
+  std::thread attach_worker([&] {
+    attach_result =
+        environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+            observer);
+  });
+  const bool can_detach_entered = observer->WaitUntilCanDetachEntered();
+
+  CallbackGuestFunction function(0x82000300, 0x8200031C,
+                                 [](ThreadState* call_thread_state,
+                                    uint32_t return_address) { return true; });
+  const bool call_result = function.Call(thread_state.get(), 0x82000400);
+
+  observer->ReleaseCanDetach();
+  attach_worker.join();
+
+  REQUIRE(can_detach_entered);
+  REQUIRE(call_result);
+  REQUIRE_FALSE(attach_result);
+  REQUIRE(observer->seed_call_count() == 0);
+  REQUIRE(observer->events().empty());
+}
+
+TEST_CASE("Guest ThreadState publishes initialized PPC state",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto thread_state = environment.MakePendingThread(0x303);
+  constexpr uint64_t kSentinel = 0x123456789ABCDEF0ull;
+  thread_state->context()->r[31] = kSentinel;
+
+  CollectingThreadStateVisitor pending_visitor;
+  REQUIRE(environment.processor->VisitGuestExecutionCaptureThreadStates(
+              pending_visitor) ==
+          GuestExecutionCaptureThreadStateVisitResult::kParticipantNotReady);
+  REQUIRE(pending_visitor.participants().empty());
+
+  REQUIRE(thread_state->PublishGuestExecutionCaptureReady() ==
+          GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept);
+  const GuestExecutionCaptureThreadStateRegistrySnapshot snapshot =
+      environment.processor->QueryGuestExecutionCaptureParticipants();
+  REQUIRE(snapshot.all_ready());
+  REQUIRE(snapshot.participants.size() == 1);
+  REQUIRE(snapshot.participants[0].state ==
+          GuestExecutionCaptureThreadStateLifecycleState::kReady);
+
+  CollectingThreadStateVisitor visitor;
+  REQUIRE(
+      environment.processor->VisitGuestExecutionCaptureThreadStates(visitor) ==
+      GuestExecutionCaptureThreadStateVisitResult::kCompleted);
+  REQUIRE(visitor.contexts_valid());
+  REQUIRE(visitor.register_31_values() == std::vector<uint64_t>{kSentinel});
+
+  CollectingThreadStateVisitor stopping_visitor(true);
+  REQUIRE(environment.processor->VisitGuestExecutionCaptureThreadStates(
+              stopping_visitor) ==
+          GuestExecutionCaptureThreadStateVisitResult::kStoppedByVisitor);
+  REQUIRE(stopping_visitor.participants().size() == 1);
+}
+
+TEST_CASE("Guest ThreadState lifecycle exposes exact state transitions",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto observer = std::make_shared<RecordingLifecycleObserver>();
+  ScopedHostCallObserver attachment(*environment.processor, observer);
+
+  auto pending_thread = environment.MakePendingThread(0x404);
+  const GuestExecutionCaptureParticipantIdentity pending_identity = {
+      pending_thread->guest_execution_capture_instance_id(),
+      pending_thread->thread_id(),
+  };
+  pending_thread.reset();
+
+  auto ready_thread = environment.MakePendingThread(0x404);
+  const GuestExecutionCaptureParticipantIdentity ready_identity = {
+      ready_thread->guest_execution_capture_instance_id(),
+      ready_thread->thread_id(),
+  };
+  REQUIRE(ready_identity.guest_thread_id == pending_identity.guest_thread_id);
+  REQUIRE(ready_identity.capture_instance_id >
+          pending_identity.capture_instance_id);
+  REQUIRE(ready_thread->PublishGuestExecutionCaptureReady() ==
+          GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept);
+  ready_thread.reset();
+
+  REQUIRE(observer->events() ==
+          std::vector<GuestExecutionCaptureThreadStateLifecycleEvent>{
+              {pending_identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kPending},
+              {pending_identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kDestroying},
+              {ready_identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kPending},
+              {ready_identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kReady},
+              {ready_identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kDestroying},
+          });
+  const GuestExecutionCaptureThreadStateRegistrySnapshot snapshot =
+      environment.processor->QueryGuestExecutionCaptureParticipants();
+  REQUIRE(snapshot.rejection ==
+          GuestExecutionCaptureThreadStateRegistryRejection::kNone);
+  REQUIRE(snapshot.participants.empty());
+  REQUIRE(attachment.Detach());
+}
+
+TEST_CASE("Guest ThreadState remains registered throughout destruction",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto thread_state = environment.MakeThread(0x405);
+  const GuestExecutionCaptureParticipantIdentity identity = {
+      thread_state->guest_execution_capture_instance_id(),
+      thread_state->thread_id(),
+  };
+  environment.backend->BlockNextFree();
+
+  std::thread destroy_worker([&] { thread_state.reset(); });
+  const bool free_entered = environment.backend->WaitUntilFreeEntered();
+
+  const GuestExecutionCaptureThreadStateRegistrySnapshot destroying_snapshot =
+      environment.processor->QueryGuestExecutionCaptureParticipants();
+  CollectingThreadStateVisitor visitor;
+  const GuestExecutionCaptureThreadStateVisitResult visit_result =
+      environment.processor->VisitGuestExecutionCaptureThreadStates(visitor);
+  auto observer = std::make_shared<RecordingLifecycleObserver>();
+  const bool attach_result =
+      environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+          observer);
+
+  environment.backend->ReleaseFree();
+  destroy_worker.join();
+
+  REQUIRE(free_entered);
+  REQUIRE_FALSE(destroying_snapshot.all_ready());
+  REQUIRE(destroying_snapshot.participants ==
+          std::vector<GuestExecutionCaptureThreadStateLifecycleEvent>{
+              {identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kDestroying},
+          });
+  REQUIRE(visit_result ==
+          GuestExecutionCaptureThreadStateVisitResult::kParticipantNotReady);
+  REQUIRE(visitor.participants().empty());
+  REQUIRE_FALSE(attach_result);
+  REQUIRE(observer->events().empty());
+  REQUIRE(environment.processor->QueryGuestExecutionCaptureParticipants()
+              .participants.empty());
+}
+
+TEST_CASE("Guest ThreadState observer seed rejection prevents installation",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto first_thread = environment.MakeThread(0x505);
+  auto second_thread = environment.MakeThread(0x506);
+  const GuestExecutionCaptureParticipantIdentity first_identity = {
+      first_thread->guest_execution_capture_instance_id(),
+      first_thread->thread_id(),
+  };
+  const GuestExecutionCaptureParticipantIdentity second_identity = {
+      second_thread->guest_execution_capture_instance_id(),
+      second_thread->thread_id(),
+  };
+  auto rejecting_observer = std::make_shared<RecordingLifecycleObserver>();
+  rejecting_observer->RejectSeedAt(1);
+  REQUIRE_FALSE(
+      environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+          rejecting_observer));
+  REQUIRE(rejecting_observer->seed_call_count() == 1);
+  REQUIRE(rejecting_observer->events().empty());
+
+  auto accepting_observer = std::make_shared<RecordingLifecycleObserver>();
+  REQUIRE(environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+      accepting_observer));
+  REQUIRE(accepting_observer->seed_call_count() == 1);
+  REQUIRE(accepting_observer->events() ==
+          std::vector<GuestExecutionCaptureThreadStateLifecycleEvent>{
+              {first_identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kReady},
+              {second_identity,
+               GuestExecutionCaptureThreadStateLifecycleState::kReady},
+          });
+  REQUIRE(environment.processor->DetachGuestExecutionCaptureHostCallObserver(
+      accepting_observer));
+}
+
+TEST_CASE("Guest ThreadState runtime rejection is sticky and detachable",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto rejecting_observer = std::make_shared<RecordingLifecycleObserver>();
+  REQUIRE(environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+      rejecting_observer));
+  rejecting_observer->RejectNextLifecycle(
+      GuestExecutionCaptureThreadStateLifecycleState::kPending);
+
+  auto thread_state = environment.MakePendingThread(0x607);
+  const GuestExecutionCaptureThreadStateRegistrySnapshot rejected_snapshot =
+      environment.processor->QueryGuestExecutionCaptureParticipants();
+  REQUIRE(rejected_snapshot.rejection ==
+          GuestExecutionCaptureThreadStateRegistryRejection::
+              kObserverRejectedRuntimeEvent);
+  REQUIRE_FALSE(rejected_snapshot.all_ready());
+  REQUIRE(thread_state->PublishGuestExecutionCaptureReady() ==
+          GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept);
+  thread_state.reset();
+  REQUIRE(rejecting_observer->events().size() == 3);
+
+  REQUIRE(environment.processor->DetachGuestExecutionCaptureHostCallObserver(
+      rejecting_observer));
+  REQUIRE(environment.processor->QueryGuestExecutionCaptureParticipants()
+              .rejection ==
+          GuestExecutionCaptureThreadStateRegistryRejection::kNone);
+
+  auto retry_observer = std::make_shared<RecordingLifecycleObserver>();
+  REQUIRE(environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+      retry_observer));
+  REQUIRE(environment.processor->DetachGuestExecutionCaptureHostCallObserver(
+      retry_observer));
+}
+
+TEST_CASE("Guest ThreadState observer attachment snapshots a concurrent ready",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto observer = std::make_shared<RecordingLifecycleObserver>();
+  observer->BlockNextCanDetach();
+
+  bool attach_result = false;
+  std::thread attach_worker([&] {
+    attach_result =
+        environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+            observer);
+  });
+  const bool can_detach_entered = observer->WaitUntilCanDetachEntered();
+
+  auto thread_state = environment.MakeThread(0x708);
+  const GuestExecutionCaptureParticipantIdentity identity = {
+      thread_state->guest_execution_capture_instance_id(),
+      thread_state->thread_id(),
+  };
+  observer->ReleaseCanDetach();
+  attach_worker.join();
+
+  REQUIRE(can_detach_entered);
+  REQUIRE(attach_result);
+  REQUIRE(observer->seed_call_count() == 1);
+  REQUIRE(
+      observer->events() ==
+      std::vector<GuestExecutionCaptureThreadStateLifecycleEvent>{
+          {identity, GuestExecutionCaptureThreadStateLifecycleState::kReady},
+      });
+  thread_state.reset();
+  REQUIRE(
+      observer->events() ==
+      std::vector<GuestExecutionCaptureThreadStateLifecycleEvent>{
+          {identity, GuestExecutionCaptureThreadStateLifecycleState::kReady},
+          {identity,
+           GuestExecutionCaptureThreadStateLifecycleState::kDestroying},
+      });
+  REQUIRE(environment.processor->DetachGuestExecutionCaptureHostCallObserver(
+      observer));
+}
+
+TEST_CASE("Guest ThreadState lifecycle callback retains observer through race",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto observer = std::make_shared<RecordingLifecycleObserver>();
+  REQUIRE(environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+      observer));
+  observer->BlockNextLifecycle(
+      GuestExecutionCaptureThreadStateLifecycleState::kPending);
+
+  std::unique_ptr<ThreadState> thread_state;
+  std::thread create_worker(
+      [&] { thread_state = environment.MakePendingThread(0x809); });
+  const bool create_entered = observer->WaitUntilLifecycleEntered();
+  const bool detached_during_create =
+      environment.processor->DetachGuestExecutionCaptureHostCallObserver(
+          observer);
+
+  std::weak_ptr<RecordingLifecycleObserver> observer_lifetime = observer;
+  std::shared_ptr<RecordingLifecycleObserver> retained_observer = observer;
+  observer.reset();
+  retained_observer->ReleaseLifecycle();
+  create_worker.join();
+
+  REQUIRE(create_entered);
+  REQUIRE_FALSE(detached_during_create);
+  REQUIRE(observer_lifetime.lock());
+  REQUIRE(thread_state);
+  REQUIRE(thread_state->PublishGuestExecutionCaptureReady() ==
+          GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept);
+  thread_state.reset();
+  REQUIRE(retained_observer->events().size() == 3);
+  REQUIRE(environment.processor->DetachGuestExecutionCaptureHostCallObserver(
+      retained_observer));
+  retained_observer.reset();
+  REQUIRE(observer_lifetime.expired());
+}
+
+TEST_CASE("Guest ThreadState rejects duplicate ready publication",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto thread_state = environment.MakePendingThread(0x90A);
+  REQUIRE(thread_state->PublishGuestExecutionCaptureReady() ==
+          GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept);
+  REQUIRE(thread_state->PublishGuestExecutionCaptureReady() ==
+          GuestExecutionCaptureThreadStateLifecycleDisposition::kReject);
+  const GuestExecutionCaptureThreadStateRegistrySnapshot snapshot =
+      environment.processor->QueryGuestExecutionCaptureParticipants();
+  REQUIRE(snapshot.rejection ==
+          GuestExecutionCaptureThreadStateRegistryRejection::
+              kInvalidReadyTransition);
+  REQUIRE(snapshot.participants.size() == 1);
+  REQUIRE(snapshot.participants[0].state ==
+          GuestExecutionCaptureThreadStateLifecycleState::kReady);
+  CollectingThreadStateVisitor visitor;
+  REQUIRE(
+      environment.processor->VisitGuestExecutionCaptureThreadStates(visitor) ==
+      GuestExecutionCaptureThreadStateVisitResult::kRegistryRejected);
+}
+
+TEST_CASE("Guest capture callbacks reject Processor reentry without deadlock",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto observer = std::make_shared<ReentrantObserver>(*environment.processor);
+  ScopedHostCallObserver attachment(*environment.processor, observer);
+  auto thread_state = environment.MakeThread(0xA0B);
+
+  ReentrantThreadStateVisitor visitor(*environment.processor);
+  REQUIRE(
+      environment.processor->VisitGuestExecutionCaptureThreadStates(visitor) ==
+      GuestExecutionCaptureThreadStateVisitResult::kCompleted);
+  REQUIRE(visitor.rejection() ==
+          GuestExecutionCaptureThreadStateRegistryRejection::
+              kObserverCallbackReentry);
+
+  CallbackGuestFunction function(0x82000000, 0x8200001C,
+                                 [](ThreadState* call_thread_state,
+                                    uint32_t return_address) { return true; });
+  REQUIRE(function.Call(thread_state.get(), 0x82001000));
+  thread_state.reset();
+  REQUIRE_FALSE(attachment.Detach());
+
+  const auto rejections = observer->rejections();
+  REQUIRE(rejections.size() == 7);
+  for (GuestExecutionCaptureThreadStateRegistryRejection rejection :
+       rejections) {
+    REQUIRE(rejection == GuestExecutionCaptureThreadStateRegistryRejection::
+                             kObserverCallbackReentry);
+  }
+}
+
+TEST_CASE("Guest ThreadState registry tolerates concurrent lifecycle stress",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto observer = std::make_shared<RecordingLifecycleObserver>();
+  ScopedHostCallObserver attachment(*environment.processor, observer);
+  constexpr uint32_t kWorkerCount = 4;
+  constexpr uint32_t kLifetimesPerWorker = 16;
+  std::atomic<bool> publication_failed = false;
+  std::vector<std::thread> workers;
+  for (uint32_t worker_index = 0; worker_index < kWorkerCount; ++worker_index) {
+    workers.emplace_back([&, worker_index] {
+      for (uint32_t lifetime_index = 0; lifetime_index < kLifetimesPerWorker;
+           ++lifetime_index) {
+        auto thread_state =
+            environment.MakePendingThread(0xB000 + worker_index);
+        thread_state->context()->r[31] = lifetime_index;
+        if (thread_state->PublishGuestExecutionCaptureReady() !=
+            GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept) {
+          publication_failed = true;
+        }
+      }
+    });
+  }
+  for (std::thread& worker : workers) {
+    worker.join();
+  }
+
+  REQUIRE_FALSE(publication_failed.load());
+  const GuestExecutionCaptureThreadStateRegistrySnapshot snapshot =
+      environment.processor->QueryGuestExecutionCaptureParticipants();
+  REQUIRE(snapshot.rejection ==
+          GuestExecutionCaptureThreadStateRegistryRejection::kNone);
+  REQUIRE(snapshot.participants.empty());
+
+  const auto events = observer->events();
+  REQUIRE(events.size() == kWorkerCount * kLifetimesPerWorker * 3);
+  std::map<uint64_t,
+           std::vector<GuestExecutionCaptureThreadStateLifecycleState>>
+      states_by_instance;
+  for (const GuestExecutionCaptureThreadStateLifecycleEvent& event : events) {
+    states_by_instance[event.participant.capture_instance_id].push_back(
+        event.state);
+  }
+  REQUIRE(states_by_instance.size() == kWorkerCount * kLifetimesPerWorker);
+  for (const auto& instance : states_by_instance) {
+    REQUIRE(instance.second ==
+            std::vector<GuestExecutionCaptureThreadStateLifecycleState>{
+                GuestExecutionCaptureThreadStateLifecycleState::kPending,
+                GuestExecutionCaptureThreadStateLifecycleState::kReady,
+                GuestExecutionCaptureThreadStateLifecycleState::kDestroying,
+            });
+  }
+  REQUIRE(attachment.Detach());
+}
+
+TEST_CASE("Guest ThreadState locked visitor excludes destruction",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto thread_state = environment.MakeThread(0x606);
+  BlockingThreadStateVisitor visitor;
+  GuestExecutionCaptureThreadStateVisitResult visit_result =
+      GuestExecutionCaptureThreadStateVisitResult::kRegistryRejected;
+  std::thread visit_worker([&] {
+    visit_result =
+        environment.processor->VisitGuestExecutionCaptureThreadStates(visitor);
+  });
+  const bool visitor_entered = visitor.WaitUntilEntered();
+
+  std::atomic<bool> destroyer_reached_registry_gate = false;
+  std::atomic<bool> destroy_finished = false;
+  GuestExecutionCaptureRegistryTestAccess::SetThreadStateDestructionGateSignal(
+      *environment.processor, &destroyer_reached_registry_gate);
+  std::thread destroy_worker([&] {
+    thread_state.reset();
+    destroy_finished.store(true, std::memory_order_release);
+  });
+
+  const auto gate_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!destroyer_reached_registry_gate.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < gate_deadline) {
+    std::this_thread::yield();
+  }
+  const bool destroyer_reached_registry_gate_observed =
+      destroyer_reached_registry_gate.load(std::memory_order_acquire);
+  const bool destroy_finished_before_visitor_release =
+      destroy_finished.load(std::memory_order_acquire);
+
+  visitor.Release();
+  visit_worker.join();
+  destroy_worker.join();
+  GuestExecutionCaptureRegistryTestAccess::SetThreadStateDestructionGateSignal(
+      *environment.processor, nullptr);
+
+  REQUIRE(visitor_entered);
+  REQUIRE(destroyer_reached_registry_gate_observed);
+  REQUIRE_FALSE(destroy_finished_before_visitor_release);
+  REQUIRE(visit_result ==
+          GuestExecutionCaptureThreadStateVisitResult::kCompleted);
+  REQUIRE(visitor.context_valid());
+  REQUIRE(destroy_finished.load(std::memory_order_acquire));
+  REQUIRE(environment.processor->QueryGuestExecutionCaptureParticipants()
+              .participants.empty());
+}
 
 TEST_CASE("Guest host-call roster records every terminal outcome",
           "[guest-execution-capture]") {
@@ -317,7 +1204,7 @@ TEST_CASE("Guest host-call roster records every terminal outcome",
           GuestExecutionCaptureHostCallRosterRejection::kNone);
   REQUIRE(final_snapshot.active_calls.empty());
   REQUIRE(roster->CanDetach());
-  REQUIRE(attachment.Detach());
+  REQUIRE_FALSE(attachment.Detach());
 }
 
 TEST_CASE(
@@ -365,7 +1252,7 @@ TEST_CASE(
   REQUIRE(final_snapshot.active_calls.empty());
   REQUIRE(final_snapshot.rejection ==
           GuestExecutionCaptureHostCallRosterRejection::kNone);
-  REQUIRE(attachment.Detach());
+  REQUIRE_FALSE(attachment.Detach());
 }
 
 TEST_CASE("Guest host-call roster serializes concurrent participants",
@@ -427,56 +1314,59 @@ TEST_CASE("Guest host-call roster serializes concurrent participants",
   REQUIRE(final_snapshot.active_calls.empty());
   REQUIRE(final_snapshot.rejection ==
           GuestExecutionCaptureHostCallRosterRejection::kNone);
-  REQUIRE(attachment.Detach());
+  REQUIRE_FALSE(attachment.Detach());
 }
 
-TEST_CASE("Guest host-call observer registration drains before detach",
+TEST_CASE("Guest host-call observer is permanent after dispatch",
           "[guest-execution-capture]") {
-  CaptureTestEnvironment environment;
-  auto thread_state = environment.MakeThread(0x606);
-  auto observer = std::make_shared<BlockingBeginObserver>();
-  auto stale_observer = std::make_shared<GuestExecutionCaptureHostCallRoster>();
-  REQUIRE_FALSE(
-      environment.processor->AttachGuestExecutionCaptureHostCallObserver(
-          nullptr));
-  REQUIRE(environment.processor->AttachGuestExecutionCaptureHostCallObserver(
-      observer));
-  REQUIRE_FALSE(
-      environment.processor->AttachGuestExecutionCaptureHostCallObserver(
-          stale_observer));
-  REQUIRE_FALSE(
-      environment.processor->DetachGuestExecutionCaptureHostCallObserver(
-          stale_observer));
+  std::weak_ptr<BlockingBeginObserver> observer_lifetime;
+  {
+    CaptureTestEnvironment environment;
+    auto thread_state = environment.MakeThread(0x606);
+    auto observer = std::make_shared<BlockingBeginObserver>();
+    auto stale_observer =
+        std::make_shared<GuestExecutionCaptureHostCallRoster>();
+    REQUIRE_FALSE(
+        environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+            nullptr));
+    REQUIRE(environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+        observer));
+    REQUIRE_FALSE(
+        environment.processor->AttachGuestExecutionCaptureHostCallObserver(
+            stale_observer));
+    REQUIRE_FALSE(
+        environment.processor->DetachGuestExecutionCaptureHostCallObserver(
+            stale_observer));
 
-  CallbackGuestFunction function(
-      0x82030000, 0x8203001C,
-      [](ThreadState* thread_state, uint32_t return_address) { return true; });
-  bool call_result = false;
-  std::thread worker(
-      [&] { call_result = function.Call(thread_state.get(), 0x82031000); });
-  const bool begin_entered = observer->WaitUntilBeginEntered();
-  const bool detached_during_begin =
-      environment.processor->DetachGuestExecutionCaptureHostCallObserver(
-          observer);
-  std::weak_ptr<BlockingBeginObserver> observer_lifetime = observer;
-  observer.reset();
-  std::shared_ptr<BlockingBeginObserver> retained_observer =
-      observer_lifetime.lock();
-  REQUIRE(retained_observer);
-  retained_observer->ReleaseBegin();
-  worker.join();
+    CallbackGuestFunction function(
+        0x82030000, 0x8203001C,
+        [](ThreadState* call_thread_state, uint32_t return_address) {
+          return true;
+        });
+    bool call_result = false;
+    std::thread worker(
+        [&] { call_result = function.Call(thread_state.get(), 0x82031000); });
+    const bool begin_entered = observer->WaitUntilBeginEntered();
+    const bool detached_during_begin =
+        environment.processor->DetachGuestExecutionCaptureHostCallObserver(
+            observer);
+    observer_lifetime = observer;
+    std::shared_ptr<BlockingBeginObserver> retained_observer = observer;
+    observer.reset();
+    retained_observer->ReleaseBegin();
+    worker.join();
 
-  REQUIRE(begin_entered);
-  REQUIRE_FALSE(detached_during_begin);
-  REQUIRE(call_result);
-  REQUIRE(retained_observer->outcome() ==
-          GuestExecutionCaptureHostCallOutcome::kReturnedToHost);
-  REQUIRE(environment.processor->DetachGuestExecutionCaptureHostCallObserver(
-      retained_observer));
-  REQUIRE_FALSE(
-      environment.processor->DetachGuestExecutionCaptureHostCallObserver(
-          retained_observer));
-  retained_observer.reset();
+    REQUIRE(begin_entered);
+    REQUIRE_FALSE(detached_during_begin);
+    REQUIRE(call_result);
+    REQUIRE(retained_observer->outcome() ==
+            GuestExecutionCaptureHostCallOutcome::kReturnedToHost);
+    REQUIRE_FALSE(
+        environment.processor->DetachGuestExecutionCaptureHostCallObserver(
+            retained_observer));
+    retained_observer.reset();
+    REQUIRE_FALSE(observer_lifetime.expired());
+  }
   REQUIRE(observer_lifetime.expired());
 }
 
@@ -497,12 +1387,16 @@ TEST_CASE("Processor owns an attached guest host-call observer",
   std::weak_ptr<GuestExecutionCaptureHostCallRoster> observer_lifetime;
   {
     CaptureTestEnvironment environment;
+    auto thread_state = environment.MakeThread(0x909);
     auto observer = std::make_shared<GuestExecutionCaptureHostCallRoster>();
     observer_lifetime = observer;
     REQUIRE(environment.processor->AttachGuestExecutionCaptureHostCallObserver(
         observer));
     observer.reset();
     REQUIRE_FALSE(observer_lifetime.expired());
+    thread_state.reset();
+    REQUIRE(environment.processor->QueryGuestExecutionCaptureParticipants()
+                .participants.empty());
   }
   REQUIRE(observer_lifetime.expired());
 }
@@ -555,7 +1449,7 @@ TEST_CASE("Guest host-call detach query never holds the Processor lock",
   REQUIRE(call_reached_guest);
   REQUIRE_FALSE(detach_result);
   REQUIRE(call_result);
-  REQUIRE(attachment.Detach());
+  REQUIRE_FALSE(attachment.Detach());
 }
 
 }  // namespace testing

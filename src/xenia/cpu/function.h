@@ -154,7 +154,9 @@ class GuestFunction : public Function {
   uintptr_t MapGuestAddressToMachineCode(uint32_t guest_address) const;
   uint32_t MapMachineCodeToGuestAddress(uintptr_t host_address) const;
 
-  bool Call(ThreadState* thread_state, uint32_t return_address) override;
+  // Keep every host-to-guest invocation in the common dispatch wrapper so
+  // derived backends cannot bypass capture rendezvous and outcome pairing.
+  bool Call(ThreadState* thread_state, uint32_t return_address) final;
 
  protected:
   virtual bool CallImpl(ThreadState* thread_state, uint32_t return_address) = 0;

@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_PROCESSOR_H_
 #define XENIA_CPU_PROCESSOR_H_
 
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -44,6 +45,7 @@ constexpr fourcc_t kProcessorSaveSignature = make_fourcc("PROC");
 class Breakpoint;
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+class GuestExecutionCaptureRegistryTestAccess;
 class GuestInvocationCaptureEventSink;
 #endif
 class JitCorpusWriter;
@@ -95,9 +97,12 @@ class Processor {
     return guest_invocation_capture_sink_;
   }
 
-  // Orthogonal to the one-invocation event sink above. Registration is
-  // shared-owned and may not be replaced or detached while dispatch callbacks
-  // or successfully begun host-to-guest calls are active.
+  // Orthogonal to the one-invocation event sink above. Continuous capture must
+  // install one observer before title dispatch, then arm and disarm internally.
+  // Once any generic host-to-guest dispatch begins, the installed observer is
+  // Processor-lifetime permanent and later attachment or detachment is
+  // rejected so no outer call can be omitted. Registration is shared-owned;
+  // Processor releases it after guest execution is torn down.
   bool AttachGuestExecutionCaptureHostCallObserver(
       std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer);
   bool DetachGuestExecutionCaptureHostCallObserver(
@@ -109,6 +114,19 @@ class Processor {
       GuestExecutionCaptureHostCallToken token, const ThreadState& thread_state,
       const GuestFunction& function,
       GuestExecutionCaptureHostCallOutcome outcome);
+
+  // Value-only snapshot of all currently live capture ThreadState identities,
+  // publication states and the sticky registry rejection. No ThreadState or
+  // host-context pointer escapes the lifetime registry lock.
+  GuestExecutionCaptureThreadStateRegistrySnapshot
+  QueryGuestExecutionCaptureParticipants() const;
+
+  // Visits live ThreadState objects while destruction is excluded by the
+  // capture-only lifetime registry lock. The visitor must not retain a
+  // ThreadState reference or call back into Processor.
+  GuestExecutionCaptureThreadStateVisitResult
+  VisitGuestExecutionCaptureThreadStates(
+      GuestExecutionCaptureThreadStateVisitor& visitor) const noexcept;
 #endif
 
   bool Setup(std::unique_ptr<backend::Backend> backend);
@@ -271,6 +289,26 @@ class Processor {
   void DumpTraceCountsToFile();
 
  private:
+  friend class ThreadState;
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  friend class GuestExecutionCaptureRegistryTestAccess;
+
+  void RegisterGuestExecutionCaptureThreadState(
+      ThreadState& thread_state) noexcept;
+  GuestExecutionCaptureThreadStateLifecycleDisposition
+  PublishGuestExecutionCaptureThreadStateReady(
+      ThreadState& thread_state) noexcept;
+  void BeginGuestExecutionCaptureThreadStateDestruction(
+      ThreadState& thread_state) noexcept;
+  void CompleteGuestExecutionCaptureThreadStateDestruction(
+      ThreadState& thread_state) noexcept;
+  std::shared_ptr<GuestExecutionCaptureHostCallObserver>
+  AcquireGuestExecutionCaptureObserverDispatch(bool host_call_begin);
+  void ReleaseGuestExecutionCaptureObserverDispatch() noexcept;
+#endif
+
   // Write the guestcoverage, guestcoveragethreads and guestsequences tables
   // appended to the profiler's CSV dump. Both require trace_counts_mutex_.
   void DumpTraceCounts(FILE* f);
@@ -364,6 +402,21 @@ class Processor {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   GuestInvocationCaptureEventSink* guest_invocation_capture_sink_ = nullptr;
 
+  // Intrusive and allocation-free so every successfully constructed
+  // ThreadState is registered. Always acquire this before the observer mutex
+  // when both are needed. Lifecycle callbacks run while this is held.
+  mutable std::mutex guest_execution_capture_thread_state_mutex_;
+  ThreadState* guest_execution_capture_thread_state_head_ = nullptr;
+  GuestExecutionCaptureThreadStateRegistryRejection
+      guest_execution_capture_thread_state_rejection_ =
+          GuestExecutionCaptureThreadStateRegistryRejection::kNone;
+  // Non-owning deterministic test rendezvous at the exact point where a
+  // ThreadState destructor is about to acquire the lifetime registry gate.
+  // Tests configure and clear this only while no destruction is in flight.
+  std::atomic<bool>*
+      guest_execution_capture_thread_state_destruction_gate_test_signal_ =
+          nullptr;
+
   // Protects observer registration and short callback acquisition leases. It
   // is never held while invoking the observer, which may later rendezvous and
   // block guest execution in a dedicated capture build.
@@ -372,6 +425,7 @@ class Processor {
       guest_execution_capture_host_call_observer_;
   uint64_t guest_execution_capture_host_call_dispatch_count_ = 0;
   uint64_t guest_execution_capture_host_call_dispatch_epoch_ = 0;
+  bool guest_execution_capture_host_call_dispatch_seen_ = false;
   bool guest_execution_capture_host_call_observer_transition_pending_ = false;
 #endif
 

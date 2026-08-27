@@ -739,6 +739,13 @@ bool GuestInvocationRunner::Initialize(
   }
 
   thread_state_ = std::make_unique<ThreadState>(processor_.get(), 0x100u, 0, 0);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (thread_state_->PublishGuestExecutionCaptureReady() !=
+      GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept) {
+    return Fail(error, "capture ThreadState publication failed");
+  }
+#endif
   return true;
 }
 

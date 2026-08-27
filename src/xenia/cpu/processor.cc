@@ -109,6 +109,45 @@ using xe::kernel::XThread;
 
 using namespace xe::literals;
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+namespace {
+
+thread_local bool guest_execution_capture_callback_active = false;
+
+class GuestExecutionCaptureCallbackScope final {
+ public:
+  GuestExecutionCaptureCallbackScope() {
+    if (guest_execution_capture_callback_active) {
+      std::abort();
+    }
+    guest_execution_capture_callback_active = true;
+  }
+  ~GuestExecutionCaptureCallbackScope() {
+    guest_execution_capture_callback_active = false;
+  }
+
+  GuestExecutionCaptureCallbackScope(
+      const GuestExecutionCaptureCallbackScope&) = delete;
+  GuestExecutionCaptureCallbackScope& operator=(
+      const GuestExecutionCaptureCallbackScope&) = delete;
+};
+
+GuestExecutionCaptureThreadStateLifecycleEvent MakeThreadStateLifecycleEvent(
+    const ThreadState& thread_state,
+    GuestExecutionCaptureThreadStateLifecycleState state) {
+  return {
+      {
+          thread_state.guest_execution_capture_instance_id(),
+          thread_state.thread_id(),
+      },
+      state,
+  };
+}
+
+}  // namespace
+#endif
+
 class BuiltinModule : public Module {
  public:
   explicit BuiltinModule(Processor* processor)
@@ -134,6 +173,27 @@ Processor::Processor(xe::Memory* memory, ExportResolver* export_resolver)
     : memory_(memory), export_resolver_(export_resolver) {}
 
 Processor::~Processor() {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (guest_execution_capture_callback_active) {
+    std::abort();
+  }
+  // ThreadState and generated-call owners must quiesce before Processor.
+  // Failing closed here prevents their later destructors or callback releases
+  // from touching a destroyed registry.
+  {
+    std::lock_guard<std::mutex> thread_state_lock(
+        guest_execution_capture_thread_state_mutex_);
+    std::lock_guard<std::mutex> observer_lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    if (guest_execution_capture_thread_state_head_ ||
+        guest_execution_capture_host_call_dispatch_count_ ||
+        guest_execution_capture_host_call_observer_transition_pending_) {
+      std::abort();
+    }
+  }
+#endif
+
   {
     auto global_lock = global_critical_region_.Acquire();
     modules_.clear();
@@ -181,7 +241,7 @@ Processor::~Processor() {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 bool Processor::AttachGuestExecutionCaptureHostCallObserver(
     std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer) {
-  if (!observer) {
+  if (guest_execution_capture_callback_active || !observer) {
     return false;
   }
   {
@@ -189,35 +249,109 @@ bool Processor::AttachGuestExecutionCaptureHostCallObserver(
         guest_execution_capture_host_call_observer_mutex_);
     if (guest_execution_capture_host_call_observer_ ||
         guest_execution_capture_host_call_dispatch_count_ ||
+        guest_execution_capture_host_call_dispatch_seen_ ||
         guest_execution_capture_host_call_observer_transition_pending_) {
       return false;
     }
     guest_execution_capture_host_call_observer_transition_pending_ = true;
   }
-  // The observer owns its state lock. Never invoke it while holding the
-  // Processor registration lock: a later rendezvous implementation may need
-  // to wait here while other guest threads finish dispatch callbacks.
-  const bool observer_can_attach = observer->CanDetach();
-  std::lock_guard<std::mutex> lock(
-      guest_execution_capture_host_call_observer_mutex_);
-  if (guest_execution_capture_host_call_observer_ ||
-      !guest_execution_capture_host_call_observer_transition_pending_) {
+  bool observer_can_attach = false;
+  {
+    GuestExecutionCaptureCallbackScope callback_scope;
+    observer_can_attach = observer->CanDetach();
+  }
+  if (!observer_can_attach) {
+    std::lock_guard<std::mutex> lock(
+        guest_execution_capture_host_call_observer_mutex_);
     if (guest_execution_capture_host_call_observer_transition_pending_) {
       guest_execution_capture_host_call_observer_transition_pending_ = false;
     }
     return false;
   }
-  if (observer_can_attach) {
+
+  // Freeze the registry through validation, seeding and installation.
+  // Pre-validation guarantees that a pending lifetime causes zero partial seed
+  // callbacks.
+  std::lock_guard<std::mutex> thread_state_lock(
+      guest_execution_capture_thread_state_mutex_);
+  {
+    std::lock_guard<std::mutex> observer_lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    if (guest_execution_capture_host_call_observer_ ||
+        guest_execution_capture_host_call_dispatch_count_ ||
+        guest_execution_capture_host_call_dispatch_seen_ ||
+        !guest_execution_capture_host_call_observer_transition_pending_) {
+      guest_execution_capture_host_call_observer_transition_pending_ = false;
+      return false;
+    }
+  }
+  if (guest_execution_capture_thread_state_rejection_ !=
+      GuestExecutionCaptureThreadStateRegistryRejection::kNone) {
+    std::lock_guard<std::mutex> observer_lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    guest_execution_capture_host_call_observer_transition_pending_ = false;
+    return false;
+  }
+  for (const ThreadState* thread_state =
+           guest_execution_capture_thread_state_head_;
+       thread_state;
+       thread_state = thread_state->guest_execution_capture_next_) {
+    if (thread_state->guest_execution_capture_lifecycle_state_ !=
+        GuestExecutionCaptureThreadStateLifecycleState::kReady) {
+      std::lock_guard<std::mutex> observer_lock(
+          guest_execution_capture_host_call_observer_mutex_);
+      guest_execution_capture_host_call_observer_transition_pending_ = false;
+      return false;
+    }
+  }
+
+  std::vector<GuestExecutionCaptureThreadStateLifecycleEvent> seed;
+  try {
+    for (const ThreadState* thread_state =
+             guest_execution_capture_thread_state_head_;
+         thread_state;
+         thread_state = thread_state->guest_execution_capture_next_) {
+      seed.push_back(MakeThreadStateLifecycleEvent(
+          *thread_state,
+          GuestExecutionCaptureThreadStateLifecycleState::kReady));
+    }
+  } catch (...) {
+    std::lock_guard<std::mutex> observer_lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    guest_execution_capture_host_call_observer_transition_pending_ = false;
+    return false;
+  }
+  GuestExecutionCaptureThreadStateLifecycleDisposition seed_disposition;
+  {
+    GuestExecutionCaptureCallbackScope callback_scope;
+    seed_disposition = observer->OnThreadStateSeed(seed);
+  }
+  const bool seed_accepted =
+      seed_disposition ==
+      GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept;
+
+  std::lock_guard<std::mutex> observer_lock(
+      guest_execution_capture_host_call_observer_mutex_);
+  if (guest_execution_capture_host_call_observer_ ||
+      !guest_execution_capture_host_call_observer_transition_pending_ ||
+      guest_execution_capture_host_call_dispatch_count_ ||
+      guest_execution_capture_host_call_dispatch_seen_) {
+    if (guest_execution_capture_host_call_observer_transition_pending_) {
+      guest_execution_capture_host_call_observer_transition_pending_ = false;
+    }
+    return false;
+  }
+  if (seed_accepted) {
     guest_execution_capture_host_call_observer_ = std::move(observer);
     guest_execution_capture_host_call_dispatch_epoch_ = 0;
   }
   guest_execution_capture_host_call_observer_transition_pending_ = false;
-  return observer_can_attach;
+  return seed_accepted;
 }
 
 bool Processor::DetachGuestExecutionCaptureHostCallObserver(
     const std::shared_ptr<GuestExecutionCaptureHostCallObserver>& observer) {
-  if (!observer) {
+  if (guest_execution_capture_callback_active || !observer) {
     return false;
   }
   uint64_t dispatch_epoch = 0;
@@ -226,14 +360,21 @@ bool Processor::DetachGuestExecutionCaptureHostCallObserver(
         guest_execution_capture_host_call_observer_mutex_);
     if (guest_execution_capture_host_call_observer_ != observer ||
         guest_execution_capture_host_call_dispatch_count_ ||
+        guest_execution_capture_host_call_dispatch_seen_ ||
         guest_execution_capture_host_call_observer_transition_pending_) {
       return false;
     }
     guest_execution_capture_host_call_observer_transition_pending_ = true;
     dispatch_epoch = guest_execution_capture_host_call_dispatch_epoch_;
   }
-  const bool observer_can_detach = observer->CanDetach();
-  std::lock_guard<std::mutex> lock(
+  bool observer_can_detach = false;
+  {
+    GuestExecutionCaptureCallbackScope callback_scope;
+    observer_can_detach = observer->CanDetach();
+  }
+  std::lock_guard<std::mutex> thread_state_lock(
+      guest_execution_capture_thread_state_mutex_);
+  std::lock_guard<std::mutex> observer_lock(
       guest_execution_capture_host_call_observer_mutex_);
   if (guest_execution_capture_host_call_observer_ != observer ||
       !guest_execution_capture_host_call_observer_transition_pending_) {
@@ -245,9 +386,16 @@ bool Processor::DetachGuestExecutionCaptureHostCallObserver(
   const bool can_detach =
       observer_can_detach &&
       !guest_execution_capture_host_call_dispatch_count_ &&
+      !guest_execution_capture_host_call_dispatch_seen_ &&
       guest_execution_capture_host_call_dispatch_epoch_ == dispatch_epoch;
   if (can_detach) {
     guest_execution_capture_host_call_observer_ = nullptr;
+    if (guest_execution_capture_thread_state_rejection_ ==
+        GuestExecutionCaptureThreadStateRegistryRejection::
+            kObserverRejectedRuntimeEvent) {
+      guest_execution_capture_thread_state_rejection_ =
+          GuestExecutionCaptureThreadStateRegistryRejection::kNone;
+    }
   }
   guest_execution_capture_host_call_observer_transition_pending_ = false;
   return can_detach;
@@ -257,33 +405,29 @@ GuestExecutionCaptureHostCallToken
 Processor::BeginGuestExecutionCaptureHostCall(const ThreadState& thread_state,
                                               const GuestFunction& function,
                                               uint32_t return_address) {
+  if (guest_execution_capture_callback_active) {
+    return {};
+  }
   std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer;
   {
-    std::lock_guard<std::mutex> lock(
-        guest_execution_capture_host_call_observer_mutex_);
-    if (!guest_execution_capture_host_call_observer_) {
-      return {};
-    }
-    if (guest_execution_capture_host_call_dispatch_count_ ==
-            std::numeric_limits<uint64_t>::max() ||
-        guest_execution_capture_host_call_dispatch_epoch_ ==
-            std::numeric_limits<uint64_t>::max()) {
-      std::abort();
-    }
-    observer = guest_execution_capture_host_call_observer_;
-    ++guest_execution_capture_host_call_dispatch_count_;
-    ++guest_execution_capture_host_call_dispatch_epoch_;
+    // Attachment holds this lock through its transactional seed and install.
+    // Taking it before latching dispatch makes the two operations atomic: a
+    // racing call either makes attachment fail before seeding, or enters only
+    // after the observer is installed.
+    std::lock_guard<std::mutex> thread_state_lock(
+        guest_execution_capture_thread_state_mutex_);
+    observer = AcquireGuestExecutionCaptureObserverDispatch(true);
   }
-  const GuestExecutionCaptureHostCallToken token =
-      observer->OnHostGuestCallBegin(thread_state, function, return_address);
+  if (!observer) {
+    return {};
+  }
+  GuestExecutionCaptureHostCallToken token;
   {
-    std::lock_guard<std::mutex> lock(
-        guest_execution_capture_host_call_observer_mutex_);
-    if (!guest_execution_capture_host_call_dispatch_count_) {
-      std::abort();
-    }
-    --guest_execution_capture_host_call_dispatch_count_;
+    GuestExecutionCaptureCallbackScope callback_scope;
+    token =
+        observer->OnHostGuestCallBegin(thread_state, function, return_address);
   }
+  ReleaseGuestExecutionCaptureObserverDispatch();
   return token;
 }
 
@@ -291,37 +435,299 @@ bool Processor::EndGuestExecutionCaptureHostCall(
     GuestExecutionCaptureHostCallToken token, const ThreadState& thread_state,
     const GuestFunction& function,
     GuestExecutionCaptureHostCallOutcome outcome) {
-  if (!token) {
+  if (guest_execution_capture_callback_active || !token) {
     return false;
+  }
+  std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer =
+      AcquireGuestExecutionCaptureObserverDispatch(false);
+  if (!observer) {
+    return false;
+  }
+  bool result = false;
+  {
+    GuestExecutionCaptureCallbackScope callback_scope;
+    result =
+        observer->OnHostGuestCallEnd(token, thread_state, function, outcome);
+  }
+  ReleaseGuestExecutionCaptureObserverDispatch();
+  return result;
+}
+
+std::shared_ptr<GuestExecutionCaptureHostCallObserver>
+Processor::AcquireGuestExecutionCaptureObserverDispatch(bool host_call_begin) {
+  std::lock_guard<std::mutex> lock(
+      guest_execution_capture_host_call_observer_mutex_);
+  if (host_call_begin) {
+    guest_execution_capture_host_call_dispatch_seen_ = true;
+  }
+  if (!guest_execution_capture_host_call_observer_) {
+    return nullptr;
+  }
+  if (guest_execution_capture_host_call_dispatch_count_ ==
+          std::numeric_limits<uint64_t>::max() ||
+      guest_execution_capture_host_call_dispatch_epoch_ ==
+          std::numeric_limits<uint64_t>::max()) {
+    std::abort();
+  }
+  ++guest_execution_capture_host_call_dispatch_count_;
+  ++guest_execution_capture_host_call_dispatch_epoch_;
+  return guest_execution_capture_host_call_observer_;
+}
+
+void Processor::ReleaseGuestExecutionCaptureObserverDispatch() noexcept {
+  std::lock_guard<std::mutex> lock(
+      guest_execution_capture_host_call_observer_mutex_);
+  if (!guest_execution_capture_host_call_dispatch_count_) {
+    std::abort();
+  }
+  --guest_execution_capture_host_call_dispatch_count_;
+}
+
+void Processor::RegisterGuestExecutionCaptureThreadState(
+    ThreadState& thread_state) noexcept {
+  if (guest_execution_capture_callback_active) {
+    std::abort();
   }
   std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer;
   {
-    std::lock_guard<std::mutex> lock(
-        guest_execution_capture_host_call_observer_mutex_);
-    if (!guest_execution_capture_host_call_observer_) {
-      return false;
+    std::lock_guard<std::mutex> thread_state_lock(
+        guest_execution_capture_thread_state_mutex_);
+    ThreadState** insertion = &guest_execution_capture_thread_state_head_;
+    while (*insertion) {
+      if (*insertion == &thread_state) {
+        guest_execution_capture_thread_state_rejection_ =
+            GuestExecutionCaptureThreadStateRegistryRejection::
+                kDuplicateRegistration;
+        std::abort();
+      }
+      insertion = &(*insertion)->guest_execution_capture_next_;
     }
-    if (guest_execution_capture_host_call_dispatch_count_ ==
-            std::numeric_limits<uint64_t>::max() ||
-        guest_execution_capture_host_call_dispatch_epoch_ ==
-            std::numeric_limits<uint64_t>::max()) {
-      std::abort();
+    thread_state.guest_execution_capture_next_ = nullptr;
+    *insertion = &thread_state;
+
+    observer = AcquireGuestExecutionCaptureObserverDispatch(false);
+    if (observer) {
+      GuestExecutionCaptureThreadStateLifecycleDisposition disposition;
+      {
+        GuestExecutionCaptureCallbackScope callback_scope;
+        disposition =
+            observer->OnThreadStateLifecycle(MakeThreadStateLifecycleEvent(
+                thread_state,
+                GuestExecutionCaptureThreadStateLifecycleState::kPending));
+      }
+      if (disposition !=
+              GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept &&
+          guest_execution_capture_thread_state_rejection_ ==
+              GuestExecutionCaptureThreadStateRegistryRejection::kNone) {
+        guest_execution_capture_thread_state_rejection_ =
+            GuestExecutionCaptureThreadStateRegistryRejection::
+                kObserverRejectedRuntimeEvent;
+      }
+      ReleaseGuestExecutionCaptureObserverDispatch();
     }
-    observer = guest_execution_capture_host_call_observer_;
-    ++guest_execution_capture_host_call_dispatch_count_;
-    ++guest_execution_capture_host_call_dispatch_epoch_;
   }
-  const bool result =
-      observer->OnHostGuestCallEnd(token, thread_state, function, outcome);
+  observer.reset();
+}
+
+GuestExecutionCaptureThreadStateLifecycleDisposition
+Processor::PublishGuestExecutionCaptureThreadStateReady(
+    ThreadState& thread_state) noexcept {
+  if (guest_execution_capture_callback_active) {
+    return GuestExecutionCaptureThreadStateLifecycleDisposition::kReject;
+  }
+  std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer;
   {
-    std::lock_guard<std::mutex> lock(
-        guest_execution_capture_host_call_observer_mutex_);
-    if (!guest_execution_capture_host_call_dispatch_count_) {
+    std::lock_guard<std::mutex> thread_state_lock(
+        guest_execution_capture_thread_state_mutex_);
+    ThreadState* registered = guest_execution_capture_thread_state_head_;
+    while (registered && registered != &thread_state) {
+      registered = registered->guest_execution_capture_next_;
+    }
+    if (!registered) {
+      guest_execution_capture_thread_state_rejection_ =
+          GuestExecutionCaptureThreadStateRegistryRejection::
+              kMissingRegistration;
+      return GuestExecutionCaptureThreadStateLifecycleDisposition::kReject;
+    }
+    if (thread_state.guest_execution_capture_lifecycle_state_ !=
+        GuestExecutionCaptureThreadStateLifecycleState::kPending) {
+      guest_execution_capture_thread_state_rejection_ =
+          GuestExecutionCaptureThreadStateRegistryRejection::
+              kInvalidReadyTransition;
+      return GuestExecutionCaptureThreadStateLifecycleDisposition::kReject;
+    }
+    thread_state.guest_execution_capture_lifecycle_state_ =
+        GuestExecutionCaptureThreadStateLifecycleState::kReady;
+
+    observer = AcquireGuestExecutionCaptureObserverDispatch(false);
+    if (observer) {
+      GuestExecutionCaptureThreadStateLifecycleDisposition disposition;
+      {
+        GuestExecutionCaptureCallbackScope callback_scope;
+        disposition =
+            observer->OnThreadStateLifecycle(MakeThreadStateLifecycleEvent(
+                thread_state,
+                GuestExecutionCaptureThreadStateLifecycleState::kReady));
+      }
+      if (disposition !=
+              GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept &&
+          guest_execution_capture_thread_state_rejection_ ==
+              GuestExecutionCaptureThreadStateRegistryRejection::kNone) {
+        guest_execution_capture_thread_state_rejection_ =
+            GuestExecutionCaptureThreadStateRegistryRejection::
+                kObserverRejectedRuntimeEvent;
+      }
+      ReleaseGuestExecutionCaptureObserverDispatch();
+    }
+  }
+  observer.reset();
+  return GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept;
+}
+
+void Processor::BeginGuestExecutionCaptureThreadStateDestruction(
+    ThreadState& thread_state) noexcept {
+  if (guest_execution_capture_callback_active) {
+    std::abort();
+  }
+  if (guest_execution_capture_thread_state_destruction_gate_test_signal_) {
+    guest_execution_capture_thread_state_destruction_gate_test_signal_->store(
+        true, std::memory_order_release);
+  }
+  std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer;
+  {
+    std::lock_guard<std::mutex> thread_state_lock(
+        guest_execution_capture_thread_state_mutex_);
+    ThreadState** registered = &guest_execution_capture_thread_state_head_;
+    while (*registered && *registered != &thread_state) {
+      registered = &(*registered)->guest_execution_capture_next_;
+    }
+    if (!*registered) {
+      guest_execution_capture_thread_state_rejection_ =
+          GuestExecutionCaptureThreadStateRegistryRejection::
+              kMissingRegistration;
       std::abort();
     }
-    --guest_execution_capture_host_call_dispatch_count_;
+    if (thread_state.guest_execution_capture_lifecycle_state_ !=
+            GuestExecutionCaptureThreadStateLifecycleState::kPending &&
+        thread_state.guest_execution_capture_lifecycle_state_ !=
+            GuestExecutionCaptureThreadStateLifecycleState::kReady) {
+      guest_execution_capture_thread_state_rejection_ =
+          GuestExecutionCaptureThreadStateRegistryRejection::
+              kInvalidDestroyTransition;
+      std::abort();
+    }
+    thread_state.guest_execution_capture_lifecycle_state_ =
+        GuestExecutionCaptureThreadStateLifecycleState::kDestroying;
+
+    observer = AcquireGuestExecutionCaptureObserverDispatch(false);
+    if (observer) {
+      GuestExecutionCaptureThreadStateLifecycleDisposition disposition;
+      {
+        GuestExecutionCaptureCallbackScope callback_scope;
+        disposition =
+            observer->OnThreadStateLifecycle(MakeThreadStateLifecycleEvent(
+                thread_state,
+                GuestExecutionCaptureThreadStateLifecycleState::kDestroying));
+      }
+      if (disposition !=
+              GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept &&
+          guest_execution_capture_thread_state_rejection_ ==
+              GuestExecutionCaptureThreadStateRegistryRejection::kNone) {
+        guest_execution_capture_thread_state_rejection_ =
+            GuestExecutionCaptureThreadStateRegistryRejection::
+                kObserverRejectedRuntimeEvent;
+      }
+    }
+
+    if (observer) {
+      ReleaseGuestExecutionCaptureObserverDispatch();
+    }
+  }
+  observer.reset();
+}
+
+void Processor::CompleteGuestExecutionCaptureThreadStateDestruction(
+    ThreadState& thread_state) noexcept {
+  if (guest_execution_capture_callback_active) {
+    std::abort();
+  }
+  std::lock_guard<std::mutex> thread_state_lock(
+      guest_execution_capture_thread_state_mutex_);
+  ThreadState** registered = &guest_execution_capture_thread_state_head_;
+  while (*registered && *registered != &thread_state) {
+    registered = &(*registered)->guest_execution_capture_next_;
+  }
+  if (!*registered) {
+    guest_execution_capture_thread_state_rejection_ =
+        GuestExecutionCaptureThreadStateRegistryRejection::kMissingRegistration;
+    std::abort();
+  }
+  if (thread_state.guest_execution_capture_lifecycle_state_ !=
+      GuestExecutionCaptureThreadStateLifecycleState::kDestroying) {
+    guest_execution_capture_thread_state_rejection_ =
+        GuestExecutionCaptureThreadStateRegistryRejection::
+            kInvalidDestroyTransition;
+    std::abort();
+  }
+  *registered = thread_state.guest_execution_capture_next_;
+  thread_state.guest_execution_capture_next_ = nullptr;
+}
+
+GuestExecutionCaptureThreadStateRegistrySnapshot
+Processor::QueryGuestExecutionCaptureParticipants() const {
+  GuestExecutionCaptureThreadStateRegistrySnapshot result;
+  if (guest_execution_capture_callback_active) {
+    result.rejection = GuestExecutionCaptureThreadStateRegistryRejection::
+        kObserverCallbackReentry;
+    return result;
+  }
+  std::lock_guard<std::mutex> lock(guest_execution_capture_thread_state_mutex_);
+  result.rejection = guest_execution_capture_thread_state_rejection_;
+  for (const ThreadState* thread_state =
+           guest_execution_capture_thread_state_head_;
+       thread_state;
+       thread_state = thread_state->guest_execution_capture_next_) {
+    result.participants.push_back(MakeThreadStateLifecycleEvent(
+        *thread_state, thread_state->guest_execution_capture_lifecycle_state_));
   }
   return result;
+}
+
+GuestExecutionCaptureThreadStateVisitResult
+Processor::VisitGuestExecutionCaptureThreadStates(
+    GuestExecutionCaptureThreadStateVisitor& visitor) const noexcept {
+  if (guest_execution_capture_callback_active) {
+    return GuestExecutionCaptureThreadStateVisitResult::
+        kObserverCallbackReentry;
+  }
+  std::lock_guard<std::mutex> lock(guest_execution_capture_thread_state_mutex_);
+  if (guest_execution_capture_thread_state_rejection_ !=
+      GuestExecutionCaptureThreadStateRegistryRejection::kNone) {
+    return GuestExecutionCaptureThreadStateVisitResult::kRegistryRejected;
+  }
+  for (const ThreadState* thread_state =
+           guest_execution_capture_thread_state_head_;
+       thread_state;
+       thread_state = thread_state->guest_execution_capture_next_) {
+    if (thread_state->guest_execution_capture_lifecycle_state_ !=
+        GuestExecutionCaptureThreadStateLifecycleState::kReady) {
+      return GuestExecutionCaptureThreadStateVisitResult::kParticipantNotReady;
+    }
+  }
+  for (const ThreadState* thread_state =
+           guest_execution_capture_thread_state_head_;
+       thread_state;
+       thread_state = thread_state->guest_execution_capture_next_) {
+    bool continue_visiting = false;
+    {
+      GuestExecutionCaptureCallbackScope callback_scope;
+      continue_visiting = visitor.VisitThreadState(*thread_state);
+    }
+    if (!continue_visiting) {
+      return GuestExecutionCaptureThreadStateVisitResult::kStoppedByVisitor;
+    }
+  }
+  return GuestExecutionCaptureThreadStateVisitResult::kCompleted;
 }
 #endif
 

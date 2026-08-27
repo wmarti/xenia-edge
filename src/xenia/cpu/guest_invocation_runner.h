@@ -28,6 +28,10 @@ namespace cpu {
 class ExactJitCorpusModule;
 class Function;
 class GuestFunction;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+class GuestInvocationRunnerTestAccess;
+#endif
 class Processor;
 class ThreadState;
 
@@ -125,10 +129,13 @@ struct GuestInvocationReplayMetrics {
 };
 
 // Owns a bare Memory, Processor, backend and ThreadState for one selected
-// invocation on Apple A64. The invocation and corpus are borrowed and must
-// outlive the runner. File decoding, provenance hashes, command-line policy,
-// subprocess fault containment and marker output intentionally remain the
-// caller's responsibility.
+// invocation on Apple A64. Capture builds publish the worker only after this
+// runner has finished its ThreadState setup. Future persistent replay workers
+// must likewise publish after each worker's complete construction or restore
+// and before the first dispatch. The invocation and corpus are borrowed and
+// must outlive the runner. File decoding, provenance hashes, command-line
+// policy, subprocess fault containment and marker output intentionally remain
+// the caller's responsibility.
 class GuestInvocationRunner {
  public:
   static constexpr uint64_t kMaxTimedInvocationCount = 10'000'000;
@@ -167,6 +174,11 @@ class GuestInvocationRunner {
   uint32_t warmed_root_host_code_size() const;
 
  private:
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  friend class GuestInvocationRunnerTestAccess;
+#endif
+
   GuestInvocationRunner(const ppc::GuestFunctionInvocation& invocation,
                         const ExecutionJitCorpus& corpus,
                         GuestInvocationReplayPlan plan);

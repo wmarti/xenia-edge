@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xthread.h"
 
+#include <cstdlib>
+
 #if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID || XE_PLATFORM_MAC
 #include <pthread.h>
 #endif
@@ -535,6 +537,18 @@ X_STATUS XThread::Create() {
 
   // Notify processor of our creation.
   emulator()->processor()->OnThreadCreated(handle(), thread_state_, this);
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // The host thread was created suspended, and the scheduler fiber has not
+  // been marked ready. Publish only after every owner field and processor
+  // notification is complete, immediately before either path becomes runnable
+  // below.
+  if (thread_state_->PublishGuestExecutionCaptureReady() !=
+      cpu::GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept) {
+    std::abort();
+  }
+#endif
 
   if ((creation_params_.creation_flags & X_CREATE_SUSPENDED) == 0) {
     // Start the thread now that we're all setup.
@@ -1536,6 +1550,18 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
     thread->emulator()->processor()->OnThreadCreated(
         thread->handle(), thread->thread_state(), thread);
   }
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // A restored running host thread was created suspended above. Global restore
+  // cannot resume it until this method returns, so publish only after its PPC
+  // context and processor notification are complete and before returning the
+  // owner to the restore orchestrator.
+  if (thread->thread_state_->PublishGuestExecutionCaptureReady() !=
+      cpu::GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept) {
+    std::abort();
+  }
+#endif
 
   return object_ref<XThread>(thread);
 }
