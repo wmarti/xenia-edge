@@ -51,8 +51,9 @@ class GuestInvocationCaptureRuntime final {
   GuestInvocationCaptureRuntime& operator=(
       const GuestInvocationCaptureRuntime&) = delete;
 
-  // Idempotently detaches the non-owning Processor sink, then finalizes the
-  // coordinator. The caller must first stop all guest callbacks.
+  // Idempotently joins the periodic deadline poller, detaches the non-owning
+  // Processor sink, then finalizes the coordinator. The caller must first stop
+  // all guest callbacks.
   void Stop();
   GuestInvocationCaptureStatus status() const;
 

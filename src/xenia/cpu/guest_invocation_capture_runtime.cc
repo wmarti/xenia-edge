@@ -30,6 +30,7 @@
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/guest_invocation_capture_bundle.h"
 #include "xenia/cpu/guest_invocation_capture_page_reader.h"
+#include "xenia/cpu/guest_invocation_capture_poller.h"
 #include "xenia/cpu/guest_invocation_capture_runtime_config.h"
 #include "xenia/cpu/guest_invocation_replay_cli.h"
 #include "xenia/cpu/guest_invocation_replay_config.h"
@@ -294,6 +295,7 @@ struct GuestInvocationCaptureRuntime::Impl {
   GuestInvocationCapturePageReader page_reader;
   HostClock clock;
   std::unique_ptr<GuestInvocationCaptureCoordinator> coordinator;
+  std::unique_ptr<GuestInvocationCaptureDeadlinePoller> deadline_poller;
   bool attached = false;
   bool published = false;
 };
@@ -369,6 +371,15 @@ GuestInvocationCaptureRuntime::Create(Memory& memory, Processor& processor,
   processor.set_guest_invocation_capture_sink(
       runtime->impl_->coordinator.get());
   runtime->impl_->attached = true;
+  runtime->impl_->deadline_poller =
+      GuestInvocationCaptureDeadlinePoller::Create(
+          *runtime->impl_->coordinator,
+          GuestInvocationCaptureDeadlinePoller::kDefaultInterval, error);
+  if (!runtime->impl_->deadline_poller) {
+    processor.set_guest_invocation_capture_sink(nullptr);
+    runtime->impl_->attached = false;
+    return nullptr;
+  }
   return runtime;
 }
 
@@ -382,6 +393,9 @@ void GuestInvocationCaptureRuntime::Stop() {
   if (!impl_) {
     return;
   }
+  // Drain the owned worker while the coordinator is still Processor's valid
+  // sink. Once this returns it cannot race detachment or coordinator teardown.
+  impl_->deadline_poller.reset();
   if (impl_->attached) {
     GuestInvocationCaptureEventSink* const registered_sink =
         impl_->processor.guest_invocation_capture_sink();

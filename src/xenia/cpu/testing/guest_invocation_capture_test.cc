@@ -10,13 +10,19 @@
 #include "xenia/cpu/guest_invocation_capture.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "third_party/catch/include/catch.hpp"
+#include "xenia/cpu/guest_invocation_capture_poller.h"
 
 namespace xe {
 namespace cpu {
@@ -32,8 +38,12 @@ constexpr ppc::GuestInvocationRecorderIdentity kOwner = {0x1111, 0x2222};
 
 class FakeClock final : public ppc::GuestInvocationRecorderClock {
  public:
-  uint64_t NowTicks() const override { return now; }
-  uint64_t now = 100;
+  uint64_t NowTicks() const override {
+    call_count.fetch_add(1, std::memory_order_relaxed);
+    return now.load(std::memory_order_relaxed);
+  }
+  std::atomic<uint64_t> now{100};
+  mutable std::atomic<uint64_t> call_count{0};
 };
 
 class FakePageReader final : public ppc::GuestInvocationRecorderPageReader {
@@ -89,7 +99,7 @@ void Attempt(GuestInvocationCaptureCoordinator& coordinator, uint64_t seed) {
 }
 
 std::unique_ptr<GuestInvocationCaptureCoordinator> MakeCoordinator(
-    FakePageReader& reader, FakeClock& clock,
+    FakePageReader& reader, ppc::GuestInvocationRecorderClock& clock,
     GuestInvocationCaptureCoordinator::SegmentHandler handler) {
   std::string error;
   std::unique_ptr<GuestInvocationCaptureCoordinator> coordinator =
@@ -101,6 +111,73 @@ std::unique_ptr<GuestInvocationCaptureCoordinator> MakeCoordinator(
   REQUIRE(coordinator->OnFunctionDefined(kRootAddress, kRootEndAddress));
   return coordinator;
 }
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+
+template <typename Predicate>
+bool WaitUntil(Predicate predicate,
+               std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!predicate()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+class BlockingClock final : public ppc::GuestInvocationRecorderClock {
+ public:
+  uint64_t NowTicks() const override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    ++call_count_;
+    if (block_) {
+      blocked_ = true;
+      condition_.notify_all();
+      condition_.wait(lock, [this] { return released_; });
+    }
+    return now_;
+  }
+
+  void BeginBlocking() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    block_ = true;
+    blocked_ = false;
+    released_ = false;
+  }
+
+  bool WaitUntilBlocked() const {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5),
+                               [this] { return blocked_; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    condition_.notify_all();
+  }
+
+  uint64_t call_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return call_count_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  mutable std::condition_variable condition_;
+  mutable uint64_t call_count_ = 0;
+  uint64_t now_ = 100;
+  bool block_ = false;
+  mutable bool blocked_ = false;
+  mutable bool released_ = false;
+};
+
+#endif
 
 void CompleteCapture(GuestInvocationCaptureCoordinator& coordinator,
                      FakePageReader& reader) {
@@ -271,6 +348,132 @@ TEST_CASE("guest invocation capture publication is reentrancy-safe",
   REQUIRE(coordinator->Poll());
   REQUIRE(handler_count == 1);
 }
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+
+TEST_CASE("guest invocation capture deadline poller rejects a quiet attempt",
+          "[guest-invocation-capture]") {
+  FakePageReader reader;
+  reader.pages[kDataPage] = {};
+  FakeClock clock;
+  std::unique_ptr<GuestInvocationCaptureCoordinator> coordinator =
+      MakeCoordinator(reader, clock,
+                      [](uint64_t, uint64_t, uint64_t,
+                         const ppc::GuestInvocationRecorderResult&,
+                         std::string*) { return true; });
+  REQUIRE(coordinator->OnFunctionEntry(kOwner, kRootAddress, kRootEndAddress,
+                                       MakeState(1)));
+  clock.now = 1100;
+
+  std::string error;
+  std::unique_ptr<GuestInvocationCaptureDeadlinePoller> poller =
+      GuestInvocationCaptureDeadlinePoller::Create(
+          *coordinator, std::chrono::milliseconds(1), &error);
+  REQUIRE(poller);
+  REQUIRE(error.empty());
+  REQUIRE(WaitUntil([&] {
+    return coordinator->status().state ==
+           GuestInvocationCaptureState::kRejected;
+  }));
+  poller->StopAndJoin();
+
+  const GuestInvocationCaptureStatus status = coordinator->status();
+  REQUIRE(status.rejection ==
+          ppc::GuestInvocationRecorderRejection::kDeadlineExceeded);
+  REQUIRE(status.rejected_segment_count == 1);
+  REQUIRE(status.capture_end_tick == 1100);
+}
+
+TEST_CASE("guest invocation capture deadline polling is owner bounded",
+          "[guest-invocation-capture]") {
+  FakePageReader reader;
+  FakeClock clock;
+  std::unique_ptr<GuestInvocationCaptureCoordinator> coordinator =
+      MakeCoordinator(reader, clock,
+                      [](uint64_t, uint64_t, uint64_t,
+                         const ppc::GuestInvocationRecorderResult&,
+                         std::string*) { return true; });
+  const uint64_t calls_before_attach = clock.call_count.load();
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  REQUIRE(clock.call_count.load() == calls_before_attach);
+
+  std::string error;
+  std::unique_ptr<GuestInvocationCaptureDeadlinePoller> poller =
+      GuestInvocationCaptureDeadlinePoller::Create(
+          *coordinator, std::chrono::milliseconds(1), &error);
+  REQUIRE(poller);
+  REQUIRE(
+      WaitUntil([&] { return clock.call_count.load() > calls_before_attach; }));
+  poller->StopAndJoin();
+  const uint64_t calls_after_detach = clock.call_count.load();
+
+  clock.now = 1100;
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  REQUIRE(clock.call_count.load() == calls_after_detach);
+  REQUIRE(coordinator->status().state ==
+          GuestInvocationCaptureState::kRecording);
+  REQUIRE_FALSE(coordinator->Poll());
+  REQUIRE(coordinator->status().rejection ==
+          ppc::GuestInvocationRecorderRejection::kDeadlineExceeded);
+}
+
+TEST_CASE("guest invocation capture deadline poller drains shutdown",
+          "[guest-invocation-capture]") {
+  FakePageReader reader;
+  BlockingClock clock;
+  std::unique_ptr<GuestInvocationCaptureCoordinator> coordinator =
+      MakeCoordinator(reader, clock,
+                      [](uint64_t, uint64_t, uint64_t,
+                         const ppc::GuestInvocationRecorderResult&,
+                         std::string*) { return true; });
+  clock.BeginBlocking();
+
+  std::string error;
+  std::unique_ptr<GuestInvocationCaptureDeadlinePoller> poller =
+      GuestInvocationCaptureDeadlinePoller::Create(
+          *coordinator, std::chrono::milliseconds(1), &error);
+  REQUIRE(poller);
+  REQUIRE(clock.WaitUntilBlocked());
+
+  std::mutex stop_mutex;
+  std::condition_variable stop_condition;
+  bool stop_started = false;
+  bool stop_complete = false;
+  std::thread stopper([&] {
+    {
+      std::lock_guard<std::mutex> lock(stop_mutex);
+      stop_started = true;
+    }
+    stop_condition.notify_all();
+    poller->StopAndJoin();
+    {
+      std::lock_guard<std::mutex> lock(stop_mutex);
+      stop_complete = true;
+    }
+    stop_condition.notify_all();
+  });
+  bool stopped_before_release = false;
+  {
+    std::unique_lock<std::mutex> lock(stop_mutex);
+    REQUIRE(stop_condition.wait_for(lock, std::chrono::seconds(5),
+                                    [&] { return stop_started; }));
+    stopped_before_release = stop_condition.wait_for(
+        lock, std::chrono::milliseconds(25), [&] { return stop_complete; });
+  }
+
+  clock.Release();
+  stopper.join();
+  REQUIRE_FALSE(stopped_before_release);
+  REQUIRE(stop_complete);
+  const uint64_t calls_after_join = clock.call_count();
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  REQUIRE(clock.call_count() == calls_after_join);
+  REQUIRE(coordinator->status().state ==
+          GuestInvocationCaptureState::kRecording);
+}
+
+#endif
 
 }  // namespace test
 }  // namespace cpu
