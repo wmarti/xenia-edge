@@ -93,6 +93,9 @@ class GuestExecutionSessionCaptureProvider final
           participants,
       const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
       std::string* error) noexcept override;
+  bool CollectInstructionCoverageDeltas(
+      std::vector<GuestExecutionSessionInstructionCoverageDelta>* output,
+      std::string* error) noexcept override;
   bool SealCapture(
       const kernel::GuestSchedulerCheckpointBarrierSnapshot& checkpoint,
       const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,

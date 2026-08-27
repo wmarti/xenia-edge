@@ -19,6 +19,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "xenia/cpu/guest_execution_capture.h"
 #include "xenia/cpu/guest_execution_session_assembler.h"
@@ -77,6 +78,11 @@ struct GuestExecutionSessionCaptureRuntimeConfig {
   size_t checkpoint_release_attempts = 3;
 };
 
+struct GuestExecutionSessionInstructionCoverageDelta {
+  GuestExecutionCaptureParticipantIdentity participant;
+  uint64_t guest_instruction_delta = 0;
+};
+
 // Owns the exact-PC checkpoint encoding and sparse memory/code observation.
 // BeginCapture runs while the provisional start barrier is held and must arm
 // every writer before returning. SealCapture runs while the stop barrier is
@@ -96,6 +102,9 @@ class GuestExecutionSessionCaptureRuntimeProvider
       std::span<const GuestExecutionCaptureThreadStateLifecycleEvent>
           participants,
       const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
+      std::string* error) noexcept = 0;
+  virtual bool CollectInstructionCoverageDeltas(
+      std::vector<GuestExecutionSessionInstructionCoverageDelta>* output,
       std::string* error) noexcept = 0;
   virtual bool SealCapture(
       const kernel::GuestSchedulerCheckpointBarrierSnapshot& checkpoint,

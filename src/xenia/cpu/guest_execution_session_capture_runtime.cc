@@ -935,6 +935,32 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     return AssemblerAction::kContinue;
   }
 
+  bool FlushInstructionCoverage() {
+    std::string error;
+    instruction_coverage_deltas.clear();
+    if (!dependencies.provider->CollectInstructionCoverageDeltas(
+            &instruction_coverage_deltas, &error)) {
+      Reject(RuntimeRejection::kProviderFailure,
+             error.empty()
+                 ? "capture runtime could not collect instruction coverage"
+                 : std::move(error));
+      return false;
+    }
+    for (const auto& delta : instruction_coverage_deltas) {
+      if (!delta.guest_instruction_delta ||
+          assembler->OnInstructionCoverage(delta.participant,
+                                           delta.guest_instruction_delta) ==
+              AssemblerAction::kReject) {
+        Reject(RuntimeRejection::kAssemblerFailure,
+               assembler->status().message.empty()
+                   ? "capture runtime rejected instruction coverage"
+                   : assembler->status().message);
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool DrainSourceEventsDuringStop(std::string* error) {
     RuntimeEvent event;
     while (queue.TryPop(&event)) {
@@ -984,6 +1010,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     }
     if (!DrainSourceEventsDuringStop(&error)) {
       Reject(RuntimeRejection::kAssemblerFailure, std::move(error));
+      return;
+    }
+    if (!FlushInstructionCoverage()) {
       return;
     }
     // A manual stop becomes an assembler boundary only after the checkpoint
@@ -1153,6 +1182,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     if (current != RuntimeState::kRecording) {
       return;
     }
+    if (!FlushInstructionCoverage()) {
+      return;
+    }
     std::string error;
     if (ProcessSourceEvent(event, &error) == AssemblerAction::kReject) {
       Reject(event.kind == RuntimeEventKind::kScheduler
@@ -1174,6 +1206,16 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   void PollAssembler() {
     if (state_atomic.load(std::memory_order_acquire) !=
         RuntimeState::kRecording) {
+      return;
+    }
+    if (!FlushInstructionCoverage()) {
+      return;
+    }
+    const AssemblerState coverage_state = assembler->status().state;
+    if (coverage_state == AssemblerState::kStopRequested ||
+        coverage_state == AssemblerState::kStopRendezvous ||
+        coverage_state == AssemblerState::kPublishing) {
+      HandleStop(false);
       return;
     }
     const AssemblerAction action = assembler->Poll();
@@ -1279,6 +1321,8 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       checkpoint_controller = nullptr;
   std::unique_ptr<GuestExecutionSessionAssembler> assembler;
   std::optional<CheckpointSnapshot> initial_scheduler_checkpoint;
+  std::vector<GuestExecutionSessionInstructionCoverageDelta>
+      instruction_coverage_deltas;
 
   std::thread worker;
   std::thread::id worker_id;

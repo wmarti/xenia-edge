@@ -413,6 +413,33 @@ TEST_CASE(
           GuestExecutionSessionCaptureProviderState::kAccepted);
 }
 
+TEST_CASE("guest execution session provider owns instruction counters",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  std::string error;
+  REQUIRE(harness.provider->BeginCapture(harness.Checkpoint(),
+                                         harness.Participants(),
+                                         harness.HostCalls(), &error));
+  ppc::PPCContext* context = harness.thread->context();
+  REQUIRE(context->guest_execution_session_instruction_counter ==
+          &context->guest_execution_session_instruction_count);
+
+  std::atomic_ref<uint64_t>(context->guest_execution_session_instruction_count)
+      .fetch_add(37, std::memory_order_relaxed);
+  std::vector<GuestExecutionSessionInstructionCoverageDelta> deltas;
+  REQUIRE(harness.provider->CollectInstructionCoverageDeltas(&deltas, &error));
+  REQUIRE(deltas.size() == 1);
+  REQUIRE(deltas.front().participant == harness.participant);
+  REQUIRE(deltas.front().guest_instruction_delta == 37);
+  REQUIRE(harness.provider->CollectInstructionCoverageDeltas(&deltas, &error));
+  REQUIRE(deltas.empty());
+
+  REQUIRE(harness.provider->SealCapture(harness.Checkpoint(),
+                                        harness.HostCalls(), &error));
+  REQUIRE(context->guest_execution_session_instruction_counter == nullptr);
+  harness.provider->EndCapture(true);
+}
+
 TEST_CASE("guest execution session provider authenticates nested returns",
           "[guest-execution-session-capture-provider]") {
   ProviderHarness harness;

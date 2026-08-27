@@ -275,6 +275,16 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
     return true;
   }
 
+  bool CollectInstructionCoverageDeltas(
+      std::vector<GuestExecutionSessionInstructionCoverageDelta>* output,
+      std::string*) noexcept override {
+    std::lock_guard<std::mutex> lock(coverage_mutex);
+    output->clear();
+    output->swap(pending_coverage);
+    ++coverage_collection_count;
+    return true;
+  }
+
   bool SealCapture(const CheckpointSnapshot&,
                    const GuestExecutionCaptureHostCallRosterSnapshot&,
                    std::string*) noexcept override {
@@ -371,9 +381,17 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
     seal_condition.notify_all();
   }
 
+  void QueueInstructionCoverage(
+      const GuestExecutionCaptureParticipantIdentity& participant,
+      uint64_t guest_instruction_delta) {
+    std::lock_guard<std::mutex> lock(coverage_mutex);
+    pending_coverage.push_back({participant, guest_instruction_delta});
+  }
+
   std::atomic<uint32_t> begin_count{0};
   std::atomic<uint32_t> seal_count{0};
   std::atomic<uint32_t> end_count{0};
+  std::atomic<uint32_t> coverage_collection_count{0};
   std::atomic<bool> ended_accepted{false};
   bool emit_invalid_state = false;
 
@@ -387,6 +405,8 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
   bool block_seal = false;
   bool seal_entered = false;
   std::atomic<uint64_t> state_generation{1};
+  std::mutex coverage_mutex;
+  std::vector<GuestExecutionSessionInstructionCoverageDelta> pending_coverage;
   std::vector<uint8_t> code_page_;
   std::vector<uint8_t> code_corpus_;
 };
@@ -607,8 +627,11 @@ class CanonicalEventBridge final
 
 class CountingPublisher final : public GuestExecutionSessionAssemblerPublisher {
  public:
-  bool Publish(const GuestExecutionSessionBundle&,
+  bool Publish(const GuestExecutionSessionBundle& bundle,
                std::string*) noexcept override {
+    stop_request_guest_instruction_count.store(
+        bundle.manifest.stop_request_guest_instruction_count,
+        std::memory_order_release);
     std::unique_lock<std::mutex> lock(mutex);
     entered = true;
     condition.notify_all();
@@ -646,6 +669,7 @@ class CountingPublisher final : public GuestExecutionSessionAssemblerPublisher {
 
   std::atomic<uint32_t> calls{0};
   std::atomic<bool> reentered{false};
+  std::atomic<uint64_t> stop_request_guest_instruction_count{0};
 
  private:
   std::mutex mutex;
@@ -956,6 +980,30 @@ TEST_CASE("session capture runtime rejects invocation-segment mode",
   REQUIRE_FALSE(harness.runtime);
   REQUIRE(harness.error ==
           "capture runtime requires continuous instruction coverage mode");
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime drains provider instruction coverage",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  harness.provider.QueueInstructionCoverage(
+      {thread->guest_execution_capture_instance_id(), thread->thread_id()}, 7);
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  REQUIRE(harness.runtime->status().state == RuntimeState::kComplete);
+  REQUIRE(harness.publisher.stop_request_guest_instruction_count.load(
+              std::memory_order_acquire) == 17);
+  REQUIRE(harness.provider.coverage_collection_count.load(
+              std::memory_order_acquire) != 0);
+
+  harness.runtime->Shutdown();
   thread.reset();
 }
 
