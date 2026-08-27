@@ -9,10 +9,13 @@
 
 #include "xenia/cpu/exact_jit_corpus_module.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -20,6 +23,7 @@
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/cpu/testing/util.h"
 #include "xenia/memory.h"
 
 #include "third_party/catch/include/catch.hpp"
@@ -193,6 +197,176 @@ TEST_CASE("exact JIT corpus module exposes only recorded function entries",
           Symbol::Status::kNew);
   REQUIRE(foreign_function);
   REQUIRE_FALSE(module_ptr->HasExactExtent(*foreign_function));
+}
+
+TEST_CASE("exact JIT corpus module translates explicit resume suffixes",
+          "[execution-jit-corpus][resume]") {
+  constexpr uint32_t kOwnerEntry = 0x82040000;
+  constexpr uint32_t kOwnerEnd = kOwnerEntry + 12;
+  constexpr uint32_t kInteriorResume = kOwnerEntry + 4;
+  constexpr uint32_t kEndResume = kOwnerEnd;
+
+  std::vector<uint8_t> encoded = MakeHeader();
+  AppendPage(&encoded, kOwnerEntry, 0x44);
+  AppendFunction(&encoded, kOwnerEntry, kOwnerEnd,
+                 FunctionFlags(Function::Behavior::kProlog,
+                               SaveRestoreType::FPR, false, 28));
+  ExecutionJitCorpus corpus;
+  REQUIRE(ExecutionJitCorpus::Decode(encoded, &corpus));
+  const std::vector<uint32_t> captured_definition_order =
+      corpus.function_definition_order();
+
+  Memory memory;
+  REQUIRE(memory.Initialize());
+  store_and_swap<uint32_t>(memory.TranslateVirtual(kOwnerEntry),
+                           0x38630001u);  // addi r3, r3, 1
+  store_and_swap<uint32_t>(memory.TranslateVirtual(kOwnerEntry + 4),
+                           0x38630002u);  // addi r3, r3, 2
+  store_and_swap<uint32_t>(memory.TranslateVirtual(kOwnerEntry + 8),
+                           0x38630004u);  // addi r3, r3, 4
+  store_and_swap<uint32_t>(memory.TranslateVirtual(kOwnerEnd),
+                           0x4E800020u);  // blr
+
+  auto backend = testing::CreateBackend();
+  REQUIRE(backend);
+  Processor processor(&memory, nullptr);
+  REQUIRE(processor.Setup(std::move(backend)));
+
+  const std::array<ExactJitCorpusModule::ResumeEntry, 2> resume_entries = {{
+      {kEndResume, kOwnerEntry, kOwnerEnd},
+      {kInteriorResume, kOwnerEntry, kOwnerEnd},
+  }};
+  std::string error;
+  auto module = ExactJitCorpusModule::Create(
+      &processor, corpus,
+      std::span<const ExactJitCorpusModule::ResumeEntry>(resume_entries),
+      "resumes", &error);
+  REQUIRE(module);
+  REQUIRE(error.empty());
+  ExactJitCorpusModule* module_ptr = module.get();
+  REQUIRE(processor.AddModule(std::move(module)));
+
+  REQUIRE(module_ptr->ContainsAddress(kOwnerEntry));
+  REQUIRE(module_ptr->ContainsAddress(kInteriorResume));
+  REQUIRE(module_ptr->ContainsAddress(kEndResume));
+  REQUIRE_FALSE(module_ptr->ContainsAddress(kOwnerEntry + 8));
+  REQUIRE_FALSE(module_ptr->ContainsAddress(kOwnerEnd + 4));
+  REQUIRE(processor.LookupModule(kOwnerEntry + 8) == nullptr);
+
+  Function* interior_function = processor.ResolveFunction(kInteriorResume);
+  REQUIRE(interior_function);
+  REQUIRE(interior_function->address() == kInteriorResume);
+  REQUIRE(interior_function->end_address() == kOwnerEnd);
+  REQUIRE(interior_function->behavior() == Function::Behavior::kDefault);
+  REQUIRE(interior_function->SaverestType() == SaveRestoreType::NONE);
+  REQUIRE_FALSE(interior_function->IsSaverest());
+  REQUIRE(module_ptr->HasExactExtent(*interior_function));
+
+  Function* end_function = processor.ResolveFunction(kEndResume);
+  REQUIRE(end_function);
+  REQUIRE(end_function->address() == kEndResume);
+  REQUIRE(end_function->end_address() == kOwnerEnd);
+  REQUIRE(end_function->behavior() == Function::Behavior::kDefault);
+  REQUIRE(end_function->SaverestType() == SaveRestoreType::NONE);
+  REQUIRE_FALSE(end_function->IsSaverest());
+  REQUIRE(module_ptr->HasExactExtent(*end_function));
+
+  Function* owner_function = nullptr;
+  REQUIRE(module_ptr->DeclareFunction(kOwnerEntry, &owner_function) ==
+          Symbol::Status::kNew);
+  REQUIRE(owner_function);
+  REQUIRE(owner_function->end_address() == kOwnerEnd);
+  REQUIRE(owner_function->behavior() == Function::Behavior::kProlog);
+  REQUIRE(owner_function->SaverestType() == SaveRestoreType::FPR);
+  REQUIRE(owner_function->IsSave());
+  REQUIRE(owner_function->SaverestIndex() == 28);
+  REQUIRE(module_ptr->HasExactExtent(*owner_function));
+  REQUIRE(corpus.function_definition_order() == captured_definition_order);
+
+  const uint32_t stack_size = 64 * 1024;
+  const uint32_t stack_address = memory.SystemHeapAlloc(stack_size);
+  REQUIRE(stack_address != 0);
+  auto thread_state = std::make_unique<ThreadState>(&processor, 0x100,
+                                                    stack_address + stack_size);
+  thread_state->context()->lr = 0xBCBCBCBC;
+  thread_state->context()->r[3] = 10;
+  REQUIRE(interior_function->Call(thread_state.get(),
+                                  uint32_t(thread_state->context()->lr)));
+  REQUIRE(thread_state->context()->r[3] == 16);
+  thread_state->context()->r[3] = 20;
+  REQUIRE(end_function->Call(thread_state.get(),
+                             uint32_t(thread_state->context()->lr)));
+  REQUIRE(thread_state->context()->r[3] == 20);
+  thread_state.reset();
+  memory.SystemHeapFree(stack_address);
+
+  interior_function->set_end_address(kOwnerEnd - 4);
+  REQUIRE_FALSE(module_ptr->HasExactExtent(*interior_function));
+  REQUIRE(module_ptr->DeclareFunction(kInteriorResume, &interior_function) ==
+          Symbol::Status::kFailed);
+  REQUIRE(interior_function->status() == Symbol::Status::kFailed);
+}
+
+TEST_CASE("exact JIT corpus module rejects invalid resume declarations",
+          "[execution-jit-corpus][resume]") {
+  constexpr uint32_t kOwnerEntry = 0x82050000;
+  constexpr uint32_t kOwnerEnd = kOwnerEntry + 28;
+  constexpr uint32_t kNestedEntry = kOwnerEntry + 16;
+  constexpr uint32_t kNestedEnd = kOwnerEnd;
+
+  std::vector<uint8_t> encoded = MakeHeader();
+  AppendPage(&encoded, kOwnerEntry, 0x55);
+  AppendFunction(&encoded, kNestedEntry, kNestedEnd);
+  AppendFunction(&encoded, kOwnerEntry, kOwnerEnd);
+  ExecutionJitCorpus corpus;
+  REQUIRE(ExecutionJitCorpus::Decode(encoded, &corpus));
+  REQUIRE(corpus.function_definition_order() ==
+          std::vector<uint32_t>{kNestedEntry, kOwnerEntry});
+
+  Memory memory;
+  auto backend = std::make_unique<StubBackend>();
+  StubBackend* backend_ptr = backend.get();
+  Processor processor(&memory, nullptr);
+  REQUIRE(processor.Setup(std::move(backend)));
+
+  using ResumeEntry = ExactJitCorpusModule::ResumeEntry;
+  std::string error;
+  const auto require_rejected = [&](std::initializer_list<ResumeEntry> entries,
+                                    std::string_view expected_error) {
+    const std::vector<ResumeEntry> declaration(entries);
+    auto module = ExactJitCorpusModule::Create(
+        &processor, corpus, std::span<const ResumeEntry>(declaration),
+        "rejected", &error);
+    REQUIRE_FALSE(module);
+    REQUIRE(error == expected_error);
+  };
+
+  require_rejected({{0, kOwnerEntry, kOwnerEnd}},
+                   "exact corpus resume PC is zero or unaligned");
+  require_rejected({{kOwnerEntry + 2, kOwnerEntry, kOwnerEnd}},
+                   "exact corpus resume PC is zero or unaligned");
+  require_rejected({{kOwnerEntry + 4, kOwnerEntry + 8, kOwnerEnd}},
+                   "exact corpus resume entry has an unknown owner");
+  require_rejected({{kOwnerEntry + 4, kOwnerEntry, kOwnerEnd - 4}},
+                   "exact corpus resume entry owner extent is inconsistent");
+  require_rejected({{kOwnerEntry + 12, kNestedEntry, kNestedEnd}},
+                   "exact corpus resume PC is outside its owner extent");
+  require_rejected({{kOwnerEnd + 4, kOwnerEntry, kOwnerEnd}},
+                   "exact corpus resume PC is outside its owner extent");
+  require_rejected({{kNestedEntry, kOwnerEntry, kOwnerEnd}},
+                   "exact corpus resume PC overlaps a captured entry");
+  require_rejected({{kOwnerEntry, kOwnerEntry, kOwnerEnd}},
+                   "exact corpus resume PC overlaps a captured entry");
+  require_rejected({{kOwnerEntry + 4, kOwnerEntry, kOwnerEnd},
+                    {kOwnerEntry + 4, kOwnerEntry, kOwnerEnd}},
+                   "exact corpus contains a duplicate resume entry");
+  require_rejected({{kOwnerEntry + 20, kOwnerEntry, kOwnerEnd},
+                    {kOwnerEntry + 20, kNestedEntry, kNestedEnd}},
+                   "exact corpus contains conflicting resume entries");
+
+  REQUIRE(backend_ptr->executable_ranges.empty());
+  REQUIRE(corpus.function_definition_order() ==
+          std::vector<uint32_t>{kNestedEntry, kOwnerEntry});
 }
 
 }  // namespace xe::cpu::test

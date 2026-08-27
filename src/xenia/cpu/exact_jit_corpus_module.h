@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,14 +23,26 @@
 namespace xe {
 namespace cpu {
 
-// Replay-only module exposing exactly the validated corpus entries. It does
-// not create a broad RawModule address range: interior addresses and gaps are
-// never accepted as function entries, and only contiguous recorded code-page
-// runs are committed to the backend as executable ranges.
+// Replay-only module exposing exactly the validated corpus entries and any
+// explicitly declared resume entries. It does not create a broad RawModule
+// address range: undeclared interior addresses and gaps are never accepted as
+// function entries, and only contiguous recorded code-page runs are committed
+// to the backend as executable ranges.
 class ExactJitCorpusModule final : public Module {
  public:
+  struct ResumeEntry {
+    uint32_t resume_pc;
+    uint32_t owning_function_entry;
+    uint32_t owning_function_end;
+  };
+
   static std::unique_ptr<ExactJitCorpusModule> Create(
       Processor* processor, const ExecutionJitCorpus& corpus,
+      std::string_view name = "execution_jit_corpus",
+      std::string* error = nullptr);
+  static std::unique_ptr<ExactJitCorpusModule> Create(
+      Processor* processor, const ExecutionJitCorpus& corpus,
+      std::span<const ResumeEntry> resume_entries,
       std::string_view name = "execution_jit_corpus",
       std::string* error = nullptr);
 
@@ -41,8 +54,8 @@ class ExactJitCorpusModule final : public Module {
   Symbol::Status DeclareFunction(uint32_t address,
                                  Function** out_function) override;
 
-  // The PPC scanner must reproduce the captured inclusive end address. A
-  // runner calls this after translation before accepting or timing a replay.
+  // The PPC scanner must reproduce the captured owner inclusive end address.
+  // A runner calls this after translation before accepting or timing a replay.
   bool HasExactExtent(const Function& function) const;
 
  protected:
@@ -50,13 +63,16 @@ class ExactJitCorpusModule final : public Module {
 
  private:
   ExactJitCorpusModule(Processor* processor, const ExecutionJitCorpus& corpus,
+                       std::vector<ResumeEntry> resume_entries,
                        std::string_view name);
 
   const ExecutionJitCorpus::FunctionRecord* FindFunction(
       uint32_t entry_address) const;
+  const ResumeEntry* FindResumeEntry(uint32_t resume_pc) const;
 
   std::string name_;
   std::vector<ExecutionJitCorpus::FunctionRecord> functions_;
+  std::vector<ResumeEntry> resume_entries_;
 };
 
 }  // namespace cpu
