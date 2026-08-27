@@ -339,6 +339,10 @@ bool BuildSyntheticGuestInvocationFixture(
           GuestInvocationReplayConfig::kMaxHostProtectionPageSize) {
     return Fail(error, "synthetic fixture host page size is unsupported");
   }
+  if (!captured_host_code_size) {
+    return Fail(error,
+                "synthetic fixture is missing the captured host code size");
+  }
 
   SyntheticGuestInvocationFixture fixture;
   fixture.host_page_size = host_page_size;

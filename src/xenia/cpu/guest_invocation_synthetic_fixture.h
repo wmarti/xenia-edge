@@ -54,9 +54,9 @@ struct SyntheticGuestInvocationFixture {
 };
 
 // Builds strict in-memory inputs using exactly one host-protection-granule of
-// code and, for the valid invocation, exactly one granule of data. A zero host
-// code size is permitted only while bootstrapping the fixture before the
-// initialized backend has reported its actual warmed root size.
+// code and, for the valid invocation, exactly one granule of data. The host
+// code size must be nonzero because execution replay rejects compile-only
+// corpus records that lack this capture provenance.
 bool BuildSyntheticGuestInvocationFixture(
     uint32_t host_page_size, uint32_t captured_host_code_size,
     SyntheticGuestInvocationFixture* output, std::string* error = nullptr);

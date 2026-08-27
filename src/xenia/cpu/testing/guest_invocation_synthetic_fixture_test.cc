@@ -117,6 +117,11 @@ TEST_CASE("synthetic invocation fixture rejects unsupported host granules",
 
   REQUIRE_FALSE(BuildSyntheticGuestInvocationFixture(4096, 1, nullptr, &error));
   REQUIRE(error == "synthetic fixture output is null");
+
+  REQUIRE_FALSE(
+      BuildSyntheticGuestInvocationFixture(4096, 0, &fixture, &error));
+  REQUIRE(error == "synthetic fixture is missing the captured host code size");
+  REQUIRE(fixture.host_page_size == 0);
 }
 
 }  // namespace test

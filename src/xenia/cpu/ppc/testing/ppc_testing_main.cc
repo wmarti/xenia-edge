@@ -1015,7 +1015,7 @@ bool WriteSyntheticFixture(const std::filesystem::path& executable_path) {
   }
   SyntheticGuestInvocationFixture bootstrap_fixture;
   if (!BuildSyntheticGuestInvocationFixture(
-          static_cast<uint32_t>(native_page_size), 0, &bootstrap_fixture,
+          static_cast<uint32_t>(native_page_size), 1, &bootstrap_fixture,
           &error)) {
     return Reject("synthetic fixture construction", error);
   }

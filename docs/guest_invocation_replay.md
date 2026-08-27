@@ -258,7 +258,7 @@ before publication.
 The manifest contains the complete effective configuration, configuration,
 corpus, artifact and capture-executable hashes, the corpus shape, and the exact
 reset-page and reset-byte expectations. The valid artifact must emit the one
-canonical 15-field benchmark marker. Each fault artifact must be launched as a
+canonical 17-field benchmark marker. Each fault artifact must be launched as a
 disposable child; a signal, rejection or other nonzero exit with no accepted
 marker is the expected containment result. These fixtures contain only bytes
 constructed by the test generator and must never be replaced with or committed
