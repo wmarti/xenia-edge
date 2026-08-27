@@ -962,6 +962,7 @@ TEST_CASE("A64_SESSION_INSTRUCTION_COVERAGE_COUNTS_EXECUTED_BLOCKS",
             &context->guest_execution_session_instruction_count;
       },
       [](ppc::PPCContext* context) {
+        REQUIRE(context->r[4] == 1);
         REQUIRE(context->guest_execution_session_instruction_count == 8);
       });
   function.Run(
