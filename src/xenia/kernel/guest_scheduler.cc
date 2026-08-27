@@ -2373,6 +2373,13 @@ void GuestScheduler::WatchdogLoop() {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 bool GuestScheduler::AttachCaptureObserver(
     std::shared_ptr<GuestSchedulerCaptureObserver> observer) {
+  return AttachCaptureObserverTransactionally(std::move(observer),
+                                              []() { return true; });
+}
+
+bool GuestScheduler::AttachCaptureObserverTransactionally(
+    std::shared_ptr<GuestSchedulerCaptureObserver> observer,
+    const std::function<bool()>& attach_companion) {
   if (!observer || !observer->CanDetach()) {
     return false;
   }
@@ -2385,6 +2392,9 @@ bool GuestScheduler::AttachCaptureObserver(
     if (cpu.ready_summary) {
       return false;
     }
+  }
+  if (!attach_companion || !attach_companion()) {
+    return false;
   }
   capture_observer_ = std::move(observer);
   capture_sequence_ = 0;

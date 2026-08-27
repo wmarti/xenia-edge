@@ -207,6 +207,15 @@ class GuestScheduler {
   // joined and before leftover fibers are reclaimed.
   bool AttachCaptureObserver(
       std::shared_ptr<GuestSchedulerCaptureObserver> observer);
+  // Runs |attach_companion| while holding the scheduler gate after all
+  // scheduler-side preconditions have passed, then installs |observer| with
+  // no intervening scheduler mutation. The callback must not call back into
+  // GuestScheduler. A false result leaves the scheduler source untouched.
+  // This is the two-source attachment primitive used by continuous capture so
+  // a racing first dispatch cannot strand a half-attached observer.
+  bool AttachCaptureObserverTransactionally(
+      std::shared_ptr<GuestSchedulerCaptureObserver> observer,
+      const std::function<bool()>& attach_companion);
   bool DetachCaptureObserver(
       const std::shared_ptr<GuestSchedulerCaptureObserver>& observer);
 

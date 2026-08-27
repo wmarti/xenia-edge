@@ -178,6 +178,13 @@ class Processor {
   // host-context pointer escapes the lifetime registry lock.
   GuestExecutionCaptureThreadStateRegistrySnapshot
   QueryGuestExecutionCaptureParticipants() const;
+  // Takes the final lifecycle snapshot and closes |capture_active| under the
+  // same registry lock. A lifecycle mutation is therefore wholly before the
+  // cutoff and present in the snapshot, or wholly after it and outside the
+  // capture; it can never land in the gap between those operations.
+  GuestExecutionCaptureThreadStateRegistrySnapshot
+  QueryGuestExecutionCaptureParticipantsAtCutoff(
+      std::atomic<bool>& capture_active) const;
 
   // Visits live ThreadState objects while destruction is excluded by the
   // capture-only lifetime registry lock. The visitor must not retain a

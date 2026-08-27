@@ -979,6 +979,28 @@ Processor::QueryGuestExecutionCaptureParticipants() const {
   return result;
 }
 
+GuestExecutionCaptureThreadStateRegistrySnapshot
+Processor::QueryGuestExecutionCaptureParticipantsAtCutoff(
+    std::atomic<bool>& capture_active) const {
+  GuestExecutionCaptureThreadStateRegistrySnapshot result;
+  if (guest_execution_capture_callback_active) {
+    result.rejection = GuestExecutionCaptureThreadStateRegistryRejection::
+        kObserverCallbackReentry;
+    return result;
+  }
+  std::lock_guard<std::mutex> lock(guest_execution_capture_thread_state_mutex_);
+  capture_active.store(false, std::memory_order_release);
+  result.rejection = guest_execution_capture_thread_state_rejection_;
+  for (const ThreadState* thread_state =
+           guest_execution_capture_thread_state_head_;
+       thread_state;
+       thread_state = thread_state->guest_execution_capture_next_) {
+    result.participants.push_back(MakeThreadStateLifecycleEvent(
+        *thread_state, thread_state->guest_execution_capture_lifecycle_state_));
+  }
+  return result;
+}
+
 GuestExecutionCaptureThreadStateVisitResult
 Processor::VisitGuestExecutionCaptureThreadStates(
     GuestExecutionCaptureThreadStateVisitor& visitor) const noexcept {
