@@ -964,6 +964,21 @@ void XThread::PublishPriority(int32_t priority) {
   StorePublishedPriority(priority);
 }
 
+void XThread::PublishBasePriorityAndPriority(int32_t base_priority,
+                                             int32_t priority) {
+  if (fiber_) {
+    kernel_state()->guest_scheduler()->PublishBasePriorityAndPriority(
+        this, base_priority, priority);
+    return;
+  }
+  StorePublishedBasePriority(base_priority);
+  StorePublishedPriority(priority);
+}
+
+void XThread::StorePublishedBasePriority(int32_t base_priority) {
+  base_priority_ = base_priority;
+}
+
 void XThread::StorePublishedPriority(int32_t priority) {
   priority_.store(priority, std::memory_order_relaxed);
   if (is_guest_thread()) {
@@ -981,9 +996,8 @@ int32_t XThread::SetPriority(int32_t increment) {
   // Clamp to the valid Xenon priority range. Negative values can arrive via
   // KeSetBasePriorityThread (signed offset from process base).
   int32_t clamped = std::clamp(increment, 0, 31);
-  base_priority_ = clamped;
   boost_amount_ = 0;
-  PublishPriority(clamped);
+  PublishBasePriorityAndPriority(clamped, clamped);
   return old_priority;
 }
 
@@ -1028,12 +1042,9 @@ int32_t XThread::SetBasePriority(int32_t increment) {
     new_cur = 0;
   }
   kt->base_priority = static_cast<uint8_t>(new_base);
-  base_priority_ = new_base;
   kt->priority_decrement = 0;
   boost_amount_ = 0;
-  if (new_cur != priority()) {
-    PublishPriority(new_cur);
-  }
+  PublishBasePriorityAndPriority(new_base, new_cur);
   return result;
 }
 

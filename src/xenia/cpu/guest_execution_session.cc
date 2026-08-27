@@ -32,6 +32,8 @@ constexpr std::array<uint8_t, 8> kEnvelopeMagic = {'X', 'E', 'G', 'S',
                                                    'E', 'S', 'S', 0};
 constexpr std::array<uint8_t, 8> kClosureMagic = {'X', 'E', 'G', 'C',
                                                   'L', 'O', 'S', 'E'};
+constexpr std::array<uint8_t, 8> kSchedulerTopologyMagic = {'X', 'E', 'G', 'T',
+                                                            'O', 'P', 'O', 0};
 constexpr uint32_t kManifestEnvelopeKind = 1;
 constexpr uint32_t kManifestOrdinal = UINT32_MAX;
 constexpr uint32_t kKnownEnvelopeFlags = 0;
@@ -471,10 +473,331 @@ bool IsKnownChunkKind(GuestExecutionSessionChunkKind kind) {
     case GuestExecutionSessionChunkKind::kCheckpoint:
     case GuestExecutionSessionChunkKind::kContinuousEvents:
     case GuestExecutionSessionChunkKind::kCodeCorpus:
+    case GuestExecutionSessionChunkKind::kSchedulerTopology:
       return true;
     default:
       return false;
   }
+}
+
+bool IsKnownSchedulerTopologyBoundary(
+    GuestExecutionSessionSchedulerTopologyBoundary boundary) {
+  switch (boundary) {
+    case GuestExecutionSessionSchedulerTopologyBoundary::kStart:
+    case GuestExecutionSessionSchedulerTopologyBoundary::kFinal:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsKnownSchedulerParticipantState(
+    GuestExecutionSessionSchedulerParticipantState state) {
+  switch (state) {
+    case GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned:
+    case GuestExecutionSessionSchedulerParticipantState::kRunning:
+    case GuestExecutionSessionSchedulerParticipantState::kReady:
+    case GuestExecutionSessionSchedulerParticipantState::kBlocked:
+    case GuestExecutionSessionSchedulerParticipantState::kSuspended:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsKnownSchedulerResumeKind(
+    GuestExecutionSessionSchedulerResumeKind resume_kind) {
+  switch (resume_kind) {
+    case GuestExecutionSessionSchedulerResumeKind::kJitSafepoint:
+    case GuestExecutionSessionSchedulerResumeKind::kNativeContinuation:
+    case GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport:
+    case GuestExecutionSessionSchedulerResumeKind::kNotYetRun:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool ValidateSchedulerBlockedWait(
+    const GuestExecutionSessionSchedulerBlockedWaitBinding& wait,
+    std::string* error) {
+  constexpr uint32_t kKnownWaitFlags =
+      kGuestExecutionSessionSchedulerWaitFlagGated |
+      kGuestExecutionSessionSchedulerWaitFlagAlertable |
+      kGuestExecutionSessionSchedulerWaitFlagInterruptible |
+      kGuestExecutionSessionSchedulerWaitFlagUserApcPending;
+  if (wait.kind == GuestExecutionSessionSchedulerWaitKind::kNone ||
+      wait.handle_count > kGuestExecutionSessionSchedulerMaximumWaitHandles ||
+      (wait.flags & ~kKnownWaitFlags) ||
+      ((wait.flags & kGuestExecutionSessionSchedulerWaitFlagUserApcPending) &&
+       !(wait.flags & kGuestExecutionSessionSchedulerWaitFlagAlertable))) {
+    return Fail(error, "scheduler blocked-wait binding is malformed");
+  }
+
+  uint64_t epochs_before = 0;
+  uint64_t epochs_observed = 0;
+  bool has_signal_epochs = false;
+  for (size_t index = 0;
+       index < kGuestExecutionSessionSchedulerMaximumWaitHandles; ++index) {
+    if (index < wait.handle_count) {
+      if (!wait.handles[index]) {
+        return Fail(error, "scheduler blocked-wait handle is invalid");
+      }
+    } else if (wait.handles[index] || wait.signal_epochs_before[index] ||
+               wait.signal_epochs_observed[index]) {
+      return Fail(error, "scheduler blocked-wait padding is nonzero");
+    }
+    epochs_before += wait.signal_epochs_before[index];
+    epochs_observed += wait.signal_epochs_observed[index];
+    has_signal_epochs |= wait.signal_epochs_before[index] != 0 ||
+                         wait.signal_epochs_observed[index] != 0;
+  }
+  if (epochs_before != wait.wait_epoch ||
+      epochs_observed != wait.observed_wait_epoch) {
+    return Fail(error, "scheduler blocked-wait epochs are inconsistent");
+  }
+
+  switch (wait.kind) {
+    case GuestExecutionSessionSchedulerWaitKind::kSingle:
+      if (wait.handle_count != 1) {
+        return Fail(error, "scheduler single wait has no unique handle");
+      }
+      break;
+    case GuestExecutionSessionSchedulerWaitKind::kMultiAny:
+    case GuestExecutionSessionSchedulerWaitKind::kMultiAll:
+      if (!wait.handle_count) {
+        return Fail(error, "scheduler multi-wait has no handles");
+      }
+      break;
+    case GuestExecutionSessionSchedulerWaitKind::kDelay:
+    case GuestExecutionSessionSchedulerWaitKind::kFence:
+    case GuestExecutionSessionSchedulerWaitKind::kIoOffload:
+    case GuestExecutionSessionSchedulerWaitKind::kSpinBackoff:
+      if (wait.handle_count) {
+        return Fail(error, "scheduler handle-free wait names an object");
+      }
+      break;
+    case GuestExecutionSessionSchedulerWaitKind::kIoCompletion:
+    case GuestExecutionSessionSchedulerWaitKind::kSocketIo:
+      if (wait.handle_count != 1) {
+        return Fail(error, "scheduler external wait has no unique handle");
+      }
+      break;
+    default:
+      return Fail(error, "scheduler blocked-wait kind is unknown");
+  }
+
+  if ((wait.kind == GuestExecutionSessionSchedulerWaitKind::kDelay ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kFence ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kIoOffload ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kSpinBackoff ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kIoCompletion ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kSocketIo) &&
+      has_signal_epochs) {
+    return Fail(error, "scheduler non-object wait carries signal epochs");
+  }
+  if ((wait.kind == GuestExecutionSessionSchedulerWaitKind::kFence ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kIoOffload ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kSpinBackoff) &&
+      wait.deadline_ms) {
+    return Fail(error, "scheduler untimed wait carries a deadline");
+  }
+  if (wait.kind == GuestExecutionSessionSchedulerWaitKind::kDelay &&
+      !wait.deadline_ms) {
+    return Fail(error, "scheduler delay wait has no deadline");
+  }
+
+  const bool gated = wait.flags & kGuestExecutionSessionSchedulerWaitFlagGated;
+  const bool alertable =
+      wait.flags & kGuestExecutionSessionSchedulerWaitFlagAlertable;
+  const bool interruptible =
+      wait.flags & kGuestExecutionSessionSchedulerWaitFlagInterruptible;
+  if ((wait.kind == GuestExecutionSessionSchedulerWaitKind::kFence ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kIoOffload ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kSpinBackoff ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kIoCompletion ||
+       wait.kind == GuestExecutionSessionSchedulerWaitKind::kSocketIo) &&
+      gated) {
+    return Fail(error, "scheduler polling wait is incorrectly gated");
+  }
+  switch (wait.kind) {
+    case GuestExecutionSessionSchedulerWaitKind::kSingle:
+    case GuestExecutionSessionSchedulerWaitKind::kMultiAny:
+    case GuestExecutionSessionSchedulerWaitKind::kMultiAll:
+      if (!interruptible) {
+        return Fail(error,
+                    "scheduler object wait is incorrectly non-interruptible");
+      }
+      break;
+    case GuestExecutionSessionSchedulerWaitKind::kDelay:
+      if (!interruptible || gated == alertable) {
+        return Fail(error, "scheduler delay wait flags are impossible");
+      }
+      break;
+    case GuestExecutionSessionSchedulerWaitKind::kFence:
+    case GuestExecutionSessionSchedulerWaitKind::kIoOffload:
+      if (alertable || interruptible) {
+        return Fail(error, "scheduler stack-owned wait flags are impossible");
+      }
+      break;
+    case GuestExecutionSessionSchedulerWaitKind::kSpinBackoff:
+    case GuestExecutionSessionSchedulerWaitKind::kIoCompletion:
+    case GuestExecutionSessionSchedulerWaitKind::kSocketIo:
+      if (alertable || !interruptible) {
+        return Fail(error, "scheduler polling wait flags are impossible");
+      }
+      break;
+    default:
+      return Fail(error, "scheduler blocked-wait kind is unknown");
+  }
+  return true;
+}
+
+bool ValidateSchedulerTopology(
+    const GuestExecutionSessionSchedulerTopologyChunk& chunk,
+    const GuestExecutionSessionLimits& limits, std::string* error) {
+  if (!chunk.session_epoch ||
+      !IsKnownSchedulerTopologyBoundary(chunk.boundary) ||
+      chunk.participants.empty() ||
+      chunk.participants.size() > limits.maximum_participants ||
+      (chunk.boundary == GuestExecutionSessionSchedulerTopologyBoundary::kStart
+           ? chunk.global_sequence != 0
+           : chunk.global_sequence == 0)) {
+    return Fail(error, "scheduler topology envelope is invalid");
+  }
+
+  std::set<uint32_t> guest_thread_ids;
+  std::set<uint64_t> capture_instance_ids;
+  std::map<std::pair<uint32_t, uint32_t>, std::set<uint32_t>> ready_orders;
+  for (size_t index = 0; index < chunk.participants.size(); ++index) {
+    const auto& participant = chunk.participants[index];
+    if (participant.ordinal != index || !participant.guest_thread_id ||
+        !participant.capture_instance_id ||
+        !guest_thread_ids.insert(participant.guest_thread_id).second ||
+        !capture_instance_ids.insert(participant.capture_instance_id).second ||
+        !IsKnownSchedulerParticipantState(participant.state)) {
+      return Fail(error,
+                  "scheduler topology participants are not uniquely bound");
+    }
+
+    const bool no_cpu =
+        participant.cpu == kGuestExecutionSessionSchedulerNoValue;
+    const bool no_priority = participant.effective_priority ==
+                             kGuestExecutionSessionSchedulerNoValue;
+    const bool no_base_priority =
+        participant.base_priority == kGuestExecutionSessionSchedulerNoValue;
+    const bool no_suspension_count =
+        participant.suspension_count == kGuestExecutionSessionSchedulerNoValue;
+    const bool no_quantum = participant.quantum_remaining_us ==
+                            kGuestExecutionSessionSchedulerNoQuantum;
+    const bool no_ready_level =
+        participant.ready_queue_level == kGuestExecutionSessionSchedulerNoValue;
+    const bool no_ready_ordinal = participant.ready_queue_fifo_ordinal ==
+                                  kGuestExecutionSessionSchedulerNoValue;
+    const bool no_resume =
+        participant.resume_kind ==
+            GuestExecutionSessionSchedulerResumeKind::kNone &&
+        !participant.guest_pc && !participant.restorable;
+    const bool no_wait = participant.blocked_wait ==
+                         GuestExecutionSessionSchedulerBlockedWaitBinding{};
+    if (participant.state ==
+        GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned) {
+      if (!no_cpu || !no_priority || !no_base_priority ||
+          !no_suspension_count || !no_quantum || !no_ready_level ||
+          !no_ready_ordinal || !no_resume || !no_wait) {
+        return Fail(error,
+                    "scheduler-unowned topology participant has queue state");
+      }
+      continue;
+    }
+    if (no_cpu || participant.cpu >= 6 || no_priority ||
+        participant.effective_priority >= 32 || no_base_priority ||
+        participant.base_priority >= 32 || no_suspension_count ||
+        participant.suspension_count > UINT8_MAX || no_quantum ||
+        participant.quantum_remaining_us > UINT32_MAX) {
+      return Fail(error,
+                  "scheduler topology CPU, priority or quantum is invalid");
+    }
+    if (participant.state ==
+            GuestExecutionSessionSchedulerParticipantState::kSuspended &&
+        !participant.suspension_count) {
+      return Fail(error, "scheduler suspended participant has zero count");
+    }
+    if (participant.state ==
+        GuestExecutionSessionSchedulerParticipantState::kReady) {
+      if (no_ready_level || participant.ready_queue_level >= 32 ||
+          participant.ready_queue_level != participant.effective_priority ||
+          no_ready_ordinal ||
+          !ready_orders[{participant.cpu, participant.ready_queue_level}]
+               .insert(participant.ready_queue_fifo_ordinal)
+               .second) {
+        return Fail(error, "scheduler ready topology is invalid");
+      }
+    } else if (!no_ready_level || !no_ready_ordinal) {
+      return Fail(error,
+                  "non-ready scheduler topology participant has queue order");
+    }
+    if (participant.state ==
+        GuestExecutionSessionSchedulerParticipantState::kBlocked) {
+      if (!ValidateSchedulerBlockedWait(participant.blocked_wait, error)) {
+        return false;
+      }
+    } else if (!no_wait) {
+      return Fail(error,
+                  "non-blocked scheduler participant has a wait binding");
+    }
+
+    if (!IsKnownSchedulerResumeKind(participant.resume_kind)) {
+      return Fail(error, "scheduler topology resume kind is unknown");
+    }
+    switch (participant.resume_kind) {
+      case GuestExecutionSessionSchedulerResumeKind::kJitSafepoint:
+        if (!participant.restorable || !participant.guest_pc ||
+            (participant.guest_pc & 3) ||
+            participant.state ==
+                GuestExecutionSessionSchedulerParticipantState::kBlocked) {
+          return Fail(error, "scheduler JIT resume route is invalid");
+        }
+        break;
+      case GuestExecutionSessionSchedulerResumeKind::kNativeContinuation:
+        if (participant.restorable || participant.guest_pc ||
+            participant.state ==
+                GuestExecutionSessionSchedulerParticipantState::kRunning ||
+            participant.state ==
+                GuestExecutionSessionSchedulerParticipantState::kBlocked) {
+          return Fail(error, "scheduler native resume route is invalid");
+        }
+        break;
+      case GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport:
+        if (participant.restorable || !participant.guest_pc ||
+            (participant.guest_pc & 3) ||
+            participant.state !=
+                GuestExecutionSessionSchedulerParticipantState::kBlocked) {
+          return Fail(error, "scheduler blocked resume route is invalid");
+        }
+        break;
+      case GuestExecutionSessionSchedulerResumeKind::kNotYetRun:
+        if (participant.restorable || participant.guest_pc ||
+            (participant.state !=
+                 GuestExecutionSessionSchedulerParticipantState::kReady &&
+             participant.state !=
+                 GuestExecutionSessionSchedulerParticipantState::kSuspended)) {
+          return Fail(error, "scheduler not-yet-run route is invalid");
+        }
+        break;
+      default:
+        return Fail(error, "scheduler topology resume kind is unknown");
+    }
+  }
+  for (const auto& ready_order : ready_orders) {
+    uint32_t expected = 0;
+    for (uint32_t ordinal : ready_order.second) {
+      if (ordinal != expected++) {
+        return Fail(error, "scheduler ready FIFO order is not dense");
+      }
+    }
+  }
+  return true;
 }
 
 bool ValidateGuestRange(uint64_t guest_address, uint64_t byte_count,
@@ -693,8 +1016,10 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
   uint64_t previous_checkpoint_sequence = 0;
   bool has_checkpoint = false;
   bool has_continuous_events = false;
+  bool has_scheduler_topology = false;
   uint64_t total_checkpoint_thread_states = 0;
   uint32_t code_corpus_chunk_count = 0;
+  uint32_t scheduler_topology_chunk_count = 0;
   uint64_t chunk_bytes = 0;
   // Segmented version-2 sessions are checkpoint, canonical events, optional
   // continuous overlay, checkpoint. Zero-segment continuous sessions insert
@@ -734,7 +1059,8 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
     } else if (chunk.kind ==
                GuestExecutionSessionChunkKind::kContinuousEvents) {
       uint64_t expected_last = 0;
-      if (i + 1 >= manifest.chunks.size() || next_event_sequence == 0 ||
+      if (has_scheduler_topology || i + 1 >= manifest.chunks.size() ||
+          next_event_sequence == 0 ||
           next_event_sequence - 1 != manifest.last_event_sequence ||
           chunk.record_count > limits.maximum_events_per_chunk ||
           chunk.first_event_sequence != next_continuous_event_sequence ||
@@ -747,6 +1073,22 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
             error, "manifest continuous event overlay is invalid or misplaced");
       }
       has_continuous_events = true;
+    } else if (chunk.kind ==
+               GuestExecutionSessionChunkKind::kSchedulerTopology) {
+      const uint64_t expected_sequence = scheduler_topology_chunk_count == 0
+                                             ? 0
+                                             : manifest.last_event_sequence;
+      if (!continuous_instruction_coverage || !has_continuous_events ||
+          i + 1 >= manifest.chunks.size() ||
+          scheduler_topology_chunk_count >= 2 ||
+          chunk.record_count != manifest.participants.size() ||
+          chunk.first_event_sequence != expected_sequence ||
+          chunk.last_event_sequence != expected_sequence) {
+        return Fail(error,
+                    "manifest scheduler topology is invalid or misplaced");
+      }
+      ++scheduler_topology_chunk_count;
+      has_scheduler_topology = true;
     } else if (chunk.kind == GuestExecutionSessionChunkKind::kCheckpoint) {
       if (!CheckedAdd(total_checkpoint_thread_states,
                       manifest.participants.size(),
@@ -780,6 +1122,8 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
       manifest.chunks.back().first_event_sequence !=
           manifest.last_event_sequence ||
       !has_checkpoint ||
+      (scheduler_topology_chunk_count != 0 &&
+       scheduler_topology_chunk_count != 2) ||
       code_corpus_chunk_count != (continuous_instruction_coverage ? 1u : 0u) ||
       next_event_sequence - 1 != manifest.last_event_sequence ||
       (has_continuous_events &&
@@ -1922,6 +2266,212 @@ bool GuestExecutionSessionCodec::DecodeCodeCorpusChunk(
   return true;
 }
 
+bool GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+    const GuestExecutionSessionSchedulerTopologyChunk& chunk,
+    std::vector<uint8_t>* output, std::string* error,
+    GuestExecutionSessionLimits limits) {
+  if (!output) {
+    return Fail(error, "scheduler topology encoded output is null");
+  }
+  output->clear();
+  if (error) {
+    error->clear();
+  }
+  if (!ValidateSchedulerTopology(chunk, limits, error)) {
+    return false;
+  }
+  uint64_t record_bytes = 0;
+  uint64_t payload_size = kSchedulerTopologyPayloadHeaderSize;
+  if (!CheckedMultiply(chunk.participants.size(), kSchedulerTopologyRecordSize,
+                       &record_bytes) ||
+      !CheckedAdd(payload_size, record_bytes, &payload_size) ||
+      payload_size > limits.maximum_chunk_bytes ||
+      payload_size > std::numeric_limits<size_t>::max()) {
+    return Fail(error, "scheduler topology payload byte count is invalid");
+  }
+
+  Writer payload_writer(static_cast<size_t>(payload_size));
+  payload_writer.WriteBytes(kSchedulerTopologyMagic.data(),
+                            kSchedulerTopologyMagic.size());
+  payload_writer.WriteU32(kSchedulerTopologyVersion);
+  payload_writer.WriteU32(kSchedulerTopologyPayloadHeaderSize);
+  payload_writer.WriteU32(static_cast<uint32_t>(chunk.boundary));
+  payload_writer.WriteU32(kSchedulerTopologyRecordSize);
+  payload_writer.WriteU32(static_cast<uint32_t>(chunk.participants.size()));
+  payload_writer.WriteU32(0);
+  for (const auto& participant : chunk.participants) {
+    payload_writer.WriteU32(participant.ordinal);
+    payload_writer.WriteU32(participant.guest_thread_id);
+    payload_writer.WriteU64(participant.capture_instance_id);
+    payload_writer.WriteU32(static_cast<uint32_t>(participant.state));
+    payload_writer.WriteU32(participant.cpu);
+    payload_writer.WriteU32(participant.effective_priority);
+    payload_writer.WriteU32(participant.base_priority);
+    payload_writer.WriteU32(participant.suspension_count);
+    payload_writer.WriteU32(participant.ready_queue_level);
+    payload_writer.WriteU32(participant.ready_queue_fifo_ordinal);
+    payload_writer.WriteU32(static_cast<uint32_t>(participant.resume_kind));
+    payload_writer.WriteU32(participant.guest_pc);
+    payload_writer.WriteU32(participant.restorable ? 1 : 0);
+    payload_writer.WriteU32(
+        static_cast<uint32_t>(participant.blocked_wait.kind));
+    payload_writer.WriteU32(participant.blocked_wait.handle_count);
+    payload_writer.WriteU32(participant.blocked_wait.flags);
+    payload_writer.WriteU32(participant.blocked_wait.wait_epoch);
+    payload_writer.WriteU32(participant.blocked_wait.observed_wait_epoch);
+    payload_writer.WriteU64(participant.quantum_remaining_us);
+    payload_writer.WriteU64(participant.blocked_wait.deadline_ms);
+    payload_writer.WriteU64(participant.blocked_wait.observed_uptime_ms);
+    for (uint32_t value : participant.blocked_wait.handles) {
+      payload_writer.WriteU32(value);
+    }
+    for (uint32_t value : participant.blocked_wait.signal_epochs_before) {
+      payload_writer.WriteU32(value);
+    }
+    for (uint32_t value : participant.blocked_wait.signal_epochs_observed) {
+      payload_writer.WriteU32(value);
+    }
+    payload_writer.WriteU32(0);
+  }
+
+  EnvelopeMetadata metadata;
+  metadata.kind =
+      static_cast<uint32_t>(GuestExecutionSessionChunkKind::kSchedulerTopology);
+  metadata.session_epoch = chunk.session_epoch;
+  metadata.ordinal = chunk.ordinal;
+  metadata.record_count = static_cast<uint32_t>(chunk.participants.size());
+  metadata.first_event_sequence = chunk.global_sequence;
+  metadata.last_event_sequence = chunk.global_sequence;
+  return EncodeEnvelope(metadata, payload_writer.TakeData(),
+                        limits.maximum_chunk_bytes, output, error);
+}
+
+bool GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+    const uint8_t* data, size_t data_size,
+    GuestExecutionSessionSchedulerTopologyChunk* output, std::string* error,
+    GuestExecutionSessionLimits limits) {
+  if (!output) {
+    return Fail(error, "scheduler topology decoded output is null");
+  }
+  *output = {};
+  if (error) {
+    error->clear();
+  }
+  DecodedEnvelope envelope;
+  if (!DecodeEnvelope(data, data_size,
+                      static_cast<uint32_t>(
+                          GuestExecutionSessionChunkKind::kSchedulerTopology),
+                      limits.maximum_chunk_bytes, &envelope, error)) {
+    return false;
+  }
+  if (!envelope.metadata.session_epoch || !envelope.metadata.record_count ||
+      envelope.metadata.record_count > limits.maximum_participants ||
+      envelope.metadata.first_event_sequence !=
+          envelope.metadata.last_event_sequence ||
+      envelope.payload_size < kSchedulerTopologyPayloadHeaderSize) {
+    return Fail(error, "scheduler topology envelope metadata is invalid");
+  }
+
+  Reader reader(envelope.payload, envelope.payload_size);
+  std::array<uint8_t, 8> magic = {};
+  uint32_t version = 0;
+  uint32_t header_size = 0;
+  uint32_t raw_boundary = 0;
+  uint32_t record_size = 0;
+  uint32_t participant_count = 0;
+  uint32_t reserved = 0;
+  if (!reader.ReadBytes(magic.data(), magic.size()) ||
+      !reader.ReadU32(&version) || !reader.ReadU32(&header_size) ||
+      !reader.ReadU32(&raw_boundary) || !reader.ReadU32(&record_size) ||
+      !reader.ReadU32(&participant_count) || !reader.ReadU32(&reserved) ||
+      magic != kSchedulerTopologyMagic ||
+      version != kSchedulerTopologyVersion ||
+      header_size != kSchedulerTopologyPayloadHeaderSize ||
+      record_size != kSchedulerTopologyRecordSize || reserved ||
+      participant_count != envelope.metadata.record_count) {
+    return Fail(error, "scheduler topology payload version is unsupported");
+  }
+  uint64_t record_bytes = 0;
+  uint64_t expected_payload_size = kSchedulerTopologyPayloadHeaderSize;
+  if (!CheckedMultiply(participant_count, kSchedulerTopologyRecordSize,
+                       &record_bytes) ||
+      !CheckedAdd(expected_payload_size, record_bytes,
+                  &expected_payload_size) ||
+      expected_payload_size != envelope.payload_size) {
+    return Fail(error, "scheduler topology payload byte count is invalid");
+  }
+
+  GuestExecutionSessionSchedulerTopologyChunk chunk;
+  chunk.session_epoch = envelope.metadata.session_epoch;
+  chunk.ordinal = envelope.metadata.ordinal;
+  chunk.boundary =
+      static_cast<GuestExecutionSessionSchedulerTopologyBoundary>(raw_boundary);
+  chunk.global_sequence = envelope.metadata.first_event_sequence;
+  chunk.participants.resize(participant_count);
+  for (auto& participant : chunk.participants) {
+    uint32_t raw_state = 0;
+    uint32_t raw_resume_kind = 0;
+    uint32_t raw_restorable = 0;
+    uint32_t raw_wait_kind = 0;
+    uint32_t record_reserved = 0;
+    if (!reader.ReadU32(&participant.ordinal) ||
+        !reader.ReadU32(&participant.guest_thread_id) ||
+        !reader.ReadU64(&participant.capture_instance_id) ||
+        !reader.ReadU32(&raw_state) || !reader.ReadU32(&participant.cpu) ||
+        !reader.ReadU32(&participant.effective_priority) ||
+        !reader.ReadU32(&participant.base_priority) ||
+        !reader.ReadU32(&participant.suspension_count) ||
+        !reader.ReadU32(&participant.ready_queue_level) ||
+        !reader.ReadU32(&participant.ready_queue_fifo_ordinal) ||
+        !reader.ReadU32(&raw_resume_kind) ||
+        !reader.ReadU32(&participant.guest_pc) ||
+        !reader.ReadU32(&raw_restorable) || raw_restorable > 1 ||
+        !reader.ReadU32(&raw_wait_kind) ||
+        !reader.ReadU32(&participant.blocked_wait.handle_count) ||
+        !reader.ReadU32(&participant.blocked_wait.flags) ||
+        !reader.ReadU32(&participant.blocked_wait.wait_epoch) ||
+        !reader.ReadU32(&participant.blocked_wait.observed_wait_epoch) ||
+        !reader.ReadU64(&participant.quantum_remaining_us) ||
+        !reader.ReadU64(&participant.blocked_wait.deadline_ms) ||
+        !reader.ReadU64(&participant.blocked_wait.observed_uptime_ms)) {
+      return Fail(error, "scheduler topology participant record is truncated");
+    }
+    participant.state =
+        static_cast<GuestExecutionSessionSchedulerParticipantState>(raw_state);
+    participant.resume_kind =
+        static_cast<GuestExecutionSessionSchedulerResumeKind>(raw_resume_kind);
+    participant.restorable = raw_restorable != 0;
+    participant.blocked_wait.kind =
+        static_cast<GuestExecutionSessionSchedulerWaitKind>(raw_wait_kind);
+    for (uint32_t& value : participant.blocked_wait.handles) {
+      if (!reader.ReadU32(&value)) {
+        return Fail(error,
+                    "scheduler topology participant record is truncated");
+      }
+    }
+    for (uint32_t& value : participant.blocked_wait.signal_epochs_before) {
+      if (!reader.ReadU32(&value)) {
+        return Fail(error,
+                    "scheduler topology participant record is truncated");
+      }
+    }
+    for (uint32_t& value : participant.blocked_wait.signal_epochs_observed) {
+      if (!reader.ReadU32(&value)) {
+        return Fail(error,
+                    "scheduler topology participant record is truncated");
+      }
+    }
+    if (!reader.ReadU32(&record_reserved) || record_reserved) {
+      return Fail(error, "scheduler topology participant record is truncated");
+    }
+  }
+  if (reader.remaining() || !ValidateSchedulerTopology(chunk, limits, error)) {
+    return false;
+  }
+  *output = std::move(chunk);
+  return true;
+}
+
 bool GuestExecutionSessionCodec::ValidateSession(
     const GuestExecutionSessionManifest& manifest,
     const std::vector<std::vector<uint8_t>>& encoded_chunks, std::string* error,
@@ -1988,6 +2538,8 @@ bool GuestExecutionSessionCodec::ValidateSession(
   bool saw_boundary_held = false;
   bool saw_initial_checkpoint = false;
   bool saw_final_checkpoint = false;
+  bool saw_start_scheduler_topology = false;
+  bool saw_final_scheduler_topology = false;
   const bool manifest_has_continuous_events = std::any_of(
       manifest.chunks.cbegin(), manifest.chunks.cend(),
       [](const GuestExecutionSessionChunkReference& chunk) {
@@ -2288,6 +2840,53 @@ bool GuestExecutionSessionCodec::ValidateSession(
       continuous_events.insert(continuous_events.end(),
                                std::make_move_iterator(decoded_events.begin()),
                                std::make_move_iterator(decoded_events.end()));
+    } else if (reference.kind ==
+               GuestExecutionSessionChunkKind::kSchedulerTopology) {
+      GuestExecutionSessionSchedulerTopologyChunk chunk;
+      if (!DecodeSchedulerTopologyChunk(encoded, &chunk, error, limits)) {
+        return false;
+      }
+      GuestExecutionSessionChunkReference derived;
+      derived.kind = GuestExecutionSessionChunkKind::kSchedulerTopology;
+      derived.ordinal = chunk.ordinal;
+      derived.first_event_sequence = chunk.global_sequence;
+      derived.last_event_sequence = chunk.global_sequence;
+      derived.record_count = static_cast<uint32_t>(chunk.participants.size());
+      derived.encoded_size = encoded.size();
+      derived.encoded_sha256 = HashBytes(encoded);
+      const bool is_start =
+          chunk.boundary ==
+          GuestExecutionSessionSchedulerTopologyBoundary::kStart;
+      const bool is_final =
+          chunk.boundary ==
+          GuestExecutionSessionSchedulerTopologyBoundary::kFinal;
+      if (chunk.session_epoch != manifest.session_epoch ||
+          derived != reference ||
+          (is_start ? chunk.global_sequence != 0
+                    : (!is_final || chunk.global_sequence !=
+                                        manifest.last_event_sequence)) ||
+          (is_start ? saw_start_scheduler_topology
+                    : saw_final_scheduler_topology) ||
+          chunk.participants.size() != manifest.participants.size()) {
+        return Fail(error,
+                    "scheduler topology does not match its manifest boundary");
+      }
+      for (size_t participant_index = 0;
+           participant_index < chunk.participants.size(); ++participant_index) {
+        const auto& topology = chunk.participants[participant_index];
+        const auto& participant = manifest.participants[participant_index];
+        if (topology.ordinal != participant.ordinal ||
+            topology.guest_thread_id != participant.guest_thread_id ||
+            topology.capture_instance_id != participant.capture_instance_id) {
+          return Fail(error,
+                      "scheduler topology participant differs from roster");
+        }
+      }
+      if (is_start) {
+        saw_start_scheduler_topology = true;
+      } else {
+        saw_final_scheduler_topology = true;
+      }
     } else if (reference.kind == GuestExecutionSessionChunkKind::kCheckpoint) {
       GuestExecutionSessionCheckpointChunk chunk;
       if (!DecodeCheckpointChunk(encoded, &chunk, error, limits)) {
@@ -2482,6 +3081,7 @@ bool GuestExecutionSessionCodec::ValidateSession(
   if (supplied_chunk_bytes != manifest_chunk_bytes || !segment_starts.empty() ||
       !segment_ends.empty() || !saw_initial_checkpoint ||
       !saw_final_checkpoint ||
+      saw_start_scheduler_topology != saw_final_scheduler_topology ||
       saw_code_corpus != continuous_instruction_coverage) {
     return Fail(error,
                 "session chunk closure or segment coverage is incomplete");

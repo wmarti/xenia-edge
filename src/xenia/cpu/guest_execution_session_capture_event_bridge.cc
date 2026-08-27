@@ -56,6 +56,55 @@ constexpr uint8_t kKnownWaitFlags =
     kernel::kGuestSchedulerCaptureWaitFlagInterruptible |
     kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
 
+static_assert(kGuestExecutionSessionSchedulerMaximumWaitHandles ==
+              kernel::kGuestSchedulerCaptureMaximumWaitHandles);
+static_assert(
+    static_cast<uint32_t>(GuestExecutionSessionSchedulerWaitKind::kNone) ==
+    static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kNone));
+static_assert(
+    static_cast<uint32_t>(GuestExecutionSessionSchedulerWaitKind::kSingle) ==
+    static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kSingle));
+static_assert(
+    static_cast<uint32_t>(GuestExecutionSessionSchedulerWaitKind::kMultiAny) ==
+    static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kMultiAny));
+static_assert(
+    static_cast<uint32_t>(GuestExecutionSessionSchedulerWaitKind::kMultiAll) ==
+    static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kMultiAll));
+static_assert(
+    static_cast<uint32_t>(GuestExecutionSessionSchedulerWaitKind::kDelay) ==
+    static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kDelay));
+static_assert(
+    static_cast<uint32_t>(GuestExecutionSessionSchedulerWaitKind::kFence) ==
+    static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kFence));
+static_assert(
+    static_cast<uint32_t>(GuestExecutionSessionSchedulerWaitKind::kIoOffload) ==
+    static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kIoOffload));
+static_assert(
+    static_cast<uint32_t>(
+        GuestExecutionSessionSchedulerWaitKind::kSpinBackoff) ==
+    static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kSpinBackoff));
+static_assert(
+    static_cast<uint32_t>(
+        GuestExecutionSessionSchedulerWaitKind::kIoCompletion) ==
+    static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kIoCompletion));
+static_assert(
+    static_cast<uint32_t>(GuestExecutionSessionSchedulerWaitKind::kSocketIo) ==
+    static_cast<uint8_t>(kernel::GuestSchedulerCaptureWaitKind::kSocketIo));
+static_assert(
+    static_cast<uint32_t>(kGuestExecutionSessionSchedulerWaitFlagGated) ==
+    static_cast<uint8_t>(kernel::kGuestSchedulerCaptureWaitFlagGated));
+static_assert(
+    static_cast<uint32_t>(kGuestExecutionSessionSchedulerWaitFlagAlertable) ==
+    static_cast<uint8_t>(kernel::kGuestSchedulerCaptureWaitFlagAlertable));
+static_assert(
+    static_cast<uint32_t>(
+        kGuestExecutionSessionSchedulerWaitFlagInterruptible) ==
+    static_cast<uint8_t>(kernel::kGuestSchedulerCaptureWaitFlagInterruptible));
+static_assert(
+    static_cast<uint32_t>(
+        kGuestExecutionSessionSchedulerWaitFlagUserApcPending) ==
+    static_cast<uint8_t>(kernel::kGuestSchedulerCaptureWaitFlagUserApcPending));
+
 bool Fail(std::string* error, std::string_view message) {
   if (error) {
     error->assign(message);
@@ -601,6 +650,140 @@ GuestExecutionSessionCaptureSchedulerEventBridge::FindParticipant(
   return &*it;
 }
 
+bool GuestExecutionSessionCaptureSchedulerEventBridge::BuildSchedulerTopology(
+    const kernel::GuestSchedulerCheckpointBarrierSnapshot& checkpoint,
+    GuestExecutionSessionSchedulerTopologyBoundary boundary,
+    GuestExecutionSessionSchedulerTopologyChunk* output,
+    std::string* error) const {
+  if (!output || participants_.empty() || !checkpoint.generation ||
+      checkpoint.rejection !=
+          kernel::GuestSchedulerCheckpointBarrierRejection::kNone ||
+      !checkpoint.active || !checkpoint.quiesced ||
+      checkpoint.roster_scope !=
+          kernel::GuestSchedulerCheckpointRosterScope::kSchedulerOwned ||
+      checkpoint.release_policy !=
+          kernel::GuestSchedulerCheckpointReleasePolicy::
+              kRunningSafepointsRequeueAtHead) {
+    return Fail(error, "scheduler topology checkpoint is invalid");
+  }
+
+  GuestExecutionSessionSchedulerTopologyChunk topology;
+  topology.boundary = boundary;
+  topology.global_sequence =
+      boundary == GuestExecutionSessionSchedulerTopologyBoundary::kStart ? 0
+                                                                         : 1;
+  try {
+    topology.participants.resize(participants_.size());
+    std::vector<bool> seen(participants_.size());
+    for (const Participant& participant : participants_) {
+      auto& durable = topology.participants[participant.ordinal];
+      durable.ordinal = participant.ordinal;
+      durable.guest_thread_id = participant.identity.guest_thread_id;
+      durable.capture_instance_id = participant.identity.capture_instance_id;
+    }
+
+    for (const auto& participant : checkpoint.participants) {
+      const Participant* durable_identity = FindParticipant(
+          participant.capture_instance_id, participant.thread_id);
+      if (!durable_identity || seen[durable_identity->ordinal] ||
+          participant.cpu < 0 || participant.cpu >= 6 ||
+          participant.effective_priority >= 32 ||
+          participant.base_priority >= 32) {
+        return Fail(error,
+                    "scheduler topology snapshot participant is invalid");
+      }
+      seen[durable_identity->ordinal] = true;
+      auto& durable = topology.participants[durable_identity->ordinal];
+      durable.cpu = static_cast<uint32_t>(participant.cpu);
+      durable.effective_priority = participant.effective_priority;
+      durable.base_priority = participant.base_priority;
+      durable.suspension_count = participant.suspension_count;
+      durable.quantum_remaining_us = participant.quantum_remaining_us;
+      durable.guest_pc = participant.guest_pc;
+      durable.restorable = participant.restorable;
+      switch (participant.resume_kind) {
+        case kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint:
+          durable.resume_kind =
+              GuestExecutionSessionSchedulerResumeKind::kJitSafepoint;
+          break;
+        case kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation:
+          durable.resume_kind =
+              GuestExecutionSessionSchedulerResumeKind::kNativeContinuation;
+          break;
+        case kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport:
+          durable.resume_kind =
+              GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport;
+          break;
+        case kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun:
+          durable.resume_kind =
+              GuestExecutionSessionSchedulerResumeKind::kNotYetRun;
+          break;
+        default:
+          return Fail(error, "scheduler topology resume kind is unknown");
+      }
+      switch (participant.state) {
+        case kernel::GuestSchedulerCheckpointParticipantState::kRunning:
+          durable.state =
+              GuestExecutionSessionSchedulerParticipantState::kRunning;
+          break;
+        case kernel::GuestSchedulerCheckpointParticipantState::kReady:
+          if (participant.ready_queue_level < 0 ||
+              participant.ready_queue_level >= 32 ||
+              participant.ready_queue_level != participant.effective_priority ||
+              participant.ready_queue_fifo_ordinal == UINT32_MAX) {
+            return Fail(error, "scheduler ready topology snapshot is invalid");
+          }
+          durable.state =
+              GuestExecutionSessionSchedulerParticipantState::kReady;
+          durable.ready_queue_level =
+              static_cast<uint32_t>(participant.ready_queue_level);
+          durable.ready_queue_fifo_ordinal =
+              participant.ready_queue_fifo_ordinal;
+          break;
+        case kernel::GuestSchedulerCheckpointParticipantState::kBlocked:
+          durable.state =
+              GuestExecutionSessionSchedulerParticipantState::kBlocked;
+          durable.blocked_wait.kind =
+              static_cast<GuestExecutionSessionSchedulerWaitKind>(
+                  participant.blocked_wait_kind);
+          durable.blocked_wait.deadline_ms =
+              participant.blocked_wait.deadline_ms;
+          durable.blocked_wait.observed_uptime_ms =
+              participant.blocked_wait.observed_uptime_ms;
+          durable.blocked_wait.wait_epoch = participant.blocked_wait.wait_epoch;
+          durable.blocked_wait.observed_wait_epoch =
+              participant.blocked_wait.observed_wait_epoch;
+          durable.blocked_wait.handle_count =
+              participant.blocked_wait.handle_count;
+          durable.blocked_wait.flags = participant.blocked_wait.flags;
+          std::copy(participant.blocked_wait.handles.cbegin(),
+                    participant.blocked_wait.handles.cend(),
+                    durable.blocked_wait.handles.begin());
+          std::copy(participant.blocked_wait.signal_epochs_before.cbegin(),
+                    participant.blocked_wait.signal_epochs_before.cend(),
+                    durable.blocked_wait.signal_epochs_before.begin());
+          std::copy(participant.blocked_wait.signal_epochs_observed.cbegin(),
+                    participant.blocked_wait.signal_epochs_observed.cend(),
+                    durable.blocked_wait.signal_epochs_observed.begin());
+          break;
+        case kernel::GuestSchedulerCheckpointParticipantState::kSuspended:
+          if (!participant.suspension_count) {
+            return Fail(error, "scheduler suspended topology count is invalid");
+          }
+          durable.state =
+              GuestExecutionSessionSchedulerParticipantState::kSuspended;
+          break;
+        default:
+          return Fail(error, "scheduler topology snapshot state is unknown");
+      }
+    }
+  } catch (...) {
+    return Fail(error, "scheduler topology snapshot could not be allocated");
+  }
+  *output = std::move(topology);
+  return true;
+}
+
 bool GuestExecutionSessionCaptureSchedulerEventBridge::BeginSession(
     GuestExecutionSessionAssembler& assembler,
     const kernel::GuestSchedulerCheckpointBarrierSnapshot& checkpoint,
@@ -663,6 +846,12 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::BeginSession(
     participants_ = std::move(catalog);
   } catch (...) {
     return Fail(error, "scheduler event bridge could not allocate its roster");
+  }
+  if (!BuildSchedulerTopology(
+          checkpoint, GuestExecutionSessionSchedulerTopologyBoundary::kStart,
+          &start_scheduler_topology_, error)) {
+    rejected_ = true;
+    return false;
   }
   start_checkpoint_generation_ = checkpoint.generation;
   begun_ = true;
@@ -763,6 +952,12 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::SealSession(
       !checkpoint.active || !checkpoint.quiesced ||
       assembler.status().state != AssemblerState::kPublishing) {
     return Fail(error, "scheduler event bridge stop boundary is invalid");
+  }
+  if (!BuildSchedulerTopology(
+          checkpoint, GuestExecutionSessionSchedulerTopologyBoundary::kFinal,
+          &final_scheduler_topology_, error)) {
+    rejected_ = true;
+    return false;
   }
   sealed_ = true;
   return true;
@@ -1038,10 +1233,43 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::FinalizeBundle(
       begin += count;
     }
 
-    const uint64_t final_ordinal = final_index + overlay_chunks.size();
+    const uint64_t start_topology_ordinal = final_index + overlay_chunks.size();
+    const uint64_t final_topology_ordinal = start_topology_ordinal + 1;
+    const uint64_t final_ordinal = final_topology_ordinal + 1;
     if (final_ordinal > std::numeric_limits<uint32_t>::max()) {
       return Fail(error, "scheduler event bridge final ordinal overflows");
     }
+    start_scheduler_topology_.session_epoch = bundle->manifest.session_epoch;
+    start_scheduler_topology_.ordinal =
+        static_cast<uint32_t>(start_topology_ordinal);
+    start_scheduler_topology_.global_sequence = 0;
+    final_scheduler_topology_.session_epoch = bundle->manifest.session_epoch;
+    final_scheduler_topology_.ordinal =
+        static_cast<uint32_t>(final_topology_ordinal);
+    final_scheduler_topology_.global_sequence =
+        bundle->manifest.last_event_sequence;
+    std::vector<uint8_t> start_topology_bytes;
+    std::vector<uint8_t> final_topology_bytes;
+    if (!GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+            start_scheduler_topology_, &start_topology_bytes, error) ||
+        !GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+            final_scheduler_topology_, &final_topology_bytes, error)) {
+      return false;
+    }
+    const GuestExecutionSessionChunkReference start_topology_reference =
+        ChunkReference(GuestExecutionSessionChunkKind::kSchedulerTopology,
+                       start_scheduler_topology_.ordinal, 0, 0,
+                       static_cast<uint32_t>(
+                           start_scheduler_topology_.participants.size()),
+                       start_topology_bytes);
+    const GuestExecutionSessionChunkReference final_topology_reference =
+        ChunkReference(GuestExecutionSessionChunkKind::kSchedulerTopology,
+                       final_scheduler_topology_.ordinal,
+                       bundle->manifest.last_event_sequence,
+                       bundle->manifest.last_event_sequence,
+                       static_cast<uint32_t>(
+                           final_scheduler_topology_.participants.size()),
+                       final_topology_bytes);
     final_checkpoint.ordinal = static_cast<uint32_t>(final_ordinal);
     std::vector<uint8_t> final_bytes;
     if (!GuestExecutionSessionCodec::EncodeCheckpointChunk(
@@ -1057,11 +1285,19 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::FinalizeBundle(
     bundle->chunks.insert(bundle->chunks.end() - 1,
                           std::make_move_iterator(overlay_chunks.begin()),
                           std::make_move_iterator(overlay_chunks.end()));
+    bundle->chunks.insert(bundle->chunks.end() - 1,
+                          std::move(start_topology_bytes));
+    bundle->chunks.insert(bundle->chunks.end() - 1,
+                          std::move(final_topology_bytes));
     bundle->manifest.chunks.back() = std::move(final_reference);
     bundle->manifest.chunks.insert(
         bundle->manifest.chunks.end() - 1,
         std::make_move_iterator(overlay_references.begin()),
         std::make_move_iterator(overlay_references.end()));
+    bundle->manifest.chunks.insert(bundle->manifest.chunks.end() - 1,
+                                   start_topology_reference);
+    bundle->manifest.chunks.insert(bundle->manifest.chunks.end() - 1,
+                                   final_topology_reference);
   } catch (...) {
     return Fail(error, "scheduler event bridge could not allocate the overlay");
   }

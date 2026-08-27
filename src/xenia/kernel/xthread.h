@@ -775,6 +775,11 @@ class XThread : public XObject, public cpu::Thread {
   // Publishes a new effective priority to the guest KTHREAD field, the host
   // thread and the scheduler's ready queue. Every change goes through here.
   void PublishPriority(int32_t priority);
+  // Publishes a base/effective pair through one scheduler critical section.
+  void PublishBasePriorityAndPriority(int32_t base_priority, int32_t priority);
+  // Stores the base priority after GuestScheduler has established its total
+  // order, or directly when the cooperative scheduler is disabled.
+  void StorePublishedBasePriority(int32_t base_priority);
   // Stores the effective priority after GuestScheduler has established its
   // total order, or directly when the cooperative scheduler is disabled.
   void StorePublishedPriority(int32_t priority);
@@ -811,8 +816,10 @@ class XThread : public XObject, public cpu::Thread {
   // cooperative fiber is running. Scheduler decisions additionally serialize
   // every mutation under GuestScheduler::lock_.
   std::mutex priority_mutex_;
-  int32_t base_priority_ = 0;  // priority floor — decay never goes below this
-  int32_t boost_amount_ = 0;   // accumulated priority boost above base
+  // Priority floor. Fiber mutations are published under GuestScheduler::lock_
+  // so a scheduler topology snapshot observes it with the effective priority.
+  int32_t base_priority_ = 0;
+  int32_t boost_amount_ = 0;  // accumulated priority boost above base
 
 #if !XE_PLATFORM_WIN32
   // Condition variable for thread self-suspension.

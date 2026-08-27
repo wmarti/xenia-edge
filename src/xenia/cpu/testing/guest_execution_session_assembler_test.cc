@@ -486,11 +486,18 @@ kernel::GuestSchedulerCheckpointBarrierSnapshot BridgeCheckpoint(
       kernel::GuestSchedulerCheckpointRosterScope::kSchedulerOwned;
   checkpoint.release_policy = kernel::GuestSchedulerCheckpointReleasePolicy::
       kRunningSafepointsRequeueAtHead;
+  uint32_t ready_queue_fifo_ordinal = 0;
   for (const GuestExecutionCaptureParticipantIdentity& identity : identities) {
     kernel::GuestSchedulerCheckpointParticipant participant;
     participant.thread_id = identity.guest_thread_id;
+    participant.capture_instance_id = identity.capture_instance_id;
     participant.guest_pc = 0x82000040;
     participant.cpu = 0;
+    participant.effective_priority = 8;
+    participant.base_priority = 6;
+    participant.quantum_remaining_us = 500;
+    participant.ready_queue_level = 8;
+    participant.ready_queue_fifo_ordinal = ready_queue_fifo_ordinal++;
     participant.state =
         kernel::GuestSchedulerCheckpointParticipantState::kReady;
     participant.resume_kind =
@@ -2571,7 +2578,7 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
   REQUIRE(harness.assembler->SeedParticipants(seeds, roster));
 
   GuestExecutionSessionCaptureSchedulerEventBridge bridge;
-  REQUIRE(bridge.BeginSession(*harness.assembler, BridgeCheckpoint(1, {kA, kB}),
+  REQUIRE(bridge.BeginSession(*harness.assembler, BridgeCheckpoint(1, {kA}),
                               seeds, &harness.error));
   REQUIRE(harness.assembler->Arm(&harness.error));
   REQUIRE(harness.assembler->RequestStart(&harness.error));
@@ -2626,6 +2633,42 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
   INFO(harness.error);
   REQUIRE(finalized);
   REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &harness.error));
+  std::vector<GuestExecutionSessionSchedulerTopologyChunk> scheduler_topologies;
+  for (size_t chunk_index = 0; chunk_index < bundle.manifest.chunks.size();
+       ++chunk_index) {
+    if (bundle.manifest.chunks[chunk_index].kind !=
+        GuestExecutionSessionChunkKind::kSchedulerTopology) {
+      continue;
+    }
+    GuestExecutionSessionSchedulerTopologyChunk topology;
+    REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+        bundle.chunks[chunk_index], &topology, &harness.error));
+    scheduler_topologies.push_back(std::move(topology));
+  }
+  REQUIRE(scheduler_topologies.size() == 2);
+  REQUIRE(scheduler_topologies[0].boundary ==
+          GuestExecutionSessionSchedulerTopologyBoundary::kStart);
+  REQUIRE(scheduler_topologies[0].participants[0].state ==
+          GuestExecutionSessionSchedulerParticipantState::kReady);
+  REQUIRE(scheduler_topologies[0].participants[0].ready_queue_fifo_ordinal ==
+          0);
+  REQUIRE(scheduler_topologies[0].participants[0].base_priority == 6);
+  REQUIRE(scheduler_topologies[0].participants[0].quantum_remaining_us == 500);
+  REQUIRE(scheduler_topologies[0].participants[0].resume_kind ==
+          GuestExecutionSessionSchedulerResumeKind::kJitSafepoint);
+  REQUIRE(scheduler_topologies[0].participants[0].guest_pc == 0x82000040);
+  REQUIRE(scheduler_topologies[0].participants[1].state ==
+          GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned);
+  REQUIRE(scheduler_topologies[1].boundary ==
+          GuestExecutionSessionSchedulerTopologyBoundary::kFinal);
+  REQUIRE(scheduler_topologies[1].participants[0].state ==
+          GuestExecutionSessionSchedulerParticipantState::kReady);
+  REQUIRE(scheduler_topologies[1].participants[1].state ==
+          GuestExecutionSessionSchedulerParticipantState::kReady);
+  REQUIRE(scheduler_topologies[1].participants[0].ready_queue_fifo_ordinal ==
+          0);
+  REQUIRE(scheduler_topologies[1].participants[1].ready_queue_fifo_ordinal ==
+          1);
   const std::vector<GuestExecutionContinuousEvent> overlay =
       DecodeBridgeOverlay(bundle);
   REQUIRE(overlay.size() == bundle.manifest.accepted_event_count);

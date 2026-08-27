@@ -837,13 +837,18 @@ struct RereadyWaitControl {
 class RereadyWaitRuntimeThread final : public XThread {
  public:
   RereadyWaitRuntimeThread(KernelState* kernel_state,
-                           RereadyWaitControl* control, XEvent* event)
+                           RereadyWaitControl* control, XEvent* event,
+                           uint32_t blocked_continuation_pc = 0)
       : XThread(kernel_state, 64 * 1024, 0, kSafepointPc, 0, kCpu0CreationFlags,
                 true, false, kernel_state->GetSystemProcess()),
         control_(control),
-        event_(event) {}
+        event_(event),
+        blocked_continuation_pc_(blocked_continuation_pc) {}
 
   void Execute() override {
+    if (blocked_continuation_pc_) {
+      thread_state()->context()->lr = blocked_continuation_pc_;
+    }
     event_->Wait(0, 0, 0, nullptr);
     {
       std::lock_guard<std::mutex> lock(control_->mutex);
@@ -856,6 +861,7 @@ class RereadyWaitRuntimeThread final : public XThread {
  private:
   RereadyWaitControl* control_;
   XEvent* event_;
+  uint32_t blocked_continuation_pc_;
 };
 
 class CheckpointRuntimeThread final : public XThread {
@@ -1595,6 +1601,77 @@ TEST_CASE("Guest scheduler atomically publishes running and ready priorities",
   REQUIRE(ready_changes[1].target_cpu == -1);
 }
 
+TEST_CASE("Guest scheduler orders base-only priority mutations",
+          "[guest_scheduler_checkpoint][guest_scheduler_priority][runtime]") {
+  FiberControl ready_control;
+  FiberControl higher_priority_control;
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+
+  CreatedThread ready =
+      CreateRuntimeThread(environment, ready_control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(ready.status));
+  REQUIRE(ready_control.WaitForStart(2s));
+
+  CreatedThread higher_priority =
+      CreateRuntimeThread(environment, higher_priority_control,
+                          kCpu0CreationFlags | X_CREATE_SUSPENDED);
+  REQUIRE(XSUCCEEDED(higher_priority.status));
+  higher_priority.thread->SetPriority(31);
+  REQUIRE(XSUCCEEDED(higher_priority.thread->Resume()));
+  REQUIRE(higher_priority_control.WaitForStart(2s));
+  REQUIRE(WaitUntilQueued(scheduler, ready.thread.get(), 2s));
+
+  X_KTHREAD* guest_thread = ready.thread->guest_object<X_KTHREAD>();
+  const int32_t old_base_priority = guest_thread->base_priority;
+  const int32_t class_base_priority = guest_thread->base_priority_copy;
+  const int32_t max_dynamic_priority = guest_thread->max_dynamic_priority;
+  REQUIRE(old_base_priority < max_dynamic_priority);
+  ready.thread->SetPriority(max_dynamic_priority);
+  REQUIRE(ready.thread->priority() == max_dynamic_priority);
+  REQUIRE(guest_thread->base_priority == old_base_priority);
+  REQUIRE(GuestSchedulerCheckpointRuntimeTestAccess::QueuedPriority(
+              scheduler, ready.thread.get()) == max_dynamic_priority);
+
+  GuestSchedulerCheckpointBarrierSnapshot snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
+          Rejection::kNone);
+  const auto* before = FindThread(snapshot, ready.thread->thread_id());
+  REQUIRE(before);
+  REQUIRE(before->base_priority == max_dynamic_priority);
+  REQUIRE(before->effective_priority == max_dynamic_priority);
+
+  const int32_t new_base_priority = old_base_priority + 1;
+  const int32_t new_base_increment = new_base_priority - class_base_priority;
+  ready.thread->SetBasePriority(new_base_increment);
+  REQUIRE(guest_thread->base_priority == new_base_priority);
+  REQUIRE(ready.thread->priority() == max_dynamic_priority);
+  REQUIRE(GuestSchedulerCheckpointRuntimeTestAccess::QueuedPriority(
+              scheduler, ready.thread.get()) == max_dynamic_priority);
+
+  GuestSchedulerCheckpointBarrierSnapshot rejected_snapshot;
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(snapshot.generation,
+                                                       &rejected_snapshot) ==
+          Rejection::kTopologyChanged);
+  REQUIRE(rejected_snapshot.rejection == Rejection::kTopologyChanged);
+  REQUIRE(higher_priority_control.WaitForSafepointReturn(2s));
+
+  GuestSchedulerCheckpointBarrierSnapshot updated_snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &updated_snapshot) ==
+          Rejection::kNone);
+  const auto* after = FindThread(updated_snapshot, ready.thread->thread_id());
+  REQUIRE(after);
+  REQUIRE(after->base_priority == new_base_priority);
+  REQUIRE(after->effective_priority == max_dynamic_priority);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              updated_snapshot.generation, nullptr) == Rejection::kNone);
+
+  REQUIRE(StopRuntimeThread(higher_priority, higher_priority_control));
+  REQUIRE(ready_control.WaitForSafepointReturn(2s));
+  REQUIRE(StopRuntimeThread(ready, ready_control));
+}
+
 void ThrowBeforeCheckpointSnapshot(void*) { throw std::bad_alloc(); }
 
 struct ReleaseRaceResult {
@@ -2327,6 +2404,15 @@ TEST_CASE("Guest scheduler checkpoint preserves an exact ready JIT route",
   REQUIRE(participant);
   REQUIRE(participant->state ==
           GuestSchedulerCheckpointParticipantState::kReady);
+  REQUIRE(participant->capture_instance_id ==
+          ready.thread->thread_state()->guest_execution_capture_instance_id());
+  REQUIRE(participant->effective_priority == ready.thread->priority());
+  REQUIRE(participant->base_priority ==
+          ready.thread->guest_object<X_KTHREAD>()->base_priority);
+  REQUIRE(participant->suspension_count == 0);
+  REQUIRE(participant->quantum_remaining_us == 0);
+  REQUIRE(participant->ready_queue_level == ready.thread->priority());
+  REQUIRE(participant->ready_queue_fifo_ordinal != UINT32_MAX);
   REQUIRE(participant->guest_pc == kSafepointPc);
   REQUIRE(participant->resume_kind == ResumeKind::kJitSafepoint);
   REQUIRE(participant->restorable);
@@ -2370,6 +2456,17 @@ TEST_CASE("Guest scheduler checkpoint preserves an exact suspended JIT route",
   REQUIRE(participant);
   REQUIRE(participant->state ==
           GuestSchedulerCheckpointParticipantState::kSuspended);
+  REQUIRE(
+      participant->capture_instance_id ==
+      suspended.thread->thread_state()->guest_execution_capture_instance_id());
+  REQUIRE(participant->effective_priority == suspended.thread->priority());
+  REQUIRE(participant->base_priority ==
+          suspended.thread->guest_object<X_KTHREAD>()->base_priority);
+  REQUIRE(participant->suspension_count == suspended.thread->suspend_count());
+  REQUIRE(participant->suspension_count != 0);
+  REQUIRE(participant->quantum_remaining_us == 0);
+  REQUIRE(participant->ready_queue_level == -1);
+  REQUIRE(participant->ready_queue_fifo_ordinal == UINT32_MAX);
   REQUIRE(participant->guest_pc == kSafepointPc);
   REQUIRE(participant->resume_kind == ResumeKind::kJitSafepoint);
   REQUIRE(participant->restorable);
@@ -2382,6 +2479,75 @@ TEST_CASE("Guest scheduler checkpoint preserves an exact suspended JIT route",
               scheduler, suspended.thread.get())
               .checkpoint_jit_safepoint_pc == 0);
   REQUIRE(StopRuntimeThread(suspended, control));
+}
+
+TEST_CASE("Guest scheduler checkpoint authenticates a blocked wait topology",
+          "[guest_scheduler_checkpoint][guest_scheduler_capture_wait]"
+          "[runtime]") {
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  auto event =
+      object_ref<XEvent>(new XEvent(environment.emulator()->kernel_state()));
+  event->Initialize(false, false);
+  RereadyWaitControl control;
+  constexpr uint32_t kBlockedContinuationPc = 0x82004000;
+  auto thread =
+      object_ref<RereadyWaitRuntimeThread>(new RereadyWaitRuntimeThread(
+          environment.emulator()->kernel_state(), &control, event.get(),
+          kBlockedContinuationPc));
+  thread->set_name("Scheduler blocked checkpoint topology test");
+  REQUIRE(thread->Create() == X_STATUS_SUCCESS);
+
+  const auto blocked_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!GuestSchedulerCaptureWaitRuntimeTestAccess::IsBlocked(scheduler,
+                                                                thread.get()) &&
+         std::chrono::steady_clock::now() < blocked_deadline) {
+    std::this_thread::yield();
+  }
+  REQUIRE(GuestSchedulerCaptureWaitRuntimeTestAccess::IsBlocked(scheduler,
+                                                                thread.get()));
+
+  GuestSchedulerCheckpointBarrierSnapshot snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
+          Rejection::kNone);
+  const auto* participant = FindThread(snapshot, thread->thread_id());
+  REQUIRE(participant);
+  REQUIRE(participant->state ==
+          GuestSchedulerCheckpointParticipantState::kBlocked);
+  REQUIRE(participant->cpu >= 0);
+  REQUIRE(participant->effective_priority == thread->priority());
+  REQUIRE(participant->base_priority ==
+          thread->guest_object<X_KTHREAD>()->base_priority);
+  REQUIRE(participant->suspension_count == 0);
+  REQUIRE(participant->quantum_remaining_us == 0);
+  REQUIRE(participant->ready_queue_level == -1);
+  REQUIRE(participant->ready_queue_fifo_ordinal == UINT32_MAX);
+  REQUIRE(participant->resume_kind == ResumeKind::kAfterBlockingExport);
+  REQUIRE(participant->guest_pc == kBlockedContinuationPc);
+  REQUIRE_FALSE(participant->restorable);
+  REQUIRE(participant->blocked_wait_kind ==
+          GuestSchedulerCaptureWaitKind::kSingle);
+  REQUIRE(participant->blocked_wait.handle_count == 1);
+  REQUIRE(participant->blocked_wait.handles[0] == event->handle());
+  REQUIRE(participant->blocked_wait.flags ==
+          (kGuestSchedulerCaptureWaitFlagGated |
+           kGuestSchedulerCaptureWaitFlagInterruptible));
+  REQUIRE(participant->blocked_wait.wait_epoch ==
+          participant->blocked_wait.signal_epochs_before[0]);
+  REQUIRE(participant->blocked_wait.observed_wait_epoch ==
+          participant->blocked_wait.signal_epochs_observed[0]);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              snapshot.generation, nullptr) == Rejection::kNone);
+
+  event->Set(0, false);
+  REQUIRE(control.WaitForCompletion(2s));
+  scheduler.Shutdown();
+  thread->ReclaimExited();
+  thread->ReleaseHandle();
+  thread.reset();
+  event->ReleaseHandle();
+  event.reset();
 }
 
 TEST_CASE("Guest scheduler discards a suspended exact JIT route",

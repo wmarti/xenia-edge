@@ -69,8 +69,15 @@ class GuestExecutionSessionCaptureSchedulerEventBridge final
 
   const Participant* FindParticipant(uint64_t capture_instance_id,
                                      uint32_t guest_thread_id) const;
+  bool BuildSchedulerTopology(
+      const kernel::GuestSchedulerCheckpointBarrierSnapshot& checkpoint,
+      GuestExecutionSessionSchedulerTopologyBoundary boundary,
+      GuestExecutionSessionSchedulerTopologyChunk* output,
+      std::string* error) const;
 
   std::vector<Participant> participants_;
+  GuestExecutionSessionSchedulerTopologyChunk start_scheduler_topology_;
+  GuestExecutionSessionSchedulerTopologyChunk final_scheduler_topology_;
   uint64_t start_checkpoint_generation_ = 0;
   uint64_t first_scheduler_sequence_ = 0;
   uint64_t last_scheduler_sequence_ = 0;

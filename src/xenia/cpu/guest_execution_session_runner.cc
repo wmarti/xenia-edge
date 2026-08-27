@@ -807,7 +807,7 @@ bool BuildGuestExecutionContinuousReplayPlan(
   if (manifest.rejected_event_count || manifest.unsupported_event_count) {
     return fail("continuous session contains rejected or unsupported events");
   }
-  if (manifest.chunks.size() < 5 ||
+  if (manifest.chunks.size() < 7 ||
       manifest.chunks.front().kind !=
           GuestExecutionSessionChunkKind::kCheckpoint ||
       manifest.chunks[1].kind != GuestExecutionSessionChunkKind::kCodeCorpus ||
@@ -847,6 +847,8 @@ bool BuildGuestExecutionContinuousReplayPlan(
 
   std::vector<GuestExecutionSessionEvent> canonical_events;
   std::vector<GuestExecutionContinuousEvent> control_events;
+  bool saw_start_scheduler_topology = false;
+  bool saw_final_scheduler_topology = false;
   for (size_t i = 2; i + 1 < bundle.chunks.size(); ++i) {
     switch (manifest.chunks[i].kind) {
       case GuestExecutionSessionChunkKind::kEvents: {
@@ -873,9 +875,38 @@ bool BuildGuestExecutionContinuousReplayPlan(
                               std::make_move_iterator(chunk.end()));
         break;
       }
+      case GuestExecutionSessionChunkKind::kSchedulerTopology: {
+        GuestExecutionSessionSchedulerTopologyChunk topology;
+        if (!GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+                bundle.chunks[i], &topology, error)) {
+          *output = {};
+          return false;
+        }
+        if (topology.boundary ==
+            GuestExecutionSessionSchedulerTopologyBoundary::kStart) {
+          if (saw_start_scheduler_topology) {
+            return fail("continuous start scheduler topology is duplicated");
+          }
+          saw_start_scheduler_topology = true;
+          plan.initial_scheduler_topology = std::move(topology);
+        } else if (topology.boundary ==
+                   GuestExecutionSessionSchedulerTopologyBoundary::kFinal) {
+          if (saw_final_scheduler_topology) {
+            return fail("continuous final scheduler topology is duplicated");
+          }
+          saw_final_scheduler_topology = true;
+          plan.final_scheduler_topology = std::move(topology);
+        } else {
+          return fail("continuous scheduler topology boundary is unknown");
+        }
+        break;
+      }
       default:
         return fail("continuous session contains a misplaced chunk");
     }
+  }
+  if (!saw_start_scheduler_topology || !saw_final_scheduler_topology) {
+    return fail("continuous scheduler topology closure is missing");
   }
   if (canonical_events.size() != control_events.size() ||
       canonical_events.size() != manifest.accepted_event_count) {

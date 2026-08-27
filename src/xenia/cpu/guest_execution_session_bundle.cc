@@ -108,6 +108,9 @@ std::filesystem::path ChunkFileName(
     case GuestExecutionSessionChunkKind::kCodeCorpus:
       kind = "code-corpus";
       break;
+    case GuestExecutionSessionChunkKind::kSchedulerTopology:
+      kind = "scheduler-topology";
+      break;
     default:
       kind = "unknown";
       break;
@@ -359,6 +362,9 @@ bool CollectRequiredBlobs(
                GuestExecutionSessionChunkKind::kContinuousEvents) {
       continue;
     } else if (manifest.chunks[i].kind ==
+               GuestExecutionSessionChunkKind::kSchedulerTopology) {
+      continue;
+    } else if (manifest.chunks[i].kind ==
                GuestExecutionSessionChunkKind::kCheckpoint) {
       GuestExecutionSessionCheckpointChunk chunk;
       if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
@@ -441,6 +447,111 @@ bool ValidateContinuousCheckpointBlobs(
     }
   }
   return true;
+}
+
+bool ValidateSchedulerTopologyCheckpointBindings(
+    const GuestExecutionSessionBundle& bundle,
+    const GuestExecutionSessionBundleLimits& limits,
+    const ValidatedBundle& validated, std::string* error) {
+  GuestExecutionSessionSchedulerTopologyChunk start_topology;
+  GuestExecutionSessionSchedulerTopologyChunk final_topology;
+  bool has_start_topology = false;
+  bool has_final_topology = false;
+  for (size_t index = 0; index < bundle.chunks.size(); ++index) {
+    if (bundle.manifest.chunks[index].kind !=
+        GuestExecutionSessionChunkKind::kSchedulerTopology) {
+      continue;
+    }
+    GuestExecutionSessionSchedulerTopologyChunk topology;
+    if (!GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+            bundle.chunks[index], &topology, error, limits.session)) {
+      return false;
+    }
+    if (topology.boundary ==
+        GuestExecutionSessionSchedulerTopologyBoundary::kStart) {
+      start_topology = std::move(topology);
+      has_start_topology = true;
+    } else {
+      final_topology = std::move(topology);
+      has_final_topology = true;
+    }
+  }
+  if (!has_start_topology && !has_final_topology) {
+    return true;
+  }
+  if (!has_start_topology || !has_final_topology) {
+    return Fail(error, "scheduler topology checkpoint binding is incomplete");
+  }
+
+  GuestExecutionSessionCheckpointChunk initial_checkpoint;
+  GuestExecutionSessionCheckpointChunk final_checkpoint;
+  if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
+          bundle.chunks.front(), &initial_checkpoint, error, limits.session) ||
+      !GuestExecutionSessionCodec::DecodeCheckpointChunk(
+          bundle.chunks.back(), &final_checkpoint, error, limits.session)) {
+    return false;
+  }
+  auto validate_boundary = [&](const auto& topology, const auto& checkpoint,
+                               std::string_view boundary) {
+    if (topology.participants.size() !=
+        checkpoint.checkpoint.thread_states.size()) {
+      return Fail(error,
+                  "scheduler topology and PPC checkpoint rosters differ");
+    }
+    for (const auto& participant : topology.participants) {
+      if (participant.ordinal >= checkpoint.checkpoint.thread_states.size()) {
+        return Fail(error,
+                    "scheduler topology PPC checkpoint ordinal is invalid");
+      }
+      const GuestExecutionSessionThreadStateReference& reference =
+          checkpoint.checkpoint.thread_states[participant.ordinal];
+      const auto blob = validated.blobs.find(reference.sha256);
+      ppc::GuestPPCThreadCheckpoint decoded;
+      if (reference.thread_ordinal != participant.ordinal ||
+          blob == validated.blobs.end() ||
+          blob->second->bytes.size() != reference.byte_size ||
+          !ppc::GuestPPCThreadCheckpointCodec::Decode(blob->second->bytes,
+                                                      &decoded, error) ||
+          decoded.participant_ordinal != participant.ordinal ||
+          decoded.guest_thread_id != participant.guest_thread_id) {
+        return Fail(error, std::string("scheduler ") + std::string(boundary) +
+                               " topology PPC checkpoint identity differs");
+      }
+      if (participant.state ==
+          GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned) {
+        continue;
+      }
+      switch (participant.resume_kind) {
+        case GuestExecutionSessionSchedulerResumeKind::kJitSafepoint:
+          if (decoded.resume_kind !=
+                  ppc::GuestPPCThreadResumeKind::kGuestBlockHead ||
+              decoded.resume_pc != participant.guest_pc) {
+            return Fail(error, std::string("scheduler ") +
+                                   std::string(boundary) +
+                                   " topology JIT route differs from PPC");
+          }
+          break;
+        case GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport:
+          if (decoded.resume_kind != ppc::GuestPPCThreadResumeKind::
+                                         kPendingModeledBlockingExtern ||
+              decoded.resume_pc != participant.guest_pc) {
+            return Fail(error, std::string("scheduler ") +
+                                   std::string(boundary) +
+                                   " topology blocked route differs from PPC");
+          }
+          break;
+        case GuestExecutionSessionSchedulerResumeKind::kNativeContinuation:
+        case GuestExecutionSessionSchedulerResumeKind::kNotYetRun:
+        case GuestExecutionSessionSchedulerResumeKind::kNone:
+        default:
+          return Fail(error, std::string("scheduler ") + std::string(boundary) +
+                                 " topology has no durable PPC route");
+      }
+    }
+    return true;
+  };
+  return validate_boundary(start_topology, initial_checkpoint, "start") &&
+         validate_boundary(final_topology, final_checkpoint, "final");
 }
 
 bool ValidateContinuousCodeClosure(
@@ -616,6 +727,8 @@ bool ValidateBundle(const GuestExecutionSessionBundle& bundle,
     }
   }
   if (!ValidateContinuousCheckpointBlobs(bundle, limits, *output, error) ||
+      !ValidateSchedulerTopologyCheckpointBindings(bundle, limits, *output,
+                                                   error) ||
       !ValidateContinuousCodeClosure(bundle, output->blobs, limits.session,
                                      error)) {
     return false;

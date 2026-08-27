@@ -84,6 +84,10 @@ class GuestScheduler {
   // observe the new level; running, blocked and suspended changes share that
   // same total order.
   void PublishPriority(XThread* thread, int32_t priority);
+  // Publishes the scheduler base and effective priorities as one ordered state
+  // change. The effective priority may be unchanged.
+  void PublishBasePriorityAndPriority(XThread* thread, int32_t base_priority,
+                                      int32_t priority);
 
   // Yields from a spin loop. On a fiber this hands the dispatch thread to the
   // next ready fiber, since a co-resident holder can only run if we yield.
@@ -377,6 +381,10 @@ class GuestScheduler {
   // summary bit, and preempts the CPU's running fiber if outranked. Caller
   // holds lock_ and has set links.queued and links.cpu.
   void LinkReadyLocked(Cpu& cpu, XThread* thread, bool at_head);
+  // Publishes an effective-priority change and, when non-negative, a base
+  // priority change. Caller holds lock_.
+  void PublishPriorityLocked(XThread* thread, int32_t priority,
+                             int32_t base_priority);
   // Out-of-line so the yield fast path stays a single relaxed bool load.
   void ReportGlobalLockHazard();
 
@@ -393,7 +401,15 @@ class GuestScheduler {
 
   void AppendCheckpointListLocked(
       std::vector<GuestSchedulerCheckpointParticipant>& participants,
-      XThread* head, GuestSchedulerCheckpointParticipantState state) const;
+      XThread* head, GuestSchedulerCheckpointParticipantState state,
+      uint64_t snapshot_tick, uint64_t snapshot_uptime_ms,
+      int ready_queue_level = -1) const;
+  void PopulateCheckpointParticipantStateLocked(
+      GuestSchedulerCheckpointParticipant* participant, XThread* thread,
+      uint64_t snapshot_tick, uint64_t snapshot_uptime_ms,
+      GuestSchedulerCheckpointParticipantState state) const;
+  uint32_t QuantumRemainingUsLocked(XThread* thread,
+                                    uint64_t snapshot_tick) const;
   bool ValidateCheckpointDiscardRoutesLocked(
       uint64_t generation,
       std::span<const GuestSchedulerCheckpointJitRoute> routes) const;

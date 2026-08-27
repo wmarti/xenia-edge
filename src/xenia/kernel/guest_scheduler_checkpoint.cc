@@ -86,7 +86,7 @@ bool GuestSchedulerCheckpointBarrier::Begin(
 bool GuestSchedulerCheckpointBarrier::ArriveAtSafepoint(
     uint32_t thread_id, int cpu, uint32_t guest_pc,
     uint32_t preempt_defers_irql, uint32_t preempt_defers_lock,
-    uint32_t capture_declined_safepoints) {
+    uint32_t capture_declined_safepoints, uint32_t quantum_remaining_us) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!active_.load(std::memory_order_relaxed) ||
       rejection_ != GuestSchedulerCheckpointBarrierRejection::kNone) {
@@ -123,6 +123,7 @@ bool GuestSchedulerCheckpointBarrier::ArriveAtSafepoint(
   it->preempt_defers_irql = preempt_defers_irql;
   it->preempt_defers_lock = preempt_defers_lock;
   it->capture_declined_safepoints = capture_declined_safepoints;
+  it->quantum_remaining_us = quantum_remaining_us;
   return true;
 }
 

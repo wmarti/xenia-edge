@@ -21,6 +21,8 @@
 #include <span>
 #include <vector>
 
+#include "xenia/kernel/guest_scheduler_capture_observer.h"
+
 namespace xe {
 namespace kernel {
 
@@ -40,8 +42,12 @@ enum class GuestSchedulerCheckpointResumeKind : uint8_t {
 
 struct GuestSchedulerCheckpointParticipant {
   uint32_t thread_id = 0;
+  uint64_t capture_instance_id = 0;
   uint32_t guest_pc = 0;
   int8_t cpu = -1;
+  uint8_t effective_priority = 0;
+  int8_t ready_queue_level = -1;
+  uint32_t ready_queue_fifo_ordinal = UINT32_MAX;
   GuestSchedulerCheckpointParticipantState state =
       GuestSchedulerCheckpointParticipantState::kReady;
   GuestSchedulerCheckpointResumeKind resume_kind =
@@ -50,6 +56,16 @@ struct GuestSchedulerCheckpointParticipant {
   uint32_t preempt_defers_irql = 0;
   uint32_t preempt_defers_lock = 0;
   uint32_t capture_declined_safepoints = 0;
+  // Cooperative-scheduler decay floor, ordered with effective_priority under
+  // the scheduler lock.
+  uint8_t base_priority = 0;
+  uint8_t suspension_count = 0;
+  // Remaining cooperative-scheduler slice in microseconds. A zero quantum
+  // configuration and an expired slice both have a zero remainder.
+  uint32_t quantum_remaining_us = 0;
+  GuestSchedulerCaptureWaitKind blocked_wait_kind =
+      GuestSchedulerCaptureWaitKind::kNone;
+  GuestSchedulerCaptureWaitState blocked_wait;
 
   bool operator==(const GuestSchedulerCheckpointParticipant&) const = default;
 };
@@ -126,7 +142,8 @@ class GuestSchedulerCheckpointBarrier {
   bool ArriveAtSafepoint(uint32_t thread_id, int cpu, uint32_t guest_pc,
                          uint32_t preempt_defers_irql = 0,
                          uint32_t preempt_defers_lock = 0,
-                         uint32_t capture_declined_safepoints = 0);
+                         uint32_t capture_declined_safepoints = 0,
+                         uint32_t quantum_remaining_us = 0);
   bool ConfirmSwitchOut(uint32_t thread_id, int cpu);
   bool AcknowledgeDispatchQuiesced(int cpu);
   void Reject(GuestSchedulerCheckpointBarrierRejection rejection);

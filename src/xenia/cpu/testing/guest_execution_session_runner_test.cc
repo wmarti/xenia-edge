@@ -486,6 +486,48 @@ ppc::GuestPPCThreadCheckpointBinding ContinuousBinding(
   return binding;
 }
 
+GuestExecutionSessionSchedulerTopologyChunk MakeSchedulerTopology(
+    GuestExecutionSessionSchedulerTopologyBoundary boundary,
+    uint64_t global_sequence, uint32_t ordinal,
+    const std::array<uint32_t, 2>& guest_thread_ids,
+    const std::array<ppc::GuestPPCThreadCheckpoint, 2>& checkpoints) {
+  GuestExecutionSessionSchedulerTopologyChunk topology;
+  topology.session_epoch = kEpoch;
+  topology.ordinal = ordinal;
+  topology.boundary = boundary;
+  topology.global_sequence = global_sequence;
+  for (uint32_t i = 0; i < guest_thread_ids.size(); ++i) {
+    GuestExecutionSessionSchedulerTopologyParticipant participant;
+    participant.ordinal = i;
+    participant.guest_thread_id = guest_thread_ids[i];
+    participant.capture_instance_id = 0x1000 + i;
+    participant.cpu = i;
+    participant.effective_priority = 8 - i;
+    participant.base_priority = 6;
+    participant.suspension_count = 0;
+    participant.quantum_remaining_us = 500 + i;
+    participant.resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kJitSafepoint;
+    participant.guest_pc = checkpoints[i].resume_pc;
+    participant.restorable = true;
+    if (boundary == GuestExecutionSessionSchedulerTopologyBoundary::kStart) {
+      participant.state =
+          GuestExecutionSessionSchedulerParticipantState::kReady;
+      participant.cpu = 0;
+      participant.effective_priority = 8;
+      participant.ready_queue_level = 8;
+      participant.ready_queue_fifo_ordinal = i;
+    } else {
+      participant.state =
+          i == 0 ? GuestExecutionSessionSchedulerParticipantState::kRunning
+                 : GuestExecutionSessionSchedulerParticipantState::kSuspended;
+      participant.suspension_count = i == 0 ? 0 : 1;
+    }
+    topology.participants.push_back(participant);
+  }
+  return topology;
+}
+
 GuestExecutionSessionBundle MakeContinuousSessionBundle(
     uint32_t host_page_size) {
   GuestExecutionSessionBundle bundle;
@@ -591,7 +633,7 @@ GuestExecutionSessionBundle MakeContinuousSessionBundle(
 
   GuestExecutionSessionCheckpointChunk final_chunk;
   final_chunk.session_epoch = kEpoch;
-  final_chunk.ordinal = 4;
+  final_chunk.ordinal = 6;
   final_chunk.checkpoint.global_sequence = event_chunk.events.size();
   for (uint32_t i = 0; i < kParticipantCount; ++i) {
     final_chunk.checkpoint.thread_states.push_back(
@@ -633,7 +675,16 @@ GuestExecutionSessionBundle MakeContinuousSessionBundle(
     arrival.checkpoint.binding = ContinuousBinding(final[i]);
   }
 
-  bundle.chunks.resize(5);
+  GuestExecutionSessionSchedulerTopologyChunk start_topology =
+      MakeSchedulerTopology(
+          GuestExecutionSessionSchedulerTopologyBoundary::kStart, 0, 4,
+          guest_thread_ids, initial);
+  GuestExecutionSessionSchedulerTopologyChunk final_topology =
+      MakeSchedulerTopology(
+          GuestExecutionSessionSchedulerTopologyBoundary::kFinal,
+          final_chunk.checkpoint.global_sequence, 5, guest_thread_ids, final);
+
+  bundle.chunks.resize(7);
   REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
       initial_chunk, &bundle.chunks[0], &error));
   REQUIRE(GuestExecutionSessionCodec::EncodeCodeCorpusChunk(
@@ -642,8 +693,12 @@ GuestExecutionSessionBundle MakeContinuousSessionBundle(
       event_chunk, &bundle.chunks[2], &error));
   REQUIRE(GuestExecutionContinuousEventCodec::Encode(
       control_events, &bundle.chunks[3], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      start_topology, &bundle.chunks[4], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      final_topology, &bundle.chunks[5], &error));
   REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
-      final_chunk, &bundle.chunks[4], &error));
+      final_chunk, &bundle.chunks[6], &error));
 
   GuestExecutionSessionManifest& manifest = bundle.manifest;
   manifest.session_epoch = kEpoch;
@@ -694,9 +749,17 @@ GuestExecutionSessionBundle MakeContinuousSessionBundle(
       control_events.size(), static_cast<uint32_t>(control_events.size()),
       bundle.chunks[3]));
   manifest.chunks.push_back(
-      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 4,
+      Reference(GuestExecutionSessionChunkKind::kSchedulerTopology, 4, 0, 0,
+                kParticipantCount, bundle.chunks[4]));
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kSchedulerTopology, 5,
                 final_chunk.checkpoint.global_sequence,
-                final_chunk.checkpoint.global_sequence, 1, bundle.chunks[4]));
+                final_chunk.checkpoint.global_sequence, kParticipantCount,
+                bundle.chunks[5]));
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 6,
+                final_chunk.checkpoint.global_sequence,
+                final_chunk.checkpoint.global_sequence, 1, bundle.chunks[6]));
   REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
   REQUIRE(error.empty());
   return bundle;
@@ -754,6 +817,15 @@ void ReplaceInitialContinuousCheckpoint(
   bundle->manifest.chunks.front() =
       Reference(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
                 bundle->chunks.front());
+  GuestExecutionSessionSchedulerTopologyChunk topology;
+  REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+      bundle->chunks[4], &topology, &error));
+  topology.participants[ordinal].guest_pc = checkpoint.resume_pc;
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      topology, &bundle->chunks[4], &error));
+  bundle->manifest.chunks[4] = Reference(
+      GuestExecutionSessionChunkKind::kSchedulerTopology, 4, 0, 0,
+      static_cast<uint32_t>(topology.participants.size()), bundle->chunks[4]);
   REQUIRE(ValidateGuestExecutionSessionBundle(*bundle, &error));
   REQUIRE(error.empty());
 }
@@ -775,6 +847,30 @@ TEST_CASE("continuous replay planner binds exact participant continuations",
   REQUIRE(plan.corpus.functions().size() == 1);
   REQUIRE(plan.initial_session_checkpoint.global_sequence == 0);
   REQUIRE(plan.final_session_checkpoint.global_sequence == 8);
+  REQUIRE(plan.initial_scheduler_topology.boundary ==
+          GuestExecutionSessionSchedulerTopologyBoundary::kStart);
+  REQUIRE(plan.final_scheduler_topology.boundary ==
+          GuestExecutionSessionSchedulerTopologyBoundary::kFinal);
+  REQUIRE(plan.initial_scheduler_topology.participants.size() == 2);
+  REQUIRE(plan.initial_scheduler_topology.participants[0].state ==
+          GuestExecutionSessionSchedulerParticipantState::kReady);
+  REQUIRE(plan.initial_scheduler_topology.participants[0].base_priority == 6);
+  REQUIRE(
+      plan.initial_scheduler_topology.participants[0].quantum_remaining_us ==
+      500);
+  REQUIRE(plan.initial_scheduler_topology.participants[0].resume_kind ==
+          GuestExecutionSessionSchedulerResumeKind::kJitSafepoint);
+  REQUIRE(plan.initial_scheduler_topology.participants[0].guest_pc ==
+          kCodeAddress + 0x40);
+  REQUIRE(plan.initial_scheduler_topology.participants[0]
+              .ready_queue_fifo_ordinal == 0);
+  REQUIRE(plan.initial_scheduler_topology.participants[1]
+              .ready_queue_fifo_ordinal == 1);
+  REQUIRE(plan.final_scheduler_topology.participants[0].state ==
+          GuestExecutionSessionSchedulerParticipantState::kRunning);
+  REQUIRE(plan.final_scheduler_topology.participants[1].state ==
+          GuestExecutionSessionSchedulerParticipantState::kSuspended);
+  REQUIRE(plan.final_scheduler_topology.participants[1].suspension_count == 1);
   REQUIRE(plan.participants[0].initial_checkpoint.resume_pc ==
           kCodeAddress + 0x40);
   REQUIRE(plan.participants[1].initial_checkpoint.resume_pc ==
@@ -805,6 +901,57 @@ TEST_CASE("continuous replay planner binds exact participant continuations",
           std::vector<GuestInvocationReplayProtectionGranule>{
               {kDataAddress, kHostPageSize, true},
               {kCodeAddress, kHostPageSize, false}});
+}
+
+TEST_CASE("continuous replay planner requires complete scheduler topology",
+          "[guest-execution-session-runner][continuous]"
+          "[guest-execution-scheduler-topology]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  GuestExecutionContinuousReplayPlan plan;
+  std::string error;
+
+  SECTION("legacy continuous bundle without topology is not replayable") {
+    GuestExecutionSessionBundle bundle =
+        MakeContinuousSessionBundle(kHostPageSize);
+    GuestExecutionSessionCheckpointChunk final_checkpoint;
+    REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+        bundle.chunks.back(), &final_checkpoint, &error));
+    final_checkpoint.ordinal = 4;
+    bundle.chunks.erase(bundle.chunks.begin() + 4, bundle.chunks.begin() + 6);
+    bundle.manifest.chunks.erase(bundle.manifest.chunks.begin() + 4,
+                                 bundle.manifest.chunks.begin() + 6);
+    REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+        final_checkpoint, &bundle.chunks.back(), &error));
+    bundle.manifest.chunks.back() = Reference(
+        GuestExecutionSessionChunkKind::kCheckpoint, 4,
+        final_checkpoint.checkpoint.global_sequence,
+        final_checkpoint.checkpoint.global_sequence, 1, bundle.chunks.back());
+    REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+    REQUIRE(error == "continuous session chunk closure is missing");
+  }
+
+  SECTION("topology missing one roster participant fails bundle closure") {
+    GuestExecutionSessionBundle bundle =
+        MakeContinuousSessionBundle(kHostPageSize);
+    GuestExecutionSessionSchedulerTopologyChunk topology;
+    REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+        bundle.chunks[4], &topology, &error));
+    topology.participants.pop_back();
+    REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        topology, &bundle.chunks[4], &error));
+    bundle.manifest.chunks[4] =
+        Reference(GuestExecutionSessionChunkKind::kSchedulerTopology, 4, 0, 0,
+                  1, bundle.chunks[4]);
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+  }
+
+  REQUIRE(plan.participants.empty());
+  REQUIRE(plan.initial_scheduler_topology.participants.empty());
+  REQUIRE(plan.final_scheduler_topology.participants.empty());
 }
 
 TEST_CASE("continuous replay planner rejects ambiguous continuation routes",

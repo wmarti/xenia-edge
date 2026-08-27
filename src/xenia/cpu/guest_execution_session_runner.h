@@ -201,6 +201,11 @@ struct GuestExecutionContinuousReplayPlan {
   ExecutionJitCorpus corpus;
   GuestExecutionSessionCheckpoint initial_session_checkpoint;
   GuestExecutionSessionCheckpoint final_session_checkpoint;
+  // Authoritative scheduler seed and closure decoded from the quiescent
+  // boundary snapshots. Replay event transitions must start from these rather
+  // than inferring queue state from the first observed scheduler event.
+  GuestExecutionSessionSchedulerTopologyChunk initial_scheduler_topology;
+  GuestExecutionSessionSchedulerTopologyChunk final_scheduler_topology;
   std::vector<GuestExecutionContinuousReplayParticipant> participants;
   std::vector<GuestExecutionContinuousReplayEvent> events;
   std::vector<GuestExecutionContinuousReplayResumeEntry> resume_entries;

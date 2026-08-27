@@ -718,6 +718,101 @@ GuestExecutionSessionBundle MakeContinuousBundle(
   return bundle;
 }
 
+void AddSchedulerTopologyClosure(GuestExecutionSessionBundle* bundle) {
+  REQUIRE(bundle != nullptr);
+  REQUIRE(bundle->chunks.size() == 5);
+  REQUIRE(bundle->manifest.chunks.size() == 5);
+  REQUIRE(bundle->manifest.chunks[3].kind ==
+          GuestExecutionSessionChunkKind::kContinuousEvents);
+
+  GuestExecutionSessionSchedulerTopologyChunk start;
+  start.session_epoch = bundle->manifest.session_epoch;
+  start.ordinal = 4;
+  start.boundary = GuestExecutionSessionSchedulerTopologyBoundary::kStart;
+  GuestExecutionSessionSchedulerTopologyParticipant participant;
+  participant.guest_thread_id = 7;
+  participant.capture_instance_id = 0x100;
+  participant.state = GuestExecutionSessionSchedulerParticipantState::kReady;
+  participant.cpu = 0;
+  participant.effective_priority = 8;
+  participant.base_priority = 6;
+  participant.suspension_count = 0;
+  participant.quantum_remaining_us = 500;
+  participant.ready_queue_level = 8;
+  participant.ready_queue_fifo_ordinal = 0;
+  participant.resume_kind =
+      GuestExecutionSessionSchedulerResumeKind::kJitSafepoint;
+  participant.restorable = true;
+
+  GuestExecutionSessionCheckpointChunk initial_checkpoint;
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+      bundle->chunks.front(), &initial_checkpoint, &error));
+  REQUIRE(initial_checkpoint.checkpoint.thread_states.size() == 1);
+  const auto find_blob = [&](const GuestExecutionSessionSha256& sha256) {
+    return std::find_if(
+        bundle->content_blobs.cbegin(), bundle->content_blobs.cend(),
+        [&](const auto& blob) { return blob.sha256 == sha256; });
+  };
+  auto state_blob =
+      find_blob(initial_checkpoint.checkpoint.thread_states[0].sha256);
+  REQUIRE(state_blob != bundle->content_blobs.cend());
+  ppc::GuestPPCThreadCheckpoint initial_state;
+  REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(state_blob->bytes,
+                                                     &initial_state, &error));
+  participant.guest_pc = initial_state.resume_pc;
+  start.participants.push_back(participant);
+
+  GuestExecutionSessionSchedulerTopologyChunk final = start;
+  final.ordinal = 5;
+  final.boundary = GuestExecutionSessionSchedulerTopologyBoundary::kFinal;
+  final.global_sequence = bundle->manifest.last_event_sequence;
+  GuestExecutionSessionCheckpointChunk final_checkpoint;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+      bundle->chunks.back(), &final_checkpoint, &error));
+  final_checkpoint.ordinal = 6;
+  REQUIRE(final_checkpoint.checkpoint.thread_states.size() == 1);
+  state_blob = find_blob(final_checkpoint.checkpoint.thread_states[0].sha256);
+  REQUIRE(state_blob != bundle->content_blobs.cend());
+  ppc::GuestPPCThreadCheckpoint final_state;
+  REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(state_blob->bytes,
+                                                     &final_state, &error));
+  final.participants[0].guest_pc = final_state.resume_pc;
+
+  std::vector<uint8_t> start_bytes;
+  std::vector<uint8_t> final_bytes;
+  std::vector<uint8_t> final_checkpoint_bytes;
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      start, &start_bytes, &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      final, &final_bytes, &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_checkpoint, &final_checkpoint_bytes, &error));
+
+  const GuestExecutionSessionChunkReference start_reference =
+      ReferenceFor(GuestExecutionSessionChunkKind::kSchedulerTopology,
+                   start.ordinal, 0, 0, 1, start_bytes);
+  const GuestExecutionSessionChunkReference final_reference = ReferenceFor(
+      GuestExecutionSessionChunkKind::kSchedulerTopology, final.ordinal,
+      final.global_sequence, final.global_sequence, 1, final_bytes);
+  const GuestExecutionSessionChunkReference final_checkpoint_reference =
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint,
+                   final_checkpoint.ordinal,
+                   final_checkpoint.checkpoint.global_sequence,
+                   final_checkpoint.checkpoint.global_sequence, 1,
+                   final_checkpoint_bytes);
+
+  bundle->chunks.back() = std::move(final_checkpoint_bytes);
+  bundle->chunks.insert(bundle->chunks.end() - 1, std::move(start_bytes));
+  bundle->chunks.insert(bundle->chunks.end() - 1, std::move(final_bytes));
+  bundle->manifest.chunks.back() = final_checkpoint_reference;
+  bundle->manifest.chunks.insert(bundle->manifest.chunks.end() - 1,
+                                 start_reference);
+  bundle->manifest.chunks.insert(bundle->manifest.chunks.end() - 1,
+                                 final_reference);
+  REQUIRE(ValidateGuestExecutionSessionBundle(*bundle, &error));
+}
+
 std::map<GuestExecutionSessionSha256, std::vector<uint8_t>> BlobMap(
     const GuestExecutionSessionBundle& bundle) {
   std::map<GuestExecutionSessionSha256, std::vector<uint8_t>> result;
@@ -762,6 +857,9 @@ std::filesystem::path ChunkName(
       break;
     case GuestExecutionSessionChunkKind::kCodeCorpus:
       kind = "code-corpus";
+      break;
+    case GuestExecutionSessionChunkKind::kSchedulerTopology:
+      kind = "scheduler-topology";
       break;
     default:
       kind = "unknown";
@@ -851,6 +949,74 @@ TEST_CASE("session bundle publishes and reads one exact closed object graph",
     ++file_count;
   }
   CHECK(file_count == 1 + bundle.chunks.size() + bundle.content_blobs.size());
+}
+
+TEST_CASE("session bundle durably closes scheduler topology boundaries",
+          "[guest-execution-session-bundle]"
+          "[guest-execution-scheduler-topology]") {
+  ScopedTestDirectory temporary_directory;
+  GuestExecutionSessionBundle bundle =
+      MakeContinuousBundle(true, true, 0x82000000, 0x820000FC, true);
+  AddSchedulerTopologyClosure(&bundle);
+  const std::filesystem::path output = temporary_directory.path() / "topology";
+  std::string error;
+
+  REQUIRE(WriteGuestExecutionSessionBundle(output, bundle, &error));
+  GuestExecutionSessionBundle decoded;
+  REQUIRE(ReadGuestExecutionSessionBundle(output, &decoded, &error));
+  REQUIRE(decoded.manifest == bundle.manifest);
+  REQUIRE(decoded.chunks == bundle.chunks);
+
+  std::vector<GuestExecutionSessionSchedulerTopologyChunk> topologies;
+  for (size_t i = 0; i < decoded.manifest.chunks.size(); ++i) {
+    if (decoded.manifest.chunks[i].kind !=
+        GuestExecutionSessionChunkKind::kSchedulerTopology) {
+      continue;
+    }
+    REQUIRE(std::filesystem::is_regular_file(
+        output / ChunkName(decoded.manifest.chunks[i])));
+    GuestExecutionSessionSchedulerTopologyChunk topology;
+    REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+        decoded.chunks[i], &topology, &error));
+    topologies.push_back(std::move(topology));
+  }
+  REQUIRE(topologies.size() == 2);
+  REQUIRE(topologies[0].boundary ==
+          GuestExecutionSessionSchedulerTopologyBoundary::kStart);
+  REQUIRE(topologies[1].boundary ==
+          GuestExecutionSessionSchedulerTopologyBoundary::kFinal);
+  REQUIRE(topologies[0].participants[0].state ==
+          GuestExecutionSessionSchedulerParticipantState::kReady);
+  REQUIRE(topologies[1].participants[0].state ==
+          GuestExecutionSessionSchedulerParticipantState::kReady);
+  REQUIRE(topologies[1].participants[0].guest_pc != 0);
+
+  GuestExecutionSessionBundle corrupted = bundle;
+  const auto final_topology_reference = std::find_if(
+      corrupted.manifest.chunks.cbegin(), corrupted.manifest.chunks.cend(),
+      [](const GuestExecutionSessionChunkReference& reference) {
+        return reference.kind ==
+                   GuestExecutionSessionChunkKind::kSchedulerTopology &&
+               reference.first_event_sequence != 0;
+      });
+  REQUIRE(final_topology_reference != corrupted.manifest.chunks.cend());
+  const size_t final_topology_index = static_cast<size_t>(
+      final_topology_reference - corrupted.manifest.chunks.cbegin());
+  GuestExecutionSessionSchedulerTopologyChunk corrupted_topology;
+  REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+      corrupted.chunks[final_topology_index], &corrupted_topology, &error));
+  corrupted_topology.participants[0].guest_pc += 4;
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      corrupted_topology, &corrupted.chunks[final_topology_index], &error));
+  corrupted.manifest.chunks[final_topology_index] = ReferenceFor(
+      GuestExecutionSessionChunkKind::kSchedulerTopology,
+      corrupted_topology.ordinal, corrupted_topology.global_sequence,
+      corrupted_topology.global_sequence,
+      static_cast<uint32_t>(corrupted_topology.participants.size()),
+      corrupted.chunks[final_topology_index]);
+  REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(corrupted, &error));
+  REQUIRE(error.find("final topology JIT route differs from PPC") !=
+          std::string::npos);
 }
 
 TEST_CASE("session bundle accepts an ordered chunked continuous overlay",

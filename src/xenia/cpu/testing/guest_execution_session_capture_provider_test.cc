@@ -193,10 +193,18 @@ class ProviderHarness final {
         kernel::GuestSchedulerCheckpointRosterScope::kSchedulerOwned;
     checkpoint.release_policy = kernel::GuestSchedulerCheckpointReleasePolicy::
         kRunningSafepointsRequeueAtHead;
-    checkpoint.participants.push_back(
-        {kThreadId, guest_pc, 0,
-         kernel::GuestSchedulerCheckpointParticipantState::kRunning,
-         kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint, true});
+    kernel::GuestSchedulerCheckpointParticipant checkpoint_participant;
+    checkpoint_participant.thread_id = kThreadId;
+    checkpoint_participant.capture_instance_id =
+        participant.capture_instance_id;
+    checkpoint_participant.guest_pc = guest_pc;
+    checkpoint_participant.cpu = 0;
+    checkpoint_participant.state =
+        kernel::GuestSchedulerCheckpointParticipantState::kRunning;
+    checkpoint_participant.resume_kind =
+        kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint;
+    checkpoint_participant.restorable = true;
+    checkpoint.participants.push_back(checkpoint_participant);
     return checkpoint;
   }
 
@@ -220,10 +228,18 @@ class ProviderHarness final {
 
   kernel::GuestSchedulerCheckpointBarrierSnapshot TwoThreadCheckpoint() const {
     auto checkpoint = Checkpoint();
-    checkpoint.participants.push_back(
-        {kSecondThreadId, kFunctionAddress, 1,
-         kernel::GuestSchedulerCheckpointParticipantState::kRunning,
-         kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint, true});
+    kernel::GuestSchedulerCheckpointParticipant checkpoint_participant;
+    checkpoint_participant.thread_id = kSecondThreadId;
+    checkpoint_participant.capture_instance_id =
+        second_participant.capture_instance_id;
+    checkpoint_participant.guest_pc = kFunctionAddress;
+    checkpoint_participant.cpu = 1;
+    checkpoint_participant.state =
+        kernel::GuestSchedulerCheckpointParticipantState::kRunning;
+    checkpoint_participant.resume_kind =
+        kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint;
+    checkpoint_participant.restorable = true;
+    checkpoint.participants.push_back(checkpoint_participant);
     return checkpoint;
   }
 

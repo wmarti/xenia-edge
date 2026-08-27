@@ -10,6 +10,7 @@
 #include "xenia/kernel/guest_scheduler.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <string>
 #include <vector>
@@ -383,12 +384,23 @@ int GuestScheduler::CpuOf(XThread* thread) const {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 void GuestScheduler::AppendCheckpointListLocked(
     std::vector<GuestSchedulerCheckpointParticipant>& participants,
-    XThread* head, GuestSchedulerCheckpointParticipantState state) const {
+    XThread* head, GuestSchedulerCheckpointParticipantState state,
+    uint64_t snapshot_tick, uint64_t snapshot_uptime_ms,
+    int ready_queue_level) const {
+  uint32_t ready_queue_fifo_ordinal = 0;
   for (XThread* thread = head; thread;
        thread = thread->scheduler_links().ready_next) {
     GuestSchedulerCheckpointParticipant participant;
     participant.thread_id = thread->thread_id();
+    participant.capture_instance_id =
+        thread->thread_state()->guest_execution_capture_instance_id();
     participant.cpu = static_cast<int8_t>(thread->scheduler_links().cpu);
+    PopulateCheckpointParticipantStateLocked(
+        &participant, thread, snapshot_tick, snapshot_uptime_ms, state);
+    if (state == GuestSchedulerCheckpointParticipantState::kReady) {
+      participant.ready_queue_level = static_cast<int8_t>(ready_queue_level);
+      participant.ready_queue_fifo_ordinal = ready_queue_fifo_ordinal++;
+    }
     participant.state = state;
     const auto& links = thread->scheduler_links();
     participant.preempt_defers_irql =
@@ -415,6 +427,48 @@ void GuestScheduler::AppendCheckpointListLocked(
           GuestSchedulerCheckpointResumeKind::kNativeContinuation;
     }
     participants.push_back(participant);
+  }
+}
+
+uint32_t GuestScheduler::QuantumRemainingUsLocked(
+    XThread* thread, uint64_t snapshot_tick) const {
+  if (!quantum_ticks_) {
+    return 0;
+  }
+  const uint32_t full_quantum_us = cvars::guest_scheduler_quantum_us;
+  const uint64_t deadline = thread->scheduler_links().quantum_deadline_tick;
+  if (!deadline) {
+    return full_quantum_us;
+  }
+  if (deadline <= snapshot_tick) {
+    return 0;
+  }
+  const uint64_t remaining_ticks =
+      std::min(deadline - snapshot_tick, quantum_ticks_);
+  const double remaining_us =
+      std::ceil(double(remaining_ticks) * double(full_quantum_us) /
+                double(quantum_ticks_));
+  return static_cast<uint32_t>(std::min(remaining_us, double(full_quantum_us)));
+}
+
+void GuestScheduler::PopulateCheckpointParticipantStateLocked(
+    GuestSchedulerCheckpointParticipant* participant, XThread* thread,
+    uint64_t snapshot_tick, uint64_t snapshot_uptime_ms,
+    GuestSchedulerCheckpointParticipantState state) const {
+  participant->effective_priority =
+      static_cast<uint8_t>(ClampPriority(thread->priority()));
+  X_KTHREAD* guest_thread = thread->guest_object<X_KTHREAD>();
+  participant->base_priority =
+      static_cast<uint8_t>(ClampPriority(thread->base_priority_));
+  participant->suspension_count =
+      std::atomic_ref<uint8_t>(guest_thread->suspend_count)
+          .load(std::memory_order_acquire);
+  participant->quantum_remaining_us =
+      QuantumRemainingUsLocked(thread, snapshot_tick);
+  if (state == GuestSchedulerCheckpointParticipantState::kBlocked) {
+    participant->blocked_wait_kind = static_cast<GuestSchedulerCaptureWaitKind>(
+        thread->scheduler_links().wait_kind);
+    participant->blocked_wait = CaptureWaitState(thread, snapshot_uptime_ms);
   }
 }
 
@@ -455,6 +509,8 @@ GuestScheduler::PauseForCheckpointBarrier(
         }
       }
       std::vector<GuestSchedulerCheckpointParticipant> participants;
+      const uint64_t snapshot_tick = Clock::host_tick_count_raw();
+      const uint64_t snapshot_uptime_ms = Clock::QueryHostUptimeMillis();
       for (int cpu_index = 0; cpu_index < kMaxCpus; ++cpu_index) {
         Cpu& cpu = cpus_[cpu_index];
         if (cpu.host_thread) {
@@ -463,7 +519,14 @@ GuestScheduler::PauseForCheckpointBarrier(
         if (cpu.current_thread) {
           GuestSchedulerCheckpointParticipant participant;
           participant.thread_id = cpu.current_thread->thread_id();
+          participant.capture_instance_id =
+              cpu.current_thread->thread_state()
+                  ->guest_execution_capture_instance_id();
           participant.cpu = static_cast<int8_t>(cpu_index);
+          PopulateCheckpointParticipantStateLocked(
+              &participant, cpu.current_thread, snapshot_tick,
+              snapshot_uptime_ms,
+              GuestSchedulerCheckpointParticipantState::kRunning);
           participant.state =
               GuestSchedulerCheckpointParticipantState::kRunning;
           participant.resume_kind =
@@ -480,14 +543,17 @@ GuestScheduler::PauseForCheckpointBarrier(
         for (int priority = 31; priority >= 0; --priority) {
           AppendCheckpointListLocked(
               participants, cpu.ready_head[priority],
-              GuestSchedulerCheckpointParticipantState::kReady);
+              GuestSchedulerCheckpointParticipantState::kReady, snapshot_tick,
+              snapshot_uptime_ms, priority);
         }
         AppendCheckpointListLocked(
             participants, cpu.blocked_head,
-            GuestSchedulerCheckpointParticipantState::kBlocked);
+            GuestSchedulerCheckpointParticipantState::kBlocked, snapshot_tick,
+            snapshot_uptime_ms);
         AppendCheckpointListLocked(
             participants, cpu.suspended_head,
-            GuestSchedulerCheckpointParticipantState::kSuspended);
+            GuestSchedulerCheckpointParticipantState::kSuspended, snapshot_tick,
+            snapshot_uptime_ms);
       }
       if (!dispatch_cpu_mask ||
           !checkpoint_barrier_.Begin(dispatch_cpu_mask, participants,
@@ -867,8 +933,8 @@ bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
             thread->thread_id(), cpu_index, guest_pc,
             links.preempt_defers_irql.load(std::memory_order_relaxed),
             links.preempt_defers_lock.load(std::memory_order_relaxed),
-            links.capture_declined_safepoints.load(
-                std::memory_order_relaxed))) {
+            links.capture_declined_safepoints.load(std::memory_order_relaxed),
+            QuantumRemainingUsLocked(thread, Clock::host_tick_count_raw()))) {
       return true;
     }
     if (!thread->scheduler_links().SetCheckpointJitSafepoint(guest_pc)) {
@@ -1427,9 +1493,24 @@ void GuestScheduler::UnlinkLocked(XThread*& head, XThread*& tail,
 
 void GuestScheduler::PublishPriority(XThread* thread, int32_t priority) {
   std::lock_guard<std::mutex> lock(lock_);
+  PublishPriorityLocked(thread, priority, -1);
+}
+
+void GuestScheduler::PublishBasePriorityAndPriority(XThread* thread,
+                                                    int32_t base_priority,
+                                                    int32_t priority) {
+  std::lock_guard<std::mutex> lock(lock_);
+  PublishPriorityLocked(thread, priority, ClampPriority(base_priority));
+}
+
+void GuestScheduler::PublishPriorityLocked(XThread* thread, int32_t priority,
+                                           int32_t base_priority) {
   const int old_priority = ClampPriority(thread->priority());
   const int new_priority = ClampPriority(priority);
-  if (new_priority == old_priority) {
+  const int old_base_priority = thread->base_priority_;
+  const bool base_priority_changed =
+      base_priority >= 0 && base_priority != old_base_priority;
+  if (new_priority == old_priority && !base_priority_changed) {
     return;
   }
   auto& links = thread->scheduler_links();
@@ -1437,6 +1518,10 @@ void GuestScheduler::PublishPriority(XThread* thread, int32_t priority) {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   RejectCheckpointTopologyChangeLocked();
 #endif
+  if (new_priority == old_priority) {
+    thread->StorePublishedBasePriority(base_priority);
+    return;
+  }
   const bool queued = links.queued && links.cpu >= 0;
   if (queued) {
     Cpu& cpu = cpus_[links.cpu];
@@ -1470,6 +1555,9 @@ void GuestScheduler::PublishPriority(XThread* thread, int32_t priority) {
     if (!cpu.ready_head[queued_priority]) {
       cpu.ready_summary &= ~(uint32_t(1) << queued_priority);
     }
+  }
+  if (base_priority_changed) {
+    thread->StorePublishedBasePriority(base_priority);
   }
   thread->StorePublishedPriority(new_priority);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \

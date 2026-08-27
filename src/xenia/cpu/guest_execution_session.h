@@ -97,6 +97,10 @@ enum class GuestExecutionSessionChunkKind : uint32_t {
   // checkpoint. Segmented version-2 sessions continue to bind their corpus
   // through each segment reference and reject this extension.
   kCodeCorpus = 5,
+  // Versioned start or final cooperative-scheduler topology. These chunks
+  // bind the durable participant roster to one authoritative quiescent
+  // scheduler snapshot without treating PPC register state as queue state.
+  kSchedulerTopology = 6,
 };
 
 enum class GuestExecutionSessionEventKind : uint32_t {
@@ -340,6 +344,110 @@ struct GuestExecutionSessionCodeCorpusChunk {
   bool operator==(const GuestExecutionSessionCodeCorpusChunk&) const = default;
 };
 
+enum class GuestExecutionSessionSchedulerTopologyBoundary : uint32_t {
+  kStart = 1,
+  kFinal = 2,
+};
+
+enum class GuestExecutionSessionSchedulerParticipantState : uint32_t {
+  // The participant belongs to the fixed session roster but was not yet owned
+  // by any scheduler CPU or queue at this boundary.
+  kSchedulerUnowned = 1,
+  kRunning = 2,
+  kReady = 3,
+  kBlocked = 4,
+  kSuspended = 5,
+};
+
+enum class GuestExecutionSessionSchedulerResumeKind : uint32_t {
+  kNone = 0,
+  kJitSafepoint = 1,
+  kNativeContinuation = 2,
+  kAfterBlockingExport = 3,
+  kNotYetRun = 4,
+};
+
+enum class GuestExecutionSessionSchedulerWaitKind : uint32_t {
+  kNone = 0,
+  kSingle = 1,
+  kMultiAny = 2,
+  kMultiAll = 3,
+  kDelay = 4,
+  kFence = 5,
+  kIoOffload = 6,
+  kSpinBackoff = 7,
+  kIoCompletion = 8,
+  kSocketIo = 9,
+};
+
+enum GuestExecutionSessionSchedulerWaitFlags : uint32_t {
+  kGuestExecutionSessionSchedulerWaitFlagGated = 1u << 0,
+  kGuestExecutionSessionSchedulerWaitFlagAlertable = 1u << 1,
+  kGuestExecutionSessionSchedulerWaitFlagInterruptible = 1u << 2,
+  kGuestExecutionSessionSchedulerWaitFlagUserApcPending = 1u << 3,
+};
+
+constexpr size_t kGuestExecutionSessionSchedulerMaximumWaitHandles = 8;
+constexpr uint32_t kGuestExecutionSessionSchedulerNoValue = UINT32_MAX;
+constexpr uint64_t kGuestExecutionSessionSchedulerNoQuantum = UINT64_MAX;
+
+struct GuestExecutionSessionSchedulerBlockedWaitBinding {
+  GuestExecutionSessionSchedulerWaitKind kind =
+      GuestExecutionSessionSchedulerWaitKind::kNone;
+  uint64_t deadline_ms = 0;
+  uint64_t observed_uptime_ms = 0;
+  uint32_t wait_epoch = 0;
+  uint32_t observed_wait_epoch = 0;
+  uint32_t handle_count = 0;
+  uint32_t flags = 0;
+  std::array<uint32_t, kGuestExecutionSessionSchedulerMaximumWaitHandles>
+      handles = {};
+  std::array<uint32_t, kGuestExecutionSessionSchedulerMaximumWaitHandles>
+      signal_epochs_before = {};
+  std::array<uint32_t, kGuestExecutionSessionSchedulerMaximumWaitHandles>
+      signal_epochs_observed = {};
+
+  bool operator==(
+      const GuestExecutionSessionSchedulerBlockedWaitBinding&) const = default;
+};
+
+struct GuestExecutionSessionSchedulerTopologyParticipant {
+  uint32_t ordinal = 0;
+  uint32_t guest_thread_id = 0;
+  uint64_t capture_instance_id = 0;
+  GuestExecutionSessionSchedulerParticipantState state =
+      GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned;
+  uint32_t cpu = kGuestExecutionSessionSchedulerNoValue;
+  uint32_t effective_priority = kGuestExecutionSessionSchedulerNoValue;
+  // Cooperative-scheduler decay floor. KeSetPriorityThread may make this
+  // differ from the guest KTHREAD base queried by KeQueryBasePriorityThread.
+  uint32_t base_priority = kGuestExecutionSessionSchedulerNoValue;
+  uint32_t suspension_count = kGuestExecutionSessionSchedulerNoValue;
+  uint64_t quantum_remaining_us = kGuestExecutionSessionSchedulerNoQuantum;
+  uint32_t ready_queue_level = kGuestExecutionSessionSchedulerNoValue;
+  uint32_t ready_queue_fifo_ordinal = kGuestExecutionSessionSchedulerNoValue;
+  GuestExecutionSessionSchedulerResumeKind resume_kind =
+      GuestExecutionSessionSchedulerResumeKind::kNone;
+  uint32_t guest_pc = 0;
+  bool restorable = false;
+  GuestExecutionSessionSchedulerBlockedWaitBinding blocked_wait;
+
+  bool operator==(
+      const GuestExecutionSessionSchedulerTopologyParticipant&) const = default;
+};
+
+struct GuestExecutionSessionSchedulerTopologyChunk {
+  uint64_t session_epoch = 0;
+  uint32_t ordinal = 0;
+  GuestExecutionSessionSchedulerTopologyBoundary boundary =
+      GuestExecutionSessionSchedulerTopologyBoundary::kStart;
+  uint64_t global_sequence = 0;
+  std::vector<GuestExecutionSessionSchedulerTopologyParticipant> participants;
+
+  bool operator==(const GuestExecutionSessionSchedulerTopologyChunk&) const =
+      default;
+};
+
 // Decoder limits are caller-selectable so capture policy can be stricter than
 // the format maxima and tests can prove that limits reject rather than slice.
 struct GuestExecutionSessionLimits {
@@ -379,6 +487,9 @@ class GuestExecutionSessionCodec {
   static constexpr uint32_t kThreadStateReferenceSize = 48;
   static constexpr uint32_t kContentReferenceSize = 56;
   static constexpr uint32_t kCodeCorpusPayloadSize = 32;
+  static constexpr uint32_t kSchedulerTopologyVersion = 1;
+  static constexpr uint32_t kSchedulerTopologyPayloadHeaderSize = 32;
+  static constexpr uint32_t kSchedulerTopologyRecordSize = 200;
   static constexpr uint32_t kGuestPageSize = 4096;
 
   static GuestExecutionSessionSha256 HashBytes(const uint8_t* data,
@@ -448,6 +559,22 @@ class GuestExecutionSessionCodec {
       std::string* error = nullptr, GuestExecutionSessionLimits limits = {}) {
     return DecodeCodeCorpusChunk(data.data(), data.size(), output, error,
                                  limits);
+  }
+
+  static bool EncodeSchedulerTopologyChunk(
+      const GuestExecutionSessionSchedulerTopologyChunk& chunk,
+      std::vector<uint8_t>* output, std::string* error = nullptr,
+      GuestExecutionSessionLimits limits = {});
+  static bool DecodeSchedulerTopologyChunk(
+      const uint8_t* data, size_t data_size,
+      GuestExecutionSessionSchedulerTopologyChunk* output,
+      std::string* error = nullptr, GuestExecutionSessionLimits limits = {});
+  static bool DecodeSchedulerTopologyChunk(
+      const std::vector<uint8_t>& data,
+      GuestExecutionSessionSchedulerTopologyChunk* output,
+      std::string* error = nullptr, GuestExecutionSessionLimits limits = {}) {
+    return DecodeSchedulerTopologyChunk(data.data(), data.size(), output, error,
+                                        limits);
   }
 
   // Fully decodes and binds each supplied chunk to the corresponding manifest

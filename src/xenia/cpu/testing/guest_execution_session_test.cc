@@ -10,6 +10,7 @@
 #include "xenia/cpu/guest_execution_session.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -583,7 +584,180 @@ void RewritePayloadHash(std::vector<uint8_t>* bytes) {
             bytes->begin() + footer_offset + 64);
 }
 
+GuestExecutionSessionSchedulerTopologyChunk MakeSchedulerTopologyFixture() {
+  GuestExecutionSessionSchedulerTopologyChunk chunk;
+  chunk.session_epoch = 0x123456789ABCDEF0ull;
+  chunk.ordinal = 3;
+  chunk.boundary = GuestExecutionSessionSchedulerTopologyBoundary::kStart;
+  const std::array states = {
+      GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned,
+      GuestExecutionSessionSchedulerParticipantState::kRunning,
+      GuestExecutionSessionSchedulerParticipantState::kReady,
+      GuestExecutionSessionSchedulerParticipantState::kReady,
+      GuestExecutionSessionSchedulerParticipantState::kBlocked,
+      GuestExecutionSessionSchedulerParticipantState::kSuspended,
+  };
+  for (uint32_t i = 0; i < states.size(); ++i) {
+    GuestExecutionSessionSchedulerTopologyParticipant participant;
+    participant.ordinal = i;
+    participant.guest_thread_id = 0x100 + i;
+    participant.capture_instance_id = 0x1000 + i;
+    participant.state = states[i];
+    if (states[i] !=
+        GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned) {
+      participant.cpu = i % 2;
+      participant.effective_priority = 8;
+      participant.base_priority = 7;
+      participant.suspension_count =
+          states[i] ==
+                  GuestExecutionSessionSchedulerParticipantState::kSuspended
+              ? 2
+              : 0;
+      participant.quantum_remaining_us = 750 + i;
+      participant.resume_kind =
+          GuestExecutionSessionSchedulerResumeKind::kJitSafepoint;
+      participant.guest_pc = 0x82000100 + i * 4;
+      participant.restorable = true;
+    }
+    if (states[i] == GuestExecutionSessionSchedulerParticipantState::kReady) {
+      participant.cpu = 0;
+      participant.ready_queue_level = 8;
+      // Roster order is independent of ready FIFO order.
+      participant.ready_queue_fifo_ordinal = i == 2 ? 1 : 0;
+    }
+    if (states[i] == GuestExecutionSessionSchedulerParticipantState::kBlocked) {
+      participant.resume_kind =
+          GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport;
+      participant.restorable = false;
+      participant.blocked_wait.kind =
+          GuestExecutionSessionSchedulerWaitKind::kSingle;
+      participant.blocked_wait.observed_uptime_ms = 100;
+      participant.blocked_wait.wait_epoch = 3;
+      participant.blocked_wait.observed_wait_epoch = 4;
+      participant.blocked_wait.handle_count = 1;
+      participant.blocked_wait.flags =
+          kGuestExecutionSessionSchedulerWaitFlagGated |
+          kGuestExecutionSessionSchedulerWaitFlagInterruptible;
+      participant.blocked_wait.handles[0] = 0xF8000010;
+      participant.blocked_wait.signal_epochs_before[0] = 3;
+      participant.blocked_wait.signal_epochs_observed[0] = 4;
+    }
+    chunk.participants.push_back(participant);
+  }
+  return chunk;
+}
+
 }  // namespace
+
+TEST_CASE("Guest execution scheduler topology is versioned and fail closed",
+          "[cpu][guest-execution-scheduler-topology]") {
+  GuestExecutionSessionSchedulerTopologyChunk chunk =
+      MakeSchedulerTopologyFixture();
+  std::vector<uint8_t> encoded;
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      chunk, &encoded, &error));
+  GuestExecutionSessionSchedulerTopologyChunk decoded;
+  REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+      encoded, &decoded, &error));
+  REQUIRE(decoded == chunk);
+  REQUIRE(decoded.participants[0].state ==
+          GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned);
+  REQUIRE(decoded.participants[1].state ==
+          GuestExecutionSessionSchedulerParticipantState::kRunning);
+  REQUIRE(decoded.participants[2].ready_queue_fifo_ordinal == 1);
+  REQUIRE(decoded.participants[3].ready_queue_fifo_ordinal == 0);
+  REQUIRE(decoded.participants[4].state ==
+          GuestExecutionSessionSchedulerParticipantState::kBlocked);
+  REQUIRE(decoded.participants[4].blocked_wait.kind ==
+          GuestExecutionSessionSchedulerWaitKind::kSingle);
+  REQUIRE(decoded.participants[4].blocked_wait.handles[0] == 0xF8000010);
+  REQUIRE(decoded.participants[5].state ==
+          GuestExecutionSessionSchedulerParticipantState::kSuspended);
+  REQUIRE(decoded.participants[5].suspension_count == 2);
+  REQUIRE(decoded.participants[1].base_priority == 7);
+  REQUIRE(decoded.participants[1].quantum_remaining_us == 751);
+  REQUIRE(decoded.participants[1].guest_pc == 0x82000104);
+
+  SECTION("duplicate durable identity is rejected") {
+    chunk.participants[1].capture_instance_id =
+        chunk.participants[0].capture_instance_id;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+  }
+
+  SECTION("CPU and priority bounds are rejected") {
+    chunk.participants[1].cpu = 6;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+    chunk.participants[1].cpu = 1;
+    chunk.participants[1].effective_priority = 32;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+  }
+
+  SECTION("base priority, suspension and quantum bounds are rejected") {
+    chunk.participants[1].base_priority = 32;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+    chunk = MakeSchedulerTopologyFixture();
+    chunk.participants[5].suspension_count = 0;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+    chunk = MakeSchedulerTopologyFixture();
+    chunk.participants[1].quantum_remaining_us = UINT64_MAX - 1;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+  }
+
+  SECTION("ready FIFO duplicates and gaps are rejected") {
+    chunk.participants[2].ready_queue_fifo_ordinal = 0;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+    chunk.participants[2].ready_queue_fifo_ordinal = 2;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+  }
+
+  SECTION("blocked-wait identity and padding are rejected") {
+    chunk.participants[4].blocked_wait.kind =
+        GuestExecutionSessionSchedulerWaitKind::kNone;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+    chunk = MakeSchedulerTopologyFixture();
+    chunk.participants[4].blocked_wait.handles[1] = 1;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+    chunk = MakeSchedulerTopologyFixture();
+    ++chunk.participants[4].blocked_wait.observed_wait_epoch;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+  }
+
+  SECTION("resume route and PC corruption are rejected") {
+    chunk.participants[1].guest_pc |= 2;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+    chunk = MakeSchedulerTopologyFixture();
+    chunk.participants[4].resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kJitSafepoint;
+    chunk.participants[4].restorable = true;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+  }
+
+  SECTION("unknown payload version is rejected") {
+    REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+    WriteU32(&encoded, GuestExecutionSessionCodec::kEnvelopeHeaderSize + 8,
+             GuestExecutionSessionCodec::kSchedulerTopologyVersion + 1);
+    RewritePayloadHash(&encoded);
+    REQUIRE_FALSE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+        encoded, &decoded, &error));
+    REQUIRE(error == "scheduler topology payload version is unsupported");
+    REQUIRE(decoded == GuestExecutionSessionSchedulerTopologyChunk{});
+  }
+}
 
 TEST_CASE("Guest execution session metadata round trips and binds all chunks",
           "[cpu]") {
