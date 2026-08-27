@@ -17,6 +17,7 @@
 #include <string_view>
 #include <utility>
 
+#include "third_party/crypto/sha256.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/backend/backend.h"
@@ -58,6 +59,135 @@ bool FailPlan(GuestInvocationReplayPlan* output, std::string* error,
 }
 
 bool IsPowerOfTwo(uint32_t value) { return value && !(value & (value - 1)); }
+
+bool IsMovz(uint32_t instruction) {
+  return (instruction & 0x7F800000u) == 0x52800000u;
+}
+
+bool IsMovk(uint32_t instruction) {
+  return (instruction & 0x7F800000u) == 0x72800000u;
+}
+
+bool IsMovn(uint32_t instruction) {
+  return (instruction & 0x7F800000u) == 0x12800000u;
+}
+
+uint32_t WideMoveRegister(uint32_t instruction) { return instruction & 0x1Fu; }
+
+uint32_t WideMoveImmediate(uint32_t instruction) {
+  return (instruction >> 5) & 0xFFFFu;
+}
+
+uint32_t WideMoveShift(uint32_t instruction) {
+  return ((instruction >> 21) & 0x3u) * 16u;
+}
+
+bool WideMoveIs64Bit(uint32_t instruction) {
+  return (instruction & 0x80000000u) != 0;
+}
+
+// Native pointers emitted by the A64 backend are materialized with wide moves.
+// Their nonzero 16-bit lanes, and therefore the number of MOVKs, vary with
+// ASLR. Identify every known value above the 32-bit guest address space so only
+// its immediate values can be masked; the emitted chain structure remains in
+// the hash. Native pointers cannot be distinguished from other 64-bit constants
+// from the encoding alone. Small constants and unclassifiable MOVK-only
+// sequences remain exact instruction words in the shape hash.
+bool FindWideMaterializationEnd(const uint8_t* code, size_t instruction_count,
+                                size_t start, size_t* end) {
+  uint32_t first = 0;
+  std::memcpy(&first, code + start * sizeof(uint32_t), sizeof(first));
+  if (!IsMovz(first) && !IsMovn(first) && !IsMovk(first)) {
+    return false;
+  }
+
+  const uint32_t rd = WideMoveRegister(first);
+  const bool sf = WideMoveIs64Bit(first);
+  bool value_known = !IsMovk(first);
+  uint64_t value = 0;
+  if (IsMovz(first)) {
+    value = uint64_t(WideMoveImmediate(first)) << WideMoveShift(first);
+  } else if (IsMovn(first)) {
+    value = ~(uint64_t(WideMoveImmediate(first)) << WideMoveShift(first));
+  }
+
+  size_t next = start + 1;
+  for (; next < instruction_count; ++next) {
+    uint32_t continuation = 0;
+    std::memcpy(&continuation, code + next * sizeof(uint32_t),
+                sizeof(continuation));
+    if (!IsMovk(continuation) || WideMoveRegister(continuation) != rd ||
+        WideMoveIs64Bit(continuation) != sf) {
+      break;
+    }
+    if (value_known) {
+      const uint32_t shift = WideMoveShift(continuation);
+      value &= ~(uint64_t(0xFFFFu) << shift);
+      value |= uint64_t(WideMoveImmediate(continuation)) << shift;
+    }
+  }
+  if (!sf) {
+    value &= 0xFFFFFFFFu;
+  }
+  if (!value_known || value <= 0xFFFFFFFFull) {
+    return false;
+  }
+  *end = next;
+  return true;
+}
+
+uint32_t NormalizePcRelativeInstruction(uint32_t instruction,
+                                        bool* normalized) {
+  *normalized = true;
+  // B and BL: imm26.
+  if ((instruction & 0x7C000000u) == 0x14000000u) {
+    return instruction & 0xFC000000u;
+  }
+  // B.cond, CBZ/CBNZ and literal loads: imm19.
+  if ((instruction & 0xFF000010u) == 0x54000000u ||
+      (instruction & 0x7E000000u) == 0x34000000u ||
+      (instruction & 0x3B000000u) == 0x18000000u) {
+    return instruction & ~0x00FFFFE0u;
+  }
+  // TBZ/TBNZ: imm14.
+  if ((instruction & 0x7E000000u) == 0x36000000u) {
+    return instruction & ~0x0007FFE0u;
+  }
+  // ADR/ADRP: immlo and immhi.
+  if ((instruction & 0x1F000000u) == 0x10000000u) {
+    return instruction & ~(0x60000000u | 0x00FFFFE0u);
+  }
+  *normalized = false;
+  return instruction;
+}
+
+void HashByte(sha256::SHA256* hash, uint8_t value) {
+  hash->add(&value, sizeof(value));
+}
+
+void HashU32(sha256::SHA256* hash, uint32_t value) {
+  std::array<uint8_t, 4> bytes = {};
+  for (uint32_t i = 0; i < bytes.size(); ++i) {
+    bytes[i] = static_cast<uint8_t>(value >> (i * 8));
+  }
+  hash->add(bytes.data(), bytes.size());
+}
+
+void HashU64(sha256::SHA256* hash, uint64_t value) {
+  std::array<uint8_t, 8> bytes = {};
+  for (uint32_t i = 0; i < bytes.size(); ++i) {
+    bytes[i] = static_cast<uint8_t>(value >> (i * 8));
+  }
+  hash->add(bytes.data(), bytes.size());
+}
+
+bool IncrementShapeCounter(uint64_t* value, std::string* error) {
+  if (*value == std::numeric_limits<uint64_t>::max()) {
+    return Fail(error, "normalized code-shape counter overflowed");
+  }
+  ++*value;
+  return true;
+}
 
 bool IsSupportedDataPageAddress(uint32_t address) {
   return (address >= 0x00001000u && address <= 0x7EFFF000u) ||
@@ -257,6 +387,101 @@ bool ReadCurrentThreadCpuNanoseconds(thread_t thread,
 #endif  // XE_PLATFORM_MAC
 
 }  // namespace
+
+bool HashGuestInvocationReplayA64CodeShape(
+    const std::vector<GuestInvocationReplayCodeShapeFunction>& functions,
+    GuestInvocationReplayCodeShape* output, std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!output) {
+    return Fail(error, "code-shape output is null");
+  }
+  *output = {};
+  if (functions.empty()) {
+    return Fail(error, "code-shape function list is empty");
+  }
+
+  constexpr std::array<uint8_t, 8> kDomain = {'X', 'E', 'R', 'P',
+                                              'L', 'Y', 'C', '2'};
+  sha256::SHA256 hash;
+  hash.add(kDomain.data(), kDomain.size());
+
+  GuestInvocationReplayCodeShape shape;
+  std::set<uint32_t> guest_addresses;
+  for (const GuestInvocationReplayCodeShapeFunction& function : functions) {
+    if (!function.guest_address || (function.guest_address & 3) ||
+        (function.guest_end_address & 3) ||
+        function.guest_end_address < function.guest_address ||
+        !guest_addresses.insert(function.guest_address).second) {
+      return Fail(error, "code-shape guest extents are invalid or duplicate");
+    }
+    if (!function.machine_code || !function.machine_code_length ||
+        (function.machine_code_length & 3)) {
+      return Fail(error, "code-shape native function body is invalid");
+    }
+    if (!IncrementShapeCounter(&shape.function_count, error)) {
+      return false;
+    }
+
+    HashByte(&hash, 0xF0u);
+    HashU32(&hash, function.guest_address);
+    HashU32(&hash, function.guest_end_address);
+
+    const size_t instruction_count = function.machine_code_length / 4;
+    for (size_t i = 0; i < instruction_count;) {
+      size_t materialization_end = 0;
+      if (FindWideMaterializationEnd(function.machine_code, instruction_count,
+                                     i, &materialization_end)) {
+        HashByte(&hash, 0xA0u);
+        if (!IncrementShapeCounter(&shape.wide_materialization_site_count,
+                                   error)) {
+          return false;
+        }
+        for (size_t j = i; j < materialization_end; ++j) {
+          uint32_t materialization_instruction = 0;
+          std::memcpy(&materialization_instruction,
+                      function.machine_code + j * sizeof(uint32_t),
+                      sizeof(materialization_instruction));
+          // Preserve opcode, register and lane choice, masking only imm16.
+          HashByte(&hash, 0xA1u);
+          HashU32(&hash, materialization_instruction & ~0x001FFFE0u);
+          if (!IncrementShapeCounter(&shape.host_instruction_count, error)) {
+            return false;
+          }
+        }
+        HashByte(&hash, 0xAFu);
+        i = materialization_end;
+        continue;
+      }
+
+      uint32_t instruction = 0;
+      std::memcpy(&instruction, function.machine_code + i * 4,
+                  sizeof(instruction));
+      bool pc_relative = false;
+      instruction = NormalizePcRelativeInstruction(instruction, &pc_relative);
+      HashByte(&hash, 0x10u);
+      HashU32(&hash, instruction);
+      if (!IncrementShapeCounter(&shape.host_instruction_count, error) ||
+          (pc_relative &&
+           !IncrementShapeCounter(&shape.pc_relative_site_count, error))) {
+        return false;
+      }
+      ++i;
+    }
+    HashByte(&hash, 0xF1u);
+  }
+
+  HashByte(&hash, 0xFFu);
+  HashU64(&hash, shape.function_count);
+  HashU64(&hash, shape.host_instruction_count);
+  HashU64(&hash, shape.wide_materialization_site_count);
+  HashU64(&hash, shape.pc_relative_site_count);
+  static_assert(sizeof(unsigned char) == sizeof(uint8_t));
+  hash.getHash(reinterpret_cast<unsigned char*>(shape.sha256.data()));
+  *output = shape;
+  return true;
+}
 
 bool BuildGuestInvocationReplayPlan(
     const ppc::GuestFunctionInvocation& invocation,
@@ -600,24 +825,46 @@ bool GuestInvocationRunner::PrepareResetPageCopies(std::string* error) {
 
 bool GuestInvocationRunner::ResolveFunctionsInCaptureOrder(std::string* error) {
   root_function_ = nullptr;
+  resolved_functions_.clear();
+  resolved_functions_.reserve(corpus_->function_definition_order().size());
   for (uint32_t address : corpus_->function_definition_order()) {
     Function* function = processor_->ResolveFunction(address);
     if (!function) {
+      resolved_functions_.clear();
       return Fail(error,
                   "captured function failed to resolve during replay warmup");
     }
     if (!module_->HasExactExtent(*function)) {
+      resolved_functions_.clear();
       return Fail(error,
                   "replayed function does not have its captured exact extent");
     }
+    if (!function->is_guest()) {
+      resolved_functions_.clear();
+      return Fail(error, "replayed corpus function is not guest code");
+    }
+    resolved_functions_.push_back(static_cast<GuestFunction*>(function));
     if (address == invocation_->function_address) {
       root_function_ = function;
     }
   }
   if (!root_function_) {
+    resolved_functions_.clear();
     return Fail(error, "selected invocation root was not defined in order");
   }
   return true;
+}
+
+bool GuestInvocationRunner::CaptureWarmedCodeShape(
+    GuestInvocationReplayCodeShape* output, std::string* error) const {
+  std::vector<GuestInvocationReplayCodeShapeFunction> functions;
+  functions.reserve(resolved_functions_.size());
+  for (const GuestFunction* function : resolved_functions_) {
+    functions.push_back(GuestInvocationReplayCodeShapeFunction{
+        function->address(), function->end_address(), function->machine_code(),
+        function->machine_code_length()});
+  }
+  return HashGuestInvocationReplayA64CodeShape(functions, output, error);
 }
 
 bool GuestInvocationRunner::WarmAndVerify(std::string* error) {
@@ -628,7 +875,8 @@ bool GuestInvocationRunner::WarmAndVerify(std::string* error) {
     return Fail(error, "invocation replay has already been warmed");
   }
   if (!ResolveFunctionsInCaptureOrder(error) || !ResetInvocation(error) ||
-      !Invoke(error) || !VerifyCurrentState(error)) {
+      !Invoke(error) || !VerifyCurrentState(error) ||
+      !CaptureWarmedCodeShape(&warmed_code_shape_, error)) {
     return false;
   }
   warmed_ = true;
@@ -826,6 +1074,14 @@ bool GuestInvocationRunner::RunTimed(uint64_t invocation_count,
                 "code placement changed during reset diagnostic verification");
   }
 
+  GuestInvocationReplayCodeShape final_code_shape;
+  if (!CaptureWarmedCodeShape(&final_code_shape, error)) {
+    return false;
+  }
+  if (final_code_shape != warmed_code_shape_) {
+    return Fail(error, "normalized warmed code shape changed during replay");
+  }
+
   GuestInvocationReplayMetrics accepted_metrics;
   accepted_metrics.timed_invocation_count = invocation_count;
   accepted_metrics.thread_cpu_nanoseconds = thread_cpu_end - thread_cpu_start;
@@ -840,6 +1096,7 @@ bool GuestInvocationRunner::RunTimed(uint64_t invocation_count,
       plan_.reset_page_addresses.size();
   accepted_metrics.reset_bytes_per_invocation =
       uint64_t(plan_.reset_page_addresses.size()) * kGuestPageSize;
+  accepted_metrics.code_shape = warmed_code_shape_;
   *metrics = accepted_metrics;
   return true;
 #endif  // XE_PLATFORM_MAC

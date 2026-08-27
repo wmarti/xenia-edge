@@ -53,9 +53,10 @@ struct GuestInvocationReplayBenchmarkProvenance {
   GuestInvocationReplaySha256 config_sha256 = {};
 };
 
-// Returns the driver's canonical 17-field marker without a trailing newline.
+// Returns the driver's canonical 22-field marker without a trailing newline.
 // Verification fields are fixed to 1 because callers must only invoke this
-// after warm, timed-exit, placement and final verification have all succeeded.
+// after warm, timed-exit, placement, code-shape and final verification have all
+// succeeded.
 std::string FormatGuestInvocationReplayBenchmarkMarker(
     const GuestInvocationReplayBenchmarkProvenance& provenance,
     const GuestInvocationReplayMetrics& metrics);

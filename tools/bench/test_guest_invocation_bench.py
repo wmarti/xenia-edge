@@ -26,6 +26,11 @@ def metric_values(**overrides):
         "capture_build_sha256": SHA_C,
         "candidate_build_sha256": SHA_D,
         "config_sha256": SHA_E,
+        "code_shape_sha256": "0" * 64,
+        "code_shape_functions": 3,
+        "host_instructions": 400,
+        "wide_materialization_sites": 7,
+        "pc_relative_sites": 11,
         "iterations": 100,
         "reset_pages": 2,
         "reset_bytes_per_iteration": 8192,
@@ -101,10 +106,10 @@ class MarkerParserTest(unittest.TestCase):
             "diagnostic\n" + metric_line() + "\nmore")
         self.assertEqual(parsed, metric_values())
 
-    def test_rejects_superseded_v1_marker(self):
+    def test_rejects_superseded_markers(self):
         legacy = metric_line().replace(
             benchmark.METRIC_PREFIX,
-            "XENIA_GUEST_INVOCATION_BENCHMARK_V1",
+            "XENIA_GUEST_INVOCATION_BENCHMARK_V2",
             1,
         )
         with self.assertRaises(benchmark.BenchmarkError):
@@ -134,6 +139,8 @@ class MarkerParserTest(unittest.TestCase):
             metric_line(reset_only_uptime_raw_ns=0),
             metric_line(iterations="0100"),
             metric_line(artifact_sha256="A" * 64),
+            metric_line(code_shape_functions=0),
+            metric_line(host_instructions=0),
             metric_line(warm_verified=0),
             metric_line(timed_exit_verified=2),
             metric_line(final_verified="true"),
@@ -214,6 +221,7 @@ class RunnerTest(unittest.TestCase):
             "--config-sha256", SHA_E,
             "--iterations", "1",
             "--reset-pages", "0",
+            "--same-build-tree-toolchain-attested",
         ]
 
     def test_main_rejects_nonfinite_float_before_inputs(self):
@@ -302,7 +310,7 @@ class RunnerTest(unittest.TestCase):
             report = json.loads(output.read_text())
             self.assertEqual(result, 0)
             self.assertEqual(
-                report["schema"], "xenia-guest-invocation-result-v2")
+                report["schema"], "xenia-guest-invocation-result-v3")
             self.assertEqual(report["verdict"], "improvement")
             self.assertEqual(
                 report["inputs"]["executables"]["a"]
@@ -312,6 +320,24 @@ class RunnerTest(unittest.TestCase):
             self.assertIn("driver_sha256", report["environment"])
             self.assertFalse(
                 report["measurement"]["reset_only_subtracted_from_primary"])
+            self.assertTrue(
+                report["environment"]["build_provenance"]
+                ["same_build_tree_compiler_sdk_flags_attested"])
+            self.assertFalse(
+                report["environment"]["build_provenance"]
+                ["machine_verified"])
+
+    def test_main_requires_explicit_procedural_toolchain_attestation(self):
+        args = self._main_args()
+        args.remove("--same-build-tree-toolchain-attested")
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            result = benchmark.main(args)
+        self.assertEqual(result, 2)
+        self.assertIn(
+            "--same-build-tree-toolchain-attested is required",
+            stderr.getvalue(),
+        )
 
     def test_role_mapping_pins_each_executable_hash(self):
         common = expected()
@@ -327,6 +353,20 @@ class RunnerTest(unittest.TestCase):
             expected_a["capture_build_sha256"],
             expected_b["capture_build_sha256"],
         )
+
+    def test_normalized_code_shape_is_pinned_independently_per_role(self):
+        pinned = {}
+        metric_a = metric_values(code_shape_sha256="1" * 64)
+        metric_b = metric_values(code_shape_sha256="2" * 64)
+        benchmark.pin_role_code_shape(metric_a, "a", pinned)
+        benchmark.pin_role_code_shape(metric_b, "b", pinned)
+        benchmark.pin_role_code_shape(metric_a, "a", pinned)
+
+        with self.assertRaisesRegex(
+                benchmark.BenchmarkError,
+                "normalized warmed code shape changed for role a"):
+            benchmark.pin_role_code_shape(
+                metric_values(code_shape_sha256="3" * 64), "a", pinned)
 
     def test_fixed_identity_and_work_flags_follow_user_extras(self):
         process = types.SimpleNamespace(

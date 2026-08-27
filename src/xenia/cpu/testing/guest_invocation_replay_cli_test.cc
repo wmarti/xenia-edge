@@ -44,16 +44,26 @@ TEST_CASE("Guest invocation benchmark marker is canonical",
   metrics.reset_only_uptime_raw_nanoseconds = 45678;
   metrics.placement_generation_before = 8;
   metrics.placement_generation_after = 8;
+  metrics.code_shape.sha256 = RepeatedHash(0x66);
+  metrics.code_shape.function_count = 3;
+  metrics.code_shape.host_instruction_count = 400;
+  metrics.code_shape.wide_materialization_site_count = 7;
+  metrics.code_shape.pc_relative_site_count = 11;
 
   const std::string marker =
       FormatGuestInvocationReplayBenchmarkMarker(provenance, metrics);
   REQUIRE(marker ==
-          "XENIA_GUEST_INVOCATION_BENCHMARK_V2"
+          "XENIA_GUEST_INVOCATION_BENCHMARK_V3"
           "\tartifact_sha256=" +
               std::string(64, '1') + "\tcorpus_sha256=" + std::string(64, '2') +
               "\tcapture_build_sha256=" + std::string(64, '3') +
               "\tcandidate_build_sha256=" + std::string(64, '4') +
               "\tconfig_sha256=" + std::string(64, '5') +
+              "\tcode_shape_sha256=" + std::string(64, '6') +
+              "\tcode_shape_functions=3"
+              "\thost_instructions=400"
+              "\twide_materialization_sites=7"
+              "\tpc_relative_sites=11"
               "\titerations=17"
               "\treset_pages=2"
               "\treset_bytes_per_iteration=8192"

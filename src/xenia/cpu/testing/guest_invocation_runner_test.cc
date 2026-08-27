@@ -38,6 +38,37 @@ void AppendU32(std::vector<uint8_t>* data, uint32_t value) {
   }
 }
 
+std::vector<uint8_t> A64Code(std::initializer_list<uint32_t> instructions) {
+  std::vector<uint8_t> code;
+  code.reserve(instructions.size() * sizeof(uint32_t));
+  for (uint32_t instruction : instructions) {
+    AppendU32(&code, instruction);
+  }
+  return code;
+}
+
+uint32_t A64Movz64(uint32_t rd, uint32_t immediate, uint32_t shift) {
+  return 0xD2800000u | ((shift / 16) << 21) | (immediate << 5) | rd;
+}
+
+uint32_t A64Movk64(uint32_t rd, uint32_t immediate, uint32_t shift) {
+  return 0xF2800000u | ((shift / 16) << 21) | (immediate << 5) | rd;
+}
+
+uint32_t A64Movz32(uint32_t rd, uint32_t immediate, uint32_t shift) {
+  return 0x52800000u | ((shift / 16) << 21) | (immediate << 5) | rd;
+}
+
+GuestInvocationReplayCodeShape HashShape(const std::vector<uint8_t>& code) {
+  const std::vector<GuestInvocationReplayCodeShapeFunction> functions = {
+      {kCodeAddress, kCodeAddress + 12, code.data(), code.size()}};
+  GuestInvocationReplayCodeShape shape;
+  std::string error;
+  REQUIRE(HashGuestInvocationReplayA64CodeShape(functions, &shape, &error));
+  REQUIRE(error.empty());
+  return shape;
+}
+
 void StoreGuestInstruction(std::array<uint8_t, JitCorpus::kPageSize>* page,
                            uint32_t offset, uint32_t instruction) {
   (*page)[offset + 0] = static_cast<uint8_t>(instruction >> 24);
@@ -176,6 +207,107 @@ ppc::GuestFunctionInvocation MakeInvocation(uint32_t closure_page_count,
 }
 
 }  // namespace
+
+TEST_CASE("guest invocation code shape normalizes A64 ASLR materialization",
+          "[guest-invocation-runner][code-shape]") {
+  const std::vector<uint8_t> first = A64Code({
+      A64Movz64(9, 1, 0),
+      A64Movk64(9, 1, 32),
+      A64Movk64(9, 1, 48),
+      0x54000000u | (4u << 5),  // b.eq with one process-relative displacement
+      0x8B010000u,              // add x0, x0, x1
+  });
+  const std::vector<uint8_t> second = A64Code({
+      A64Movz64(9, 2, 0),
+      A64Movk64(9, 2, 32),
+      A64Movk64(9, 3, 48),
+      0x54000000u | (9u << 5),  // Same branch shape, shifted native layout.
+      0x8B010000u,
+  });
+
+  const GuestInvocationReplayCodeShape first_shape = HashShape(first);
+  const GuestInvocationReplayCodeShape second_shape = HashShape(second);
+  REQUIRE(first_shape == second_shape);
+  REQUIRE(first_shape.function_count == 1);
+  REQUIRE(first_shape.host_instruction_count == 5);
+  REQUIRE(first_shape.wide_materialization_site_count == 1);
+  REQUIRE(first_shape.pc_relative_site_count == 1);
+}
+
+TEST_CASE("guest invocation code shape retains non-ASLR A64 structure",
+          "[guest-invocation-runner][code-shape]") {
+  const std::vector<uint8_t> baseline =
+      A64Code({A64Movz32(9, 7, 0), 0x8B010000u});
+  const std::vector<uint8_t> changed_constant =
+      A64Code({A64Movz32(9, 8, 0), 0x8B010000u});
+  const std::vector<uint8_t> changed_opcode =
+      A64Code({A64Movz32(9, 7, 0), 0xCB010000u});
+  const std::vector<uint8_t> changed_address_register =
+      A64Code({A64Movz64(10, 1, 0), A64Movk64(10, 1, 32), 0x8B010000u});
+  const std::vector<uint8_t> baseline_address_register =
+      A64Code({A64Movz64(9, 1, 0), A64Movk64(9, 1, 32), 0x8B010000u});
+  const std::vector<uint8_t> changed_materialization_chain =
+      A64Code({A64Movz64(9, 1, 0), A64Movk64(9, 1, 32), A64Movk64(9, 1, 48),
+               0x8B010000u});
+
+  REQUIRE(HashShape(baseline).sha256 != HashShape(changed_constant).sha256);
+  REQUIRE(HashShape(baseline).sha256 != HashShape(changed_opcode).sha256);
+  REQUIRE(HashShape(baseline_address_register).sha256 !=
+          HashShape(changed_address_register).sha256);
+  REQUIRE(HashShape(baseline_address_register).sha256 !=
+          HashShape(changed_materialization_chain).sha256);
+}
+
+TEST_CASE("guest invocation code shape retains captured function order",
+          "[guest-invocation-runner][code-shape]") {
+  const std::vector<uint8_t> first_code = A64Code({0xD503201Fu});   // nop
+  const std::vector<uint8_t> second_code = A64Code({0xD503205Fu});  // wfe
+  const std::vector<GuestInvocationReplayCodeShapeFunction> forward = {
+      {kCodeAddress, kCodeAddress, first_code.data(), first_code.size()},
+      {kCodeAddress + 4, kCodeAddress + 4, second_code.data(),
+       second_code.size()},
+  };
+  const std::vector<GuestInvocationReplayCodeShapeFunction> reverse = {
+      forward[1], forward[0]};
+  GuestInvocationReplayCodeShape forward_shape;
+  GuestInvocationReplayCodeShape reverse_shape;
+  std::string error;
+  REQUIRE(
+      HashGuestInvocationReplayA64CodeShape(forward, &forward_shape, &error));
+  REQUIRE(
+      HashGuestInvocationReplayA64CodeShape(reverse, &reverse_shape, &error));
+  REQUIRE(forward_shape.sha256 != reverse_shape.sha256);
+}
+
+TEST_CASE("guest invocation code shape rejects malformed function streams",
+          "[guest-invocation-runner][code-shape]") {
+  const std::vector<uint8_t> code = A64Code({0xD503201Fu});  // nop
+  GuestInvocationReplayCodeShape shape;
+  std::string error;
+
+  SECTION("empty list") {
+    REQUIRE_FALSE(HashGuestInvocationReplayA64CodeShape({}, &shape, &error));
+    REQUIRE(error == "code-shape function list is empty");
+  }
+
+  SECTION("unaligned native bytes") {
+    const std::vector<GuestInvocationReplayCodeShapeFunction> functions = {
+        {kCodeAddress, kCodeAddress, code.data(), code.size() - 1}};
+    REQUIRE_FALSE(
+        HashGuestInvocationReplayA64CodeShape(functions, &shape, &error));
+    REQUIRE(error == "code-shape native function body is invalid");
+  }
+
+  SECTION("duplicate guest functions") {
+    const std::vector<GuestInvocationReplayCodeShapeFunction> functions = {
+        {kCodeAddress, kCodeAddress, code.data(), code.size()},
+        {kCodeAddress, kCodeAddress + 4, code.data(), code.size()},
+    };
+    REQUIRE_FALSE(
+        HashGuestInvocationReplayA64CodeShape(functions, &shape, &error));
+    REQUIRE(error == "code-shape guest extents are invalid or duplicate");
+  }
+}
 
 TEST_CASE("guest invocation planner derives closed reset and access sets",
           "[guest-invocation-runner]") {
@@ -413,6 +545,8 @@ TEST_CASE("guest invocation runner executes and verifies a real backend",
   REQUIRE(metrics.reset_page_count_per_invocation ==
           xe::memory::page_size() / JitCorpus::kPageSize);
   REQUIRE(metrics.reset_bytes_per_invocation == xe::memory::page_size());
+  REQUIRE(metrics.code_shape.function_count == 1);
+  REQUIRE(metrics.code_shape.host_instruction_count > 0);
 #endif  // !XE_PLATFORM_MAC || !XE_ARCH_ARM64
 }
 

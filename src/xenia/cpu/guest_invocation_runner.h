@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_GUEST_INVOCATION_RUNNER_H_
 #define XENIA_CPU_GUEST_INVOCATION_RUNNER_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -26,6 +27,7 @@ namespace cpu {
 
 class ExactJitCorpusModule;
 class Function;
+class GuestFunction;
 class Processor;
 class ThreadState;
 
@@ -77,6 +79,38 @@ bool BuildGuestInvocationReplayPlan(
     const ExecutionJitCorpus& corpus, uint32_t host_page_size,
     GuestInvocationReplayPlan* output, std::string* error = nullptr);
 
+// One actual warmed function body used to compute an ASLR-normalized A64 code
+// shape. Addresses identify guest functions only; native addresses are never
+// hashed or reported.
+struct GuestInvocationReplayCodeShapeFunction {
+  uint32_t guest_address = 0;
+  uint32_t guest_end_address = 0;
+  const uint8_t* machine_code = nullptr;
+  size_t machine_code_length = 0;
+};
+
+// This is a structural identity, not an exact native-code digest. It masks the
+// immediate values in >32-bit MOVZ/MOVN-plus-MOVK materialization chains and
+// displacement bits in PC-relative instructions. The emitted opcode, register,
+// lane and chain structure, every other warmed A64 instruction word, guest
+// extents and function boundaries remain in the hash.
+struct GuestInvocationReplayCodeShape {
+  std::array<uint8_t, 32> sha256 = {};
+  uint64_t function_count = 0;
+  uint64_t host_instruction_count = 0;
+  uint64_t wide_materialization_site_count = 0;
+  uint64_t pc_relative_site_count = 0;
+
+  bool operator==(const GuestInvocationReplayCodeShape&) const = default;
+};
+
+// Pure, bounded helper used by the Apple A64 runner after warmup. Input must be
+// in captured successful-definition order with unique guest addresses, and
+// every native body must be a nonempty, four-byte-aligned A64 stream.
+bool HashGuestInvocationReplayA64CodeShape(
+    const std::vector<GuestInvocationReplayCodeShapeFunction>& functions,
+    GuestInvocationReplayCodeShape* output, std::string* error = nullptr);
+
 struct GuestInvocationReplayMetrics {
   uint64_t timed_invocation_count = 0;
   uint64_t thread_cpu_nanoseconds = 0;
@@ -87,6 +121,7 @@ struct GuestInvocationReplayMetrics {
   uint64_t placement_generation_after = 0;
   uint64_t reset_page_count_per_invocation = 0;
   uint64_t reset_bytes_per_invocation = 0;
+  GuestInvocationReplayCodeShape code_shape;
 };
 
 // Owns a bare Memory, Processor, backend and ThreadState for one selected
@@ -142,6 +177,8 @@ class GuestInvocationRunner {
   bool CloseAndReopenGuestViews(std::string* error);
   bool PrepareResetPageCopies(std::string* error);
   bool ResolveFunctionsInCaptureOrder(std::string* error);
+  bool CaptureWarmedCodeShape(GuestInvocationReplayCodeShape* output,
+                              std::string* error) const;
   bool ResetInvocation(std::string* error);
   bool Invoke(std::string* error);
   bool VerifyCurrentState(std::string* error) const;
@@ -156,6 +193,8 @@ class GuestInvocationRunner {
   std::unique_ptr<ThreadState> thread_state_;
   ExactJitCorpusModule* module_ = nullptr;
   Function* root_function_ = nullptr;
+  std::vector<GuestFunction*> resolved_functions_;
+  GuestInvocationReplayCodeShape warmed_code_shape_;
   struct ResetPageCopy {
     uint8_t* destination = nullptr;
     const uint8_t* source = nullptr;

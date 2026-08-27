@@ -2,11 +2,17 @@
 """Fail-closed paired analysis for warmed guest-invocation replay.
 
 Each subprocess must emit exactly one canonical
-XENIA_GUEST_INVOCATION_BENCHMARK_V2 line. The metric is current-thread CPU
+XENIA_GUEST_INVOCATION_BENCHMARK_V3 line. The metric is current-thread CPU
 nanoseconds for a fixed invocation batch; reset work is included. A separate
 post-primary reset-only batch is reported as a raw diagnostic and is never
 subtracted from the primary metric.
 This tool reports per-invocation CPU cost, not whole-title performance.
+
+V3 also reports an ASLR-normalized identity computed from the actual warmed A64
+code. Every subprocess for one role must report the same identity and stable
+shape counts. Toolchain sameness is not derivable from two different binaries,
+so the driver separately requires and records an explicit procedural
+same-build-tree/compiler/SDK/flags attestation.
 
 Four deterministic phases are collected: A/A and B/B controls, then the real
 comparison in both A/B and B/A execution order. By default a phase is invalid
@@ -31,8 +37,8 @@ import sys
 import tempfile
 
 
-SCHEMA = "xenia-guest-invocation-result-v2"
-METRIC_PREFIX = "XENIA_GUEST_INVOCATION_BENCHMARK_V2"
+SCHEMA = "xenia-guest-invocation-result-v3"
+METRIC_PREFIX = "XENIA_GUEST_INVOCATION_BENCHMARK_V3"
 PAGE_SIZE = 4096
 MAX_PAIRS = 64
 METRIC_FIELDS = (
@@ -41,6 +47,11 @@ METRIC_FIELDS = (
     "capture_build_sha256",
     "candidate_build_sha256",
     "config_sha256",
+    "code_shape_sha256",
+    "code_shape_functions",
+    "host_instructions",
+    "wide_materialization_sites",
+    "pc_relative_sites",
     "iterations",
     "reset_pages",
     "reset_bytes_per_iteration",
@@ -60,14 +71,19 @@ SHA_FIELDS = frozenset((
     "capture_build_sha256",
     "candidate_build_sha256",
     "config_sha256",
+    "code_shape_sha256",
 ))
 POSITIVE_FIELDS = frozenset((
+    "code_shape_functions",
+    "host_instructions",
     "iterations",
     "thread_cpu_ns",
     "uptime_raw_ns",
     "reset_only_uptime_raw_ns",
 ))
 NONNEGATIVE_FIELDS = frozenset((
+    "wide_materialization_sites",
+    "pc_relative_sites",
     "reset_pages",
     "reset_bytes_per_iteration",
     "reset_only_thread_cpu_ns",
@@ -79,6 +95,13 @@ VERIFICATION_FIELDS = frozenset((
     "timed_exit_verified",
     "final_verified",
 ))
+CODE_SHAPE_FIELDS = (
+    "code_shape_sha256",
+    "code_shape_functions",
+    "host_instructions",
+    "wide_materialization_sites",
+    "pc_relative_sites",
+)
 PHASE_ROLES = {
     "aa": ("a", "a"),
     "bb": ("b", "b"),
@@ -220,6 +243,20 @@ def expected_for_role(expected_common, executable_sha256, role):
     expected = dict(expected_common)
     expected["candidate_build_sha256"] = executable_sha256[role]
     return expected
+
+
+def pin_role_code_shape(metric, role, pinned_shapes):
+    """Require one normalized warmed-code shape for every role subprocess."""
+    identity = tuple(metric[field] for field in CODE_SHAPE_FIELDS)
+    previous = pinned_shapes.setdefault(role, identity)
+    if identity != previous:
+        details = ", ".join(
+            f"{field}={metric[field]}"
+            for field in CODE_SHAPE_FIELDS)
+        raise BenchmarkError(
+            f"normalized warmed code shape changed for role {role}: "
+            f"{details}")
+    return identity
 
 
 def run_once(exe, extra, artifact, corpus, expected, timeout,
@@ -490,6 +527,11 @@ def main(argv=None):
     parser.add_argument("--iterations", required=True, type=int)
     parser.add_argument("--reset-pages", required=True, type=int)
     parser.add_argument(
+        "--same-build-tree-toolchain-attested", action="store_true",
+        help=("required procedural attestation that A and B came from the "
+              "same build tree, compiler, SDK, configuration and flags; "
+              "the driver records but cannot independently prove this"))
+    parser.add_argument(
         "--pairs", type=int, default=4,
         help=f"pairs per phase; multiple of 4, maximum {MAX_PAIRS}")
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -518,6 +560,11 @@ def main(argv=None):
             "--capture-build-sha256", args.capture_build_sha256)
         config_sha256 = _validate_sha256_argument(
             "--config-sha256", args.config_sha256)
+        if not args.same_build_tree_toolchain_attested:
+            raise BenchmarkError(
+                "--same-build-tree-toolchain-attested is required; the "
+                "current binary/config hashes do not identify the compiler, "
+                "SDK, build tree or complete flags")
         if args.iterations <= 0 or args.reset_pages < 0:
             raise BenchmarkError(
                 "iterations must be positive and reset pages nonnegative")
@@ -563,13 +610,16 @@ def main(argv=None):
                 "minimum CPU time rounds to a nonpositive nanosecond interval")
         exes = {"a": args.exe_a, "b": args.exe_b}
         extras = {"a": args.extra_a, "b": args.extra_b}
+        pinned_code_shapes = {}
 
         def run_role(role):
             expected = expected_for_role(
                 expected_common, executable_sha256, role)
-            return run_once(
+            metric = run_once(
                 exes[role], extras[role], args.artifact, args.corpus,
                 expected, args.timeout, minimum_cpu_ns)
+            pin_role_code_shape(metric, role, pinned_code_shapes)
+            return metric
 
         samples = collect_phases(run_role, args.pairs)
         analysis = analyze(samples, args.max_control_noise_pct)
@@ -610,6 +660,14 @@ def main(argv=None):
                 "platform": platform.platform(),
                 "python": platform.python_version(),
                 "working_directory": str(pathlib.Path.cwd()),
+                "build_provenance": {
+                    "same_build_tree_compiler_sdk_flags_attested": True,
+                    "machine_verified": False,
+                },
+            },
+            "normalized_code_shapes": {
+                role: dict(zip(CODE_SHAPE_FIELDS, identity))
+                for role, identity in sorted(pinned_code_shapes.items())
             },
             "measurement": {
                 "primary": "current_thread_cpu_ns_per_invocation",

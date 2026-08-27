@@ -175,8 +175,8 @@ std::string GuestInvocationReplaySha256Hex(
 std::string FormatGuestInvocationReplayBenchmarkMarker(
     const GuestInvocationReplayBenchmarkProvenance& provenance,
     const GuestInvocationReplayMetrics& metrics) {
-  std::string marker = "XENIA_GUEST_INVOCATION_BENCHMARK_V2";
-  marker.reserve(640);
+  std::string marker = "XENIA_GUEST_INVOCATION_BENCHMARK_V3";
+  marker.reserve(800);
   AppendField(&marker, "artifact_sha256",
               GuestInvocationReplaySha256Hex(provenance.artifact_sha256));
   AppendField(&marker, "corpus_sha256",
@@ -188,6 +188,16 @@ std::string FormatGuestInvocationReplayBenchmarkMarker(
       GuestInvocationReplaySha256Hex(provenance.candidate_build_sha256));
   AppendField(&marker, "config_sha256",
               GuestInvocationReplaySha256Hex(provenance.config_sha256));
+  AppendField(&marker, "code_shape_sha256",
+              GuestInvocationReplaySha256Hex(metrics.code_shape.sha256));
+  AppendUint64Field(&marker, "code_shape_functions",
+                    metrics.code_shape.function_count);
+  AppendUint64Field(&marker, "host_instructions",
+                    metrics.code_shape.host_instruction_count);
+  AppendUint64Field(&marker, "wide_materialization_sites",
+                    metrics.code_shape.wide_materialization_site_count);
+  AppendUint64Field(&marker, "pc_relative_sites",
+                    metrics.code_shape.pc_relative_site_count);
   AppendUint64Field(&marker, "iterations", metrics.timed_invocation_count);
   AppendUint64Field(&marker, "reset_pages",
                     metrics.reset_page_count_per_invocation);

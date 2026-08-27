@@ -89,6 +89,14 @@ and binaries produced by a different build tree are not accepted for v1 timing,
 even if their current replay-configuration hashes match. That restriction can
 be lifted only after those build-mode inputs have a canonical fingerprint.
 
+The canonical driver now fails closed unless the operator supplies
+`--same-build-tree-toolchain-attested`. This is a procedural gate: it records an
+explicit assertion that A and B were produced from the same build tree,
+compiler, SDK, configuration and flags, but it is not machine evidence that the
+assertion is true. The result JSON says `machine_verified: false`. A retained
+configure/build log remains required provenance, and the attestation does not
+make an externally supplied or separately configured binary acceptable.
+
 V1 intentionally canonicalizes these compile-time inputs: capture and replay
 must both use `enable_early_precompilation=false`,
 `fold_readonly_guest_memory_loads=false`, `inline_mmio_access=false` and
@@ -175,8 +183,30 @@ Replay performs these operations outside the timed region:
    pages compare with their final images and all others with their initial
    images.
 7. Reset state, resolve the root again and snapshot code-cache placement.
-8. Run a bounded batch, checking placement again before accepting timing.
-9. Reset once more and require a final verified invocation to match.
+8. Hash the actual warmed A64 code into an ASLR-normalized structural identity.
+9. Run a bounded batch, checking placement again before accepting timing.
+10. Reset once more, require a final verified invocation to match, and require
+    the normalized warmed-code identity to remain unchanged.
+
+The normalized identity is computed in captured function-definition order. It
+includes guest function extents and every warmed A64 instruction word, except
+that immediate values in a known greater-than-32-bit MOVZ/MOVN-plus-MOVK chain
+and displacement bits in PC-relative instructions are masked. The wide-move
+opcode, destination register, lane shifts, chain length and actual emitted
+instruction count remain part of the identity. Thus an ASLR-induced change in
+the materialization chain or emitted code size is rejected rather than hidden.
+The encoding cannot distinguish a host pointer from another greater-than-32-bit
+constant, so all such wide constants are intentionally masked structural inputs
+rather than exact semantic values. The marker also reports the function count,
+actual host instruction count, materialization-site count and PC-relative-site
+count. The paired driver pins the complete tuple independently for role A and
+role B across all subprocesses.
+
+This is a code-*shape* identity, not an exact native-code digest. It deliberately
+cannot distinguish a change only in a masked pointer value or branch
+displacement. Artifact/configuration hashes and output verification remain
+separate gates; shape consistency does not prove toolchain sameness or a title
+performance result.
 
 Before creating guest memory or compiling a function, replay also applies a
 checked aggregate workload budget to the paired corpus: at most 32,768 eager
@@ -283,10 +313,11 @@ the guest again after that diagnostic before accepting any marker. Captures
 with excessive reset cost or insufficient guest work are not benchmark
 candidates.
 
-The strict benchmark-output marker is `XENIA_GUEST_INVOCATION_BENCHMARK_V2`.
-V2 adds the two reset-only interval fields as one atomic schema change; the
-driver rejects V1 and all partially upgraded markers. This replacement is safe
-because no title capture or accepted title benchmark used the earlier marker.
+The strict benchmark-output marker is `XENIA_GUEST_INVOCATION_BENCHMARK_V3`.
+V3 adds the normalized warmed-code identity and four structural counts as one
+atomic schema change. The driver rejects V1, V2 and all partially upgraded
+markers. This replacement is safe because no title capture or accepted title
+benchmark used the earlier markers.
 
 ## Performance acceptance
 
@@ -297,6 +328,9 @@ An optimization comparison is accepted only when all of these hold:
 - baseline and candidate produce identical verified replay outputs;
 - every timed run has the requested invocation count and unchanged code-cache
   placement generation;
+- every subprocess for each role has the same normalized warmed-code identity;
+- the procedural same-build-tree/compiler/SDK/flags attestation is present and
+  backed by a retained configure/build log;
 - A/A and B/B controls are stable enough to resolve the proposed effect;
 - A/B and B/A ordering agree in sign beyond that measured floor; and
 - no crash, timeout, zero-work run, missing marker or rejected sample is
