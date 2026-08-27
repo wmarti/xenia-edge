@@ -1209,8 +1209,8 @@ TEST_CASE("A64_CAPTURE_SINK_TRANSITION_DRAINS_AND_REJECTS_STALE_CONTROL",
     callback_condition.wait(lock, [&] { return callback_release; });
   };
   std::thread callback([&] {
-    CaptureGuestInvocationFunctionEntry(context_a, kRootA, kRootA + 4,
-                                        old_control);
+    backend::a64::CaptureGuestInvocationFunctionEntry(context_a, kRootA,
+                                                      kRootA + 4, old_control);
   });
   {
     std::unique_lock<std::mutex> lock(callback_mutex);
@@ -1265,8 +1265,8 @@ TEST_CASE("A64_CAPTURE_SINK_TRANSITION_DRAINS_AND_REJECTS_STALE_CONTROL",
       processor->TrySetGuestInvocationCaptureSink(&capture_a, &capture_c));
   REQUIRE(processor->guest_invocation_capture_sink() == &capture_b);
   REQUIRE(load_control(context_a) == new_control);
-  CaptureGuestInvocationFunctionEntry(context_a, kRootA, kRootA + 4,
-                                      old_control);
+  backend::a64::CaptureGuestInvocationFunctionEntry(context_a, kRootA,
+                                                    kRootA + 4, old_control);
   REQUIRE(capture_b.ControlEvents().empty());
   REQUIRE(load_control(context_a) == new_control);
 
@@ -1288,7 +1288,7 @@ TEST_CASE("A64_CAPTURE_TERMINAL_ENTRY_CLEARS_ALL_CONTEXT_MASKS",
   auto thread_a = std::make_unique<ThreadState>(processor, 0xC1);
   auto thread_b = std::make_unique<ThreadState>(processor, 0xC2);
 
-  CaptureGuestInvocationFunctionEntry(
+  backend::a64::CaptureGuestInvocationFunctionEntry(
       thread_a->context(), kRoot, kRoot + 4,
       thread_a->context()->guest_invocation_capture_control);
   REQUIRE(GuestInvocationCaptureControlEventMask(
