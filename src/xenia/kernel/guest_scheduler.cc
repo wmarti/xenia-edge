@@ -136,6 +136,11 @@ static GuestSchedulerCaptureWaitState CaptureWaitState(XThread* thread,
 // rate, so this is a short wait in wall-clock terms, and the alternative is an
 // unbounded livelock when the holder it spins on is co-resident.
 static constexpr uint32_t kMaxIrqlPreemptDefers = 4096;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+static_assert(kMaxIrqlPreemptDefers ==
+              kGuestSchedulerCaptureForcedIrqlMinimumDeclines);
+#endif
 // Reporting threshold for the lock case, which is never forced.
 static constexpr uint32_t kLockPreemptDeferReport = 65536;
 

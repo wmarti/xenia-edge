@@ -2756,7 +2756,8 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
         case kernel::GuestSchedulerCaptureEventKind::kSafepoint:
           event.reason = kernel::GuestSchedulerCaptureReason::kForcedIrql;
           event.flags = kernel::kGuestSchedulerCaptureFlagSchedulerRequested;
-          event.count = 1;
+          event.value = 2;
+          event.count = kernel::kGuestSchedulerCaptureForcedIrqlMinimumDeclines;
           break;
         case kernel::GuestSchedulerCaptureEventKind::kBlock:
           event.flags = kernel::kGuestSchedulerCaptureFlagGated |
@@ -2861,6 +2862,41 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
         10, kernel::GuestSchedulerCaptureEventKind::kSafepoint);
     safepoint.reason = kernel::GuestSchedulerCaptureReason::kForcedIrql;
     safepoint.flags = kernel::kGuestSchedulerCaptureFlagSchedulerRequested;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, safepoint,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("safepoint provenance") != std::string::npos);
+  }
+
+  SECTION("forced safepoint below the force threshold fails closed") {
+    kernel::GuestSchedulerCaptureEvent safepoint = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kSafepoint);
+    safepoint.reason = kernel::GuestSchedulerCaptureReason::kForcedIrql;
+    safepoint.flags = kernel::kGuestSchedulerCaptureFlagSchedulerRequested;
+    safepoint.value = 2;
+    safepoint.count =
+        kernel::kGuestSchedulerCaptureForcedIrqlMinimumDeclines - 1;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, safepoint,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("safepoint provenance") != std::string::npos);
+  }
+
+  SECTION("IRQL safepoint below dispatch level fails closed") {
+    kernel::GuestSchedulerCaptureEvent safepoint = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kSafepoint);
+    safepoint.reason = kernel::GuestSchedulerCaptureReason::kDeferredIrql;
+    safepoint.flags = kernel::kGuestSchedulerCaptureFlagSchedulerRequested;
+    safepoint.value = 1;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, safepoint,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("safepoint provenance") != std::string::npos);
+  }
+
+  SECTION("yielded safepoint at dispatch level fails closed") {
+    kernel::GuestSchedulerCaptureEvent safepoint = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kSafepoint);
+    safepoint.reason = kernel::GuestSchedulerCaptureReason::kYielded;
+    safepoint.flags = kernel::kGuestSchedulerCaptureFlagSchedulerRequested;
+    safepoint.value = 2;
     REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, safepoint,
                                     &harness.error) == Action::kReject);
     REQUIRE(harness.error.find("safepoint provenance") != std::string::npos);

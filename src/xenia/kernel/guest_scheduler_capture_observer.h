@@ -98,6 +98,9 @@ enum GuestSchedulerCaptureEventFlags : uint16_t {
   kGuestSchedulerCaptureFlagHasDeadline = 1u << 13,
 };
 
+inline constexpr uint32_t kGuestSchedulerCaptureForcedIrqlMinimumDeclines =
+    4096;
+
 constexpr size_t kGuestSchedulerCaptureMaximumWaitHandles = 8;
 
 // Durable values carried by GuestSchedulerCaptureEvent::value for kBlock and

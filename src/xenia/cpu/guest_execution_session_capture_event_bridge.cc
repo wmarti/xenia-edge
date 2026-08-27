@@ -460,12 +460,34 @@ bool ValidateSchedulerEvent(const CaptureEvent& event, std::string* error) {
   }
   if (event.kind == CaptureKind::kSafepoint) {
     if (!event.guest_pc || (event.guest_pc & 3) ||
-        !(event.flags & kernel::kGuestSchedulerCaptureFlagSchedulerRequested) ||
-        (event.reason == CaptureReason::kForcedIrql && !event.count) ||
-        ((event.reason == CaptureReason::kDeferredLock ||
-          event.reason == CaptureReason::kDeferredIrql) &&
-         event.count)) {
+        !(event.flags & kernel::kGuestSchedulerCaptureFlagSchedulerRequested)) {
       return Fail(error, "scheduler safepoint provenance is invalid");
+    }
+    switch (event.reason) {
+      case CaptureReason::kDeferredLock:
+        if (event.count) {
+          return Fail(error, "scheduler safepoint provenance is invalid");
+        }
+        break;
+      case CaptureReason::kDeferredIrql:
+        if (event.value < 2 || event.count) {
+          return Fail(error, "scheduler safepoint provenance is invalid");
+        }
+        break;
+      case CaptureReason::kForcedIrql:
+        if (event.value < 2 ||
+            event.count <
+                kernel::kGuestSchedulerCaptureForcedIrqlMinimumDeclines) {
+          return Fail(error, "scheduler safepoint provenance is invalid");
+        }
+        break;
+      case CaptureReason::kYielded:
+        if (event.value >= 2) {
+          return Fail(error, "scheduler safepoint provenance is invalid");
+        }
+        break;
+      default:
+        return Fail(error, "scheduler safepoint provenance is invalid");
     }
   }
   if (event.kind == CaptureKind::kPriorityChange && event.value > 31) {
