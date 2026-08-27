@@ -23,6 +23,7 @@
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 #include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
+#include "xenia/cpu/guest_invocation_recorder.h"
 #endif
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
@@ -853,6 +854,34 @@ void EmitCallPathCount(A64Emitter& e, volatile uint64_t* counter,
 }
 }  // namespace
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+namespace {
+void EmitInlineSaverestCaptureAccesses(
+    A64Emitter& e, const WReg& guest_stack, uint32_t first_slot_offset,
+    uint32_t span, ppc::GuestInvocationRecorderMemoryAccess access) {
+  for (uint32_t offset = 0; offset < span;
+       offset += kMaximumGuestInvocationCaptureMemoryAccessSize) {
+    const uint32_t size =
+        span - offset > kMaximumGuestInvocationCaptureMemoryAccessSize
+            ? kMaximumGuestInvocationCaptureMemoryAccessSize
+            : span - offset;
+    // The native callback may clobber caller-saved x14, so reload the logical
+    // guest stack before every chunk and leave it valid for the real access.
+    e.ldr(guest_stack,
+          ptr(e.x20, static_cast<int32_t>(offsetof(ppc::PPCContext, r[1]))));
+    e.sub(e.w1, guest_stack, first_slot_offset - offset);
+    e.mov(e.w2, static_cast<uint64_t>(size));
+    e.mov(e.w3, static_cast<uint64_t>(access));
+    e.CallNativeSafe(
+        reinterpret_cast<void*>(&CaptureGuestInvocationMemoryAccess));
+  }
+  e.ldr(guest_stack,
+        ptr(e.x20, static_cast<int32_t>(offsetof(ppc::PPCContext, r[1]))));
+}
+}  // namespace
+#endif
+
 void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   assert_not_null(function);
   EnsureFpuFpcrModeForTransition();
@@ -1019,6 +1048,13 @@ bool A64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
   const uint32_t lr_slot_offset = (32 - first_gpr) * 8;
 
   ldr(w14, ptr(x20, static_cast<int32_t>(offsetof(ppc::PPCContext, r[1]))));
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  EmitInlineSaverestCaptureAccesses(
+      *this, w14, first_slot_offset, lr_slot_offset + sizeof(uint32_t),
+      function->IsSave() ? ppc::GuestInvocationRecorderMemoryAccess::kWrite
+                         : ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
   if (xe::memory::allocation_granularity() > 0x1000) {
     // Branch-free: w15 = w14 + 0x1000, keep it only when w14 >= 0xE0000000.
     mov(w15, 0xE0000000u);

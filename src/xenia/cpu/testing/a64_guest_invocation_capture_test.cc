@@ -12,6 +12,7 @@
 #if XE_ARCH_ARM64 && defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -468,6 +469,89 @@ std::vector<CaptureEvent> RunTailCapture(bool indirect) {
   return capture.ControlEvents();
 }
 
+struct SaverestCaptureResult {
+  std::vector<CaptureEvent> events;
+  uint32_t guest_stack = 0;
+};
+
+SaverestCaptureResult RunInlineSaverestCapture(bool restore) {
+  constexpr uint32_t kCallerAddress = 0x80000000;
+  constexpr uint32_t kHelperAddress = 0x80001000;
+  constexpr unsigned kFirstGpr = 14;
+  constexpr uint32_t kFirstSlotOffset = (33 - kFirstGpr) * 8;
+  constexpr uint32_t kReturnAddress = 0xBCBCBCBC;
+
+  auto memory = std::make_unique<Memory>();
+  REQUIRE(memory->Initialize());
+  auto processor = std::make_unique<Processor>(memory.get(), nullptr);
+  REQUIRE(processor->Setup(CreateBackend()));
+
+  int generation = 0;
+  Function* helper = nullptr;
+  auto module = std::make_unique<TestModule>(
+      processor.get(), "CaptureInlineSaverest",
+      [](uint32_t address) {
+        return address == kCallerAddress || address == kHelperAddress;
+      },
+      [&](hir::HIRBuilder& builder) {
+        if (generation++) {
+          REQUIRE(helper != nullptr);
+          builder.Call(helper, restore ? hir::CALL_TAIL : 0);
+        }
+        builder.Return();
+        return true;
+      },
+      /*skip_cf_simplification=*/true);
+  processor->AddModule(std::move(module));
+  processor->backend()->CommitExecutableRange(kCallerAddress,
+                                              kHelperAddress + 0x1000);
+
+  helper = processor->ResolveFunction(kHelperAddress);
+  REQUIRE(helper != nullptr);
+  helper->SetSaverest(SaveRestoreType::GPR, restore, kFirstGpr);
+  Function* caller = processor->ResolveFunction(kCallerAddress);
+  REQUIRE(caller != nullptr);
+
+  constexpr uint32_t kHostStackSize = 64 * 1024;
+  const uint32_t host_stack = memory->SystemHeapAlloc(kHostStackSize);
+  const uint32_t frame = memory->SystemHeapAlloc(1024);
+  REQUIRE(host_stack != 0);
+  REQUIRE(frame != 0);
+  const uint32_t guest_stack = frame + 512;
+  std::memset(memory->TranslateVirtual(frame), 0, 1024);
+  if (restore) {
+    for (unsigned gpr = kFirstGpr; gpr <= 31; ++gpr) {
+      store_and_swap<uint64_t>(
+          memory->TranslateVirtual(guest_stack - kFirstSlotOffset +
+                                   (gpr - kFirstGpr) * 8),
+          0xA500000000000000ull | gpr);
+    }
+    store_and_swap<uint32_t>(memory->TranslateVirtual(guest_stack - 8),
+                             kReturnAddress);
+  }
+
+  auto thread_state = std::make_unique<ThreadState>(
+      processor.get(), 0x100, host_stack + kHostStackSize);
+  ppc::PPCContext* context = thread_state->context();
+  context->lr = kReturnAddress;
+  context->r[1] = guest_stack;
+  context->r[12] = kReturnAddress;
+  for (unsigned gpr = kFirstGpr; gpr <= 31; ++gpr) {
+    context->r[gpr] = 0x5A00000000000000ull | gpr;
+  }
+
+  RecordingCaptureSink capture;
+  {
+    ScopedCaptureSink scoped_capture(*processor, capture);
+    REQUIRE(caller->Call(thread_state.get(), kReturnAddress));
+  }
+
+  thread_state.reset();
+  memory->SystemHeapFree(frame);
+  memory->SystemHeapFree(host_stack);
+  return {std::move(capture.events), guest_stack};
+}
+
 }  // namespace
 
 TEST_CASE("A64_CAPTURE_HELPERS_FORWARD_EXACT_CONTROL_EVENTS",
@@ -796,6 +880,42 @@ TEST_CASE("A64_CAPTURE_ROUND_TRIPS_INDIRECT_TAIL_TARGET",
   REQUIRE(events[2].address == kTargetAddress);
   REQUIRE(events[3].kind == CaptureEventKind::kExit);
   REQUIRE(events[3].address == kTargetAddress);
+}
+
+TEST_CASE("A64_CAPTURE_RECORDS_INLINED_GPR_SAVEREST_MEMORY",
+          "[backend][guest-invocation-capture]") {
+  constexpr uint32_t kFirstSlotOffset = (33 - 14) * 8;
+  using MemoryAccess = ppc::GuestInvocationRecorderMemoryAccess;
+
+  for (bool restore : {false, true}) {
+    CAPTURE(restore);
+    SaverestCaptureResult result = RunInlineSaverestCapture(restore);
+    std::vector<CaptureEvent> memory_events;
+    std::vector<CaptureEvent> control_events;
+    for (const CaptureEvent& event : result.events) {
+      if (event.kind == CaptureEventKind::kMemory) {
+        memory_events.push_back(event);
+      } else if (event.kind == CaptureEventKind::kEntry ||
+                 event.kind == CaptureEventKind::kExit) {
+        control_events.push_back(event);
+      }
+    }
+
+    REQUIRE(memory_events.size() == 2);
+    REQUIRE(memory_events[0].address == result.guest_stack - kFirstSlotOffset);
+    REQUIRE(memory_events[0].second_address == 128);
+    REQUIRE(memory_events[1].address == result.guest_stack - 24);
+    REQUIRE(memory_events[1].second_address == 20);
+    const uint32_t expected_access = static_cast<uint32_t>(
+        restore ? MemoryAccess::kRead : MemoryAccess::kWrite);
+    REQUIRE(memory_events[0].flags == expected_access);
+    REQUIRE(memory_events[1].flags == expected_access);
+    REQUIRE(control_events.size() == 2);
+    REQUIRE(control_events[0].kind == CaptureEventKind::kEntry);
+    REQUIRE(control_events[0].address == 0x80000000);
+    REQUIRE(control_events[1].kind == CaptureEventKind::kExit);
+    REQUIRE(control_events[1].address == 0x80000000);
+  }
 }
 
 TEST_CASE("A64_CAPTURE_COORDINATOR_ACCEPTS_EMITTED_INVOCATION",
@@ -1195,6 +1315,117 @@ TEST_CASE("A64_CAPTURE_MEMORY_EVENTS_PRECEDE_GUEST_ACCESSES",
   for (const CaptureEvent& event : memory_events) {
     REQUIRE(event.identity.thread_id == 0x100);
   }
+
+  test.memory->SystemHeapFree(allocation);
+}
+
+TEST_CASE("A64_CAPTURE_RECORDS_PARTIAL_VECTOR_MEMORY_RANGES",
+          "[backend][guest-invocation-capture]") {
+  constexpr uint32_t kSize = 128;
+  TestFunction test([](hir::HIRBuilder& builder) {
+    StoreVR(builder, 3, builder.LoadVectorLeft(LoadGPR(builder, 4)));
+    StoreVR(builder, 4, builder.LoadVectorRight(LoadGPR(builder, 5)));
+    builder.StoreVectorLeft(LoadGPR(builder, 6), LoadVR(builder, 5));
+    builder.StoreVectorRight(LoadGPR(builder, 7), LoadVR(builder, 6));
+    builder.Return();
+  });
+  REQUIRE(test.processors.size() == 1);
+  const uint32_t allocation = test.memory->SystemHeapAlloc(kSize, 16);
+  REQUIRE(allocation != 0);
+  const uint32_t aligned = (allocation + 15) & ~0xFu;
+
+  RecordingCaptureSink capture;
+  bool left_store_was_unmodified = false;
+  bool right_store_was_unmodified = false;
+  capture.memory_observer = [&](const CaptureEvent& event) {
+    using MemoryAccess = ppc::GuestInvocationRecorderMemoryAccess;
+    uint8_t* bytes = test.memory->TranslateVirtual(event.address);
+    if (event.flags == static_cast<uint32_t>(MemoryAccess::kRead)) {
+      std::memset(bytes, 0, event.second_address);
+    } else if (event.address == aligned + 37) {
+      left_store_was_unmodified =
+          std::all_of(bytes, bytes + event.second_address,
+                      [](uint8_t value) { return value == 0x5A; });
+    } else if (event.address == aligned + 48) {
+      right_store_was_unmodified =
+          std::all_of(bytes, bytes + event.second_address,
+                      [](uint8_t value) { return value == 0x5A; });
+    }
+  };
+
+  std::memset(test.memory->TranslateVirtual(aligned), 0x5A, kSize - 16);
+  {
+    ScopedCaptureSink scoped_capture(*test.processors[0], capture);
+    test.Run(
+        [&](ppc::PPCContext* context) {
+          context->r[4] = aligned + 3;
+          context->r[5] = aligned + 23;
+          context->r[6] = aligned + 37;
+          context->r[7] = aligned + 57;
+          context->v[5] = vec128i(1, 2, 3, 4);
+          context->v[6] = vec128i(5, 6, 7, 8);
+        },
+        [](ppc::PPCContext* context) {
+          REQUIRE(context->v[3] == vec128_t{});
+          REQUIRE(context->v[4] == vec128_t{});
+        });
+  }
+
+  std::vector<CaptureEvent> memory_events;
+  for (const CaptureEvent& event : capture.events) {
+    if (event.kind == CaptureEventKind::kMemory) {
+      memory_events.push_back(event);
+    }
+  }
+  REQUIRE(memory_events.size() == 4);
+  using MemoryAccess = ppc::GuestInvocationRecorderMemoryAccess;
+  const uint32_t read = static_cast<uint32_t>(MemoryAccess::kRead);
+  const uint32_t write = static_cast<uint32_t>(MemoryAccess::kWrite);
+  REQUIRE(memory_events[0].address == aligned + 3);
+  REQUIRE(memory_events[0].second_address == 13);
+  REQUIRE(memory_events[0].flags == read);
+  REQUIRE(memory_events[1].address == aligned + 16);
+  REQUIRE(memory_events[1].second_address == 7);
+  REQUIRE(memory_events[1].flags == read);
+  REQUIRE(memory_events[2].address == aligned + 37);
+  REQUIRE(memory_events[2].second_address == 11);
+  REQUIRE(memory_events[2].flags == write);
+  REQUIRE(memory_events[3].address == aligned + 48);
+  REQUIRE(memory_events[3].second_address == 9);
+  REQUIRE(memory_events[3].flags == write);
+  REQUIRE(left_store_was_unmodified);
+  REQUIRE(right_store_was_unmodified);
+
+  capture.events.clear();
+  capture.memory_observer = nullptr;
+  std::memset(test.memory->TranslateVirtual(aligned), 0x5A, kSize - 16);
+  {
+    ScopedCaptureSink scoped_capture(*test.processors[0], capture);
+    test.Run(
+        [&](ppc::PPCContext* context) {
+          context->r[4] = aligned;
+          context->r[5] = aligned + 16;
+          context->r[6] = aligned + 32;
+          context->r[7] = aligned + 48;
+          context->v[5] = vec128i(1, 2, 3, 4);
+          context->v[6] = vec128i(5, 6, 7, 8);
+        },
+        [](ppc::PPCContext*) {});
+  }
+
+  memory_events.clear();
+  for (const CaptureEvent& event : capture.events) {
+    if (event.kind == CaptureEventKind::kMemory) {
+      memory_events.push_back(event);
+    }
+  }
+  REQUIRE(memory_events.size() == 2);
+  REQUIRE(memory_events[0].address == aligned);
+  REQUIRE(memory_events[0].second_address == 16);
+  REQUIRE(memory_events[0].flags == read);
+  REQUIRE(memory_events[1].address == aligned + 32);
+  REQUIRE(memory_events[1].second_address == 16);
+  REQUIRE(memory_events[1].flags == write);
 
   test.memory->SystemHeapFree(allocation);
 }

@@ -20,6 +20,8 @@ namespace cpu {
 namespace backend {
 namespace a64 {
 
+inline constexpr uint32_t kMaximumGuestInvocationCaptureMemoryAccessSize = 128;
+
 // Native callbacks entered through the full guest-to-host thunk. Except for
 // the tail target round trip, return values are ignored by emitted code.
 uint64_t CaptureGuestInvocationFunctionEntry(void* raw_context,

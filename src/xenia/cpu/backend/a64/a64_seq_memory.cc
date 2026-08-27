@@ -21,10 +21,6 @@
 #include "xenia/base/threading.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #include "xenia/cpu/backend/a64/a64_emitter.h"
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-#include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
-#endif
 #include "xenia/cpu/backend/a64/a64_op.h"
 #include "xenia/cpu/backend/a64/a64_seq_util.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
@@ -54,57 +50,6 @@ namespace backend {
 namespace a64 {
 
 volatile int anchor_memory = 0;
-
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-
-static void EmitGuestInvocationCaptureMemoryAccess(
-    A64Emitter& e, const I64Op& address, uint32_t size,
-    ppc::GuestInvocationRecorderMemoryAccess access) {
-  if (address.is_constant) {
-    e.mov(e.w1,
-          static_cast<uint64_t>(static_cast<uint32_t>(address.constant())));
-  } else {
-    e.mov(e.w1, WReg(address.reg().getIdx()));
-  }
-  e.mov(e.w2, static_cast<uint64_t>(size));
-  e.mov(e.w3, static_cast<uint64_t>(access));
-  e.CallNativeSafe(
-      reinterpret_cast<void*>(&CaptureGuestInvocationMemoryAccess));
-}
-
-template <typename OffsetOp>
-static void EmitGuestInvocationCaptureMemoryAccessOffset(
-    A64Emitter& e, const I64Op& base, const OffsetOp& offset, uint32_t size,
-    ppc::GuestInvocationRecorderMemoryAccess access) {
-  if (base.is_constant && offset.is_constant) {
-    const uint32_t address = static_cast<uint32_t>(base.constant()) +
-                             static_cast<uint32_t>(offset.constant());
-    e.mov(e.w1, static_cast<uint64_t>(address));
-  } else {
-    if (base.is_constant) {
-      e.mov(e.w0,
-            static_cast<uint64_t>(static_cast<uint32_t>(base.constant())));
-    } else {
-      e.mov(e.w0, WReg(base.reg().getIdx()));
-    }
-    AddGuestMemoryOffset(e, e.x0, offset);
-    e.mov(e.w1, e.w0);
-  }
-  e.mov(e.w2, static_cast<uint64_t>(size));
-  e.mov(e.w3, static_cast<uint64_t>(access));
-  e.CallNativeSafe(
-      reinterpret_cast<void*>(&CaptureGuestInvocationMemoryAccess));
-}
-
-static void EmitGuestInvocationCaptureUnsupportedDependency(
-    A64Emitter& e, uint32_t dependency_flags) {
-  e.mov(e.w1, static_cast<uint64_t>(dependency_flags));
-  e.CallNativeSafe(
-      reinterpret_cast<void*>(&CaptureGuestInvocationUnsupportedDependency));
-}
-
-#endif
 
 static bool IsPossibleMMIOInstruction(A64Emitter& e, const hir::Instr* i) {
   if (!cvars::emit_mmio_aware_stores_for_recorded_exception_addresses) {

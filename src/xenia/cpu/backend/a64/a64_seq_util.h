@@ -20,6 +20,11 @@
 #include "xenia/cpu/backend/a64/a64_op.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/cpu_flags.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
+#include "xenia/cpu/guest_invocation_recorder.h"
+#endif
 
 #include "xbyak_aarch64.h"
 
@@ -44,6 +49,38 @@ using Xbyak_aarch64::SReg;
 using Xbyak_aarch64::VReg;
 using Xbyak_aarch64::WReg;
 using Xbyak_aarch64::XReg;
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+
+inline void EmitGuestInvocationCapturePreparedMemoryAccess(
+    A64Emitter& e, ppc::GuestInvocationRecorderMemoryAccess access) {
+  e.mov(e.w3, static_cast<uint64_t>(access));
+  e.CallNativeSafe(
+      reinterpret_cast<void*>(&CaptureGuestInvocationMemoryAccess));
+}
+
+inline void EmitGuestInvocationCaptureMemoryAccess(
+    A64Emitter& e, const I64Op& address, uint32_t size,
+    ppc::GuestInvocationRecorderMemoryAccess access) {
+  if (address.is_constant) {
+    e.mov(e.w1,
+          static_cast<uint64_t>(static_cast<uint32_t>(address.constant())));
+  } else {
+    e.mov(e.w1, WReg(address.reg().getIdx()));
+  }
+  e.mov(e.w2, static_cast<uint64_t>(size));
+  EmitGuestInvocationCapturePreparedMemoryAccess(e, access);
+}
+
+inline void EmitGuestInvocationCaptureUnsupportedDependency(
+    A64Emitter& e, uint32_t dependency_flags) {
+  e.mov(e.w1, static_cast<uint64_t>(dependency_flags));
+  e.CallNativeSafe(
+      reinterpret_cast<void*>(&CaptureGuestInvocationUnsupportedDependency));
+}
+
+#endif
 
 template <typename Fn>
 inline void EmitWithFpcrMode(A64Emitter& e, FPCRMode mode, Fn&& emit_op) {
@@ -441,6 +478,33 @@ inline XReg AddGuestMemoryOffset(A64Emitter& e, const XReg& base,
   }
   return e.x0;
 }
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+
+template <typename OffsetOp>
+inline void EmitGuestInvocationCaptureMemoryAccessOffset(
+    A64Emitter& e, const I64Op& base, const OffsetOp& offset, uint32_t size,
+    ppc::GuestInvocationRecorderMemoryAccess access) {
+  if (base.is_constant && offset.is_constant) {
+    const uint32_t address = static_cast<uint32_t>(base.constant()) +
+                             static_cast<uint32_t>(offset.constant());
+    e.mov(e.w1, static_cast<uint64_t>(address));
+  } else {
+    if (base.is_constant) {
+      e.mov(e.w0,
+            static_cast<uint64_t>(static_cast<uint32_t>(base.constant())));
+    } else {
+      e.mov(e.w0, WReg(base.reg().getIdx()));
+    }
+    AddGuestMemoryOffset(e, e.x0, offset);
+    e.mov(e.w1, e.w0);
+  }
+  e.mov(e.w2, static_cast<uint64_t>(size));
+  EmitGuestInvocationCapturePreparedMemoryAccess(e, access);
+}
+
+#endif
 
 // Compute a guest memory address that carries a displacement.
 //

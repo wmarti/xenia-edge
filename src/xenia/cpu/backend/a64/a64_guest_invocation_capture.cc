@@ -25,8 +25,6 @@ namespace backend {
 namespace a64 {
 namespace {
 
-constexpr uint32_t kMaximumEmittedMemoryAccessSize = 128;
-
 GuestInvocationCaptureEventSink* GetCaptureSink(
     const ppc::PPCContext* context) {
   if (!context || !context->processor) {
@@ -132,7 +130,8 @@ uint64_t CaptureGuestInvocationMemoryAccess(void* raw_context,
   const uint64_t maximum_access = static_cast<uint64_t>(
       ppc::GuestInvocationRecorderMemoryAccess::kReadWrite);
   if (logical_address > std::numeric_limits<uint32_t>::max() ||
-      size > kMaximumEmittedMemoryAccessSize || access > maximum_access) {
+      size > kMaximumGuestInvocationCaptureMemoryAccessSize ||
+      access > maximum_access) {
     sink->OnUnsupportedDependency(
         GetCaptureIdentity(*context),
         ppc::kGuestInvocationDependencyUnsupportedMappingOrProtection);

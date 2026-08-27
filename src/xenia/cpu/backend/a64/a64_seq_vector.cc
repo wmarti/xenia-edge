@@ -2129,11 +2129,56 @@ EMITTER_OPCODE_TABLE(OPCODE_UNPACK, UNPACK);
 static constexpr vec128_t kLvBaseControl =
     vec128i(0x00010203u, 0x04050607u, 0x08090A0Bu, 0x0C0D0E0Fu);
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+
+static void EmitPartialVectorCapture(
+    A64Emitter& e, const I64Op& address, bool left,
+    ppc::GuestInvocationRecorderMemoryAccess access) {
+  if (address.is_constant) {
+    uint32_t logical_address = static_cast<uint32_t>(address.constant());
+    const uint32_t offset = logical_address & 0xF;
+    const uint32_t size = left ? 16 - offset : offset;
+    if (!size) {
+      return;
+    }
+    if (!left) {
+      logical_address &= ~0xFu;
+    }
+    e.mov(e.w1, static_cast<uint64_t>(logical_address));
+    e.mov(e.w2, static_cast<uint64_t>(size));
+    EmitGuestInvocationCapturePreparedMemoryAccess(e, access);
+    return;
+  }
+
+  e.mov(e.w1, WReg(address.reg().getIdx()));
+  e.and_(e.w2, e.w1, 0xF);
+  if (left) {
+    e.mov(e.w3, 16);
+    e.sub(e.w2, e.w3, e.w2);
+    EmitGuestInvocationCapturePreparedMemoryAccess(e, access);
+    return;
+  }
+
+  Xbyak_aarch64::Label no_access;
+  e.cbz(e.w2, no_access);
+  e.and_(e.w1, e.w1, ~0xFu);
+  EmitGuestInvocationCapturePreparedMemoryAccess(e, access);
+  e.L(no_access);
+}
+
+#endif
+
 struct LVL_V128 : Sequence<LVL_V128, I<OPCODE_LVL, V128Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     // Inline LVL using TBL.  The bswap-within-lanes base pattern plus the
     // address offset gives a TBL control vector.  Indices >= 16 naturally
     // produce zero from TBL, which is the correct LVL behaviour.
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitPartialVectorCapture(e, i.src1, true,
+                             ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     auto addr = ComputeMemoryAddress(e, i.src1);
     int d = i.dest.reg().getIdx();
 
@@ -2165,6 +2210,11 @@ struct LVR_V128 : Sequence<LVR_V128, I<OPCODE_LVR, V128Op, I64Op>> {
     // Indices 0-15 read zeros (from v0), 16-31 read mem (from v1).
     // base + offset produces indices > 15 exactly where LVR should output
     // the memory bytes, and <= 15 where it should output zero.
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitPartialVectorCapture(e, i.src1, false,
+                             ppc::GuestInvocationRecorderMemoryAccess::kRead);
+#endif
     auto addr = ComputeMemoryAddress(e, i.src1);
     int d = i.dest.reg().getIdx();
     // Unqualified Label here is hir::Label.
@@ -2258,6 +2308,11 @@ struct STVL_V128 : Sequence<STVL_V128, I<OPCODE_STVL, VoidOp, I64Op, V128Op>> {
     // Store bytes offset..15 of the block holding the address, taking them from
     // the head of the byte-swapped source. That is 16 - offset bytes ending at
     // the block boundary, so it is one contiguous copy.
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitPartialVectorCapture(e, i.src1, true,
+                             ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     int s = SrcVReg(e, i.src2, 0);
 
     // Stash rev32(src) so its bytes can be addressed individually.
@@ -2284,6 +2339,11 @@ struct STVR_V128 : Sequence<STVR_V128, I<OPCODE_STVR, VoidOp, I64Op, V128Op>> {
     // Store bytes 0..offset-1 of the block from the tail of the byte-swapped
     // source, again contiguous. offset == 0 stores nothing, which matters:
     // memcpy tails use stvrx on an address that can sit one past a valid page.
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    EmitPartialVectorCapture(e, i.src1, false,
+                             ppc::GuestInvocationRecorderMemoryAccess::kWrite);
+#endif
     int s = SrcVReg(e, i.src2, 0);
 
     e.rev32(VReg(0).b16, VReg(s).b16);
