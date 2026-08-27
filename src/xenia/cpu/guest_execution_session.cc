@@ -589,12 +589,20 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
       manifest.unsupported_event_count > manifest.rejected_event_count) {
     return Fail(error, "manifest coverage accounting is inconsistent");
   }
+  const bool continuous_instruction_coverage = manifest.segments.empty();
+  if (continuous_instruction_coverage &&
+      (manifest.boundary.kind ==
+           GuestExecutionSessionBoundaryKind::kSegmentCount ||
+       manifest.rejected_segment_count || !manifest.accepted_event_count ||
+       !manifest.stop_request_guest_instruction_count)) {
+    return Fail(error,
+                "continuous manifest lacks canonical instruction coverage");
+  }
   if (manifest.participants.empty() ||
       manifest.participants.size() > limits.maximum_participants) {
     return Fail(error, "manifest participant count is invalid");
   }
-  if (manifest.segments.empty() ||
-      manifest.segments.size() > limits.maximum_segments) {
+  if (manifest.segments.size() > limits.maximum_segments) {
     return Fail(error, "manifest segment count is invalid");
   }
   if (manifest.chunks.empty() ||
@@ -1926,6 +1934,7 @@ bool GuestExecutionSessionCodec::ValidateSession(
   if (encoded_chunks.size() != manifest.chunks.size()) {
     return Fail(error, "session chunk count does not match the manifest");
   }
+  const bool continuous_instruction_coverage = manifest.segments.empty();
 
   std::map<uint64_t, uint32_t> segment_starts;
   std::map<uint64_t, uint32_t> segment_ends;
@@ -2026,6 +2035,12 @@ bool GuestExecutionSessionCodec::ValidateSession(
       }
 
       for (const GuestExecutionSessionEvent& event : chunk.events) {
+        if (continuous_instruction_coverage &&
+            (event.kind == GuestExecutionSessionEventKind::kSegmentBegin ||
+             event.kind == GuestExecutionSessionEventKind::kSegmentEnd)) {
+          return Fail(error,
+                      "continuous session contains a segment control event");
+        }
         if (manifest_has_continuous_events) {
           canonical_event_identities.push_back(
               {event.global_sequence, event.kind, event.disposition,
@@ -2496,6 +2511,12 @@ bool GuestExecutionSessionCodec::ValidateSession(
       rejected_event_count != manifest.rejected_event_count ||
       unsupported_event_count != manifest.unsupported_event_count) {
     return Fail(error, "session event coverage accounting does not match");
+  }
+  if (continuous_instruction_coverage &&
+      !stop_request_guest_instruction_count) {
+    return Fail(
+        error,
+        "continuous session has no timed participant instruction coverage");
   }
   uint64_t first_held_boundary_sequence = 0;
   if (!saw_boundary_request || !saw_boundary_held ||

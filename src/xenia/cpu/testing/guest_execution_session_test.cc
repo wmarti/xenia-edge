@@ -619,6 +619,9 @@ TEST_CASE("Continuous session shape is inferred from canonical contents",
 
   SECTION("valid zero-segment coverage round trips") {
     SessionFixture fixture = MakeContinuousSessionFixture();
+    REQUIRE(fixture.manifest.segments.empty());
+    REQUIRE(fixture.manifest.chunks[1].kind ==
+            GuestExecutionSessionChunkKind::kCodeCorpus);
     GuestExecutionSessionManifest decoded;
     REQUIRE(GuestExecutionSessionCodec::DecodeManifest(fixture.encoded_manifest,
                                                        &decoded, &error));
@@ -736,6 +739,12 @@ TEST_CASE("Continuous session shape is inferred from canonical contents",
 
   SECTION("legacy segmented fixture remains valid") {
     SessionFixture fixture = MakeSessionFixture();
+    REQUIRE_FALSE(fixture.manifest.segments.empty());
+    REQUIRE(std::none_of(
+        fixture.manifest.chunks.cbegin(), fixture.manifest.chunks.cend(),
+        [](const GuestExecutionSessionChunkReference& chunk) {
+          return chunk.kind == GuestExecutionSessionChunkKind::kCodeCorpus;
+        }));
     REQUIRE(GuestExecutionSessionCodec::ValidateSession(
         fixture.manifest, fixture.chunks, &error));
   }
