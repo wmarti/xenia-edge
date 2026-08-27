@@ -1729,6 +1729,11 @@ bool Processor::Execute(ThreadState* thread_state, uint32_t address) {
 }
 
 bool Processor::ExecuteRaw(ThreadState* thread_state, uint32_t address) {
+  return ExecuteRaw(thread_state, address, 0xBCBCBCBC);
+}
+
+bool Processor::ExecuteRaw(ThreadState* thread_state, uint32_t address,
+                           uint32_t return_address) {
   SCOPE_profile_cpu_f("cpu");
 
   // Attempt to get the function.
@@ -1739,7 +1744,7 @@ bool Processor::ExecuteRaw(ThreadState* thread_state, uint32_t address) {
     return false;
   }
 
-  return function->Call(thread_state, 0xBCBCBCBC);
+  return function->Call(thread_state, return_address);
 }
 
 uint64_t Processor::Execute(ThreadState* thread_state, uint32_t address,

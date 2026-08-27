@@ -243,6 +243,8 @@ class Processor {
 
   bool Execute(ThreadState* thread_state, uint32_t address);
   bool ExecuteRaw(ThreadState* thread_state, uint32_t address);
+  bool ExecuteRaw(ThreadState* thread_state, uint32_t address,
+                  uint32_t return_address);
   uint64_t Execute(ThreadState* thread_state, uint32_t address, uint64_t args[],
                    size_t arg_count);
 

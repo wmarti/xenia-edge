@@ -25,6 +25,7 @@ using xe::cpu::ppc::PPCContext;
 TEST_CASE("EXECUTE_RAW_RESUMES_GUEST_CONTINUATION", "[backend][resume]") {
   constexpr uint32_t kResumeAddress = 0x82040000u;
   constexpr uint32_t kCallerContinuationAddress = 0x82040100u;
+  constexpr uint32_t kOuterReturnAddress = 0x83000000u;
   constexpr uint32_t kSyntheticReturnAddress = 0xBCBCBCBCu;
 
   auto memory = std::make_unique<Memory>();
@@ -61,9 +62,17 @@ TEST_CASE("EXECUTE_RAW_RESUMES_GUEST_CONTINUATION", "[backend][resume]") {
                                                     stack_address + stack_size);
   PPCContext* context = thread_state->context();
   context->r[3] = 10;
-  context->r[11] = kSyntheticReturnAddress;
+  context->r[11] = kOuterReturnAddress;
   context->lr = kCallerContinuationAddress;
 
+  REQUIRE(processor->ExecuteRaw(thread_state.get(), kResumeAddress,
+                                kOuterReturnAddress));
+  REQUIRE(context->r[3] == 16);
+  REQUIRE(context->lr == kOuterReturnAddress);
+
+  context->r[3] = 10;
+  context->r[11] = kSyntheticReturnAddress;
+  context->lr = kCallerContinuationAddress;
   REQUIRE(processor->ExecuteRaw(thread_state.get(), kResumeAddress));
   REQUIRE(context->r[3] == 16);
   REQUIRE(context->lr == kSyntheticReturnAddress);
