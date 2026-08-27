@@ -4,6 +4,7 @@
 import importlib.util
 import pathlib
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -45,6 +46,60 @@ class RunSuiteTest(unittest.TestCase):
         self.assertEqual(row["verdict"], "pass")
         self.assertEqual(row["total"], 7)
         self.assertEqual(row["passed"], 7)
+
+
+class DiscoverSuitesTest(unittest.TestCase):
+
+    def test_requires_exact_runner_visible_source_closure(self):
+        with tempfile.TemporaryDirectory() as root_string:
+            root = pathlib.Path(root_string)
+            source = root / "source"
+            corpus = root / "corpus"
+            source.mkdir()
+            corpus.mkdir()
+            for suite in ("instr_z", "instr_a"):
+                (source / f"{suite}.s").touch()
+                (corpus / f"{suite}.map").touch()
+                (corpus / f"{suite}.bin").touch()
+            # seq_ files are helpers that the PPC runner deliberately does not
+            # discover, even though the assembler also emits them.
+            (source / "seq_helper.s").touch()
+            (corpus / "seq_helper.map").touch()
+            (corpus / "seq_helper.bin").touch()
+
+            self.assertEqual(
+                VERIFY_CORPUS.discover_suites(corpus, source),
+                ["instr_a", "instr_z"],
+            )
+
+    def test_rejects_stale_or_incomplete_corpus(self):
+        with tempfile.TemporaryDirectory() as root_string:
+            root = pathlib.Path(root_string)
+            source = root / "source"
+            corpus = root / "corpus"
+            source.mkdir()
+            corpus.mkdir()
+            (source / "instr_current.s").touch()
+            (corpus / "instr_stale.map").touch()
+            (corpus / "instr_stale.bin").touch()
+
+            with self.assertRaisesRegex(ValueError, "missing .map suites"):
+                VERIFY_CORPUS.discover_suites(corpus, source)
+
+    def test_restricted_run_still_requires_source_map_and_binary(self):
+        with tempfile.TemporaryDirectory() as root_string:
+            root = pathlib.Path(root_string)
+            source = root / "source"
+            corpus = root / "corpus"
+            source.mkdir()
+            corpus.mkdir()
+            (source / "instr_one.s").touch()
+            (corpus / "instr_one.map").touch()
+
+            with self.assertRaisesRegex(ValueError, "missing .bin suites"):
+                VERIFY_CORPUS.discover_suites(
+                    corpus, source, ["instr_one"]
+                )
 
 
 if __name__ == "__main__":

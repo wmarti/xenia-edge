@@ -24,6 +24,46 @@ PASSED_RE = re.compile(r"^Passed: (\d+)$", re.M)
 FAILED_RE = re.compile(r"^Failed: (\d+)$", re.M)
 
 
+def discover_suites(corpus, test_path, requested=None):
+    """Return the exact source-backed corpus closure accepted by the runner."""
+    source_suites = {p.stem for p in test_path.glob("instr_*.s")}
+    map_suites = {p.stem for p in corpus.glob("instr_*.map")}
+    bin_suites = {p.stem for p in corpus.glob("instr_*.bin")}
+
+    if requested is not None:
+        requested_suites = set(requested)
+        unknown = requested_suites - source_suites
+        missing_maps = requested_suites - map_suites
+        missing_bins = requested_suites - bin_suites
+    else:
+        requested_suites = source_suites
+        unknown = set()
+        missing_maps = source_suites - map_suites
+        missing_bins = source_suites - bin_suites
+
+    problems = []
+    if unknown:
+        problems.append("unknown source suites: " + ", ".join(sorted(unknown)))
+    if missing_maps:
+        problems.append("missing .map suites: " +
+                        ", ".join(sorted(missing_maps)))
+    if missing_bins:
+        problems.append("missing .bin suites: " +
+                        ", ".join(sorted(missing_bins)))
+    if requested is None:
+        orphan_maps = map_suites - source_suites
+        orphan_bins = bin_suites - source_suites
+        if orphan_maps:
+            problems.append("orphan .map suites: " +
+                            ", ".join(sorted(orphan_maps)))
+        if orphan_bins:
+            problems.append("orphan .bin suites: " +
+                            ", ".join(sorted(orphan_bins)))
+    if problems:
+        raise ValueError("; ".join(problems))
+    return sorted(requested_suites)
+
+
 def describe_exit(code):
     """Turn a subprocess returncode into (verdict, signal-name-or-None)."""
     if code == 0:
@@ -104,12 +144,16 @@ def main():
     args = ap.parse_args()
 
     corpus = pathlib.Path(args.corpus)
-    # Discovery is driven by the corpus rather than by the .s sources so that
-    # both refs are asked exactly the same questions. A ref whose tree lacks a
-    # source still has to answer for the suite if the corpus ships it.
-    suites = args.suites or sorted(p.stem for p in corpus.glob("*.map"))
+    test_path = pathlib.Path(args.test_path)
+    # The PPC runner discovers only instr_*.s. Require the prebuilt .map/.bin
+    # corpus to be the exact closure of those sources so a stale archive can't
+    # silently omit a new suite or feed annotations to an older binary.
+    try:
+        suites = discover_suites(corpus, test_path, args.suites)
+    except ValueError as error:
+        sys.exit(f"error: corpus/source mismatch: {error}")
     if not suites:
-        sys.exit(f"error: no .map suites found under {corpus}")
+        sys.exit(f"error: no instr_*.s suites found under {test_path}")
 
     results = []
     for i, suite in enumerate(suites, 1):
