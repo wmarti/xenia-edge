@@ -128,6 +128,103 @@ class GuestPPCRegisterStateCodec {
   }
 };
 
+// Portable re-entry mode for one captured guest thread. Version 1 restores at
+// an exact catalog-bound guest block head. The pending-extern form has a
+// canonical wire representation for a modeled blocking export, but replay
+// support must still opt in by supplying the exact binding below.
+enum class GuestPPCThreadResumeKind : uint32_t {
+  kGuestBlockHead = 1,
+  kPendingModeledBlockingExtern = 2,
+};
+
+// Pointer-free semantic state for one fixed session participant. Host stacks,
+// backend contexts, native pointers, reservations and thread lifecycle state
+// are deliberately absent. Version 1 reserves canonical-zero wire space for
+// the latter two contracts rather than silently pretending they were saved.
+struct GuestPPCThreadCheckpoint {
+  // Exact session participant and guest thread whose state this blob holds.
+  // This is the scheduler subject identity. A scheduler event's actor is a
+  // separate event-schema concern and must not be inferred from this pair.
+  uint32_t participant_ordinal = 0;
+  uint32_t guest_thread_id = 0;
+  GuestPPCThreadResumeKind resume_kind =
+      GuestPPCThreadResumeKind::kGuestBlockHead;
+  uint32_t resume_pc = 0;
+
+  // Inclusive exact-corpus extent owning resume_pc. A consumer must bind both
+  // endpoints to its code catalog before attaching the state to a ThreadState.
+  uint32_t owning_function_address = 0;
+  uint32_t owning_function_end_address = 0;
+  uint32_t outer_guest_return_address = 0;
+
+  // Both fields are zero at an ordinary block head. Both are nonzero for a
+  // pending modeled blocking extern, and the export address is PPC-aligned.
+  uint64_t pending_external_event_sequence = 0;
+  uint32_t pending_export_guest_address = 0;
+
+  GuestPPCRegisterState registers = {};
+
+  bool operator==(const GuestPPCThreadCheckpoint&) const = default;
+};
+
+// Exact session/catalog identity that a decoded checkpoint must match before
+// it is attached to a live or replay-created ThreadState. Keeping this
+// pointer-free lets bundle validation reject a misplaced blob before any
+// platform-specific restore is attempted.
+struct GuestPPCThreadCheckpointBinding {
+  uint32_t participant_ordinal = 0;
+  uint32_t guest_thread_id = 0;
+  GuestPPCThreadResumeKind resume_kind =
+      GuestPPCThreadResumeKind::kGuestBlockHead;
+  uint32_t resume_pc = 0;
+  uint32_t owning_function_address = 0;
+  uint32_t owning_function_end_address = 0;
+  uint32_t outer_guest_return_address = 0;
+  uint64_t pending_external_event_sequence = 0;
+  uint32_t pending_export_guest_address = 0;
+
+  bool operator==(const GuestPPCThreadCheckpointBinding&) const = default;
+};
+
+// Fixed-size canonical wrapper around the complete 2676-byte standalone
+// register-state blob. All integers are little-endian and every field is
+// emitted explicitly; C++ object padding is never serialized.
+class GuestPPCThreadCheckpointCodec {
+ public:
+  static constexpr uint32_t kVersion = 1;
+  static constexpr uint32_t kHeaderSize = 32;
+  static constexpr uint32_t kMetadataSize = 72;
+  static constexpr uint32_t kReservationReservedSize = 16;
+  static constexpr uint32_t kLifecycleReservedSize = 16;
+  static constexpr uint32_t kRegisterStateOffset = kHeaderSize + kMetadataSize;
+  static constexpr uint32_t kEncodedSize =
+      kRegisterStateOffset + GuestPPCRegisterStateCodec::kEncodedSize;
+
+  // On failure, output is cleared and error (when non-null) describes the
+  // first rejected invariant.
+  static bool Encode(const GuestPPCThreadCheckpoint& checkpoint,
+                     std::vector<uint8_t>* output,
+                     std::string* error = nullptr);
+
+  // Decodes and validates into a temporary. On failure, output is not
+  // modified, including for truncation, trailing data and a malformed nested
+  // register blob.
+  static bool Decode(const uint8_t* data, size_t data_size,
+                     GuestPPCThreadCheckpoint* output,
+                     std::string* error = nullptr);
+  static bool Decode(const std::vector<uint8_t>& data,
+                     GuestPPCThreadCheckpoint* output,
+                     std::string* error = nullptr) {
+    return Decode(data.data(), data.size(), output, error);
+  }
+
+  // Validates the semantic state and requires every re-entry and participant
+  // identity field to equal the caller's session/catalog binding.
+  static bool ValidateBinding(const GuestPPCThreadCheckpoint& checkpoint,
+                              const GuestPPCThreadCheckpointBinding& binding,
+                              std::string* error = nullptr);
+};
+
 struct GuestInvocationPage {
   uint32_t guest_address = 0;
   std::array<uint8_t, 4096> data = {};

@@ -129,6 +129,65 @@ std::vector<uint8_t> EncodeValidRegisterState() {
   return encoded;
 }
 
+constexpr size_t kThreadParticipantOrdinalOffset = 32;
+constexpr size_t kThreadGuestThreadIdOffset = 36;
+constexpr size_t kThreadResumeKindOffset = 40;
+constexpr size_t kThreadResumePcOffset = 44;
+constexpr size_t kThreadOwningFunctionOffset = 48;
+constexpr size_t kThreadOwningFunctionEndOffset = 52;
+constexpr size_t kThreadOuterReturnOffset = 56;
+constexpr size_t kThreadPendingExportOffset = 60;
+constexpr size_t kThreadPendingEventOffset = 64;
+constexpr size_t kThreadReservationReservedOffset = 72;
+constexpr size_t kThreadLifecycleReservedOffset = 88;
+
+GuestPPCThreadCheckpoint MakeThreadCheckpoint(
+    GuestPPCThreadResumeKind resume_kind =
+        GuestPPCThreadResumeKind::kGuestBlockHead) {
+  GuestPPCThreadCheckpoint checkpoint;
+  checkpoint.participant_ordinal = 3;
+  checkpoint.guest_thread_id = 0x11223344;
+  checkpoint.resume_kind = resume_kind;
+  checkpoint.resume_pc = 0x82004000;
+  checkpoint.owning_function_address = 0x82003000;
+  checkpoint.owning_function_end_address = 0x82004FFC;
+  checkpoint.outer_guest_return_address = 0xBCBCBCBC;
+  if (resume_kind == GuestPPCThreadResumeKind::kPendingModeledBlockingExtern) {
+    checkpoint.pending_external_event_sequence = 0x1020304050607080ull;
+    checkpoint.pending_export_guest_address = 0x80008000;
+  }
+  checkpoint.registers = MakeRegisterState(0x6B, 0x90006000);
+  return checkpoint;
+}
+
+GuestPPCThreadCheckpointBinding MakeThreadCheckpointBinding(
+    const GuestPPCThreadCheckpoint& checkpoint) {
+  GuestPPCThreadCheckpointBinding binding;
+  binding.participant_ordinal = checkpoint.participant_ordinal;
+  binding.guest_thread_id = checkpoint.guest_thread_id;
+  binding.resume_kind = checkpoint.resume_kind;
+  binding.resume_pc = checkpoint.resume_pc;
+  binding.owning_function_address = checkpoint.owning_function_address;
+  binding.owning_function_end_address = checkpoint.owning_function_end_address;
+  binding.outer_guest_return_address = checkpoint.outer_guest_return_address;
+  binding.pending_external_event_sequence =
+      checkpoint.pending_external_event_sequence;
+  binding.pending_export_guest_address =
+      checkpoint.pending_export_guest_address;
+  return binding;
+}
+
+std::vector<uint8_t> EncodeValidThreadCheckpoint(
+    GuestPPCThreadResumeKind resume_kind =
+        GuestPPCThreadResumeKind::kGuestBlockHead) {
+  std::vector<uint8_t> encoded;
+  std::string error;
+  REQUIRE(GuestPPCThreadCheckpointCodec::Encode(
+      MakeThreadCheckpoint(resume_kind), &encoded, &error));
+  REQUIRE(error.empty());
+  return encoded;
+}
+
 void WriteU32(std::vector<uint8_t>* data, size_t offset, uint32_t value) {
   REQUIRE(offset + 4 <= data->size());
   for (size_t i = 0; i < 4; ++i) {
@@ -152,6 +211,15 @@ uint64_t ReadU64(const std::vector<uint8_t>& data, size_t offset) {
   return value;
 }
 
+uint32_t ReadU32(const std::vector<uint8_t>& data, size_t offset) {
+  REQUIRE(offset + 4 <= data.size());
+  uint32_t value = 0;
+  for (size_t i = 0; i < 4; ++i) {
+    value |= uint32_t(data[offset + i]) << (i * 8);
+  }
+  return value;
+}
+
 void RequireDecodeFailure(const std::vector<uint8_t>& data) {
   GuestInvocationArtifact output = MakeArtifact();
   std::string error;
@@ -166,6 +234,26 @@ void RequireRegisterStateDecodeFailure(const std::vector<uint8_t>& data) {
   REQUIRE_FALSE(GuestPPCRegisterStateCodec::Decode(data, &output, &error));
   REQUIRE_FALSE(error.empty());
   REQUIRE(output == GuestPPCRegisterState{});
+}
+
+void RequireThreadCheckpointDecodeFailure(const std::vector<uint8_t>& data) {
+  GuestPPCThreadCheckpoint output = MakeThreadCheckpoint(
+      GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  const GuestPPCThreadCheckpoint original = output;
+  std::string error;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::Decode(data, &output, &error));
+  REQUIRE_FALSE(error.empty());
+  REQUIRE(output == original);
+}
+
+void RequireThreadCheckpointEncodeFailure(
+    const GuestPPCThreadCheckpoint& checkpoint) {
+  std::vector<uint8_t> output = {1, 2, 3};
+  std::string error;
+  REQUIRE_FALSE(
+      GuestPPCThreadCheckpointCodec::Encode(checkpoint, &output, &error));
+  REQUIRE_FALSE(error.empty());
+  REQUIRE(output.empty());
 }
 
 }  // namespace
@@ -288,6 +376,396 @@ TEST_CASE("PPC register-state codec preserves architectural edge bits",
   GuestPPCRegisterState decoded;
   REQUIRE(GuestPPCRegisterStateCodec::Decode(first, &decoded));
   REQUIRE(decoded == expected);
+}
+
+TEST_CASE("PPC thread checkpoint wraps one exact canonical register blob",
+          "[guest-invocation-artifact]") {
+  REQUIRE(GuestPPCRegisterStateCodec::kEncodedSize == 2676);
+  REQUIRE(GuestPPCThreadCheckpointCodec::kHeaderSize == 32);
+  REQUIRE(GuestPPCThreadCheckpointCodec::kMetadataSize == 72);
+  REQUIRE(GuestPPCThreadCheckpointCodec::kReservationReservedSize == 16);
+  REQUIRE(GuestPPCThreadCheckpointCodec::kLifecycleReservedSize == 16);
+  REQUIRE(GuestPPCThreadCheckpointCodec::kRegisterStateOffset == 104);
+  REQUIRE(GuestPPCThreadCheckpointCodec::kEncodedSize == 2780);
+
+  for (GuestPPCThreadResumeKind resume_kind :
+       {GuestPPCThreadResumeKind::kGuestBlockHead,
+        GuestPPCThreadResumeKind::kPendingModeledBlockingExtern}) {
+    INFO("resume kind " << static_cast<uint32_t>(resume_kind));
+    const GuestPPCThreadCheckpoint expected = MakeThreadCheckpoint(resume_kind);
+    std::vector<uint8_t> encoded;
+    std::string error;
+    REQUIRE(GuestPPCThreadCheckpointCodec::Encode(expected, &encoded, &error));
+    REQUIRE(error.empty());
+    REQUIRE(encoded.size() == GuestPPCThreadCheckpointCodec::kEncodedSize);
+    constexpr std::array<uint8_t, 8> kExpectedMagic = {'X', 'E', 'P', 'P',
+                                                       'C', 'T', 'C', 0};
+    REQUIRE(std::equal(encoded.cbegin(),
+                       encoded.cbegin() + kExpectedMagic.size(),
+                       kExpectedMagic.cbegin()));
+    REQUIRE(ReadU32(encoded, 8) == GuestPPCThreadCheckpointCodec::kVersion);
+    REQUIRE(ReadU32(encoded, 12) == GuestPPCThreadCheckpointCodec::kHeaderSize);
+    REQUIRE(ReadU64(encoded, 16) ==
+            GuestPPCThreadCheckpointCodec::kEncodedSize);
+    REQUIRE(ReadU32(encoded, kThreadParticipantOrdinalOffset) ==
+            expected.participant_ordinal);
+    REQUIRE(ReadU32(encoded, kThreadGuestThreadIdOffset) ==
+            expected.guest_thread_id);
+    REQUIRE(ReadU32(encoded, kThreadResumeKindOffset) ==
+            static_cast<uint32_t>(expected.resume_kind));
+    REQUIRE(ReadU32(encoded, kThreadResumePcOffset) == expected.resume_pc);
+    REQUIRE(ReadU32(encoded, kThreadOwningFunctionOffset) ==
+            expected.owning_function_address);
+    REQUIRE(ReadU32(encoded, kThreadOwningFunctionEndOffset) ==
+            expected.owning_function_end_address);
+    REQUIRE(ReadU32(encoded, kThreadOuterReturnOffset) ==
+            expected.outer_guest_return_address);
+    REQUIRE(ReadU32(encoded, kThreadPendingExportOffset) ==
+            expected.pending_export_guest_address);
+    REQUIRE(ReadU64(encoded, kThreadPendingEventOffset) ==
+            expected.pending_external_event_sequence);
+    REQUIRE(std::all_of(encoded.cbegin() + kThreadReservationReservedOffset,
+                        encoded.cbegin() + kThreadLifecycleReservedOffset,
+                        [](uint8_t value) { return value == 0; }));
+    REQUIRE(std::all_of(
+        encoded.cbegin() + kThreadLifecycleReservedOffset,
+        encoded.cbegin() + GuestPPCThreadCheckpointCodec::kRegisterStateOffset,
+        [](uint8_t value) { return value == 0; }));
+
+    std::vector<uint8_t> register_blob;
+    REQUIRE(
+        GuestPPCRegisterStateCodec::Encode(expected.registers, &register_blob));
+    REQUIRE(std::equal(
+        encoded.cbegin() + GuestPPCThreadCheckpointCodec::kRegisterStateOffset,
+        encoded.cend(), register_blob.cbegin(), register_blob.cend()));
+
+    GuestPPCThreadCheckpoint decoded = MakeThreadCheckpoint();
+    REQUIRE(GuestPPCThreadCheckpointCodec::Decode(encoded, &decoded, &error));
+    REQUIRE(error.empty());
+    REQUIRE(decoded == expected);
+    REQUIRE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+        decoded, MakeThreadCheckpointBinding(expected), &error));
+    REQUIRE(error.empty());
+  }
+}
+
+TEST_CASE("PPC thread checkpoint rejects every truncation and trailing byte",
+          "[guest-invocation-artifact]") {
+  const std::vector<uint8_t> encoded = EncodeValidThreadCheckpoint();
+  for (size_t size = 0; size < encoded.size(); ++size) {
+    INFO("truncated size " << size);
+    RequireThreadCheckpointDecodeFailure(
+        std::vector<uint8_t>(encoded.cbegin(), encoded.cbegin() + size));
+  }
+
+  std::vector<uint8_t> trailing = encoded;
+  trailing.push_back(0);
+  RequireThreadCheckpointDecodeFailure(trailing);
+
+  GuestPPCThreadCheckpoint output = MakeThreadCheckpoint(
+      GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  const GuestPPCThreadCheckpoint original = output;
+  std::string error;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::Decode(
+      nullptr, GuestPPCThreadCheckpointCodec::kEncodedSize, &output, &error));
+  REQUIRE(output == original);
+  REQUIRE_FALSE(error.empty());
+  REQUIRE_FALSE(
+      GuestPPCThreadCheckpointCodec::Decode(nullptr, 0, &output, &error));
+  REQUIRE(output == original);
+  REQUIRE_FALSE(error.empty());
+  REQUIRE_FALSE(
+      GuestPPCThreadCheckpointCodec::Decode(encoded, nullptr, &error));
+  REQUIRE_FALSE(error.empty());
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::Encode(output, nullptr, &error));
+  REQUIRE_FALSE(error.empty());
+}
+
+TEST_CASE("PPC thread checkpoint rejects forged headers and reserved space",
+          "[guest-invocation-artifact]") {
+  std::vector<uint8_t> malformed = EncodeValidThreadCheckpoint();
+  malformed[0] ^= 1;
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, 8, GuestPPCThreadCheckpointCodec::kVersion + 1);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, 12, GuestPPCThreadCheckpointCodec::kHeaderSize + 4);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU64(&malformed, 16, GuestPPCThreadCheckpointCodec::kEncodedSize - 1);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU64(&malformed, 16, UINT64_MAX);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, 24, 1);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, 24, UINT32_MAX);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, 28, 1);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  for (size_t offset = kThreadReservationReservedOffset;
+       offset < GuestPPCThreadCheckpointCodec::kRegisterStateOffset; ++offset) {
+    INFO("reserved byte offset " << offset);
+    malformed = EncodeValidThreadCheckpoint();
+    malformed[offset] = 1;
+    RequireThreadCheckpointDecodeFailure(malformed);
+  }
+
+  malformed = EncodeValidThreadCheckpoint();
+  malformed[GuestPPCThreadCheckpointCodec::kRegisterStateOffset] ^= 1;
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU64(&malformed, GuestPPCThreadCheckpointCodec::kRegisterStateOffset + 16,
+           GuestPPCRegisterStateCodec::kEncodedSize - 1);
+  RequireThreadCheckpointDecodeFailure(malformed);
+}
+
+TEST_CASE("PPC thread checkpoint enforces canonical resume identities",
+          "[guest-invocation-artifact]") {
+  GuestPPCThreadCheckpoint checkpoint = MakeThreadCheckpoint();
+  checkpoint.guest_thread_id = 0;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+
+  checkpoint = MakeThreadCheckpoint();
+  checkpoint.resume_pc = 0;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint.resume_pc = 0x82004002;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+
+  checkpoint = MakeThreadCheckpoint();
+  checkpoint.owning_function_address = 0;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint = MakeThreadCheckpoint();
+  checkpoint.owning_function_address |= 2;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint = MakeThreadCheckpoint();
+  checkpoint.owning_function_end_address |= 2;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint = MakeThreadCheckpoint();
+  checkpoint.owning_function_end_address =
+      checkpoint.owning_function_address - 4;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint = MakeThreadCheckpoint();
+  checkpoint.resume_pc = checkpoint.owning_function_address - 4;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint = MakeThreadCheckpoint();
+  checkpoint.resume_pc = checkpoint.owning_function_end_address + 4;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+
+  checkpoint = MakeThreadCheckpoint();
+  checkpoint.outer_guest_return_address = 0;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint.outer_guest_return_address = 0xBCBCBCBE;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+
+  checkpoint = MakeThreadCheckpoint();
+  checkpoint.resume_kind = static_cast<GuestPPCThreadResumeKind>(0);
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint.resume_kind = static_cast<GuestPPCThreadResumeKind>(3);
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint.resume_kind = static_cast<GuestPPCThreadResumeKind>(UINT32_MAX);
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+
+  checkpoint = MakeThreadCheckpoint();
+  checkpoint.pending_external_event_sequence = 1;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint.pending_external_event_sequence = 0;
+  checkpoint.pending_export_guest_address = 0x80008000;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint.pending_external_event_sequence = 1;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+
+  checkpoint = MakeThreadCheckpoint(
+      GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  checkpoint.pending_external_event_sequence = 0;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint = MakeThreadCheckpoint(
+      GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  checkpoint.pending_export_guest_address = 0;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+  checkpoint.pending_export_guest_address = 0x80008002;
+  RequireThreadCheckpointEncodeFailure(checkpoint);
+
+  for (uint32_t forged_kind : {0u, 3u, UINT32_MAX}) {
+    INFO("forged resume kind " << forged_kind);
+    std::vector<uint8_t> malformed = EncodeValidThreadCheckpoint();
+    WriteU32(&malformed, kThreadResumeKindOffset, forged_kind);
+    RequireThreadCheckpointDecodeFailure(malformed);
+  }
+
+  std::vector<uint8_t> malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, kThreadGuestThreadIdOffset, 0);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, kThreadResumePcOffset, 0x82004002);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, kThreadOwningFunctionOffset, 0);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, kThreadOwningFunctionEndOffset, 0x82002FFC);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, kThreadResumePcOffset, 0x82005000);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, kThreadOuterReturnOffset, 0);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU64(&malformed, kThreadPendingEventOffset, 1);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint();
+  WriteU32(&malformed, kThreadPendingExportOffset, 0x80008000);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint(
+      GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  WriteU64(&malformed, kThreadPendingEventOffset, 0);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint(
+      GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  WriteU32(&malformed, kThreadPendingExportOffset, 0);
+  RequireThreadCheckpointDecodeFailure(malformed);
+
+  malformed = EncodeValidThreadCheckpoint(
+      GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  WriteU32(&malformed, kThreadPendingExportOffset, 0x80008002);
+  RequireThreadCheckpointDecodeFailure(malformed);
+}
+
+TEST_CASE("PPC thread checkpoint binding rejects every identity mismatch",
+          "[guest-invocation-artifact]") {
+  const GuestPPCThreadCheckpoint checkpoint = MakeThreadCheckpoint(
+      GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  const GuestPPCThreadCheckpointBinding expected =
+      MakeThreadCheckpointBinding(checkpoint);
+  std::string error;
+  REQUIRE(GuestPPCThreadCheckpointCodec::ValidateBinding(checkpoint, expected,
+                                                         &error));
+  REQUIRE(error.empty());
+
+  GuestPPCThreadCheckpointBinding mismatch = expected;
+  ++mismatch.participant_ordinal;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      checkpoint, mismatch, &error));
+  REQUIRE_FALSE(error.empty());
+
+  mismatch = expected;
+  ++mismatch.guest_thread_id;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      checkpoint, mismatch, &error));
+  REQUIRE_FALSE(error.empty());
+
+  mismatch = expected;
+  mismatch.resume_pc += 4;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      checkpoint, mismatch, &error));
+  REQUIRE_FALSE(error.empty());
+
+  mismatch = expected;
+  mismatch.owning_function_address += 4;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      checkpoint, mismatch, &error));
+  REQUIRE_FALSE(error.empty());
+
+  mismatch = expected;
+  mismatch.owning_function_end_address -= 4;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      checkpoint, mismatch, &error));
+  REQUIRE_FALSE(error.empty());
+
+  mismatch = expected;
+  mismatch.outer_guest_return_address += 4;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      checkpoint, mismatch, &error));
+  REQUIRE_FALSE(error.empty());
+
+  mismatch = expected;
+  ++mismatch.pending_external_event_sequence;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      checkpoint, mismatch, &error));
+  REQUIRE_FALSE(error.empty());
+
+  mismatch = expected;
+  mismatch.pending_export_guest_address += 4;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      checkpoint, mismatch, &error));
+  REQUIRE_FALSE(error.empty());
+
+  mismatch = expected;
+  mismatch.resume_kind = GuestPPCThreadResumeKind::kGuestBlockHead;
+  mismatch.pending_external_event_sequence = 0;
+  mismatch.pending_export_guest_address = 0;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      checkpoint, mismatch, &error));
+  REQUIRE_FALSE(error.empty());
+
+  GuestPPCThreadCheckpoint invalid = checkpoint;
+  invalid.resume_pc |= 2;
+  REQUIRE_FALSE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      invalid, expected, &error));
+  REQUIRE_FALSE(error.empty());
+}
+
+TEST_CASE("PPC thread checkpoint preserves full-width routing and edge bits",
+          "[guest-invocation-artifact]") {
+  GuestPPCThreadCheckpoint expected = MakeThreadCheckpoint(
+      GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  expected.participant_ordinal = UINT32_MAX;
+  expected.guest_thread_id = UINT32_MAX;
+  expected.owning_function_address = 0xFFFFFFF0;
+  expected.owning_function_end_address = 0xFFFFFFFC;
+  expected.resume_pc = 0xFFFFFFFC;
+  expected.outer_guest_return_address = 0xFFFFFFF8;
+  expected.pending_external_event_sequence = UINT64_MAX;
+  expected.pending_export_guest_address = 0xFFFFFFF4;
+  expected.registers.gpr.front() = UINT64_MAX;
+  expected.registers.gpr.back() = 0;
+  expected.registers.fpr_bits.front() = 0xFFF0000000000001ull;
+  expected.registers.fpr_bits.back() = 0x8000000000000000ull;
+  expected.registers.vector_registers.front().fill(UINT8_MAX);
+  expected.registers.condition_register_fields.back().fill(UINT8_MAX);
+  expected.registers.link_register = UINT64_MAX;
+  expected.registers.fpscr = UINT32_MAX;
+  expected.registers.vscr_vector.fill(UINT8_MAX);
+  expected.registers.vrsave = UINT32_MAX;
+  expected.registers.xer_ca = UINT8_MAX;
+  expected.registers.xer_ov = UINT8_MAX;
+  expected.registers.xer_so = UINT8_MAX;
+  expected.registers.vscr_sat = UINT8_MAX;
+
+  std::vector<uint8_t> first;
+  std::vector<uint8_t> second;
+  REQUIRE(GuestPPCThreadCheckpointCodec::Encode(expected, &first));
+  REQUIRE(GuestPPCThreadCheckpointCodec::Encode(expected, &second));
+  REQUIRE(first == second);
+
+  GuestPPCThreadCheckpoint decoded;
+  REQUIRE(GuestPPCThreadCheckpointCodec::Decode(first, &decoded));
+  REQUIRE(decoded == expected);
+  REQUIRE(GuestPPCThreadCheckpointCodec::ValidateBinding(
+      decoded, MakeThreadCheckpointBinding(expected)));
 }
 
 TEST_CASE("guest invocation artifact round-trips multiple captures exactly",

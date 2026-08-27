@@ -29,8 +29,11 @@ constexpr std::array<uint8_t, 8> kMagic = {'X', 'E', 'P', 'P',
                                            'C', 'I', 'R', 0};
 constexpr std::array<uint8_t, 8> kRegisterStateMagic = {'X', 'E', 'P', 'P',
                                                         'C', 'S', 'T', 0};
+constexpr std::array<uint8_t, 8> kThreadCheckpointMagic = {'X', 'E', 'P', 'P',
+                                                           'C', 'T', 'C', 0};
 constexpr uint32_t kArtifactKnownFlags = 0;
 constexpr uint32_t kRegisterStateKnownFlags = 0;
+constexpr uint32_t kThreadCheckpointKnownFlags = 0;
 constexpr uint32_t kRegisterStatePayloadSize =
     32 * sizeof(uint64_t) + 32 * sizeof(uint64_t) + 128 * 16 + 8 * 4 +
     3 * sizeof(uint64_t) + sizeof(uint32_t) + 16 + sizeof(uint32_t) + 4;
@@ -47,6 +50,20 @@ static_assert(sizeof(PPCContext_s::vscr_vec) == 16);
 static_assert(kRegisterStatePayloadSize ==
               GuestPPCRegisterStateCodec::kPayloadSize);
 static_assert(8 + 4 + 4 + 8 + 4 + 4 == GuestPPCRegisterStateCodec::kHeaderSize);
+static_assert(8 + 4 + 4 + 8 + 4 + 4 ==
+              GuestPPCThreadCheckpointCodec::kHeaderSize);
+static_assert(8 * sizeof(uint32_t) + sizeof(uint64_t) +
+                  GuestPPCThreadCheckpointCodec::kReservationReservedSize +
+                  GuestPPCThreadCheckpointCodec::kLifecycleReservedSize ==
+              GuestPPCThreadCheckpointCodec::kMetadataSize);
+static_assert(GuestPPCThreadCheckpointCodec::kReservationReservedSize %
+                      sizeof(uint64_t) ==
+                  0 &&
+              GuestPPCThreadCheckpointCodec::kLifecycleReservedSize %
+                      sizeof(uint64_t) ==
+                  0);
+static_assert(GuestPPCThreadCheckpointCodec::kRegisterStateOffset == 104);
+static_assert(GuestPPCThreadCheckpointCodec::kEncodedSize == 2780);
 
 bool Fail(std::string* error, std::string_view message) {
   if (error) {
@@ -186,6 +203,63 @@ bool ValidateInvocation(const GuestFunctionInvocation& invocation,
     }
   }
   return true;
+}
+
+bool ValidateThreadCheckpointRoute(
+    uint32_t guest_thread_id, GuestPPCThreadResumeKind resume_kind,
+    uint32_t resume_pc, uint32_t owning_function_address,
+    uint32_t owning_function_end_address, uint32_t outer_guest_return_address,
+    uint64_t pending_external_event_sequence,
+    uint32_t pending_export_guest_address, std::string* error) {
+  if (!guest_thread_id) {
+    return Fail(error, "thread checkpoint guest thread ID is zero");
+  }
+  if (!resume_pc || (resume_pc & 3)) {
+    return Fail(error, "thread checkpoint resume PC is invalid");
+  }
+  if (!owning_function_address || (owning_function_address & 3) ||
+      (owning_function_end_address & 3) ||
+      owning_function_end_address < owning_function_address) {
+    return Fail(error, "thread checkpoint owning function extent is invalid");
+  }
+  if (resume_pc < owning_function_address ||
+      resume_pc > owning_function_end_address) {
+    return Fail(error,
+                "thread checkpoint resume PC is outside its owning function");
+  }
+  if (!outer_guest_return_address || (outer_guest_return_address & 3)) {
+    return Fail(error, "thread checkpoint outer return boundary is invalid");
+  }
+
+  switch (resume_kind) {
+    case GuestPPCThreadResumeKind::kGuestBlockHead:
+      if (pending_external_event_sequence || pending_export_guest_address) {
+        return Fail(error,
+                    "block-head checkpoint contains pending extern identity");
+      }
+      return true;
+    case GuestPPCThreadResumeKind::kPendingModeledBlockingExtern:
+      if (!pending_external_event_sequence || !pending_export_guest_address ||
+          (pending_export_guest_address & 3)) {
+        return Fail(
+            error,
+            "pending-extern checkpoint has invalid event/export identity");
+      }
+      return true;
+    default:
+      return Fail(error, "thread checkpoint resume kind is unsupported");
+  }
+}
+
+bool ValidateThreadCheckpoint(const GuestPPCThreadCheckpoint& checkpoint,
+                              std::string* error) {
+  return ValidateThreadCheckpointRoute(
+      checkpoint.guest_thread_id, checkpoint.resume_kind, checkpoint.resume_pc,
+      checkpoint.owning_function_address,
+      checkpoint.owning_function_end_address,
+      checkpoint.outer_guest_return_address,
+      checkpoint.pending_external_event_sequence,
+      checkpoint.pending_export_guest_address, error);
 }
 
 bool ValidateArtifact(const GuestInvocationArtifact& artifact,
@@ -524,6 +598,207 @@ bool GuestPPCRegisterStateCodec::Decode(const uint8_t* data, size_t data_size,
     return Fail(error, "register-state blob has trailing data");
   }
   *output = std::move(state);
+  return true;
+}
+
+bool GuestPPCThreadCheckpointCodec::Encode(
+    const GuestPPCThreadCheckpoint& checkpoint, std::vector<uint8_t>* output,
+    std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!output) {
+    return Fail(error, "thread checkpoint encoded output is null");
+  }
+  output->clear();
+  if (!ValidateThreadCheckpoint(checkpoint, error)) {
+    return false;
+  }
+
+  std::vector<uint8_t> register_state;
+  if (!GuestPPCRegisterStateCodec::Encode(checkpoint.registers, &register_state,
+                                          error)) {
+    return false;
+  }
+  if (register_state.size() != GuestPPCRegisterStateCodec::kEncodedSize) {
+    return Fail(error,
+                "thread checkpoint nested register size is noncanonical");
+  }
+
+  Writer writer(kEncodedSize);
+  writer.WriteBytes(kThreadCheckpointMagic.data(),
+                    kThreadCheckpointMagic.size());
+  writer.WriteU32(kVersion);
+  writer.WriteU32(kHeaderSize);
+  writer.WriteU64(kEncodedSize);
+  writer.WriteU32(kThreadCheckpointKnownFlags);
+  writer.WriteU32(0);
+  writer.WriteU32(checkpoint.participant_ordinal);
+  writer.WriteU32(checkpoint.guest_thread_id);
+  writer.WriteU32(static_cast<uint32_t>(checkpoint.resume_kind));
+  writer.WriteU32(checkpoint.resume_pc);
+  writer.WriteU32(checkpoint.owning_function_address);
+  writer.WriteU32(checkpoint.owning_function_end_address);
+  writer.WriteU32(checkpoint.outer_guest_return_address);
+  writer.WriteU32(checkpoint.pending_export_guest_address);
+  writer.WriteU64(checkpoint.pending_external_event_sequence);
+  for (uint32_t i = 0; i < kReservationReservedSize / sizeof(uint64_t); ++i) {
+    writer.WriteU64(0);
+  }
+  for (uint32_t i = 0; i < kLifecycleReservedSize / sizeof(uint64_t); ++i) {
+    writer.WriteU64(0);
+  }
+  writer.WriteBytes(register_state.data(), register_state.size());
+
+  *output = writer.TakeData();
+  if (output->size() != kEncodedSize) {
+    output->clear();
+    return Fail(error, "thread checkpoint internal encoded-size mismatch");
+  }
+  return true;
+}
+
+bool GuestPPCThreadCheckpointCodec::Decode(const uint8_t* data,
+                                           size_t data_size,
+                                           GuestPPCThreadCheckpoint* output,
+                                           std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!output) {
+    return Fail(error, "thread checkpoint decoded output is null");
+  }
+  if (!data && data_size) {
+    return Fail(error, "thread checkpoint input data is null");
+  }
+
+  Reader reader(data, data_size);
+  std::array<uint8_t, kThreadCheckpointMagic.size()> magic = {};
+  uint32_t version = 0;
+  uint32_t header_size = 0;
+  uint64_t encoded_size = 0;
+  uint32_t flags = 0;
+  uint32_t header_reserved = 0;
+  if (!reader.ReadBytes(magic.data(), magic.size()) ||
+      !reader.ReadU32(&version) || !reader.ReadU32(&header_size) ||
+      !reader.ReadU64(&encoded_size) || !reader.ReadU32(&flags) ||
+      !reader.ReadU32(&header_reserved)) {
+    return Fail(error, "thread checkpoint header is truncated");
+  }
+  if (magic != kThreadCheckpointMagic) {
+    return Fail(error, "thread checkpoint magic is invalid");
+  }
+  if (version != kVersion) {
+    return Fail(error, "thread checkpoint version is unsupported");
+  }
+  if (header_size != kHeaderSize) {
+    return Fail(error, "thread checkpoint header size is unsupported");
+  }
+  if (encoded_size != kEncodedSize) {
+    return Fail(error, "thread checkpoint encoded size is noncanonical");
+  }
+  if (flags & ~kThreadCheckpointKnownFlags) {
+    return Fail(error, "thread checkpoint contains unknown flags");
+  }
+  if (header_reserved) {
+    return Fail(error, "thread checkpoint header reserved field is nonzero");
+  }
+  if (data_size != kEncodedSize) {
+    return Fail(error, data_size < kEncodedSize
+                           ? "thread checkpoint blob is truncated"
+                           : "thread checkpoint blob has trailing data");
+  }
+
+  GuestPPCThreadCheckpoint checkpoint;
+  uint32_t resume_kind = 0;
+  std::array<uint64_t, kReservationReservedSize / sizeof(uint64_t)>
+      reservation_reserved = {};
+  std::array<uint64_t, kLifecycleReservedSize / sizeof(uint64_t)>
+      lifecycle_reserved = {};
+  if (!reader.ReadU32(&checkpoint.participant_ordinal) ||
+      !reader.ReadU32(&checkpoint.guest_thread_id) ||
+      !reader.ReadU32(&resume_kind) || !reader.ReadU32(&checkpoint.resume_pc) ||
+      !reader.ReadU32(&checkpoint.owning_function_address) ||
+      !reader.ReadU32(&checkpoint.owning_function_end_address) ||
+      !reader.ReadU32(&checkpoint.outer_guest_return_address) ||
+      !reader.ReadU32(&checkpoint.pending_export_guest_address) ||
+      !reader.ReadU64(&checkpoint.pending_external_event_sequence)) {
+    return Fail(error, "thread checkpoint metadata is truncated");
+  }
+  for (uint64_t& value : reservation_reserved) {
+    if (!reader.ReadU64(&value)) {
+      return Fail(error, "thread checkpoint reservation space is truncated");
+    }
+  }
+  for (uint64_t& value : lifecycle_reserved) {
+    if (!reader.ReadU64(&value)) {
+      return Fail(error, "thread checkpoint lifecycle space is truncated");
+    }
+  }
+  if (std::any_of(reservation_reserved.cbegin(), reservation_reserved.cend(),
+                  [](uint64_t value) { return value != 0; })) {
+    return Fail(error, "thread checkpoint reservation space is nonzero");
+  }
+  if (std::any_of(lifecycle_reserved.cbegin(), lifecycle_reserved.cend(),
+                  [](uint64_t value) { return value != 0; })) {
+    return Fail(error, "thread checkpoint lifecycle space is nonzero");
+  }
+  if (reader.remaining() != GuestPPCRegisterStateCodec::kEncodedSize) {
+    return Fail(error,
+                "thread checkpoint register-state extent is noncanonical");
+  }
+
+  checkpoint.resume_kind = static_cast<GuestPPCThreadResumeKind>(resume_kind);
+  if (!ValidateThreadCheckpoint(checkpoint, error)) {
+    return false;
+  }
+
+  std::string register_error;
+  if (!GuestPPCRegisterStateCodec::Decode(
+          data + kRegisterStateOffset, GuestPPCRegisterStateCodec::kEncodedSize,
+          &checkpoint.registers, &register_error)) {
+    return Fail(error, "thread checkpoint nested register blob is invalid: " +
+                           register_error);
+  }
+
+  *output = std::move(checkpoint);
+  return true;
+}
+
+bool GuestPPCThreadCheckpointCodec::ValidateBinding(
+    const GuestPPCThreadCheckpoint& checkpoint,
+    const GuestPPCThreadCheckpointBinding& binding, std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!ValidateThreadCheckpoint(checkpoint, error) ||
+      !ValidateThreadCheckpointRoute(
+          binding.guest_thread_id, binding.resume_kind, binding.resume_pc,
+          binding.owning_function_address, binding.owning_function_end_address,
+          binding.outer_guest_return_address,
+          binding.pending_external_event_sequence,
+          binding.pending_export_guest_address, error)) {
+    return false;
+  }
+  if (checkpoint.participant_ordinal != binding.participant_ordinal ||
+      checkpoint.guest_thread_id != binding.guest_thread_id) {
+    return Fail(error, "thread checkpoint participant identity mismatch");
+  }
+  if (checkpoint.resume_kind != binding.resume_kind ||
+      checkpoint.resume_pc != binding.resume_pc ||
+      checkpoint.owning_function_address != binding.owning_function_address ||
+      checkpoint.owning_function_end_address !=
+          binding.owning_function_end_address ||
+      checkpoint.outer_guest_return_address !=
+          binding.outer_guest_return_address) {
+    return Fail(error, "thread checkpoint resume catalog binding mismatch");
+  }
+  if (checkpoint.pending_external_event_sequence !=
+          binding.pending_external_event_sequence ||
+      checkpoint.pending_export_guest_address !=
+          binding.pending_export_guest_address) {
+    return Fail(error, "thread checkpoint pending extern binding mismatch");
+  }
   return true;
 }
 
