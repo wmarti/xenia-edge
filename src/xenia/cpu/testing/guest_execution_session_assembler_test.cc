@@ -2759,7 +2759,8 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
           event.count = 1;
           break;
         case kernel::GuestSchedulerCaptureEventKind::kBlock:
-          event.flags = kernel::kGuestSchedulerCaptureFlagGated;
+          event.flags = kernel::kGuestSchedulerCaptureFlagGated |
+                        kernel::kGuestSchedulerCaptureFlagInterruptible;
           break;
         case kernel::GuestSchedulerCaptureEventKind::kReready:
           event.reason = kernel::GuestSchedulerCaptureReason::kPolled;
@@ -2971,7 +2972,10 @@ TEST_CASE("scheduler event bridge authenticates every cooperative wait kind",
                                     &harness.error) == Action::kContinue);
   }
   REQUIRE(harness.assembler->RequestStop() == Action::kHold);
-  REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kHold);
+  const Action stop_arrival = harness.assembler->ArriveAtSafepoint(kA);
+  INFO(harness.status().message);
+  INFO(static_cast<uint32_t>(harness.rejection()));
+  REQUIRE(stop_arrival == Action::kHold);
   REQUIRE(bridge.SealSession(*harness.assembler, BridgeCheckpoint(2),
                              &harness.error));
   REQUIRE(harness.assembler->Publish(&harness.error));
