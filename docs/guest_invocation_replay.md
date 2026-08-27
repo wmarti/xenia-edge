@@ -181,6 +181,26 @@ replay cannot independently trap a new access to another supplied page in the
 same granule. V1 records this granularity limitation instead of claiming a
 guest-page access boundary that the host cannot enforce.
 
+The runner itself is created only on Apple A64. An access outside the supplied
+closure deliberately reaches a no-access mapping and may terminate the process;
+some unsupported virtual ranges may fault earlier in memory-heap lookup. V1
+does not recover in-process with a signal handler or non-local jump across JIT
+and C++ frames. Canonical benchmarking runs every invocation executable as a
+disposable subprocess through `tools/bench/bench_guest_invocation.py`. A signal,
+nonzero exit, timeout, or missing canonical marker invalidates the campaign and
+is never converted into a sample. Direct command-line replay is useful for
+diagnosis, but it is not the fault-containment boundary and may terminate when
+a capture omitted a dynamically accessed page. This subprocess boundary limits
+failure propagation; it is not a security sandbox for untrusted artifacts.
+
+Before title capture is enabled, a linked synthetic integration gate must run
+an invocation that accesses an omitted page (including an unsupported `0x7F`
+range) through the canonical driver. Passing means the real child fault or
+rejection produces driver exit 2, an invalid report and no accepted sample. The
+focused Python test mocks signaled and markerless child results; it proves the
+driver's rejection logic, not the real JIT fault path or operating-system
+containment by itself.
+
 Before each timed invocation, replay restores the full architectural input
 state and copies only pages whose accepted final bytes differ from their input
 bytes, plus any additional pages required by the host reset granularity. The

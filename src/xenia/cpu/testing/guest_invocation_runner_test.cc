@@ -200,12 +200,16 @@ TEST_CASE("guest invocation runner executes and verifies a real backend",
   std::string error;
   std::unique_ptr<GuestInvocationRunner> runner = GuestInvocationRunner::Create(
       invocation, corpus, std::move(backend), &error);
+#if !XE_PLATFORM_MAC || !XE_ARCH_ARM64
+  REQUIRE_FALSE(runner);
+  REQUIRE(error == "guest invocation replay runner requires Apple A64");
+  return;
+#else
   REQUIRE(runner);
   REQUIRE(error.empty());
   REQUIRE(runner->WarmAndVerify(&error));
   REQUIRE(error.empty());
 
-#if XE_PLATFORM_MAC
   GuestInvocationReplayMetrics metrics;
   REQUIRE(runner->RunTimed(128, &metrics, &error));
   REQUIRE(error.empty());
@@ -217,7 +221,7 @@ TEST_CASE("guest invocation runner executes and verifies a real backend",
   REQUIRE(metrics.reset_page_count_per_invocation ==
           xe::memory::page_size() / JitCorpus::kPageSize);
   REQUIRE(metrics.reset_bytes_per_invocation == xe::memory::page_size());
-#endif  // XE_PLATFORM_MAC
+#endif  // !XE_PLATFORM_MAC || !XE_ARCH_ARM64
 }
 
 }  // namespace test

@@ -75,9 +75,10 @@ struct GuestInvocationReplayMetrics {
 };
 
 // Owns a bare Memory, Processor, backend and ThreadState for one selected
-// invocation. The invocation and corpus are borrowed and must outlive the
-// runner. File decoding, provenance hashes, command-line policy and marker
-// output intentionally remain the caller's responsibility.
+// invocation on Apple A64. The invocation and corpus are borrowed and must
+// outlive the runner. File decoding, provenance hashes, command-line policy,
+// subprocess fault containment and marker output intentionally remain the
+// caller's responsibility.
 class GuestInvocationRunner {
  public:
   static constexpr uint64_t kMaxTimedInvocationCount = 10'000'000;

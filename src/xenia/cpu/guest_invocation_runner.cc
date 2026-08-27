@@ -384,6 +384,10 @@ std::unique_ptr<GuestInvocationRunner> GuestInvocationRunner::Create(
   if (error) {
     error->clear();
   }
+#if !XE_PLATFORM_MAC || !XE_ARCH_ARM64
+  Fail(error, "guest invocation replay runner requires Apple A64");
+  return nullptr;
+#endif  // !XE_PLATFORM_MAC || !XE_ARCH_ARM64
   if (!backend) {
     Fail(error, "invocation replay requires a backend");
     return nullptr;

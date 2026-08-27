@@ -313,13 +313,32 @@ class RunnerTest(unittest.TestCase):
         ])
         self.assertEqual(result["thread_cpu_ns_per_invocation"], 1000.0)
 
-    def test_rejects_nonzero_exit_and_timeout(self):
+    def test_rejects_nonzero_exit_signal_missing_marker_and_timeout(self):
         failed = types.SimpleNamespace(
             stdout="", stderr="failed", returncode=3)
         with mock.patch.object(
                 benchmark.subprocess, "run", return_value=failed):
             with self.assertRaisesRegex(
                     benchmark.BenchmarkError, "exited 3"):
+                benchmark.run_once(
+                    "/tmp/a", [], "/tmp/a.xinv", "/tmp/a.jcorpus",
+                    expected(), 1.0, 1)
+        signaled = types.SimpleNamespace(
+            stdout=metric_line(), stderr="faulted", returncode=-11)
+        with mock.patch.object(
+                benchmark.subprocess, "run", return_value=signaled):
+            with self.assertRaisesRegex(
+                    benchmark.BenchmarkError,
+                    "subprocess terminated by SIGSEGV \\(11\\)"):
+                benchmark.run_once(
+                    "/tmp/a", [], "/tmp/a.xinv", "/tmp/a.jcorpus",
+                    expected(), 1.0, 1)
+        missing_marker = types.SimpleNamespace(
+            stdout="completed without proof", stderr="", returncode=0)
+        with mock.patch.object(
+                benchmark.subprocess, "run", return_value=missing_marker):
+            with self.assertRaisesRegex(
+                    benchmark.BenchmarkError, "expected exactly one"):
                 benchmark.run_once(
                     "/tmp/a", [], "/tmp/a.xinv", "/tmp/a.jcorpus",
                     expected(), 1.0, 1)

@@ -22,6 +22,7 @@ import os
 import pathlib
 import platform
 import re
+import signal
 import statistics
 import subprocess
 import sys
@@ -228,6 +229,16 @@ def run_once(exe, extra, artifact, corpus, expected, timeout,
         raise BenchmarkError(f"unable to launch {exe}: {error}") from error
 
     output = process.stdout + "\n" + process.stderr
+    if process.returncode < 0:
+        signal_number = -process.returncode
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = "unknown signal"
+        tail = "\n".join(output.splitlines()[-20:])
+        raise BenchmarkError(
+            "guest invocation subprocess terminated by "
+            f"{signal_name} ({signal_number}) with {exe}:\n{tail}")
     if process.returncode != 0:
         tail = "\n".join(output.splitlines()[-20:])
         raise BenchmarkError(
