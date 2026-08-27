@@ -14,12 +14,62 @@
 #include <cstring>
 
 #include "xenia/base/platform.h"
+#include "xenia/cpu/raw_module.h"
 
 using namespace xe;
 using namespace xe::cpu;
 using namespace xe::cpu::hir;
 using namespace xe::cpu::testing;
 using xe::cpu::ppc::PPCContext;
+
+TEST_CASE("EXECUTE_RAW_RESUMES_GUEST_CONTINUATION", "[backend][resume]") {
+  constexpr uint32_t kResumeAddress = 0x82040000u;
+  constexpr uint32_t kCallerContinuationAddress = 0x82040100u;
+  constexpr uint32_t kSyntheticReturnAddress = 0xBCBCBCBCu;
+
+  auto memory = std::make_unique<Memory>();
+  REQUIRE(memory->Initialize());
+
+  store_and_swap<uint32_t>(memory->TranslateVirtual(kResumeAddress),
+                           0x38630002u);  // addi r3, r3, 2
+  store_and_swap<uint32_t>(memory->TranslateVirtual(kResumeAddress + 4),
+                           0x4E800020u);  // blr
+  store_and_swap<uint32_t>(memory->TranslateVirtual(kCallerContinuationAddress),
+                           0x38630004u);  // addi r3, r3, 4
+  store_and_swap<uint32_t>(
+      memory->TranslateVirtual(kCallerContinuationAddress + 4),
+      0x7D6803A6u);  // mtlr r11
+  store_and_swap<uint32_t>(
+      memory->TranslateVirtual(kCallerContinuationAddress + 8),
+      0x4E800020u);  // blr
+
+  auto backend = CreateBackend();
+  REQUIRE(backend);
+  auto processor = std::make_unique<Processor>(memory.get(), nullptr);
+  REQUIRE(processor->Setup(std::move(backend)));
+
+  auto module = std::make_unique<RawModule>(processor.get());
+  module->set_name("resume");
+  RawModule* module_ptr = module.get();
+  REQUIRE(processor->AddModule(std::move(module)));
+  module_ptr->SetAddressRange(kResumeAddress, 0x1000);
+
+  const uint32_t stack_size = 64 * 1024;
+  const uint32_t stack_address = memory->SystemHeapAlloc(stack_size);
+  REQUIRE(stack_address != 0);
+  auto thread_state = std::make_unique<ThreadState>(processor.get(), 0x100,
+                                                    stack_address + stack_size);
+  PPCContext* context = thread_state->context();
+  context->r[3] = 10;
+  context->r[11] = kSyntheticReturnAddress;
+  context->lr = kCallerContinuationAddress;
+
+  REQUIRE(processor->ExecuteRaw(thread_state.get(), kResumeAddress));
+  REQUIRE(context->r[3] == 16);
+  REQUIRE(context->lr == kSyntheticReturnAddress);
+
+  memory->SystemHeapFree(stack_address);
+}
 
 // =============================================================================
 // SetGuestRoundingMode (C++ path, not HIR opcode)
