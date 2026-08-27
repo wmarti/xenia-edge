@@ -21,7 +21,10 @@
 #include "xenia/base/threading.h"
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include <vector>
+
 #include "xenia/kernel/guest_scheduler_capture_observer.h"
+#include "xenia/kernel/guest_scheduler_checkpoint.h"
 #endif
 
 namespace xe {
@@ -163,6 +166,21 @@ class GuestScheduler {
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Quiesces the dispatch CPUs without suspending their host threads. Running
+  // guest fibers park at exact block-head JIT safepoints; ready, blocked and
+  // suspended fibers remain in place as passive snapshot subjects. Success
+  // is the checkpoint boundary: every earlier guest store is part of the
+  // baseline. The barrier stays active so callers can serialize that baseline
+  // and publish capture guards before ResumeFromCheckpointBarrier is called.
+  GuestSchedulerCheckpointBarrierRejection PauseForCheckpointBarrier(
+      std::chrono::milliseconds timeout,
+      GuestSchedulerCheckpointBarrierSnapshot* out_snapshot);
+  bool ResumeFromCheckpointBarrier();
+
+  // Internal JIT-safepoint entry. Returns true when the checkpoint request
+  // consumed this preemption, including when it deferred for the global lock.
+  bool TryCheckpointCurrentFiber(XThread* thread, uint32_t guest_pc);
+
   // Installs the shared-owned scheduler capture observer. Rejected once any
   // thread is queued or dispatched, or after Shutdown, so the observer is
   // scheduler-lifetime permanent, sees every enqueue, and arms or disarms
@@ -291,6 +309,11 @@ class GuestScheduler {
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  void AppendCheckpointListLocked(
+      std::vector<GuestSchedulerCheckpointParticipant>& participants,
+      XThread* head, GuestSchedulerCheckpointParticipantState state) const;
+  void RejectCheckpointTopologyChangeLocked();
+
   // Assigns the next sequence and delivers under lock_, which the caller
   // holds. A rejecting observer is latched and receives nothing further.
   void EmitCaptureLocked(GuestSchedulerCaptureEventKind kind, XThread* thread,
@@ -340,6 +363,11 @@ class GuestScheduler {
   // switch.
   mutable std::mutex lock_;
   Cpu cpus_[kMaxCpus];
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  GuestSchedulerCheckpointBarrier checkpoint_barrier_;
+  XThread* checkpoint_held_[kMaxCpus] = {};
+#endif
 
   // A fiber yielding while it holds the recursive global lock lets a
   // co-resident fiber re-enter it, silently breaking mutual exclusion. Each

@@ -30,7 +30,13 @@ void* Backend::AllocThreadData() { return nullptr; }
 
 void Backend::FreeThreadData(void* thread_data) {}
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+void (*preempt_yield_handler)(void* raw_context,
+                              uint64_t guest_address) = nullptr;
+#else
 void (*preempt_yield_handler)(void* raw_context) = nullptr;
+#endif
 
 uint32_t Backend::ReservedLoad32(ppc::PPCContext* context, uint32_t address) {
   return xe::byte_swap(*context->TranslateVirtual<uint32_t*>(address));

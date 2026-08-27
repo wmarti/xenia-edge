@@ -72,11 +72,24 @@ static constexpr uint32_t kLockPreemptDeferReport = 65536;
 
 // JIT safepoint handler. The cold path cleared the flag, so the deferred
 // cases re-set it to retry at the next safepoint.
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+static void PreemptCurrentFiber(void* /*raw_context*/, uint64_t guest_address) {
+#else
 static void PreemptCurrentFiber(void* /*raw_context*/) {
+#endif
   XThread* self = XThread::GetCurrentFiberThread();
   if (!self) {
     return;
   }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  auto* scheduler = self->kernel_state()->guest_scheduler();
+  if (scheduler->TryCheckpointCurrentFiber(
+          self, static_cast<uint32_t>(guest_address))) {
+    return;
+  }
+#endif
   auto* context = self->thread_state()->context();
   auto& links = self->scheduler_links();
   // A co-resident fiber would re-enter the recursive lock on this host thread,
@@ -211,6 +224,182 @@ int GuestScheduler::CpuOf(XThread* thread) const {
   return DispatchCpuOf(thread->guest_object<X_KTHREAD>()->current_cpu);
 }
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+void GuestScheduler::AppendCheckpointListLocked(
+    std::vector<GuestSchedulerCheckpointParticipant>& participants,
+    XThread* head, GuestSchedulerCheckpointParticipantState state) const {
+  for (XThread* thread = head; thread;
+       thread = thread->scheduler_links().ready_next) {
+    GuestSchedulerCheckpointParticipant participant;
+    participant.thread_id = thread->thread_id();
+    participant.cpu = static_cast<int8_t>(thread->scheduler_links().cpu);
+    participant.state = state;
+    if (!thread->scheduler_links().has_run) {
+      participant.resume_kind = GuestSchedulerCheckpointResumeKind::kNotYetRun;
+    } else if (state == GuestSchedulerCheckpointParticipantState::kBlocked) {
+      participant.guest_pc =
+          static_cast<uint32_t>(thread->thread_state()->context()->lr);
+      participant.resume_kind =
+          GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+    } else {
+      participant.resume_kind =
+          GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+    }
+    participants.push_back(participant);
+  }
+}
+
+GuestSchedulerCheckpointBarrierRejection
+GuestScheduler::PauseForCheckpointBarrier(
+    std::chrono::milliseconds timeout,
+    GuestSchedulerCheckpointBarrierSnapshot* out_snapshot) {
+  if (t_current_cpu >= 0) {
+    return GuestSchedulerCheckpointBarrierRejection::kCalledFromDispatchThread;
+  }
+  if (!started_.load(std::memory_order_acquire) ||
+      shutting_down_.load(std::memory_order_acquire)) {
+    return GuestSchedulerCheckpointBarrierRejection::kNotStarted;
+  }
+
+  uint8_t dispatch_cpu_mask = 0;
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    if (checkpoint_barrier_.active()) {
+      return GuestSchedulerCheckpointBarrierRejection::kAlreadyActive;
+    }
+    std::vector<GuestSchedulerCheckpointParticipant> participants;
+    for (int cpu_index = 0; cpu_index < kMaxCpus; ++cpu_index) {
+      Cpu& cpu = cpus_[cpu_index];
+      if (cpu.host_thread) {
+        dispatch_cpu_mask |= uint8_t{1} << cpu_index;
+      }
+      if (cpu.current_thread) {
+        GuestSchedulerCheckpointParticipant participant;
+        participant.thread_id = cpu.current_thread->thread_id();
+        participant.cpu = static_cast<int8_t>(cpu_index);
+        participant.state = GuestSchedulerCheckpointParticipantState::kRunning;
+        participant.resume_kind =
+            GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+        participants.push_back(participant);
+      }
+      for (int priority = 31; priority >= 0; --priority) {
+        AppendCheckpointListLocked(
+            participants, cpu.ready_head[priority],
+            GuestSchedulerCheckpointParticipantState::kReady);
+      }
+      AppendCheckpointListLocked(
+          participants, cpu.blocked_head,
+          GuestSchedulerCheckpointParticipantState::kBlocked);
+      AppendCheckpointListLocked(
+          participants, cpu.suspended_head,
+          GuestSchedulerCheckpointParticipantState::kSuspended);
+    }
+    if (!dispatch_cpu_mask ||
+        !checkpoint_barrier_.Begin(dispatch_cpu_mask, participants)) {
+      auto snapshot = checkpoint_barrier_.snapshot();
+      return snapshot.rejection ==
+                     GuestSchedulerCheckpointBarrierRejection::kNone
+                 ? GuestSchedulerCheckpointBarrierRejection::kInvalidTopology
+                 : snapshot.rejection;
+    }
+    for (Cpu& cpu : cpus_) {
+      if (cpu.current_thread) {
+        cpu.current_thread->thread_state()->context()->preempt_requested = 1;
+      }
+    }
+  }
+
+  for (Cpu& cpu : cpus_) {
+    if (cpu.ready_event) {
+      cpu.ready_event->Set();
+    }
+  }
+
+  if (!checkpoint_barrier_.WaitUntilQuiesced(timeout)) {
+    const auto snapshot = checkpoint_barrier_.snapshot();
+    if (out_snapshot) {
+      *out_snapshot = snapshot;
+    }
+    ResumeFromCheckpointBarrier();
+    return snapshot.rejection == GuestSchedulerCheckpointBarrierRejection::kNone
+               ? GuestSchedulerCheckpointBarrierRejection::kInvalidTopology
+               : snapshot.rejection;
+  }
+  if (out_snapshot) {
+    *out_snapshot = checkpoint_barrier_.snapshot();
+  }
+  return GuestSchedulerCheckpointBarrierRejection::kNone;
+}
+
+bool GuestScheduler::ResumeFromCheckpointBarrier() {
+  std::lock_guard<std::mutex> lock(lock_);
+  if (!checkpoint_barrier_.active()) {
+    return false;
+  }
+  checkpoint_barrier_.Release();
+  for (int cpu_index = 0; cpu_index < kMaxCpus; ++cpu_index) {
+    XThread* thread = checkpoint_held_[cpu_index];
+    if (!thread) {
+      continue;
+    }
+    checkpoint_held_[cpu_index] = nullptr;
+    auto& links = thread->scheduler_links();
+    assert_false(links.running || links.queued || links.blocked ||
+                 links.suspended);
+    links.queued = true;
+    links.cpu = cpu_index;
+    links.preempted = false;
+    LinkReadyLocked(cpus_[cpu_index], thread, true);
+  }
+  for (Cpu& cpu : cpus_) {
+    if (cpu.ready_event) {
+      cpu.ready_event->Set();
+    }
+  }
+  return true;
+}
+
+bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
+                                               uint32_t guest_pc) {
+  if (!checkpoint_barrier_.active()) {
+    return false;
+  }
+  if (xe::global_critical_region::is_held_by_current_thread()) {
+    thread->thread_state()->context()->preempt_requested = 1;
+    return true;
+  }
+  const int cpu_index = t_current_cpu;
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    if (!checkpoint_barrier_.active()) {
+      return false;
+    }
+    if (cpu_index < 0 || cpu_index >= kMaxCpus ||
+        cpus_[cpu_index].current_thread != thread ||
+        checkpoint_held_[cpu_index]) {
+      checkpoint_barrier_.Reject(
+          GuestSchedulerCheckpointBarrierRejection::kUnexpectedSafepoint);
+      return true;
+    }
+    if (!checkpoint_barrier_.ArriveAtSafepoint(thread->thread_id(), cpu_index,
+                                               guest_pc)) {
+      return true;
+    }
+    checkpoint_held_[cpu_index] = thread;
+  }
+  YieldToScheduler();
+  return true;
+}
+
+void GuestScheduler::RejectCheckpointTopologyChangeLocked() {
+  if (checkpoint_barrier_.active()) {
+    checkpoint_barrier_.Reject(
+        GuestSchedulerCheckpointBarrierRejection::kTopologyChanged);
+  }
+}
+#endif
+
 void GuestScheduler::EnsureStarted() {
   bool expected = false;
   if (!started_.compare_exchange_strong(expected, true)) {
@@ -264,7 +453,20 @@ void GuestScheduler::Shutdown() {
   if (stopped_.load()) {
     return;
   }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (checkpoint_barrier_.active()) {
+    checkpoint_barrier_.Reject(
+        GuestSchedulerCheckpointBarrierRejection::kShutdown);
+  }
+#endif
   shutting_down_.store(true);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (checkpoint_barrier_.active()) {
+    ResumeFromCheckpointBarrier();
+  }
+#endif
   for (Cpu& cpu : cpus_) {
     if (cpu.ready_event) {
       cpu.ready_event->Set();
@@ -411,6 +613,10 @@ void GuestScheduler::EnqueueReady(XThread* thread, int cpu_index,
     if (links.queued) {
       return;
     }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    RejectCheckpointTopologyChangeLocked();
+#endif
     links.queued = true;
     links.cpu = cpu_index;
     bool at_head = links.preempted;
@@ -452,6 +658,10 @@ void GuestScheduler::ResumeThread(XThread* thread) {
     std::lock_guard<std::mutex> lock(lock_);
     auto& links = thread->scheduler_links();
     if (links.suspended) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      RejectCheckpointTopologyChangeLocked();
+#endif
       Cpu& cpu = cpus_[links.cpu];
       UnlinkLocked(cpu.suspended_head, cpu.suspended_tail, thread);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
@@ -469,6 +679,10 @@ void GuestScheduler::ResumeThread(XThread* thread) {
 
 bool GuestScheduler::ParkSuspended(XThread* thread, int cpu_index) {
   std::lock_guard<std::mutex> lock(lock_);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  RejectCheckpointTopologyChangeLocked();
+#endif
   auto& links = thread->scheduler_links();
   // Re-read under the lock, a Resume racing the dispatcher's check would have
   // found us not yet parked and parking anyway would strand the thread.
@@ -516,6 +730,10 @@ XThread* GuestScheduler::DequeueReady(int cpu_index) {
   if (cpu.ready_summary == 0) {
     return nullptr;
   }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  RejectCheckpointTopologyChangeLocked();
+#endif
   // Strict priority alone lets a high-priority yield-spinner deadlock on the
   // lower-priority co-resident it depends on, so a voluntary yield opts out.
   XThread* yielder = cpu.yield_to_other;
@@ -586,6 +804,10 @@ void GuestScheduler::LinkHeadLocked(XThread*& head, XThread*& tail,
 }
 
 void GuestScheduler::LinkReadyLocked(Cpu& cpu, XThread* thread, bool at_head) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  RejectCheckpointTopologyChangeLocked();
+#endif
   auto& links = thread->scheduler_links();
   int prio = ClampPriority(thread->priority());
   links.queued_prio = prio;
@@ -635,6 +857,10 @@ void GuestScheduler::RequeueForPriority(XThread* thread) {
   if (!links.queued || links.cpu < 0) {
     return;
   }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  RejectCheckpointTopologyChangeLocked();
+#endif
   Cpu& cpu = cpus_[links.cpu];
   int old = links.queued_prio;
   UnlinkLocked(cpu.ready_head[old], cpu.ready_tail[old], thread);
@@ -651,6 +877,10 @@ void GuestScheduler::RequeueForPriority(XThread* thread) {
 
 bool GuestScheduler::ForgetThread(XThread* thread) {
   std::lock_guard<std::mutex> lock(lock_);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  RejectCheckpointTopologyChangeLocked();
+#endif
   auto& links = thread->scheduler_links();
   // A thread that ever ran has a live fiber stack and one a dispatch thread
   // owns is about to be switched to, so neither may be freed.
@@ -698,6 +928,10 @@ bool GuestScheduler::TerminateThread(XThread* thread) {
   int wake_cpu = -1;
   {
     std::lock_guard<std::mutex> lock(lock_);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    RejectCheckpointTopologyChangeLocked();
+#endif
     auto& links = thread->scheduler_links();
     links.terminate_pending.store(true, std::memory_order_relaxed);
     if (stopped_.load() || !started_.load()) {
@@ -793,16 +1027,34 @@ void GuestScheduler::SwitchTo(XThread* next) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   const bool capture_first_run = !links.has_run;
-#endif
+#else
   if (!links.has_run) {
     links.has_run = true;
     dispatched_any_.store(true);
     XELOGI("GuestScheduler: first run tid={:08X} '{}'", next->thread_id(),
            next->thread_name());
   }
+#endif
   {
     std::lock_guard<std::mutex> lock(lock_);
     assert_true(links.running);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    if (checkpoint_barrier_.active()) {
+      RejectCheckpointTopologyChangeLocked();
+      links.running = false;
+      links.queued = true;
+      links.cpu = t_current_cpu;
+      LinkReadyLocked(cpus_[t_current_cpu], next, true);
+      return;
+    }
+    if (!links.has_run) {
+      links.has_run = true;
+      dispatched_any_.store(true);
+      XELOGI("GuestScheduler: first run tid={:08X} '{}'", next->thread_id(),
+             next->thread_name());
+    }
+#endif
     cpus_[t_current_cpu].switch_seq.fetch_add(1, std::memory_order_relaxed);
     cpus_[t_current_cpu].current_thread = next;
     // Grant a fresh slice only if the previous one was consumed. A preempted
@@ -851,6 +1103,9 @@ void GuestScheduler::SwitchTo(XThread* next) {
     cpus_[t_current_cpu].current_thread = nullptr;
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    if (checkpoint_held_[t_current_cpu] == next) {
+      checkpoint_barrier_.ConfirmSwitchOut(next->thread_id(), t_current_cpu);
+    }
     EmitCaptureLocked(CaptureKind::kSwitchOut, next, t_current_cpu, -1,
                       CaptureReason::kNone, 0, 0);
 #endif
@@ -1228,7 +1483,16 @@ void GuestScheduler::NotifyThreadExited(XThread* thread) {
          thread->thread_name());
   // This CPU's dispatch loop reclaims it, since we can't drop the last handle
   // while running on its fiber.
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    RejectCheckpointTopologyChangeLocked();
+    cpus_[t_current_cpu].exited_thread = thread;
+  }
+#else
   cpus_[t_current_cpu].exited_thread = thread;
+#endif
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   EmitCapture(CaptureKind::kExit, thread, t_current_cpu, -1,
@@ -1279,6 +1543,10 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
   }
   {
     std::lock_guard<std::mutex> lock(lock_);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    RejectCheckpointTopologyChangeLocked();
+#endif
     // A signal between the caller's failed poll and this park bumped the epoch
     // but walked the blocked list before we joined it, so nothing would re-poll
     // us before the backstop. Compare under the walk's own lock and poke this
@@ -1355,6 +1623,10 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
   stats_.repolls.fetch_add(1, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(lock_);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    RejectCheckpointTopologyChangeLocked();
+#endif
     Cpu& cpu = cpus_[cpu_index];
     uint64_t now_ms = Clock::QueryHostUptimeMillis();
     bool force_all = now_ms >= cpu.next_force_repoll_ms;
@@ -1466,6 +1738,18 @@ void GuestScheduler::RunLoop(int cpu_index) {
   XELOGI("GuestScheduler: CPU {} dispatch loop started", cpu_index);
 
   while (!shutting_down_.load()) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    if (checkpoint_barrier_.active()) {
+      checkpoint_barrier_.AcknowledgeDispatchQuiesced(cpu_index);
+      cpu.parked.store(true);
+      if (checkpoint_barrier_.active()) {
+        xe::threading::Wait(cpu.ready_event.get(), false);
+      }
+      cpu.parked.store(false);
+      continue;
+    }
+#endif
     if (cpu_index == 0) {
       ReportStatsIfDue();
     }

@@ -1951,6 +1951,7 @@ void X64Emitter::EmitPreemptCheck(uint32_t guest_address) {
           e.mov(e.rcx, e.qword[e.rax]);
           e.test(e.rcx, e.rcx);
           e.jz(scheduler_done, X64Emitter::T_NEAR);
+          e.mov(e.edx, guest_address);
           e.call(e.backend()->guest_to_host_thunk());
           e.L(scheduler_done);
         }

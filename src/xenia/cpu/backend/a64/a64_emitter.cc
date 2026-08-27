@@ -1535,6 +1535,7 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
                       &xe::cpu::backend::preempt_yield_handler));
       e.ldr(e.x0, ptr(e.x0));
       e.cbz(e.x0, scheduler_done);
+      e.mov(e.x1, static_cast<uint64_t>(guest_address));
       e.ldr(e.x9, ptr(e.GetBackendCtxReg(),
                       static_cast<uint32_t>(offsetof(
                           A64BackendContext, guest_to_host_thunk_address))));

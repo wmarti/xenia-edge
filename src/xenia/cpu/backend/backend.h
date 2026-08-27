@@ -229,7 +229,12 @@ struct GuestTrampolineGroup
 // Registered by the cooperative scheduler when it starts, null otherwise. A
 // JIT safepoint calls it with the PPCContext once the scheduler has raised the
 // context's preempt_requested flag.
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+extern void (*preempt_yield_handler)(void* raw_context, uint64_t guest_address);
+#else
 extern void (*preempt_yield_handler)(void* raw_context);
+#endif
 
 }  // namespace backend
 }  // namespace cpu
