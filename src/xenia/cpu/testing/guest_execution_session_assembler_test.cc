@@ -530,9 +530,11 @@ kernel::GuestSchedulerCaptureEvent BridgeSchedulerEvent(
     event.wait.observed_wait_epoch = 7;
     event.wait.signal_epochs_before[0] = 7;
     event.wait.signal_epochs_observed[0] = 7;
+    event.wait.flags = kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
     if (kind == kernel::GuestSchedulerCaptureEventKind::kBlock) {
-      event.flags = kernel::kGuestSchedulerCaptureFlagGated;
-      event.wait.flags = kernel::kGuestSchedulerCaptureWaitFlagGated;
+      event.flags = kernel::kGuestSchedulerCaptureFlagGated |
+                    kernel::kGuestSchedulerCaptureFlagInterruptible;
+      event.wait.flags |= kernel::kGuestSchedulerCaptureWaitFlagGated;
     }
   }
   return event;
@@ -544,6 +546,7 @@ kernel::GuestSchedulerCaptureEvent BridgeBlockEvent(
   kernel::GuestSchedulerCaptureEvent event = BridgeSchedulerEvent(
       sequence, kernel::GuestSchedulerCaptureEventKind::kBlock);
   event.value = static_cast<uint8_t>(wait_kind);
+  event.flags = 0;
   event.wait = {};
   event.wait.observed_uptime_ms = 50;
   bool interruptible = true;
@@ -2597,7 +2600,8 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
   kernel::GuestSchedulerCaptureEvent reready = BridgeSchedulerEvent(
       43, kernel::GuestSchedulerCaptureEventKind::kReready, kB);
   reready.reason = kernel::GuestSchedulerCaptureReason::kSignalEpoch;
-  reready.wait.flags = kernel::kGuestSchedulerCaptureWaitFlagGated;
+  reready.wait.flags = kernel::kGuestSchedulerCaptureWaitFlagGated |
+                       kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
   reready.wait.observed_wait_epoch = 8;
   reready.wait.signal_epochs_observed[0] = 8;
   REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, reready,
