@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "xenia/cpu/execution_jit_corpus.h"
+#include "xenia/cpu/guest_execution_continuous_event.h"
 #include "xenia/cpu/guest_execution_session.h"
 #include "xenia/cpu/guest_execution_session_bundle.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
@@ -157,6 +158,61 @@ struct GuestExecutionSessionReplayPlan {
 bool BuildGuestExecutionSessionReplayPlan(
     const GuestExecutionSessionBundle& bundle, uint32_t host_page_size,
     GuestExecutionSessionReplayPlan* output, std::string* error = nullptr);
+
+struct GuestExecutionContinuousReplayResumeEntry {
+  uint32_t resume_pc = 0;
+  uint32_t owning_function_address = 0;
+  uint32_t owning_function_end_address = 0;
+
+  bool operator==(const GuestExecutionContinuousReplayResumeEntry&) const =
+      default;
+};
+
+struct GuestExecutionContinuousReplayParticipant {
+  uint32_t ordinal = 0;
+  uint32_t guest_thread_id = 0;
+  GuestExecutionSessionInitialOuterCallState initial_outer_call_state =
+      GuestExecutionSessionInitialOuterCallState::kOutside;
+  GuestExecutionSessionBoundaryArrivalKind boundary_arrival_kind =
+      GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside;
+  uint64_t held_after_event_sequence = 0;
+  ppc::GuestPPCThreadCheckpoint initial_checkpoint;
+  ppc::GuestPPCThreadCheckpoint final_checkpoint;
+};
+
+struct GuestExecutionContinuousReplayEvent {
+  GuestExecutionSessionEvent canonical;
+  GuestExecutionContinuousEvent control;
+  const std::vector<uint8_t>* payload = nullptr;
+};
+
+struct GuestExecutionContinuousReplayPlan {
+  GuestExecutionContinuousReplayPlan() = default;
+  GuestExecutionContinuousReplayPlan(GuestExecutionContinuousReplayPlan&&) =
+      default;
+  GuestExecutionContinuousReplayPlan& operator=(
+      GuestExecutionContinuousReplayPlan&&) = default;
+  GuestExecutionContinuousReplayPlan(
+      const GuestExecutionContinuousReplayPlan&) = delete;
+  GuestExecutionContinuousReplayPlan& operator=(
+      const GuestExecutionContinuousReplayPlan&) = delete;
+
+  uint32_t host_page_size = 0;
+  ExecutionJitCorpus corpus;
+  GuestExecutionSessionCheckpoint initial_session_checkpoint;
+  GuestExecutionSessionCheckpoint final_session_checkpoint;
+  std::vector<GuestExecutionContinuousReplayParticipant> participants;
+  std::vector<GuestExecutionContinuousReplayEvent> events;
+  std::vector<GuestExecutionContinuousReplayResumeEntry> resume_entries;
+  std::vector<GuestExecutionSessionReplayPage> pages;
+  std::vector<GuestInvocationReplayProtectionGranule> protection_granules;
+  std::vector<uint32_t> reset_page_addresses;
+  std::map<GuestExecutionSessionSha256, const std::vector<uint8_t>*> blobs;
+};
+
+bool BuildGuestExecutionContinuousReplayPlan(
+    const GuestExecutionSessionBundle& bundle, uint32_t host_page_size,
+    GuestExecutionContinuousReplayPlan* output, std::string* error = nullptr);
 
 struct GuestExecutionSessionReplayParticipantMetrics {
   uint64_t thread_cpu_nanoseconds = 0;

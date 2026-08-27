@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -442,7 +443,416 @@ GuestExecutionSessionBundle MakeSessionBundle(const BundleOptions& options) {
   return bundle;
 }
 
+ppc::GuestPPCThreadCheckpoint MakeContinuousThreadCheckpoint(
+    uint32_t ordinal, uint32_t guest_thread_id, uint32_t resume_pc,
+    uint32_t outer_return, uint64_t seed) {
+  ppc::GuestPPCThreadCheckpoint checkpoint;
+  checkpoint.participant_ordinal = ordinal;
+  checkpoint.guest_thread_id = guest_thread_id;
+  checkpoint.resume_pc = resume_pc;
+  checkpoint.owning_function_address = kCodeAddress;
+  checkpoint.owning_function_end_address = kCodeAddress + 0xFC;
+  checkpoint.outer_guest_return_address = outer_return;
+  checkpoint.registers.gpr[3] = kDataAddress;
+  checkpoint.registers.gpr[8] = seed;
+  checkpoint.registers.link_register = kCodeAddress + 0xC0;
+  return checkpoint;
+}
+
+std::vector<uint8_t> EncodeContinuousThreadCheckpoint(
+    const ppc::GuestPPCThreadCheckpoint& checkpoint) {
+  std::vector<uint8_t> bytes;
+  std::string error;
+  REQUIRE(
+      ppc::GuestPPCThreadCheckpointCodec::Encode(checkpoint, &bytes, &error));
+  REQUIRE(error.empty());
+  return bytes;
+}
+
+ppc::GuestPPCThreadCheckpointBinding ContinuousBinding(
+    const ppc::GuestPPCThreadCheckpoint& checkpoint) {
+  ppc::GuestPPCThreadCheckpointBinding binding;
+  binding.participant_ordinal = checkpoint.participant_ordinal;
+  binding.guest_thread_id = checkpoint.guest_thread_id;
+  binding.resume_kind = checkpoint.resume_kind;
+  binding.resume_pc = checkpoint.resume_pc;
+  binding.owning_function_address = checkpoint.owning_function_address;
+  binding.owning_function_end_address = checkpoint.owning_function_end_address;
+  binding.outer_guest_return_address = checkpoint.outer_guest_return_address;
+  binding.pending_external_event_sequence =
+      checkpoint.pending_external_event_sequence;
+  binding.pending_export_guest_address =
+      checkpoint.pending_export_guest_address;
+  return binding;
+}
+
+GuestExecutionSessionBundle MakeContinuousSessionBundle(
+    uint32_t host_page_size) {
+  GuestExecutionSessionBundle bundle;
+  constexpr uint32_t kParticipantCount = 2;
+  const std::array<uint32_t, kParticipantCount> guest_thread_ids = {0x101,
+                                                                    0x202};
+  const std::array<ppc::GuestPPCThreadCheckpoint, kParticipantCount> initial = {
+      MakeContinuousThreadCheckpoint(0, guest_thread_ids[0],
+                                     kCodeAddress + 0x40, kReturnAddress, 1),
+      MakeContinuousThreadCheckpoint(
+          1, guest_thread_ids[1], kCodeAddress + 0x80, kReturnAddress + 4, 2)};
+  const std::array<ppc::GuestPPCThreadCheckpoint, kParticipantCount> final = {
+      MakeContinuousThreadCheckpoint(0, guest_thread_ids[0],
+                                     kCodeAddress + 0x44, kReturnAddress, 11),
+      MakeContinuousThreadCheckpoint(
+          1, guest_thread_ids[1], kCodeAddress + 0x84, kReturnAddress + 4, 12)};
+
+  std::array<GuestExecutionSessionSha256, kParticipantCount> initial_digests;
+  std::array<GuestExecutionSessionSha256, kParticipantCount> final_digests;
+  for (uint32_t i = 0; i < kParticipantCount; ++i) {
+    initial_digests[i] =
+        AddBlob(&bundle, EncodeContinuousThreadCheckpoint(initial[i]));
+    final_digests[i] =
+        AddBlob(&bundle, EncodeContinuousThreadCheckpoint(final[i]));
+  }
+
+  ExecutionJitCorpusBuilder corpus_builder(JitCorpus::kConfigGuestScheduler);
+  GuestExecutionSessionCheckpointChunk initial_chunk;
+  initial_chunk.session_epoch = kEpoch;
+  initial_chunk.ordinal = 0;
+  for (uint32_t i = 0; i < kParticipantCount; ++i) {
+    initial_chunk.checkpoint.thread_states.push_back(
+        {i, ppc::GuestPPCThreadCheckpointCodec::kEncodedSize,
+         initial_digests[i]});
+  }
+  const uint32_t page_count = host_page_size / kGuestPageSize;
+  std::string error;
+  for (uint32_t i = 0; i < page_count; ++i) {
+    std::vector<uint8_t> code(kGuestPageSize, static_cast<uint8_t>(0x30 + i));
+    REQUIRE(corpus_builder.AddCodePage(kCodeAddress + i * kGuestPageSize,
+                                       code.data(), code.size(), &error));
+    initial_chunk.checkpoint.content.push_back(
+        {GuestExecutionSessionContentKind::kGuestCode,
+         kCodeAddress + i * kGuestPageSize, kGuestPageSize,
+         AddBlob(&bundle, std::move(code))});
+  }
+  REQUIRE(corpus_builder.AddFunction({kCodeAddress, kCodeAddress + 0xFC, 64, 0},
+                                     &error));
+  std::vector<uint8_t> corpus_bytes;
+  REQUIRE(corpus_builder.Encode(&corpus_bytes, &error));
+  const GuestExecutionSessionSha256 corpus_digest =
+      AddBlob(&bundle, std::move(corpus_bytes));
+
+  std::vector<GuestExecutionSessionSha256> initial_page_digests;
+  std::vector<GuestExecutionSessionSha256> final_page_digests;
+  for (uint32_t i = 0; i < page_count; ++i) {
+    std::vector<uint8_t> initial_page(kGuestPageSize,
+                                      static_cast<uint8_t>(0x60 + i));
+    std::vector<uint8_t> final_page = initial_page;
+    if (!i) {
+      final_page[0] ^= 0xFF;
+    }
+    initial_page_digests.push_back(AddBlob(&bundle, std::move(initial_page)));
+    final_page_digests.push_back(AddBlob(&bundle, std::move(final_page)));
+    initial_chunk.checkpoint.content.push_back(
+        {GuestExecutionSessionContentKind::kGuestPage,
+         kDataAddress + i * kGuestPageSize, kGuestPageSize,
+         initial_page_digests.back()});
+  }
+  std::sort(initial_chunk.checkpoint.content.begin(),
+            initial_chunk.checkpoint.content.end(),
+            [](const GuestExecutionSessionContentReference& left,
+               const GuestExecutionSessionContentReference& right) {
+              return std::tie(left.kind, left.guest_address) <
+                     std::tie(right.kind, right.guest_address);
+            });
+
+  GuestExecutionSessionCodeCorpusChunk corpus_chunk;
+  corpus_chunk.session_epoch = kEpoch;
+  corpus_chunk.ordinal = 1;
+  corpus_chunk.code_corpus_sha256 = corpus_digest;
+
+  GuestExecutionSessionEventChunk event_chunk;
+  event_chunk.session_epoch = kEpoch;
+  event_chunk.ordinal = 2;
+  auto push = [&](uint32_t owner, GuestExecutionSessionEventKind kind) {
+    GuestExecutionSessionEvent event = ControlEvent(owner, kind);
+    event.global_sequence = event_chunk.events.size() + 1;
+    event_chunk.events.push_back(event);
+  };
+  push(0, GuestExecutionSessionEventKind::kOuterHostCallBegin);
+  push(1, GuestExecutionSessionEventKind::kOuterHostCallBegin);
+  push(0, GuestExecutionSessionEventKind::kInstructionCoverage);
+  event_chunk.events.back().guest_instruction_delta = 10;
+  push(1, GuestExecutionSessionEventKind::kInstructionCoverage);
+  event_chunk.events.back().guest_instruction_delta = 20;
+  push(kGuestExecutionSessionNoThread,
+       GuestExecutionSessionEventKind::kBoundaryRequest);
+  push(0, GuestExecutionSessionEventKind::kJitSafepointArrival);
+  push(1, GuestExecutionSessionEventKind::kJitSafepointArrival);
+  push(kGuestExecutionSessionNoThread,
+       GuestExecutionSessionEventKind::kBoundaryHeld);
+
+  GuestExecutionSessionCheckpointChunk final_chunk;
+  final_chunk.session_epoch = kEpoch;
+  final_chunk.ordinal = 4;
+  final_chunk.checkpoint.global_sequence = event_chunk.events.size();
+  for (uint32_t i = 0; i < kParticipantCount; ++i) {
+    final_chunk.checkpoint.thread_states.push_back(
+        {i, ppc::GuestPPCThreadCheckpointCodec::kEncodedSize,
+         final_digests[i]});
+  }
+  for (const GuestExecutionSessionContentReference& content :
+       initial_chunk.checkpoint.content) {
+    GuestExecutionSessionContentReference final_content = content;
+    if (content.kind == GuestExecutionSessionContentKind::kGuestPage) {
+      const uint32_t page_index = static_cast<uint32_t>(
+          (content.guest_address - kDataAddress) / kGuestPageSize);
+      final_content.sha256 = final_page_digests[page_index];
+    }
+    final_chunk.checkpoint.content.push_back(final_content);
+  }
+
+  std::vector<GuestExecutionContinuousEvent> control_events;
+  for (const GuestExecutionSessionEvent& event : event_chunk.events) {
+    GuestExecutionContinuousEvent control;
+    control.global_sequence = event.global_sequence;
+    control.kind = event.kind;
+    if (event.thread_ordinal != kGuestExecutionSessionNoThread) {
+      control.actor = {event.thread_ordinal,
+                       guest_thread_ids[event.thread_ordinal]};
+    }
+    control_events.push_back(control);
+  }
+  for (uint32_t i = 0; i < kParticipantCount; ++i) {
+    GuestExecutionContinuousEvent& arrival = control_events[5 + i];
+    arrival.subject = {i, guest_thread_ids[i]};
+    arrival.checkpoint.kind =
+        GuestExecutionContinuousCheckpointReferenceKind::kThreadState;
+    arrival.checkpoint.checkpoint_global_sequence =
+        final_chunk.checkpoint.global_sequence;
+    arrival.checkpoint.state_size =
+        ppc::GuestPPCThreadCheckpointCodec::kEncodedSize;
+    arrival.checkpoint.state_sha256 = final_digests[i];
+    arrival.checkpoint.binding = ContinuousBinding(final[i]);
+  }
+
+  bundle.chunks.resize(5);
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      initial_chunk, &bundle.chunks[0], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCodeCorpusChunk(
+      corpus_chunk, &bundle.chunks[1], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
+      event_chunk, &bundle.chunks[2], &error));
+  REQUIRE(GuestExecutionContinuousEventCodec::Encode(
+      control_events, &bundle.chunks[3], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_chunk, &bundle.chunks[4], &error));
+
+  GuestExecutionSessionManifest& manifest = bundle.manifest;
+  manifest.session_epoch = kEpoch;
+  manifest.first_event_sequence = 1;
+  manifest.last_event_sequence = event_chunk.events.size();
+  manifest.capture_start_tick = 100;
+  manifest.stop_request_tick = 500;
+  manifest.capture_end_tick = 800;
+  manifest.capture_tick_frequency = 1000000000;
+  manifest.capture_build_sha256 = Identity(0x10);
+  manifest.replay_config_sha256 = Identity(0x20);
+  manifest.title_identity_sha256 = Identity(0x30);
+  manifest.module_identity_sha256 = Identity(0x40);
+  manifest.accepted_event_count = event_chunk.events.size();
+  manifest.stop_reason = GuestExecutionSessionStopReason::kManualRequest;
+  manifest.stop_request_event_sequence = 5;
+  manifest.stop_request_tick = 500;
+  manifest.stop_request_guest_instruction_count = 30;
+  manifest.maximum_stop_tail_event_count = 4;
+  manifest.maximum_stop_tail_guest_instruction_count = 1;
+  manifest.maximum_stop_tail_ticks = 400;
+  for (uint32_t i = 0; i < kParticipantCount; ++i) {
+    GuestExecutionSessionParticipant participant;
+    participant.ordinal = i;
+    participant.guest_thread_id = guest_thread_ids[i];
+    participant.capture_instance_id = 0x1000 + i;
+    participant.boundary_arrival_kind =
+        GuestExecutionSessionBoundaryArrivalKind::kJitSafepoint;
+    participant.first_event_sequence = 1 + i;
+    participant.last_event_sequence = 6 + i;
+    participant.held_after_event_sequence = 6 + i;
+    participant.initial_state_size =
+        ppc::GuestPPCThreadCheckpointCodec::kEncodedSize;
+    participant.initial_state_sha256 = initial_digests[i];
+    manifest.participants.push_back(participant);
+  }
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                bundle.chunks[0]));
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kCodeCorpus, 1, 0, 0, 1,
+                bundle.chunks[1]));
+  manifest.chunks.push_back(Reference(
+      GuestExecutionSessionChunkKind::kEvents, 2, 1, event_chunk.events.size(),
+      static_cast<uint32_t>(event_chunk.events.size()), bundle.chunks[2]));
+  manifest.chunks.push_back(Reference(
+      GuestExecutionSessionChunkKind::kContinuousEvents, 3, 1,
+      control_events.size(), static_cast<uint32_t>(control_events.size()),
+      bundle.chunks[3]));
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 4,
+                final_chunk.checkpoint.global_sequence,
+                final_chunk.checkpoint.global_sequence, 1, bundle.chunks[4]));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  REQUIRE(error.empty());
+  return bundle;
+}
+
+std::vector<GuestExecutionContinuousEvent> DecodeContinuousControlEvents(
+    const GuestExecutionSessionBundle& bundle) {
+  std::vector<GuestExecutionContinuousEvent> events;
+  std::string error;
+  REQUIRE(GuestExecutionContinuousEventCodec::Decode(bundle.chunks[3], &events,
+                                                     &error));
+  REQUIRE(error.empty());
+  return events;
+}
+
+void ReplaceContinuousControlEvents(
+    GuestExecutionSessionBundle* bundle,
+    const std::vector<GuestExecutionContinuousEvent>& events) {
+  std::string error;
+  REQUIRE(GuestExecutionContinuousEventCodec::Encode(events, &bundle->chunks[3],
+                                                     &error));
+  bundle->manifest.chunks[3] =
+      Reference(GuestExecutionSessionChunkKind::kContinuousEvents, 3,
+                events.front().global_sequence, events.back().global_sequence,
+                static_cast<uint32_t>(events.size()), bundle->chunks[3]);
+  REQUIRE(ValidateGuestExecutionSessionBundle(*bundle, &error));
+  REQUIRE(error.empty());
+}
+
+void ReplaceInitialContinuousCheckpoint(
+    GuestExecutionSessionBundle* bundle, uint32_t ordinal,
+    const ppc::GuestPPCThreadCheckpoint& checkpoint) {
+  GuestExecutionSessionCheckpointChunk initial;
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+      bundle->chunks.front(), &initial, &error));
+  GuestExecutionSessionThreadStateReference& state =
+      initial.checkpoint.thread_states[ordinal];
+  const GuestExecutionSessionSha256 old_digest = state.sha256;
+  std::vector<uint8_t> bytes = EncodeContinuousThreadCheckpoint(checkpoint);
+  const GuestExecutionSessionSha256 new_digest =
+      GuestExecutionSessionCodec::HashBytes(bytes);
+  auto blob =
+      std::find_if(bundle->content_blobs.begin(), bundle->content_blobs.end(),
+                   [&](const GuestExecutionSessionContentBlob& candidate) {
+                     return candidate.sha256 == old_digest;
+                   });
+  REQUIRE(blob != bundle->content_blobs.end());
+  blob->bytes = std::move(bytes);
+  blob->sha256 = new_digest;
+  state.sha256 = new_digest;
+  bundle->manifest.participants[ordinal].initial_state_sha256 = new_digest;
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      initial, &bundle->chunks.front(), &error));
+  bundle->manifest.chunks.front() =
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                bundle->chunks.front());
+  REQUIRE(ValidateGuestExecutionSessionBundle(*bundle, &error));
+  REQUIRE(error.empty());
+}
+
 }  // namespace
+
+TEST_CASE("continuous replay planner binds exact participant continuations",
+          "[guest-execution-session-runner][continuous]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  const GuestExecutionSessionBundle bundle =
+      MakeContinuousSessionBundle(kHostPageSize);
+  GuestExecutionContinuousReplayPlan plan;
+  std::string error;
+  REQUIRE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize, &plan,
+                                                  &error));
+  REQUIRE(error.empty());
+  REQUIRE(plan.participants.size() == 2);
+  REQUIRE(plan.events.size() == 8);
+  REQUIRE(plan.corpus.functions().size() == 1);
+  REQUIRE(plan.initial_session_checkpoint.global_sequence == 0);
+  REQUIRE(plan.final_session_checkpoint.global_sequence == 8);
+  REQUIRE(plan.participants[0].initial_checkpoint.resume_pc ==
+          kCodeAddress + 0x40);
+  REQUIRE(plan.participants[1].initial_checkpoint.resume_pc ==
+          kCodeAddress + 0x80);
+  REQUIRE(plan.participants[0].final_checkpoint.resume_pc ==
+          kCodeAddress + 0x44);
+  REQUIRE(plan.participants[1].final_checkpoint.resume_pc ==
+          kCodeAddress + 0x84);
+  REQUIRE(plan.participants[0].initial_checkpoint.outer_guest_return_address ==
+          kReturnAddress);
+  REQUIRE(plan.participants[1].initial_checkpoint.outer_guest_return_address ==
+          kReturnAddress + 4);
+  REQUIRE(plan.resume_entries ==
+          std::vector<GuestExecutionContinuousReplayResumeEntry>{
+              {kCodeAddress + 0x40, kCodeAddress, kCodeAddress + 0xFC},
+              {kCodeAddress + 0x80, kCodeAddress, kCodeAddress + 0xFC}});
+  REQUIRE(plan.events[5].control.subject.participant_ordinal == 0);
+  REQUIRE(plan.events[6].control.subject.participant_ordinal == 1);
+  REQUIRE(plan.events[5].control.checkpoint.binding.resume_pc ==
+          kCodeAddress + 0x44);
+  REQUIRE(plan.events[6].control.checkpoint.binding.resume_pc ==
+          kCodeAddress + 0x84);
+  REQUIRE(plan.pages.size() == 8);
+  REQUIRE(plan.reset_page_addresses ==
+          std::vector<uint32_t>{kDataAddress, kDataAddress + 0x1000,
+                                kDataAddress + 0x2000, kDataAddress + 0x3000});
+  REQUIRE(plan.protection_granules ==
+          std::vector<GuestInvocationReplayProtectionGranule>{
+              {kDataAddress, kHostPageSize, true},
+              {kCodeAddress, kHostPageSize, false}});
+}
+
+TEST_CASE("continuous replay planner rejects ambiguous continuation routes",
+          "[guest-execution-session-runner][continuous]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  GuestExecutionSessionBundle bundle =
+      MakeContinuousSessionBundle(kHostPageSize);
+  GuestExecutionContinuousReplayPlan plan;
+  std::string error;
+
+  SECTION("a participant final route is missing") {
+    std::vector<GuestExecutionContinuousEvent> events =
+        DecodeContinuousControlEvents(bundle);
+    events[6].checkpoint = {};
+    events[6].subject = {};
+    ReplaceContinuousControlEvents(&bundle, events);
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+    REQUIRE(error == "continuous final checkpoint route is missing");
+  }
+
+  SECTION("a participant final route is duplicated") {
+    std::vector<GuestExecutionContinuousEvent> events =
+        DecodeContinuousControlEvents(bundle);
+    events[6].subject = events[5].subject;
+    events[6].checkpoint = events[5].checkpoint;
+    ReplaceContinuousControlEvents(&bundle, events);
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+    REQUIRE(error == "continuous final checkpoint route is duplicated");
+  }
+
+  SECTION("an initial continuation owner is absent from the exact corpus") {
+    ppc::GuestPPCThreadCheckpoint checkpoint = MakeContinuousThreadCheckpoint(
+        0, 0x101, kCodeAddress + 0x140, kReturnAddress, 1);
+    checkpoint.owning_function_address = kCodeAddress + 0x100;
+    checkpoint.owning_function_end_address = kCodeAddress + 0x1FC;
+    ReplaceInitialContinuousCheckpoint(&bundle, 0, checkpoint);
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+    REQUIRE(error ==
+            "continuous initial checkpoint owner differs from the corpus");
+  }
+
+  REQUIRE(plan.participants.empty());
+  REQUIRE(plan.events.empty());
+  REQUIRE(plan.pages.empty());
+}
 
 TEST_CASE("guest execution session planner resolves segments and event roles",
           "[guest-execution-session-runner]") {

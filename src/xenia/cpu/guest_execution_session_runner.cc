@@ -778,6 +778,369 @@ bool BuildGuestExecutionSessionReplayPlan(
   return true;
 }
 
+bool BuildGuestExecutionContinuousReplayPlan(
+    const GuestExecutionSessionBundle& bundle, uint32_t host_page_size,
+    GuestExecutionContinuousReplayPlan* output, std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!output) {
+    return Fail(error, "continuous replay plan output is null");
+  }
+  *output = {};
+  const auto fail = [&](std::string_view message) {
+    *output = {};
+    return Fail(error, message);
+  };
+  if (!IsPowerOfTwo(host_page_size) || host_page_size < kGuestPageSize ||
+      host_page_size > kMaximumSupportedHostPageSize) {
+    return fail("host page size is unsupported for continuous replay");
+  }
+  if (!ValidateGuestExecutionSessionBundle(bundle, error)) {
+    return false;
+  }
+  const GuestExecutionSessionManifest& manifest = bundle.manifest;
+  if (!manifest.segments.empty() || manifest.accepted_segment_count ||
+      manifest.rejected_segment_count) {
+    return fail("continuous replay requires a zero-segment session");
+  }
+  if (manifest.rejected_event_count || manifest.unsupported_event_count) {
+    return fail("continuous session contains rejected or unsupported events");
+  }
+  if (manifest.chunks.size() < 5 ||
+      manifest.chunks.front().kind !=
+          GuestExecutionSessionChunkKind::kCheckpoint ||
+      manifest.chunks[1].kind != GuestExecutionSessionChunkKind::kCodeCorpus ||
+      manifest.chunks.back().kind !=
+          GuestExecutionSessionChunkKind::kCheckpoint) {
+    return fail("continuous session chunk closure is missing");
+  }
+
+  GuestExecutionContinuousReplayPlan plan;
+  plan.host_page_size = host_page_size;
+  for (const GuestExecutionSessionContentBlob& blob : bundle.content_blobs) {
+    if (!plan.blobs.emplace(blob.sha256, &blob.bytes).second) {
+      return fail("continuous session content digest is duplicated");
+    }
+  }
+
+  GuestExecutionSessionCheckpointChunk initial_chunk;
+  GuestExecutionSessionCheckpointChunk final_chunk;
+  GuestExecutionSessionCodeCorpusChunk corpus_chunk;
+  if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
+          bundle.chunks.front(), &initial_chunk, error) ||
+      !GuestExecutionSessionCodec::DecodeCodeCorpusChunk(
+          bundle.chunks[1], &corpus_chunk, error) ||
+      !GuestExecutionSessionCodec::DecodeCheckpointChunk(bundle.chunks.back(),
+                                                         &final_chunk, error)) {
+    *output = {};
+    return false;
+  }
+  const std::vector<uint8_t>* corpus_blob =
+      FindBlob(plan.blobs, corpus_chunk.code_corpus_sha256);
+  if (!corpus_blob ||
+      !ExecutionJitCorpus::Decode(*corpus_blob, &plan.corpus, error)) {
+    return fail("continuous session code corpus failed to decode");
+  }
+  plan.initial_session_checkpoint = std::move(initial_chunk.checkpoint);
+  plan.final_session_checkpoint = std::move(final_chunk.checkpoint);
+
+  std::vector<GuestExecutionSessionEvent> canonical_events;
+  std::vector<GuestExecutionContinuousEvent> control_events;
+  for (size_t i = 2; i + 1 < bundle.chunks.size(); ++i) {
+    switch (manifest.chunks[i].kind) {
+      case GuestExecutionSessionChunkKind::kEvents: {
+        GuestExecutionSessionEventChunk chunk;
+        if (!GuestExecutionSessionCodec::DecodeEventChunk(bundle.chunks[i],
+                                                          &chunk, error)) {
+          *output = {};
+          return false;
+        }
+        canonical_events.insert(canonical_events.end(),
+                                std::make_move_iterator(chunk.events.begin()),
+                                std::make_move_iterator(chunk.events.end()));
+        break;
+      }
+      case GuestExecutionSessionChunkKind::kContinuousEvents: {
+        std::vector<GuestExecutionContinuousEvent> chunk;
+        if (!GuestExecutionContinuousEventCodec::Decode(bundle.chunks[i],
+                                                        &chunk, error)) {
+          *output = {};
+          return false;
+        }
+        control_events.insert(control_events.end(),
+                              std::make_move_iterator(chunk.begin()),
+                              std::make_move_iterator(chunk.end()));
+        break;
+      }
+      default:
+        return fail("continuous session contains a misplaced chunk");
+    }
+  }
+  if (canonical_events.size() != control_events.size() ||
+      canonical_events.size() != manifest.accepted_event_count) {
+    return fail("continuous control overlay does not cover the canonical tape");
+  }
+  plan.events.reserve(canonical_events.size());
+  for (size_t i = 0; i < canonical_events.size(); ++i) {
+    if (canonical_events[i].global_sequence !=
+            control_events[i].global_sequence ||
+        canonical_events[i].kind != control_events[i].kind) {
+      return fail("continuous control overlay differs from the canonical tape");
+    }
+    GuestExecutionContinuousReplayEvent event;
+    event.canonical = std::move(canonical_events[i]);
+    event.control = std::move(control_events[i]);
+    if (event.canonical.payload_size) {
+      event.payload = FindBlob(plan.blobs, event.canonical.payload_sha256);
+      if (!event.payload ||
+          event.payload->size() != event.canonical.payload_size) {
+        return fail("continuous event payload blob is missing");
+      }
+    }
+    plan.events.push_back(std::move(event));
+  }
+
+  if (plan.initial_session_checkpoint.thread_states.size() !=
+          manifest.participants.size() ||
+      plan.final_session_checkpoint.thread_states.size() !=
+          manifest.participants.size()) {
+    return fail("continuous checkpoints do not cover every participant");
+  }
+  std::vector<const GuestExecutionContinuousReplayEvent*> final_routes(
+      manifest.participants.size());
+  for (const GuestExecutionContinuousReplayEvent& event : plan.events) {
+    if (event.control.checkpoint.kind ==
+        GuestExecutionContinuousCheckpointReferenceKind::kNone) {
+      continue;
+    }
+    const uint32_t ordinal = event.control.subject.participant_ordinal;
+    if (ordinal >= manifest.participants.size()) {
+      return fail("continuous checkpoint route names an unknown participant");
+    }
+    const uint64_t checkpoint_sequence =
+        event.control.checkpoint.checkpoint_global_sequence;
+    const GuestExecutionSessionCheckpoint* checkpoint = nullptr;
+    if (!checkpoint_sequence) {
+      checkpoint = &plan.initial_session_checkpoint;
+    } else if (checkpoint_sequence == manifest.last_event_sequence) {
+      checkpoint = &plan.final_session_checkpoint;
+      if (final_routes[ordinal]) {
+        return fail("continuous final checkpoint route is duplicated");
+      }
+      final_routes[ordinal] = &event;
+    } else {
+      return fail("continuous event refers to an unavailable checkpoint");
+    }
+    const GuestExecutionSessionThreadStateReference& state =
+        checkpoint->thread_states[ordinal];
+    const std::vector<uint8_t>* state_blob = FindBlob(plan.blobs, state.sha256);
+    ppc::GuestPPCThreadCheckpoint decoded;
+    if (!state_blob || state_blob->size() != state.byte_size ||
+        event.control.checkpoint.state_size != state.byte_size ||
+        event.control.checkpoint.state_sha256 != state.sha256 ||
+        !GuestExecutionContinuousEventCodec::DecodeAndValidateCheckpoint(
+            event.control, *state_blob, event.control.checkpoint.binding,
+            &decoded, error)) {
+      if (error && error->empty()) {
+        error->assign("continuous checkpoint route blob is invalid");
+      }
+      *output = {};
+      return false;
+    }
+  }
+
+  std::map<uint32_t, GuestExecutionContinuousReplayResumeEntry> resume_entries;
+  plan.participants.reserve(manifest.participants.size());
+  for (size_t i = 0; i < manifest.participants.size(); ++i) {
+    const GuestExecutionSessionParticipant& participant =
+        manifest.participants[i];
+    if (!final_routes[i]) {
+      return fail("continuous final checkpoint route is missing");
+    }
+    const GuestExecutionSessionThreadStateReference& initial_state =
+        plan.initial_session_checkpoint.thread_states[i];
+    const GuestExecutionSessionThreadStateReference& final_state =
+        plan.final_session_checkpoint.thread_states[i];
+    const std::vector<uint8_t>* initial_blob =
+        FindBlob(plan.blobs, initial_state.sha256);
+    const std::vector<uint8_t>* final_blob =
+        FindBlob(plan.blobs, final_state.sha256);
+    GuestExecutionContinuousReplayParticipant planned;
+    planned.ordinal = participant.ordinal;
+    planned.guest_thread_id = participant.guest_thread_id;
+    planned.initial_outer_call_state = participant.initial_outer_call_state;
+    planned.boundary_arrival_kind = participant.boundary_arrival_kind;
+    planned.held_after_event_sequence = participant.held_after_event_sequence;
+    if (!initial_blob || initial_blob->size() != initial_state.byte_size ||
+        !final_blob || final_blob->size() != final_state.byte_size ||
+        !ppc::GuestPPCThreadCheckpointCodec::Decode(
+            *initial_blob, &planned.initial_checkpoint, error) ||
+        !ppc::GuestPPCThreadCheckpointCodec::Decode(
+            *final_blob, &planned.final_checkpoint, error)) {
+      if (error && error->empty()) {
+        error->assign("continuous participant checkpoint blob is invalid");
+      }
+      *output = {};
+      return false;
+    }
+    auto validate_route = [&](const ppc::GuestPPCThreadCheckpoint& route,
+                              std::string_view boundary) {
+      if (route.participant_ordinal != participant.ordinal ||
+          route.guest_thread_id != participant.guest_thread_id) {
+        return Fail(error, std::string("continuous ") + std::string(boundary) +
+                               " checkpoint participant differs");
+      }
+      const ExecutionJitCorpus::FunctionRecord* owner =
+          plan.corpus.FindFunction(route.owning_function_address);
+      if (!owner || owner->end_address != route.owning_function_end_address) {
+        return Fail(error, std::string("continuous ") + std::string(boundary) +
+                               " checkpoint owner differs from the corpus");
+      }
+      const ExecutionJitCorpus::FunctionRecord* resume_entry =
+          plan.corpus.FindFunction(route.resume_pc);
+      if (resume_entry && resume_entry->address != owner->address) {
+        return Fail(error, std::string("continuous ") + std::string(boundary) +
+                               " checkpoint resume entry is ambiguous");
+      }
+      return true;
+    };
+    if (!validate_route(planned.initial_checkpoint, "initial") ||
+        !validate_route(planned.final_checkpoint, "final")) {
+      *output = {};
+      return false;
+    }
+    const ppc::GuestPPCThreadCheckpointBinding& final_binding =
+        final_routes[i]->control.checkpoint.binding;
+    if (!ppc::GuestPPCThreadCheckpointCodec::ValidateBinding(
+            planned.final_checkpoint, final_binding, error)) {
+      *output = {};
+      return false;
+    }
+    if (planned.initial_checkpoint.resume_pc !=
+        planned.initial_checkpoint.owning_function_address) {
+      const GuestExecutionContinuousReplayResumeEntry resume = {
+          planned.initial_checkpoint.resume_pc,
+          planned.initial_checkpoint.owning_function_address,
+          planned.initial_checkpoint.owning_function_end_address};
+      const auto [it, inserted] =
+          resume_entries.emplace(resume.resume_pc, resume);
+      if (!inserted && it->second != resume) {
+        return fail("continuous initial resume entry is ambiguous");
+      }
+    }
+    plan.participants.push_back(std::move(planned));
+  }
+  for (const auto& entry : resume_entries) {
+    plan.resume_entries.push_back(entry.second);
+  }
+
+  std::map<uint32_t, GuestExecutionSessionReplayPage> pages;
+  for (uint32_t address : plan.corpus.page_addresses()) {
+    pages.emplace(address,
+                  GuestExecutionSessionReplayPage{
+                      address, true, plan.corpus.FindPageData(address)});
+  }
+  for (const GuestExecutionSessionContentReference& content :
+       plan.initial_session_checkpoint.content) {
+    const std::vector<uint8_t>* blob = FindBlob(plan.blobs, content.sha256);
+    if (content.kind == GuestExecutionSessionContentKind::kGuestCode) {
+      const uint8_t* corpus_bytes = CorpusCodeRange(
+          plan.corpus, content.guest_address, content.byte_size);
+      if (!blob || !corpus_bytes || blob->size() != content.byte_size ||
+          std::memcmp(blob->data(), corpus_bytes, blob->size())) {
+        return fail("continuous checkpoint code differs from the corpus");
+      }
+      continue;
+    }
+    if (content.guest_address > UINT32_MAX ||
+        content.byte_size != kGuestPageSize) {
+      return fail("continuous initial checkpoint page is invalid");
+    }
+    const uint32_t address = static_cast<uint32_t>(content.guest_address);
+    if (!IsSupportedDataPageAddress(address) || !blob ||
+        blob->size() != kGuestPageSize || pages.contains(address)) {
+      return fail("continuous initial checkpoint page closure is invalid");
+    }
+    pages.emplace(
+        address, GuestExecutionSessionReplayPage{address, false, blob->data()});
+  }
+  for (const GuestExecutionSessionContentReference& content :
+       plan.final_session_checkpoint.content) {
+    const std::vector<uint8_t>* blob = FindBlob(plan.blobs, content.sha256);
+    if (!blob || blob->size() != content.byte_size) {
+      return fail("continuous final checkpoint content blob is missing");
+    }
+    if (content.kind == GuestExecutionSessionContentKind::kGuestCode) {
+      const uint8_t* corpus_bytes = CorpusCodeRange(
+          plan.corpus, content.guest_address, content.byte_size);
+      if (!corpus_bytes ||
+          std::memcmp(blob->data(), corpus_bytes, blob->size())) {
+        return fail("continuous final checkpoint code differs from the corpus");
+      }
+      continue;
+    }
+    if (content.guest_address > UINT32_MAX ||
+        !pages.contains(static_cast<uint32_t>(content.guest_address)) ||
+        pages.at(static_cast<uint32_t>(content.guest_address)).code) {
+      return fail(
+          "continuous final checkpoint page was not captured initially");
+    }
+  }
+  for (const GuestExecutionContinuousReplayEvent& event : plan.events) {
+    if (event.canonical.kind !=
+        GuestExecutionSessionEventKind::kMemoryMutation) {
+      continue;
+    }
+    const uint64_t end =
+        event.canonical.guest_address + event.canonical.byte_count;
+    for (uint64_t address =
+             event.canonical.guest_address & ~uint64_t(kGuestPageSize - 1);
+         address < end; address += kGuestPageSize) {
+      const auto page = pages.find(static_cast<uint32_t>(address));
+      if (address > UINT32_MAX || page == pages.end() || page->second.code) {
+        return fail("continuous memory mutation is outside captured data");
+      }
+    }
+  }
+
+  std::map<uint32_t, uint32_t> xex_backing_owners;
+  std::map<uint32_t, bool> granules;
+  for (const auto& [address, page] : pages) {
+    const uint32_t backing_address = XexBackingPageAddress(address);
+    const auto [owner, inserted] =
+        xex_backing_owners.emplace(backing_address, address);
+    if (!inserted && owner->second != address) {
+      return fail("continuous supplied pages alias one XEX backing page");
+    }
+    bool& writable = granules[address & ~(host_page_size - 1)];
+    writable |= !page.code;
+    if (!page.code) {
+      plan.reset_page_addresses.push_back(address);
+    }
+  }
+  for (const auto& [granule_address, writable] : granules) {
+    const uint64_t granule_end = uint64_t(granule_address) + host_page_size;
+    if (granule_end > kGuestAddressSpaceSize) {
+      return fail("continuous host protection granule wraps guest memory");
+    }
+    for (uint64_t address = granule_address; address < granule_end;
+         address += kGuestPageSize) {
+      if (!pages.contains(static_cast<uint32_t>(address))) {
+        return fail("continuous pages do not close a host protection granule");
+      }
+    }
+    plan.protection_granules.push_back(GuestInvocationReplayProtectionGranule{
+        granule_address, host_page_size, writable});
+  }
+  plan.pages.reserve(pages.size());
+  for (const auto& [address, page] : pages) {
+    plan.pages.push_back(page);
+  }
+  *output = std::move(plan);
+  return true;
+}
+
 // One persistent host worker owning one participant's real ThreadState. The
 // coordinator hands over commands under the mutex and reads results after the
 // worker reports completion.
