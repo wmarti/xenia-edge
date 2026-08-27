@@ -1,0 +1,1547 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2026 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#include "xenia/cpu/guest_execution_session_capture_provider.h"
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <set>
+#include <span>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "fmt/format.h"
+#include "xenia/base/memory.h"
+#include "xenia/cpu/execution_jit_corpus.h"
+#include "xenia/cpu/function.h"
+#include "xenia/cpu/guest_invocation_artifact.h"
+#include "xenia/cpu/guest_invocation_capture_page_reader.h"
+#include "xenia/cpu/processor.h"
+#include "xenia/cpu/thread_state.h"
+#include "xenia/memory.h"
+
+namespace xe {
+namespace cpu {
+
+namespace {
+
+constexpr uint32_t kGuestPageSize = JitCorpus::kPageSize;
+
+bool Fail(std::string* error, std::string_view message) {
+  if (error) {
+    error->assign(message);
+  }
+  return false;
+}
+
+bool IsPowerOfTwo(uint32_t value) { return value && !(value & (value - 1)); }
+
+bool IsSupportedPageAddress(uint32_t address) {
+  return (address >= 0x00001000u && address <= 0x7EFFF000u) ||
+         (address >= 0x80000000u && address <= 0x9FFFF000u);
+}
+
+uint32_t BackingPageAddress(uint32_t address) {
+  return address >= 0x90000000u && address < 0xA0000000u ? address - 0x10000000u
+                                                         : address;
+}
+
+bool HasWriteAccess(ppc::GuestInvocationRecorderMemoryAccess access) {
+  return access == ppc::GuestInvocationRecorderMemoryAccess::kWrite ||
+         access == ppc::GuestInvocationRecorderMemoryAccess::kReadWrite;
+}
+
+bool IsValidAccess(ppc::GuestInvocationRecorderMemoryAccess access) {
+  return access == ppc::GuestInvocationRecorderMemoryAccess::kRead ||
+         access == ppc::GuestInvocationRecorderMemoryAccess::kWrite ||
+         access == ppc::GuestInvocationRecorderMemoryAccess::kReadWrite;
+}
+
+bool IsValidFunctionExtent(uint32_t address, uint32_t end_address) {
+  return address && !(address & 3) && !(end_address & 3) &&
+         end_address >= address &&
+         uint64_t(end_address) - address + 4 <=
+             ExecutionJitCorpus::kMaxFunctionSize;
+}
+
+using ProviderState = GuestExecutionSessionCaptureProviderState;
+using CheckpointParticipant = kernel::GuestSchedulerCheckpointParticipant;
+using CheckpointSnapshot = kernel::GuestSchedulerCheckpointBarrierSnapshot;
+
+bool IsCatalogPhase(ProviderState state) {
+  return state == ProviderState::kCataloging ||
+         state == ProviderState::kRecording;
+}
+
+bool IsExecutionPhase(ProviderState state) {
+  return state == ProviderState::kRecording;
+}
+
+}  // namespace
+
+struct GuestExecutionSessionCaptureProvider::Impl {
+  struct DefinitionRecord {
+    uint32_t end_address = 0;
+    uint32_t definition_order = 0;
+    bool defined = false;
+    bool code_pages_snapshotted = false;
+    std::set<uint32_t> dependencies;
+    std::vector<uint32_t> code_pages;
+  };
+
+  struct CapturedThreadState {
+    GuestExecutionCaptureParticipantIdentity participant;
+    ppc::GuestInvocationRecorderIdentity invocation_identity;
+    ppc::GuestPPCRegisterState registers;
+  };
+
+  struct DataPageUse {
+    uint64_t first_participant = 0;
+    bool shared = false;
+    bool written = false;
+  };
+
+  enum class CodeReadResult {
+    kSuccess,
+    kRetry,
+    kFailure,
+  };
+
+  class ThreadStateVisitor final
+      : public GuestExecutionCaptureThreadStateVisitor {
+   public:
+    explicit ThreadStateVisitor(std::vector<CapturedThreadState>* output)
+        : output_(output) {}
+
+    bool VisitThreadState(const ThreadState& thread_state) noexcept override {
+      try {
+        const ppc::PPCContext* context = thread_state.context();
+        if (!context || !thread_state.guest_execution_capture_instance_id() ||
+            !thread_state.thread_id() ||
+            context->thread_id != thread_state.thread_id()) {
+          invalid_ = true;
+          return false;
+        }
+        output_->push_back(
+            {{thread_state.guest_execution_capture_instance_id(),
+              thread_state.thread_id()},
+             {reinterpret_cast<uintptr_t>(context), context->thread_id},
+             ppc::CaptureGuestPPCRegisterState(*context)});
+        return true;
+      } catch (...) {
+        allocation_failed_ = true;
+        return false;
+      }
+    }
+
+    bool invalid() const { return invalid_; }
+    bool allocation_failed() const { return allocation_failed_; }
+
+   private:
+    std::vector<CapturedThreadState>* output_ = nullptr;
+    bool invalid_ = false;
+    bool allocation_failed_ = false;
+  };
+
+  Impl(Memory& memory_value, Processor& processor_value,
+       GuestExecutionSessionCaptureProviderConfig config_value)
+      : processor(processor_value),
+        config(config_value),
+        page_reader(memory_value) {}
+
+  bool RejectLocked(std::string_view message) {
+    if (state.load(std::memory_order_relaxed) != ProviderState::kRejected) {
+      rejection_message.assign(message);
+      state.store(ProviderState::kRejected, std::memory_order_release);
+    }
+    return false;
+  }
+
+  bool RejectException() noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(mutex);
+      return RejectLocked(
+          "capture provider allocation or internal operation "
+          "threw an exception");
+    } catch (...) {
+      state.store(ProviderState::kRejected, std::memory_order_release);
+      return false;
+    }
+  }
+
+  bool RejectExternal(std::string_view message) noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(mutex);
+      return RejectLocked(message);
+    } catch (...) {
+      state.store(ProviderState::kRejected, std::memory_order_release);
+      return false;
+    }
+  }
+
+  template <typename Callback>
+  bool InvokeCallback(Callback&& callback) noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(mutex);
+      return callback();
+    } catch (...) {
+      return RejectException();
+    }
+  }
+
+  bool SetErrorFromRejection(std::string* error) const {
+    if (error) {
+      error->assign(rejection_message.empty()
+                        ? "capture provider rejected without a diagnostic"
+                        : rejection_message);
+    }
+    return false;
+  }
+
+  bool CollectProtectionPages(uint32_t first_page, uint32_t last_page,
+                              std::vector<uint32_t>* output) {
+    output->clear();
+    const uint32_t mask = ~(config.host_protection_page_size - 1);
+    const uint32_t first_granule = first_page & mask;
+    const uint32_t last_granule = last_page & mask;
+    const uint64_t end =
+        uint64_t(last_granule) + config.host_protection_page_size;
+    if (end > uint64_t(std::numeric_limits<uint32_t>::max()) + 1) {
+      return RejectLocked(
+          "capture provider host protection granule wraps guest memory");
+    }
+    for (uint64_t page = first_granule; page < end; page += kGuestPageSize) {
+      const uint32_t address = static_cast<uint32_t>(page);
+      if (!IsSupportedPageAddress(address)) {
+        return RejectLocked(
+            "capture provider protection granule uses unsupported memory");
+      }
+      output->push_back(address);
+    }
+    return true;
+  }
+
+  CodeReadResult ReadStableCodePage(
+      uint32_t page_address, std::array<uint8_t, kGuestPageSize>* output) {
+    std::array<uint8_t, kGuestPageSize> verification = {};
+    const bool first = page_reader.ReadPage(page_address, output);
+    if (!first && page_reader.last_read_was_retryable()) {
+      return CodeReadResult::kRetry;
+    }
+    const bool second =
+        first && page_reader.ReadPage(page_address, &verification);
+    if (!second && page_reader.last_read_was_retryable()) {
+      return CodeReadResult::kRetry;
+    }
+    if (!first || !second) {
+      RejectLocked("capture provider could not read a guest code page");
+      return CodeReadResult::kFailure;
+    }
+    if (*output != verification) {
+      RejectLocked("capture provider guest code changed while sampled");
+      return CodeReadResult::kFailure;
+    }
+    return CodeReadResult::kSuccess;
+  }
+
+  CodeReadResult SnapshotDefinitionLocked(DefinitionRecord& definition) {
+    std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> snapshots;
+    for (uint32_t page_address : definition.code_pages) {
+      if (written_backing_pages.contains(BackingPageAddress(page_address))) {
+        RejectLocked(
+            "capture provider guest code was written before definition");
+        return CodeReadResult::kFailure;
+      }
+      std::array<uint8_t, kGuestPageSize> page = {};
+      const CodeReadResult result = ReadStableCodePage(page_address, &page);
+      if (result != CodeReadResult::kSuccess) {
+        return result;
+      }
+      const auto existing = immutable_code_pages.find(page_address);
+      if (existing != immutable_code_pages.cend() && existing->second != page) {
+        RejectLocked(
+            "capture provider shared code page changed across definitions");
+        return CodeReadResult::kFailure;
+      }
+      snapshots.emplace(page_address, std::move(page));
+    }
+    for (auto& [address, page] : snapshots) {
+      immutable_code_pages.emplace(address, std::move(page));
+    }
+    definition.code_pages_snapshotted = true;
+    return CodeReadResult::kSuccess;
+  }
+
+  bool RetryPendingDefinitionsLocked(bool final_attempt) {
+    for (auto it = pending_definition_snapshots.begin();
+         it != pending_definition_snapshots.end();) {
+      DefinitionRecord& definition = definitions.at(*it);
+      const CodeReadResult result = SnapshotDefinitionLocked(definition);
+      if (result == CodeReadResult::kRetry) {
+        if (final_attempt) {
+          return RejectLocked(
+              "capture provider code snapshot remained contended at a "
+              "checkpoint");
+        }
+        return true;
+      }
+      if (result == CodeReadResult::kFailure) {
+        return false;
+      }
+      it = pending_definition_snapshots.erase(it);
+    }
+    return true;
+  }
+
+  bool EnsureDefinitionLocked(uint32_t address, DefinitionRecord** output) {
+    if (!address || (address & 3)) {
+      return RejectLocked(
+          "capture provider catalog has an invalid function address");
+    }
+    auto existing = definitions.find(address);
+    if (existing != definitions.end()) {
+      *output = &existing->second;
+      return true;
+    }
+    if (definitions.size() >= config.maximum_function_count) {
+      return RejectLocked(
+          "capture provider function catalog exceeds its configured limit");
+    }
+    auto [inserted, did_insert] =
+        definitions.emplace(address, DefinitionRecord{});
+    if (!did_insert) {
+      return RejectLocked("capture provider function catalog insertion failed");
+    }
+    *output = &inserted->second;
+    return true;
+  }
+
+  bool RegisterDependencyLocked(uint32_t source_address,
+                                uint32_t dependency_address) {
+    DefinitionRecord* source = nullptr;
+    DefinitionRecord* dependency = nullptr;
+    if (!EnsureDefinitionLocked(source_address, &source) ||
+        !EnsureDefinitionLocked(dependency_address, &dependency)) {
+      return false;
+    }
+    if (source->defined) {
+      return RejectLocked(
+          "capture provider dependency arrived after source definition");
+    }
+    if (!source->dependencies.contains(dependency_address)) {
+      if (dependency_count >= config.maximum_dependency_count) {
+        return RejectLocked(
+            "capture provider dependency catalog exceeds its limit");
+      }
+      source->dependencies.insert(dependency_address);
+      ++dependency_count;
+    }
+    return true;
+  }
+
+  bool RegisterDefinitionLocked(uint32_t address, uint32_t end_address) {
+    if (!IsValidFunctionExtent(address, end_address)) {
+      return RejectLocked(
+          "capture provider definition has an invalid function extent");
+    }
+    DefinitionRecord* definition = nullptr;
+    if (!EnsureDefinitionLocked(address, &definition)) {
+      return false;
+    }
+    if (definition->defined) {
+      return RejectLocked(
+          "capture provider received a duplicate successful definition");
+    }
+    std::vector<uint32_t> pages;
+    if (!CollectProtectionPages(address & ~(kGuestPageSize - 1),
+                                end_address & ~(kGuestPageSize - 1), &pages)) {
+      return false;
+    }
+    size_t new_page_count = 0;
+    for (uint32_t page : pages) {
+      if (!catalog_code_pages.contains(page)) {
+        ++new_page_count;
+      }
+    }
+    if (catalog_code_pages.size() > config.maximum_code_page_count ||
+        new_page_count >
+            config.maximum_code_page_count - catalog_code_pages.size()) {
+      return RejectLocked(
+          "capture provider code-page catalog exceeds its configured limit");
+    }
+    catalog_code_pages.insert(pages.cbegin(), pages.cend());
+    definition->defined = true;
+    definition->end_address = end_address;
+    definition->definition_order =
+        static_cast<uint32_t>(definition_order.size());
+    definition->code_pages = std::move(pages);
+    definition_order.push_back(address);
+    const CodeReadResult result = SnapshotDefinitionLocked(*definition);
+    if (result == CodeReadResult::kRetry) {
+      pending_definition_snapshots.insert(address);
+      return true;
+    }
+    return result == CodeReadResult::kSuccess;
+  }
+
+  bool AddClosureSeedLocked(uint32_t address, uint32_t end_address) {
+    const auto definition = definitions.find(address);
+    if (definition == definitions.cend() || !definition->second.defined ||
+        definition->second.end_address != end_address) {
+      return RejectLocked(
+          "capture provider execution references an uncataloged function "
+          "extent");
+    }
+    const auto existing = closure_seeds.find(address);
+    if (existing != closure_seeds.cend() && existing->second != end_address) {
+      return RejectLocked(
+          "capture provider execution reported conflicting function extents");
+    }
+    closure_seeds.emplace(address, end_address);
+    return true;
+  }
+
+  const DefinitionRecord* FindOwningDefinitionLocked(uint32_t guest_pc) {
+    const DefinitionRecord* owner = nullptr;
+    for (const auto& [address, definition] : definitions) {
+      if (!definition.defined || guest_pc < address ||
+          guest_pc > definition.end_address) {
+        continue;
+      }
+      if (owner) {
+        RejectLocked(
+            "capture provider checkpoint PC has overlapping catalog owners");
+        return nullptr;
+      }
+      owner = &definition;
+    }
+    if (!owner) {
+      RejectLocked(
+          "capture provider checkpoint PC has no successful definition");
+    }
+    return owner;
+  }
+
+  uint32_t FindDefinitionAddressLocked(const DefinitionRecord* target) const {
+    for (const auto& [address, definition] : definitions) {
+      if (&definition == target) {
+        return address;
+      }
+    }
+    return 0;
+  }
+
+  const CheckpointParticipant* FindCheckpointParticipant(
+      const CheckpointSnapshot& checkpoint, uint32_t guest_thread_id) const {
+    const CheckpointParticipant* result = nullptr;
+    for (const CheckpointParticipant& participant : checkpoint.participants) {
+      if (participant.thread_id != guest_thread_id) {
+        continue;
+      }
+      if (result) {
+        return nullptr;
+      }
+      result = &participant;
+    }
+    return result;
+  }
+
+  bool FindOuterReturn(
+      const GuestExecutionCaptureParticipantIdentity& participant,
+      const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
+      uint32_t* output) {
+    uint32_t outer_return = 0;
+    size_t outer_count = 0;
+    for (const GuestExecutionCaptureActiveHostCall& call :
+         host_calls.active_calls) {
+      if (call.participant == participant && call.participant_depth == 1) {
+        outer_return = call.return_address;
+        ++outer_count;
+      }
+    }
+    if (outer_count != 1 || !outer_return || (outer_return & 3)) {
+      return RejectLocked(
+          "capture provider JIT checkpoint lacks one outer host-call "
+          "boundary");
+    }
+    *output = outer_return;
+    return true;
+  }
+
+  bool CaptureThreadStates(size_t expected_count,
+                           std::vector<CapturedThreadState>* output,
+                           std::string* error) noexcept {
+    try {
+      output->clear();
+      output->reserve(expected_count);
+      ThreadStateVisitor visitor(output);
+      const GuestExecutionCaptureThreadStateVisitResult result =
+          processor.VisitGuestExecutionCaptureThreadStates(visitor);
+      if (result != GuestExecutionCaptureThreadStateVisitResult::kCompleted ||
+          visitor.invalid() || visitor.allocation_failed() ||
+          output->size() != expected_count) {
+        return Fail(error,
+                    "capture provider could not snapshot the exact ready "
+                    "ThreadState roster");
+      }
+      return true;
+    } catch (...) {
+      return Fail(error,
+                  "capture provider ThreadState snapshot allocation failed");
+    }
+  }
+
+  bool BuildCheckpointStatesLocked(
+      const CheckpointSnapshot& checkpoint,
+      std::span<const GuestExecutionCaptureThreadStateLifecycleEvent>
+          participants,
+      const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
+      const std::vector<CapturedThreadState>& captured,
+      std::map<uint64_t, std::vector<uint8_t>>* output,
+      bool establish_execution_identities) {
+    if (host_calls.rejection !=
+            GuestExecutionCaptureHostCallRosterRejection::kNone ||
+        participants.empty() ||
+        checkpoint.participants.size() != participants.size() ||
+        captured.size() != participants.size()) {
+      return RejectLocked(
+          "capture provider checkpoint inputs have inconsistent rosters");
+    }
+    std::vector<GuestExecutionCaptureParticipantIdentity> ordered;
+    ordered.reserve(participants.size());
+    for (const auto& lifecycle : participants) {
+      if (lifecycle.state !=
+          GuestExecutionCaptureThreadStateLifecycleState::kReady) {
+        return RejectLocked(
+            "capture provider checkpoint contains a non-ready participant");
+      }
+      ordered.push_back(lifecycle.participant);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto& left, const auto& right) {
+                return left.capture_instance_id < right.capture_instance_id;
+              });
+    for (size_t index = 0; index < ordered.size(); ++index) {
+      if (!ordered[index].capture_instance_id ||
+          !ordered[index].guest_thread_id ||
+          (index && (ordered[index - 1].capture_instance_id ==
+                         ordered[index].capture_instance_id ||
+                     ordered[index - 1].guest_thread_id ==
+                         ordered[index].guest_thread_id))) {
+        return RejectLocked(
+            "capture provider checkpoint participant identity is invalid");
+      }
+    }
+
+    std::map<uint64_t, std::vector<uint8_t>> encoded;
+    std::map<std::pair<uint64_t, uint64_t>, uint64_t> execution_identities;
+    std::map<uint64_t, uint32_t> outer_return_addresses;
+    for (size_t ordinal = 0; ordinal < ordered.size(); ++ordinal) {
+      const auto& identity = ordered[ordinal];
+      const CheckpointParticipant* scheduler_participant =
+          FindCheckpointParticipant(checkpoint, identity.guest_thread_id);
+      if (!scheduler_participant || !scheduler_participant->restorable ||
+          scheduler_participant->resume_kind !=
+              kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint ||
+          !scheduler_participant->guest_pc ||
+          (scheduler_participant->guest_pc & 3)) {
+        return RejectLocked(
+            "capture provider supports only exact-PC JIT safepoints");
+      }
+      const auto thread = std::find_if(
+          captured.cbegin(), captured.cend(), [&](const auto& candidate) {
+            return candidate.participant == identity;
+          });
+      if (thread == captured.cend() ||
+          thread->invocation_identity.thread_id != identity.guest_thread_id ||
+          !thread->invocation_identity.context_id) {
+        return RejectLocked(
+            "capture provider scheduler and ThreadState identities differ");
+      }
+      uint32_t outer_return = 0;
+      if (!FindOuterReturn(identity, host_calls, &outer_return)) {
+        return false;
+      }
+      outer_return_addresses.emplace(identity.capture_instance_id,
+                                     outer_return);
+      const DefinitionRecord* owner =
+          FindOwningDefinitionLocked(scheduler_participant->guest_pc);
+      if (!owner) {
+        return false;
+      }
+      const uint32_t owner_address = FindDefinitionAddressLocked(owner);
+      if (!owner_address || !owner->code_pages_snapshotted ||
+          !AddClosureSeedLocked(owner_address, owner->end_address)) {
+        return false;
+      }
+
+      ppc::GuestPPCThreadCheckpoint state_blob;
+      state_blob.participant_ordinal = static_cast<uint32_t>(ordinal);
+      state_blob.guest_thread_id = identity.guest_thread_id;
+      state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kGuestBlockHead;
+      state_blob.resume_pc = scheduler_participant->guest_pc;
+      state_blob.owning_function_address = owner_address;
+      state_blob.owning_function_end_address = owner->end_address;
+      state_blob.outer_guest_return_address = outer_return;
+      state_blob.registers = thread->registers;
+      std::vector<uint8_t> bytes;
+      std::string error;
+      if (!ppc::GuestPPCThreadCheckpointCodec::Encode(state_blob, &bytes,
+                                                      &error)) {
+        return RejectLocked("capture provider could not encode checkpoint: " +
+                            error);
+      }
+      encoded.emplace(identity.capture_instance_id, std::move(bytes));
+      execution_identities.emplace(
+          std::pair(thread->invocation_identity.context_id,
+                    thread->invocation_identity.thread_id),
+          identity.capture_instance_id);
+    }
+    if (encoded.size() != ordered.size() ||
+        execution_identities.size() != ordered.size() ||
+        outer_return_addresses.size() != ordered.size()) {
+      return RejectLocked(
+          "capture provider checkpoint identity mapping is not one-to-one");
+    }
+    if (establish_execution_identities) {
+      active_invocation_identities = std::move(execution_identities);
+      initial_outer_return_addresses = std::move(outer_return_addresses);
+    } else if (execution_identities != active_invocation_identities) {
+      return RejectLocked(
+          "capture provider ThreadState context identity changed in-session");
+    }
+    *output = std::move(encoded);
+    return true;
+  }
+
+  bool IsKnownExecutionIdentityLocked(
+      const ppc::GuestInvocationRecorderIdentity& identity,
+      uint64_t* participant) {
+    if (!identity.context_id || !identity.thread_id) {
+      return RejectLocked(
+          "capture provider callback has an invalid execution identity");
+    }
+    const auto found = active_invocation_identities.find(
+        {identity.context_id, identity.thread_id});
+    if (found == active_invocation_identities.cend()) {
+      return RejectLocked(
+          "capture provider callback came from outside the held roster");
+    }
+    *participant = found->second;
+    return true;
+  }
+
+  bool RecordMemoryAccessLocked(
+      const ppc::GuestInvocationRecorderIdentity& identity, uint32_t address,
+      uint32_t size, ppc::GuestInvocationRecorderMemoryAccess access) {
+    if (!IsExecutionPhase(state.load(std::memory_order_relaxed))) {
+      return state.load(std::memory_order_relaxed) != ProviderState::kRejected;
+    }
+    uint64_t participant = 0;
+    if (!IsKnownExecutionIdentityLocked(identity, &participant) || !size ||
+        !IsValidAccess(access)) {
+      return RejectLocked("capture provider memory callback is not canonical");
+    }
+    if (memory_access_count >= config.maximum_memory_access_count) {
+      return RejectLocked(
+          "capture provider memory access count exceeds its limit");
+    }
+    ++memory_access_count;
+    const uint64_t last_byte = uint64_t(address) + size - 1;
+    if (last_byte > std::numeric_limits<uint32_t>::max()) {
+      return RejectLocked("capture provider memory access wraps guest memory");
+    }
+    const uint32_t first_page = address & ~(kGuestPageSize - 1);
+    const uint32_t last_page =
+        static_cast<uint32_t>(last_byte) & ~(kGuestPageSize - 1);
+    for (uint64_t page = first_page; page <= last_page;
+         page += kGuestPageSize) {
+      if (!IsSupportedPageAddress(static_cast<uint32_t>(page))) {
+        return RejectLocked(
+            "capture provider memory access uses unsupported memory");
+      }
+    }
+
+    std::vector<uint32_t> supplied_pages;
+    if (!CollectProtectionPages(first_page, last_page, &supplied_pages)) {
+      return false;
+    }
+    std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> new_pages;
+    std::map<uint32_t, uint32_t> new_backing_views;
+    for (uint32_t page : supplied_pages) {
+      const uint32_t backing = BackingPageAddress(page);
+      const auto known_view = data_backing_views.find(backing);
+      const auto new_view = new_backing_views.find(backing);
+      if ((known_view != data_backing_views.cend() &&
+           known_view->second != page) ||
+          (new_view != new_backing_views.cend() && new_view->second != page)) {
+        return RejectLocked(
+            "capture provider observed both physical alias views");
+      }
+      if (known_view == data_backing_views.cend()) {
+        new_backing_views.emplace(backing, page);
+      }
+      if (initial_data_pages.contains(page)) {
+        continue;
+      }
+      std::array<uint8_t, kGuestPageSize> bytes = {};
+      if (!page_reader.ReadPage(page, &bytes)) {
+        return RejectLocked(
+            "capture provider could not snapshot a data-page preimage");
+      }
+      new_pages.emplace(page, std::move(bytes));
+    }
+    if (initial_data_pages.size() > config.maximum_data_page_count ||
+        new_pages.size() >
+            config.maximum_data_page_count - initial_data_pages.size()) {
+      return RejectLocked(
+          "capture provider data-page closure exceeds its configured limit");
+    }
+    for (auto& [page, bytes] : new_pages) {
+      initial_data_pages.emplace(page, std::move(bytes));
+    }
+    for (const auto& [backing, view] : new_backing_views) {
+      data_backing_views.emplace(backing, view);
+    }
+
+    const bool writes = HasWriteAccess(access);
+    for (uint64_t page = first_page; page <= last_page;
+         page += kGuestPageSize) {
+      const uint32_t page_address = static_cast<uint32_t>(page);
+      const uint32_t backing = BackingPageAddress(page_address);
+      DataPageUse& use = data_page_uses[backing];
+      if (use.first_participant && use.first_participant != participant) {
+        use.shared = true;
+      }
+      if (use.shared && (use.written || writes)) {
+        return RejectLocked(
+            "capture provider cannot order a cross-participant shared write");
+      }
+      if (!use.first_participant) {
+        use.first_participant = participant;
+      }
+      if (writes) {
+        use.written = true;
+        dirty_data_pages.insert(page_address);
+        written_backing_pages.insert(backing);
+      }
+    }
+    return true;
+  }
+
+  bool BuildClosureLocked(std::set<uint32_t>* closure) {
+    if (closure_seeds.empty()) {
+      return RejectLocked("capture provider has no exact-PC code-corpus seed");
+    }
+    std::vector<uint32_t> pending;
+    for (const auto& [address, end_address] : closure_seeds) {
+      const auto definition = definitions.find(address);
+      if (definition == definitions.cend() || !definition->second.defined ||
+          definition->second.end_address != end_address) {
+        return RejectLocked(
+            "capture provider closure seed is not an exact definition");
+      }
+      pending.push_back(address);
+    }
+    closure->clear();
+    while (!pending.empty()) {
+      const uint32_t address = pending.back();
+      pending.pop_back();
+      if (!closure->insert(address).second) {
+        continue;
+      }
+      const auto definition = definitions.find(address);
+      if (definition == definitions.cend() || !definition->second.defined ||
+          !definition->second.code_pages_snapshotted) {
+        return RejectLocked(
+            "capture provider translation closure is incomplete");
+      }
+      pending.insert(pending.end(), definition->second.dependencies.cbegin(),
+                     definition->second.dependencies.cend());
+    }
+    return true;
+  }
+
+  bool FinalizeContentAndCorpusLocked() {
+    if (!RetryPendingDefinitionsLocked(true)) {
+      return false;
+    }
+    std::set<uint32_t> closure;
+    if (!BuildClosureLocked(&closure)) {
+      return false;
+    }
+    if (!dirty_data_pages.empty()) {
+      return RejectLocked(
+          "capture provider cannot seal dirty guest pages without complete "
+          "external-memory mutation coverage");
+    }
+
+    std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> code_pages;
+    std::map<uint32_t, uint32_t> code_backing_views;
+    for (uint32_t function_address : closure) {
+      const DefinitionRecord& definition = definitions.at(function_address);
+      for (uint32_t page_address : definition.code_pages) {
+        const auto snapshot = immutable_code_pages.find(page_address);
+        if (snapshot == immutable_code_pages.cend()) {
+          return RejectLocked(
+              "capture provider closure lacks immutable code bytes");
+        }
+        const uint32_t backing = BackingPageAddress(page_address);
+        const auto backing_view = code_backing_views.find(backing);
+        if (backing_view != code_backing_views.cend() &&
+            backing_view->second != page_address) {
+          return RejectLocked(
+              "capture provider code closure uses both physical aliases");
+        }
+        if (written_backing_pages.contains(backing)) {
+          return RejectLocked(
+              "capture provider observed a write to the code closure");
+        }
+        code_backing_views.emplace(backing, page_address);
+        const auto inserted =
+            code_pages.emplace(page_address, snapshot->second);
+        if (!inserted.second && inserted.first->second != snapshot->second) {
+          return RejectLocked(
+              "capture provider closure code snapshots conflict");
+        }
+      }
+    }
+
+    for (const auto& [backing, code_view] : code_backing_views) {
+      const auto data_view = data_backing_views.find(backing);
+      if (data_view == data_backing_views.cend()) {
+        continue;
+      }
+      if (data_view->second != code_view) {
+        return RejectLocked(
+            "capture provider data aliases the selected code closure");
+      }
+      const auto initial = initial_data_pages.find(code_view);
+      const auto code = code_pages.find(code_view);
+      if (initial == initial_data_pages.cend() || code == code_pages.cend() ||
+          initial->second != code->second) {
+        return RejectLocked(
+            "capture provider data preimage conflicts with selected code");
+      }
+    }
+
+    for (const auto& [page_address, snapshot] : code_pages) {
+      std::array<uint8_t, kGuestPageSize> current = {};
+      if (ReadStableCodePage(page_address, &current) !=
+              CodeReadResult::kSuccess ||
+          current != snapshot) {
+        if (state.load(std::memory_order_relaxed) != ProviderState::kRejected) {
+          RejectLocked(
+              "capture provider code changed after successful definition");
+        }
+        return false;
+      }
+    }
+
+    ExecutionJitCorpusBuilder corpus_builder(config.jit_corpus_config_flags);
+    for (const auto& [page_address, bytes] : code_pages) {
+      std::string error;
+      if (!corpus_builder.AddCodePage(page_address, bytes.data(), bytes.size(),
+                                      &error)) {
+        return RejectLocked("capture provider code corpus page failed: " +
+                            error);
+      }
+    }
+    for (uint32_t address : definition_order) {
+      if (!closure.contains(address)) {
+        continue;
+      }
+      const DefinitionRecord& definition = definitions.at(address);
+      Function* function = processor.QueryFunction(address);
+      if (!function || !function->is_guest() ||
+          function->status() != Symbol::Status::kDefined ||
+          function->address() != address ||
+          function->end_address() != definition.end_address ||
+          function->behavior() == Function::Behavior::kExtern ||
+          function->behavior() == Function::Behavior::kBuiltin) {
+        return RejectLocked(
+            "capture provider corpus function is not published guest code");
+      }
+      auto* guest_function = static_cast<GuestFunction*>(function);
+      const size_t host_code_size = guest_function->machine_code_length();
+      if (!guest_function->machine_code() || !host_code_size ||
+          host_code_size > std::numeric_limits<uint32_t>::max()) {
+        return RejectLocked(
+            "capture provider corpus function has no bounded host code");
+      }
+      const ExecutionJitCorpusBuilder::FunctionRecord record = {
+          address, definition.end_address,
+          static_cast<uint32_t>(host_code_size),
+          JitCorpus::EncodeFunctionFlags(*function)};
+      std::string error;
+      if (!corpus_builder.AddFunction(record, &error)) {
+        return RejectLocked("capture provider corpus function failed: " +
+                            error);
+      }
+    }
+    if (corpus_builder.function_count() != closure.size()) {
+      return RejectLocked(
+          "capture provider corpus lost definition-order entries");
+    }
+    std::string corpus_error;
+    if (!corpus_builder.Encode(&code_corpus, &corpus_error)) {
+      return RejectLocked("capture provider corpus encoding failed: " +
+                          corpus_error);
+    }
+
+    initial_content.clear();
+    final_content.clear();
+    for (const auto& [page_address, bytes] : code_pages) {
+      initial_content.push_back(
+          {GuestExecutionSessionContentKind::kGuestCode, page_address,
+           std::vector<uint8_t>(bytes.cbegin(), bytes.cend())});
+    }
+    for (const auto& [page_address, initial_bytes] : initial_data_pages) {
+      const uint32_t backing = BackingPageAddress(page_address);
+      if (code_backing_views.contains(backing)) {
+        continue;
+      }
+      std::array<uint8_t, kGuestPageSize> final_bytes = {};
+      if (!page_reader.ReadPage(page_address, &final_bytes)) {
+        return RejectLocked(
+            "capture provider could not snapshot a final guest data page");
+      }
+      const bool dirtied = dirty_data_pages.contains(page_address);
+      if (!dirtied && final_bytes != initial_bytes) {
+        return RejectLocked(
+            "capture provider detected an unobserved guest memory mutation");
+      }
+      initial_content.push_back(
+          {GuestExecutionSessionContentKind::kGuestPage, page_address,
+           std::vector<uint8_t>(initial_bytes.cbegin(), initial_bytes.cend())});
+      if (dirtied) {
+        final_content.push_back(
+            {GuestExecutionSessionContentKind::kGuestPage, page_address,
+             std::vector<uint8_t>(final_bytes.cbegin(), final_bytes.cend())});
+      }
+    }
+    corpus_function_count = static_cast<uint32_t>(closure.size());
+    selected_code_page_count = static_cast<uint32_t>(code_pages.size());
+    selected_data_page_count =
+        static_cast<uint32_t>(initial_content.size() - code_pages.size());
+    return true;
+  }
+
+  bool Detach() noexcept {
+    std::lock_guard<std::mutex> attachment_lock(attachment_mutex);
+    if (!attached.load(std::memory_order_acquire)) {
+      return true;
+    }
+    if (!processor.TrySetGuestInvocationCaptureSink(owner, nullptr)) {
+      return false;
+    }
+    attached.store(false, std::memory_order_release);
+    return true;
+  }
+
+  Processor& processor;
+  GuestExecutionSessionCaptureProviderConfig config;
+  GuestInvocationCapturePageReader page_reader;
+  GuestExecutionSessionCaptureProvider* owner = nullptr;
+
+  mutable std::mutex mutex;
+  std::mutex lifecycle_mutex;
+  std::mutex attachment_mutex;
+  std::atomic<ProviderState> state{ProviderState::kCataloging};
+  std::atomic<bool> attached{false};
+  std::atomic<void (*)(void*)> seal_detached_test_hook{nullptr};
+  std::atomic<void*> seal_detached_test_context{nullptr};
+  std::atomic<uint32_t> lifecycle_waiter_count{0};
+  std::string rejection_message;
+
+  std::map<uint32_t, DefinitionRecord> definitions;
+  std::vector<uint32_t> definition_order;
+  std::set<uint32_t> pending_definition_snapshots;
+  std::set<uint32_t> catalog_code_pages;
+  std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> immutable_code_pages;
+  uint32_t dependency_count = 0;
+
+  std::map<std::pair<uint64_t, uint64_t>, uint64_t>
+      active_invocation_identities;
+  std::map<uint64_t, uint32_t> initial_outer_return_addresses;
+  std::map<uint64_t, std::vector<uint8_t>> initial_states;
+  std::map<uint64_t, std::vector<uint8_t>> final_states;
+  std::map<uint32_t, uint32_t> closure_seeds;
+
+  std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> initial_data_pages;
+  std::map<uint32_t, uint32_t> data_backing_views;
+  std::map<uint32_t, DataPageUse> data_page_uses;
+  std::set<uint32_t> dirty_data_pages;
+  std::set<uint32_t> written_backing_pages;
+  uint64_t memory_access_count = 0;
+
+  std::vector<GuestExecutionSessionAssemblerContent> initial_content;
+  std::vector<GuestExecutionSessionAssemblerContent> final_content;
+  std::vector<uint8_t> code_corpus;
+  uint32_t corpus_function_count = 0;
+  uint32_t selected_code_page_count = 0;
+  uint32_t selected_data_page_count = 0;
+};
+
+std::unique_ptr<GuestExecutionSessionCaptureProvider>
+GuestExecutionSessionCaptureProvider::CreateAndAttach(
+    Memory& memory, Processor& processor,
+    const GuestExecutionSessionCaptureProviderConfig& config,
+    std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  GuestExecutionSessionCaptureProviderConfig normalized_config = config;
+  if (!normalized_config.host_protection_page_size) {
+    const size_t native_page_size = xe::memory::page_size();
+    if (native_page_size > std::numeric_limits<uint32_t>::max()) {
+      Fail(error, "capture provider native page size is unsupported");
+      return nullptr;
+    }
+    normalized_config.host_protection_page_size =
+        static_cast<uint32_t>(native_page_size);
+  }
+  if (normalized_config.jit_corpus_config_flags !=
+          JitCorpus::kConfigGuestScheduler ||
+      !IsPowerOfTwo(normalized_config.host_protection_page_size) ||
+      normalized_config.host_protection_page_size < kGuestPageSize ||
+      normalized_config.host_protection_page_size >
+          ppc::GuestInvocationRecorderLimits::kMaximumHostProtectionPageSize ||
+      !normalized_config.maximum_data_page_count ||
+      !normalized_config.maximum_code_page_count ||
+      normalized_config.maximum_code_page_count >
+          ExecutionJitCorpus::kMaxPageRecords ||
+      !normalized_config.maximum_memory_access_count ||
+      !normalized_config.maximum_function_count ||
+      normalized_config.maximum_function_count >
+          ExecutionJitCorpus::kMaxFunctionRecords ||
+      !normalized_config.maximum_dependency_count) {
+    Fail(error,
+         "capture provider configuration is invalid or not "
+         "scheduler-on");
+    return nullptr;
+  }
+  try {
+    auto impl = std::make_unique<Impl>(memory, processor, normalized_config);
+    auto provider = std::unique_ptr<GuestExecutionSessionCaptureProvider>(
+        new GuestExecutionSessionCaptureProvider(std::move(impl)));
+    provider->impl_->owner = provider.get();
+    if (!processor.TrySetGuestInvocationCaptureSink(nullptr, provider.get())) {
+      Fail(error, "capture provider could not attach before title translation");
+      return nullptr;
+    }
+    provider->impl_->attached.store(true, std::memory_order_release);
+    return provider;
+  } catch (...) {
+    Fail(error, "capture provider allocation failed");
+    return nullptr;
+  }
+}
+
+GuestExecutionSessionCaptureProvider::GuestExecutionSessionCaptureProvider(
+    std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+GuestExecutionSessionCaptureProvider::~GuestExecutionSessionCaptureProvider() {
+  if (impl_ && !impl_->Detach() &&
+      impl_->processor.guest_invocation_capture_sink() == this) {
+    std::abort();
+  }
+}
+
+bool GuestExecutionSessionCaptureProvider::SupportsCheckpointParticipant(
+    const CheckpointParticipant& participant, std::string* error) noexcept {
+  if (error) {
+    error->clear();
+  }
+  if (!participant.restorable || !participant.thread_id ||
+      !participant.guest_pc || (participant.guest_pc & 3) ||
+      participant.resume_kind !=
+          kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint) {
+    return Fail(error,
+                "capture provider supports only restorable exact-PC JIT "
+                "safepoint participants");
+  }
+  return true;
+}
+
+bool GuestExecutionSessionCaptureProvider::BeginCapture(
+    const CheckpointSnapshot& checkpoint,
+    std::span<const GuestExecutionCaptureThreadStateLifecycleEvent>
+        participants,
+    const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
+    std::string* error) noexcept {
+  if (error) {
+    error->clear();
+  }
+  impl_->lifecycle_waiter_count.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lifecycle_lock(impl_->lifecycle_mutex);
+  impl_->lifecycle_waiter_count.fetch_sub(1, std::memory_order_relaxed);
+  std::vector<Impl::CapturedThreadState> captured;
+  if (!impl_->CaptureThreadStates(participants.size(), &captured, error)) {
+    impl_->RejectExternal(error && !error->empty()
+                              ? *error
+                              : "capture provider could not snapshot the "
+                                "initial live thread states");
+    return false;
+  }
+  try {
+    {
+      std::lock_guard<std::mutex> lock(impl_->mutex);
+      if (impl_->state.load(std::memory_order_relaxed) !=
+              ProviderState::kCataloging ||
+          !impl_->attached.load(std::memory_order_acquire)) {
+        impl_->RejectLocked(
+            "capture provider can begin only from its attached catalog state");
+        return impl_->SetErrorFromRejection(error);
+      }
+      if (!impl_->RetryPendingDefinitionsLocked(true) ||
+          !impl_->BuildCheckpointStatesLocked(checkpoint, participants,
+                                              host_calls, captured,
+                                              &impl_->initial_states, true)) {
+        return impl_->SetErrorFromRejection(error);
+      }
+      impl_->state.store(ProviderState::kRecording, std::memory_order_release);
+    }
+    if (!impl_->processor.TrySetGuestInvocationCaptureSink(this, this)) {
+      std::lock_guard<std::mutex> lock(impl_->mutex);
+      impl_->RejectLocked(
+          "capture provider could not arm the invocation hook generation");
+      return impl_->SetErrorFromRejection(error);
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->state.load(std::memory_order_relaxed) ==
+        ProviderState::kRejected) {
+      return impl_->SetErrorFromRejection(error);
+    }
+    return true;
+  } catch (...) {
+    impl_->RejectException();
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->SetErrorFromRejection(error);
+  }
+}
+
+bool GuestExecutionSessionCaptureProvider::SealCapture(
+    const CheckpointSnapshot& checkpoint,
+    const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
+    std::string* error) noexcept {
+  if (error) {
+    error->clear();
+  }
+  impl_->lifecycle_waiter_count.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lifecycle_lock(impl_->lifecycle_mutex);
+  impl_->lifecycle_waiter_count.fetch_sub(1, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->state.load(std::memory_order_relaxed) !=
+        ProviderState::kRecording) {
+      impl_->RejectLocked("capture provider can seal only an active recording");
+      return impl_->SetErrorFromRejection(error);
+    }
+  }
+  if (!impl_->Detach()) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->RejectLocked(
+        "capture provider could not detach and drain execution hooks");
+    return impl_->SetErrorFromRejection(error);
+  }
+  if (auto hook =
+          impl_->seal_detached_test_hook.load(std::memory_order_acquire)) {
+    hook(impl_->seal_detached_test_context.load(std::memory_order_acquire));
+  }
+  std::vector<Impl::CapturedThreadState> captured;
+  if (!impl_->CaptureThreadStates(impl_->initial_states.size(), &captured,
+                                  error)) {
+    impl_->RejectExternal(error && !error->empty()
+                              ? *error
+                              : "capture provider could not snapshot the "
+                                "final live thread states");
+    return false;
+  }
+  try {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->state.load(std::memory_order_relaxed) ==
+        ProviderState::kRejected) {
+      return impl_->SetErrorFromRejection(error);
+    }
+    std::vector<GuestExecutionCaptureThreadStateLifecycleEvent> participants;
+    participants.reserve(captured.size());
+    for (const auto& thread : captured) {
+      participants.push_back(
+          {thread.participant,
+           GuestExecutionCaptureThreadStateLifecycleState::kReady});
+    }
+    if (!impl_->BuildCheckpointStatesLocked(checkpoint, participants,
+                                            host_calls, captured,
+                                            &impl_->final_states, false) ||
+        !impl_->FinalizeContentAndCorpusLocked()) {
+      return impl_->SetErrorFromRejection(error);
+    }
+    impl_->state.store(ProviderState::kSealed, std::memory_order_release);
+    return true;
+  } catch (...) {
+    impl_->RejectException();
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->SetErrorFromRejection(error);
+  }
+}
+
+void GuestExecutionSessionCaptureProvider::EndCapture(bool accepted) noexcept {
+  impl_->lifecycle_waiter_count.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lifecycle_lock(impl_->lifecycle_mutex);
+  impl_->lifecycle_waiter_count.fetch_sub(1, std::memory_order_relaxed);
+  const bool detached = impl_->Detach();
+  try {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!detached) {
+      impl_->RejectLocked("capture provider could not detach at session end");
+      return;
+    }
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    if (current == ProviderState::kAccepted ||
+        current == ProviderState::kStopped) {
+      return;
+    } else if (accepted && current == ProviderState::kSealed) {
+      impl_->state.store(ProviderState::kAccepted, std::memory_order_release);
+    } else if (!accepted && current != ProviderState::kRejected) {
+      impl_->state.store(ProviderState::kStopped, std::memory_order_release);
+    } else if (accepted && current != ProviderState::kAccepted) {
+      impl_->RejectLocked(
+          "capture provider was accepted without a sealed result");
+    }
+  } catch (...) {
+    impl_->RejectException();
+  }
+}
+
+bool GuestExecutionSessionCaptureProvider::EncodeParticipantState(
+    const GuestExecutionCaptureParticipantIdentity& participant,
+    std::vector<uint8_t>* output, std::string* error) noexcept {
+  if (error) {
+    error->clear();
+  }
+  if (!output) {
+    return Fail(error, "capture provider state output is null");
+  }
+  try {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    const auto& states = current == ProviderState::kRecording
+                             ? impl_->initial_states
+                             : impl_->final_states;
+    if (current != ProviderState::kRecording &&
+        current != ProviderState::kSealed) {
+      output->clear();
+      return impl_->SetErrorFromRejection(error);
+    }
+    const auto state = states.find(participant.capture_instance_id);
+    if (state == states.cend() || participant.guest_thread_id == 0) {
+      output->clear();
+      return Fail(error, "capture provider has no state for the participant");
+    }
+    *output = state->second;
+    return true;
+  } catch (...) {
+    output->clear();
+    impl_->RejectException();
+    return Fail(error, "capture provider state copy failed");
+  }
+}
+
+bool GuestExecutionSessionCaptureProvider::CollectCheckpointContent(
+    bool initial_checkpoint,
+    std::vector<GuestExecutionSessionAssemblerContent>* output,
+    std::string* error) noexcept {
+  if (error) {
+    error->clear();
+  }
+  if (!output) {
+    return Fail(error, "capture provider content output is null");
+  }
+  try {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->state.load(std::memory_order_relaxed) !=
+        ProviderState::kSealed) {
+      output->clear();
+      return impl_->SetErrorFromRejection(error);
+    }
+    *output =
+        initial_checkpoint ? impl_->initial_content : impl_->final_content;
+    return true;
+  } catch (...) {
+    output->clear();
+    impl_->RejectException();
+    return Fail(error, "capture provider content copy failed");
+  }
+}
+
+bool GuestExecutionSessionCaptureProvider::CollectSessionCodeCorpus(
+    std::vector<uint8_t>* output, std::string* error) noexcept {
+  if (error) {
+    error->clear();
+  }
+  if (!output) {
+    return Fail(error, "capture provider corpus output is null");
+  }
+  try {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->state.load(std::memory_order_relaxed) !=
+            ProviderState::kSealed ||
+        impl_->code_corpus.empty()) {
+      output->clear();
+      return impl_->SetErrorFromRejection(error);
+    }
+    *output = impl_->code_corpus;
+    return true;
+  } catch (...) {
+    output->clear();
+    impl_->RejectException();
+    return Fail(error, "capture provider corpus copy failed");
+  }
+}
+
+uint8_t GuestExecutionSessionCaptureProvider::initial_event_mask() const {
+  return IsExecutionPhase(impl_->state.load(std::memory_order_acquire))
+             ? kGuestInvocationCaptureAllEvents
+             : 0;
+}
+
+uint8_t GuestExecutionSessionCaptureProvider::event_mask(
+    const ppc::GuestInvocationRecorderIdentity&) const {
+  return initial_event_mask();
+}
+
+bool GuestExecutionSessionCaptureProvider::Poll() noexcept {
+  return impl_->InvokeCallback([this] {
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    if (current == ProviderState::kRejected) {
+      return false;
+    }
+    return !IsCatalogPhase(current) ||
+           impl_->RetryPendingDefinitionsLocked(false);
+  });
+}
+
+bool GuestExecutionSessionCaptureProvider::OnFunctionDependency(
+    uint32_t source_address, uint32_t dependency_address) noexcept {
+  return impl_->InvokeCallback([this, source_address, dependency_address] {
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    if (current == ProviderState::kRejected) {
+      return false;
+    }
+    return !IsCatalogPhase(current) ||
+           impl_->RegisterDependencyLocked(source_address, dependency_address);
+  });
+}
+
+bool GuestExecutionSessionCaptureProvider::OnFunctionDefined(
+    uint32_t address, uint32_t end_address) noexcept {
+  return impl_->InvokeCallback([this, address, end_address] {
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    if (current == ProviderState::kRejected) {
+      return false;
+    }
+    return !IsCatalogPhase(current) ||
+           impl_->RegisterDefinitionLocked(address, end_address);
+  });
+}
+
+bool GuestExecutionSessionCaptureProvider::OnFunctionEntry(
+    const ppc::GuestInvocationRecorderIdentity& identity, uint32_t address,
+    uint32_t end_address, const ppc::GuestPPCRegisterState&) noexcept {
+  return impl_->InvokeCallback([this, identity, address, end_address] {
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    if (current == ProviderState::kRejected) {
+      return false;
+    }
+    if (!IsExecutionPhase(current)) {
+      return true;
+    }
+    uint64_t participant = 0;
+    return impl_->IsKnownExecutionIdentityLocked(identity, &participant) &&
+           impl_->RetryPendingDefinitionsLocked(true) &&
+           impl_->AddClosureSeedLocked(address, end_address);
+  });
+}
+
+bool GuestExecutionSessionCaptureProvider::OnFunctionExit(
+    const ppc::GuestInvocationRecorderIdentity& identity, uint32_t address,
+    uint32_t return_address, const ppc::GuestPPCRegisterState&) noexcept {
+  return impl_->InvokeCallback([this, identity, address, return_address] {
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    if (current == ProviderState::kRejected) {
+      return false;
+    }
+    if (!IsExecutionPhase(current)) {
+      return true;
+    }
+    uint64_t participant = 0;
+    const auto definition = impl_->definitions.find(address);
+    if (!impl_->IsKnownExecutionIdentityLocked(identity, &participant)) {
+      return false;
+    }
+    if (definition == impl_->definitions.cend() ||
+        !definition->second.defined) {
+      return impl_->RejectLocked(
+          "capture provider observed a function exit outside its exact "
+          "definition catalog");
+    }
+    const auto outer_return =
+        impl_->initial_outer_return_addresses.find(participant);
+    if (outer_return == impl_->initial_outer_return_addresses.cend()) {
+      return impl_->RejectLocked(
+          "capture provider function exit has no participant outer boundary");
+    }
+    if (return_address == outer_return->second) {
+      return true;
+    }
+    const Impl::DefinitionRecord* owner =
+        impl_->FindOwningDefinitionLocked(return_address);
+    if (!owner) {
+      return false;
+    }
+    const uint32_t owner_address = impl_->FindDefinitionAddressLocked(owner);
+    return owner_address &&
+           impl_->AddClosureSeedLocked(owner_address, owner->end_address);
+  });
+}
+
+bool GuestExecutionSessionCaptureProvider::OnMemoryAccess(
+    const ppc::GuestInvocationRecorderIdentity& identity, uint32_t address,
+    uint32_t size, ppc::GuestInvocationRecorderMemoryAccess access) noexcept {
+  return impl_->InvokeCallback([this, identity, address, size, access] {
+    return impl_->RecordMemoryAccessLocked(identity, address, size, access);
+  });
+}
+
+bool GuestExecutionSessionCaptureProvider::OnUnsupportedDependency(
+    const ppc::GuestInvocationRecorderIdentity& identity,
+    uint32_t dependency_flags) noexcept {
+  return impl_->InvokeCallback([this, identity, dependency_flags] {
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    if (current == ProviderState::kRejected) {
+      return false;
+    }
+    if (!IsExecutionPhase(current)) {
+      return true;
+    }
+    uint64_t participant = 0;
+    if (!impl_->IsKnownExecutionIdentityLocked(identity, &participant)) {
+      return false;
+    }
+    return impl_->RejectLocked(fmt::format(
+        "capture provider observed unsupported dependency flags 0x{:08X}",
+        dependency_flags));
+  });
+}
+
+bool GuestExecutionSessionCaptureProvider::OnTailCall(
+    const ppc::GuestInvocationRecorderIdentity& identity, uint32_t from_address,
+    uint32_t target_address) noexcept {
+  return impl_->InvokeCallback([this, identity, from_address, target_address] {
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    if (current == ProviderState::kRejected) {
+      return false;
+    }
+    if (!IsExecutionPhase(current)) {
+      return true;
+    }
+    uint64_t participant = 0;
+    const auto source = impl_->definitions.find(from_address);
+    const auto target = impl_->definitions.find(target_address);
+    if (!impl_->IsKnownExecutionIdentityLocked(identity, &participant) ||
+        source == impl_->definitions.cend() || !source->second.defined ||
+        target == impl_->definitions.cend() || !target->second.defined) {
+      return impl_->RejectLocked(
+          "capture provider tail call is outside the exact catalog");
+    }
+    return impl_->AddClosureSeedLocked(target_address,
+                                       target->second.end_address);
+  });
+}
+
+bool GuestExecutionSessionCaptureProvider::OnUnwindOrLongjmp(
+    const ppc::GuestInvocationRecorderIdentity& identity) noexcept {
+  return impl_->InvokeCallback([this, identity] {
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    if (current == ProviderState::kRejected) {
+      return false;
+    }
+    if (!IsExecutionPhase(current)) {
+      return true;
+    }
+    uint64_t participant = 0;
+    return impl_->IsKnownExecutionIdentityLocked(identity, &participant) &&
+           impl_->RejectLocked(
+               "capture provider cannot replay an unmodeled unwind");
+  });
+}
+
+bool GuestExecutionSessionCaptureProvider::OnAsyncReentry(
+    const ppc::GuestInvocationRecorderIdentity& identity) noexcept {
+  return impl_->InvokeCallback([this, identity] {
+    const ProviderState current = impl_->state.load(std::memory_order_relaxed);
+    if (current == ProviderState::kRejected) {
+      return false;
+    }
+    if (!IsExecutionPhase(current)) {
+      return true;
+    }
+    uint64_t participant = 0;
+    return impl_->IsKnownExecutionIdentityLocked(identity, &participant) &&
+           impl_->RejectLocked(
+               "capture provider cannot replay asynchronous reentry");
+  });
+}
+
+void GuestExecutionSessionCaptureProvider::SetSealDetachedTestHook(
+    void (*hook)(void*), void* context) noexcept {
+  if (!hook) {
+    impl_->seal_detached_test_hook.store(nullptr, std::memory_order_release);
+    impl_->seal_detached_test_context.store(nullptr, std::memory_order_relaxed);
+    return;
+  }
+  impl_->seal_detached_test_context.store(context, std::memory_order_relaxed);
+  impl_->seal_detached_test_hook.store(hook, std::memory_order_release);
+}
+
+uint32_t GuestExecutionSessionCaptureProvider::lifecycle_waiter_count_for_test()
+    const noexcept {
+  return impl_->lifecycle_waiter_count.load(std::memory_order_relaxed);
+}
+
+GuestExecutionSessionCaptureProviderStatus
+GuestExecutionSessionCaptureProvider::status() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  GuestExecutionSessionCaptureProviderStatus result;
+  result.state = impl_->state.load(std::memory_order_relaxed);
+  result.memory_access_count = impl_->memory_access_count;
+  result.catalog_function_count =
+      static_cast<uint32_t>(impl_->definition_order.size());
+  result.corpus_function_count = impl_->corpus_function_count;
+  result.code_page_count = impl_->selected_code_page_count;
+  result.data_page_count = impl_->selected_data_page_count;
+  result.message = impl_->rejection_message;
+  return result;
+}
+
+}  // namespace cpu
+}  // namespace xe
+
+#endif

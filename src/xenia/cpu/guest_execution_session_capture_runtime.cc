@@ -1022,7 +1022,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     if (shutdown_requested.load(std::memory_order_acquire)) {
       return;
     }
-    if (!dependencies.provider->SealCapture(provisional, &error)) {
+    if (!dependencies.provider->SealCapture(provisional, host_calls, &error)) {
       Reject(RuntimeRejection::kProviderFailure,
              error.empty() ? "capture runtime provider failed to seal"
                            : std::move(error));

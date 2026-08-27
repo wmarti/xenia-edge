@@ -99,6 +99,7 @@ class GuestExecutionSessionCaptureRuntimeProvider
       std::string* error) noexcept = 0;
   virtual bool SealCapture(
       const kernel::GuestSchedulerCheckpointBarrierSnapshot& checkpoint,
+      const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
       std::string* error) noexcept = 0;
   // Disarms every writer after the staged bundle no longer needs the source.
   // accepted is true only after the scheduler generation was revalidated.

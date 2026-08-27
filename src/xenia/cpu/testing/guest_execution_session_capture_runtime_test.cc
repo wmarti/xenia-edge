@@ -274,7 +274,9 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
     return true;
   }
 
-  bool SealCapture(const CheckpointSnapshot&, std::string*) noexcept override {
+  bool SealCapture(const CheckpointSnapshot&,
+                   const GuestExecutionCaptureHostCallRosterSnapshot&,
+                   std::string*) noexcept override {
     ++seal_count;
     std::unique_lock<std::mutex> lock(seal_mutex);
     seal_entered = true;
