@@ -655,6 +655,12 @@ class XThread : public XObject, public cpu::Thread {
     uint32_t preempt_defers_lock = 0;
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    // The byte in PPCContext is only a wakeup trigger. These independent
+    // ownership bits preserve whether a scheduler decision, a checkpoint
+    // rendezvous, or both caused the same JIT safepoint visit.
+    std::atomic<bool> scheduler_safepoint_requested{false};
+    std::atomic<bool> checkpoint_safepoint_requested{false};
+
     // Safepoints declined since the last terminal capture safepoint event.
     uint32_t capture_declined_safepoints = 0;
 
@@ -662,6 +668,10 @@ class XThread : public XObject, public cpu::Thread {
     // a JIT block head. The owning function extent is separate checkpoint
     // binding metadata; native stacks are deliberately not checkpoint state.
     uint32_t checkpoint_jit_safepoint_pc = 0;
+    // Set only when a fiber parked by the checkpoint barrier is released. An
+    // ordinary scheduler yield may also retain an exact JIT route, but requests
+    // raised while that fiber is off-CPU are already served by dispatch.
+    bool checkpoint_held_resume_pending = false;
 
     bool SetCheckpointJitSafepoint(uint64_t guest_pc) {
       checkpoint_jit_safepoint_pc = 0;
@@ -672,7 +682,10 @@ class XThread : public XObject, public cpu::Thread {
       return true;
     }
 
-    void ClearCheckpointResumeRoute() { checkpoint_jit_safepoint_pc = 0; }
+    void ClearCheckpointResumeRoute() {
+      checkpoint_jit_safepoint_pc = 0;
+      checkpoint_held_resume_pending = false;
+    }
 
     uint32_t RestorableCheckpointJitSafepointPc(
         GuestSchedulerCheckpointParticipantState state) const {

@@ -429,6 +429,8 @@ class GuestScheduler {
   std::atomic<void*> checkpoint_discard_test_context_{nullptr};
   std::atomic<CheckpointTestHook> checkpoint_terminate_test_hook_{nullptr};
   std::atomic<void*> checkpoint_terminate_test_context_{nullptr};
+  std::atomic<CheckpointTestHook> checkpoint_yield_test_hook_{nullptr};
+  std::atomic<void*> checkpoint_yield_test_context_{nullptr};
 
   // Shutdown keeps dispatch alive until every accepted discard has completed
   // XThread::Exit bookkeeping and reported its final yield.

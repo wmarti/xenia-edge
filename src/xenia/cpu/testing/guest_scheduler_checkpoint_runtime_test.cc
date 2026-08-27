@@ -102,6 +102,15 @@ class GuestSchedulerCheckpointRuntimeTestAccess final {
                                                     std::memory_order_release);
   }
 
+  static void SetYieldHook(GuestScheduler& scheduler,
+                           GuestScheduler::CheckpointTestHook hook,
+                           void* context) {
+    scheduler.checkpoint_yield_test_context_.store(context,
+                                                   std::memory_order_release);
+    scheduler.checkpoint_yield_test_hook_.store(hook,
+                                                std::memory_order_release);
+  }
+
   static GuestSchedulerCheckpointBarrierSnapshot Snapshot(
       GuestScheduler& scheduler) {
     return scheduler.checkpoint_barrier_.snapshot();
@@ -155,6 +164,26 @@ class GuestSchedulerCheckpointRuntimeTestAccess final {
 
   static bool DispatchReady(const GuestScheduler& scheduler) {
     return scheduler.checkpoint_dispatch_ready_.load(std::memory_order_acquire);
+  }
+
+  static void RequestSchedulerSafepoint(GuestScheduler& scheduler,
+                                        XThread* thread, bool raise_wake) {
+    std::lock_guard<std::mutex> lock(scheduler.lock_);
+    auto& links = thread->scheduler_links();
+    links.scheduler_safepoint_requested.store(true, std::memory_order_release);
+    if (raise_wake) {
+      std::atomic_ref<uint8_t>(
+          thread->thread_state()->context()->preempt_requested)
+          .store(1, std::memory_order_release);
+    }
+    scheduler.EmitCaptureLocked(GuestSchedulerCaptureEventKind::kPreemptRequest,
+                                thread, links.cpu, -1,
+                                GuestSchedulerCaptureReason::kWake, 0, 0);
+  }
+
+  static bool SchedulerSafepointPending(XThread* thread) {
+    return thread->scheduler_links().scheduler_safepoint_requested.load(
+        std::memory_order_acquire);
   }
 };
 
@@ -383,9 +412,15 @@ struct FiberControl {
   }
 
   bool WaitForSafepointReturn(std::chrono::milliseconds timeout) {
+    return WaitForSafepointReturns(1, timeout);
+  }
+
+  bool WaitForSafepointReturns(uint32_t count,
+                               std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex);
-    return condition.wait_for(
-        lock, timeout, [this]() { return safepoint_returns.load() > 0; });
+    return condition.wait_for(lock, timeout, [this, count]() {
+      return safepoint_returns.load(std::memory_order_acquire) >= count;
+    });
   }
 
   bool WaitForExit(std::chrono::milliseconds timeout) {
@@ -1018,6 +1053,334 @@ TEST_CASE("Guest scheduler checkpoint roster and release contract are explicit",
   REQUIRE(result.suspended_started_after_resume);
   REQUIRE(result.running_stopped);
   REQUIRE(result.suspended_stopped);
+}
+
+TEST_CASE("Guest scheduler checkpoint-only safepoint does not yield",
+          "[guest_scheduler_checkpoint][guest_scheduler_capture][runtime]") {
+  FiberControl control;
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(128);
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  CreatedThread created =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(created.status));
+  REQUIRE(control.WaitForStart(2s));
+
+  PauseResult pause = Pause(scheduler, 2s);
+  REQUIRE(pause.rejection == Rejection::kNone);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              pause.snapshot.generation, nullptr) == Rejection::kNone);
+  REQUIRE(control.WaitForSafepointReturn(2s));
+
+  const auto snapshot = recorder->snapshot();
+  REQUIRE(std::none_of(snapshot.events.begin(), snapshot.events.end(),
+                       [](const GuestSchedulerCaptureEvent& event) {
+                         return event.kind == Kind::kSafepoint;
+                       }));
+  REQUIRE_FALSE(
+      GuestSchedulerCheckpointRuntimeTestAccess::SchedulerSafepointPending(
+          created.thread.get()));
+  REQUIRE(StopRuntimeThread(created, control));
+}
+
+TEST_CASE("Guest scheduler scheduler-only safepoint yields once",
+          "[guest_scheduler_checkpoint][guest_scheduler_capture][runtime]") {
+  FiberControl control;
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(128);
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  CreatedThread created =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(created.status));
+  REQUIRE(control.WaitForStart(2s));
+  GuestSchedulerCheckpointRuntimeTestAccess::RequestSchedulerSafepoint(
+      scheduler, created.thread.get(), true);
+  REQUIRE(control.WaitForSafepointReturn(2s));
+
+  const auto snapshot = recorder->snapshot();
+  size_t safepoint_count = 0;
+  for (const auto& event : snapshot.events) {
+    if (event.kind != Kind::kSafepoint) {
+      continue;
+    }
+    ++safepoint_count;
+    REQUIRE(event.reason == GuestSchedulerCaptureReason::kYielded);
+    REQUIRE(event.flags == kGuestSchedulerCaptureFlagSchedulerRequested);
+  }
+  REQUIRE(safepoint_count == 1);
+  REQUIRE_FALSE(
+      GuestSchedulerCheckpointRuntimeTestAccess::SchedulerSafepointPending(
+          created.thread.get()));
+  REQUIRE(StopRuntimeThread(created, control));
+}
+
+TEST_CASE("Guest scheduler checkpoint co-delivers an earlier scheduler request",
+          "[guest_scheduler_checkpoint][guest_scheduler_capture][runtime]") {
+  FiberControl control;
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(128);
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  CreatedThread created =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(created.status));
+  REQUIRE(control.WaitForStart(2s));
+  created.thread->thread_state()->RequestGuestExecutionCaptureJitSafepoint();
+  GuestSchedulerCheckpointRuntimeTestAccess::RequestSchedulerSafepoint(
+      scheduler, created.thread.get(), false);
+
+  PauseResult pause = Pause(scheduler, 2s);
+  REQUIRE(pause.rejection == Rejection::kNone);
+  const auto* participant =
+      FindThread(pause.snapshot, created.thread->thread_id());
+  REQUIRE(participant);
+  REQUIRE(participant->guest_pc == kSafepointPc);
+  REQUIRE(participant->resume_kind == ResumeKind::kJitSafepoint);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              pause.snapshot.generation, nullptr) == Rejection::kNone);
+  REQUIRE(control.WaitForSafepointReturn(2s));
+
+  const auto snapshot = recorder->snapshot();
+  const uint16_t both = kGuestSchedulerCaptureFlagSchedulerRequested |
+                        kGuestSchedulerCaptureFlagCaptureRequested;
+  size_t safepoint_count = 0;
+  for (const auto& event : snapshot.events) {
+    if (event.kind != Kind::kSafepoint) {
+      continue;
+    }
+    ++safepoint_count;
+    REQUIRE(event.reason == GuestSchedulerCaptureReason::kYielded);
+    REQUIRE(event.flags == both);
+  }
+  REQUIRE(safepoint_count == 1);
+  REQUIRE_FALSE(
+      GuestSchedulerCheckpointRuntimeTestAccess::SchedulerSafepointPending(
+          created.thread.get()));
+  std::atomic_ref<uint8_t>(
+      created.thread->thread_state()->context()->capture_rendezvous_requested)
+      .store(0, std::memory_order_release);
+  REQUIRE(StopRuntimeThread(created, control));
+}
+
+TEST_CASE("Guest scheduler checkpoint preserves a request raised while held",
+          "[guest_scheduler_checkpoint][guest_scheduler_capture][runtime]") {
+  BlockingGate arrival_gate;
+  FiberControl control;
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(128);
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  CreatedThread created =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(created.status));
+  REQUIRE(control.WaitForStart(2s));
+  created.thread->thread_state()->RequestGuestExecutionCaptureJitSafepoint();
+  GuestSchedulerCheckpointRuntimeTestAccess::RequestSchedulerSafepoint(
+      scheduler, created.thread.get(), false);
+  GuestSchedulerCheckpointRuntimeTestAccess::SetArrivalHook(
+      scheduler, &BlockingGate::Hook, &arrival_gate);
+  auto pause_future = std::async(std::launch::async,
+                                 [&scheduler] { return Pause(scheduler, 2s); });
+  const bool arrival_entered = arrival_gate.WaitUntilEntered(2s);
+  if (!arrival_entered) {
+    arrival_gate.Release();
+  }
+  REQUIRE(arrival_entered);
+  GuestSchedulerCheckpointRuntimeTestAccess::RequestSchedulerSafepoint(
+      scheduler, created.thread.get(), true);
+  arrival_gate.Release();
+  REQUIRE(pause_future.wait_for(2s) == std::future_status::ready);
+  PauseResult pause = pause_future.get();
+  GuestSchedulerCheckpointRuntimeTestAccess::SetArrivalHook(scheduler, nullptr,
+                                                            nullptr);
+  REQUIRE(pause.rejection == Rejection::kNone);
+  const auto* participant =
+      FindThread(pause.snapshot, created.thread->thread_id());
+  REQUIRE(participant);
+  REQUIRE(participant->guest_pc == kSafepointPc);
+  REQUIRE(participant->resume_kind == ResumeKind::kJitSafepoint);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              pause.snapshot.generation, nullptr) == Rejection::kNone);
+  REQUIRE(control.WaitForSafepointReturn(2s));
+  REQUIRE_FALSE(control.WaitForSafepointReturns(2, 100ms));
+
+  const auto snapshot = recorder->snapshot();
+  size_t safepoint_count = 0;
+  for (const auto& event : snapshot.events) {
+    if (event.kind != Kind::kSafepoint) {
+      continue;
+    }
+    ++safepoint_count;
+    REQUIRE(event.reason == GuestSchedulerCaptureReason::kYielded);
+    REQUIRE(event.flags & kGuestSchedulerCaptureFlagSchedulerRequested);
+  }
+  REQUIRE(safepoint_count == 1);
+  REQUIRE_FALSE(
+      GuestSchedulerCheckpointRuntimeTestAccess::SchedulerSafepointPending(
+          created.thread.get()));
+  REQUIRE(std::atomic_ref<uint8_t>(
+              created.thread->thread_state()->context()->preempt_requested)
+              .load(std::memory_order_acquire) == 0);
+  std::atomic_ref<uint8_t>(
+      created.thread->thread_state()->context()->capture_rendezvous_requested)
+      .store(0, std::memory_order_release);
+  REQUIRE(StopRuntimeThread(created, control));
+}
+
+TEST_CASE("Guest scheduler dispatch consumes an ordinary off-CPU request",
+          "[guest_scheduler_checkpoint][guest_scheduler_capture][runtime]") {
+  BlockingGate yield_gate;
+  FiberControl control;
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(128);
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  CreatedThread created =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(created.status));
+  REQUIRE(control.WaitForStart(2s));
+  GuestSchedulerCheckpointRuntimeTestAccess::SetYieldHook(
+      scheduler, &BlockingGate::Hook, &yield_gate);
+  GuestSchedulerCheckpointRuntimeTestAccess::RequestSchedulerSafepoint(
+      scheduler, created.thread.get(), true);
+  const bool yield_entered = yield_gate.WaitUntilEntered(2s);
+  if (!yield_entered) {
+    yield_gate.Release();
+  }
+  REQUIRE(yield_entered);
+  GuestSchedulerCheckpointRuntimeTestAccess::RequestSchedulerSafepoint(
+      scheduler, created.thread.get(), true);
+  GuestSchedulerCheckpointRuntimeTestAccess::SetYieldHook(scheduler, nullptr,
+                                                          nullptr);
+  yield_gate.Release();
+
+  REQUIRE(control.WaitForSafepointReturn(2s));
+  REQUIRE_FALSE(control.WaitForSafepointReturns(2, 100ms));
+  const auto snapshot = recorder->snapshot();
+  size_t safepoint_count = 0;
+  for (const auto& event : snapshot.events) {
+    if (event.kind != Kind::kSafepoint) {
+      continue;
+    }
+    ++safepoint_count;
+    REQUIRE(event.reason == GuestSchedulerCaptureReason::kYielded);
+    REQUIRE(event.flags == kGuestSchedulerCaptureFlagSchedulerRequested);
+  }
+  REQUIRE(safepoint_count == 1);
+  REQUIRE_FALSE(
+      GuestSchedulerCheckpointRuntimeTestAccess::SchedulerSafepointPending(
+          created.thread.get()));
+  REQUIRE(std::atomic_ref<uint8_t>(
+              created.thread->thread_state()->context()->preempt_requested)
+              .load(std::memory_order_acquire) == 0);
+  REQUIRE(StopRuntimeThread(created, control));
+}
+
+TEST_CASE("Guest scheduler yields at the held real JIT safepoint",
+          "[guest_scheduler_checkpoint][guest_scheduler_capture][runtime]") {
+  BlockingGate arrival_gate;
+  FiberControl blocker_control;
+  ReplayFiberControl replay_control;
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(256);
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  REQUIRE(InstallReplayGuestCode(environment.emulator()));
+  GuestScheduler& scheduler = *environment.scheduler();
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+  Memory* memory = environment.emulator()->memory();
+
+  const uint32_t shared_address = memory->SystemHeapAlloc(4096);
+  REQUIRE(shared_address != 0);
+  std::memset(memory->TranslateVirtual(shared_address), 0, 4096);
+  store_and_swap<uint32_t>(
+      memory->TranslateVirtual(shared_address + kSharedTokenB), 1);
+
+  CreatedReplayThread replay = CreateReplayRuntimeThread(
+      environment, replay_control, kReplayResumeA, kReplayCallerA,
+      kReplayOuterReturnA, shared_address);
+  REQUIRE(XSUCCEEDED(replay.status));
+  REQUIRE(XSUCCEEDED(replay.thread->Resume()));
+  REQUIRE(WaitForGuestWord(memory, shared_address + kSharedReachedA, 1, 2s));
+  REQUIRE(WaitUntilRunning(scheduler, replay.thread.get(), 2s));
+
+  CreatedThread blocker =
+      CreateRuntimeThread(environment, blocker_control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(blocker.status));
+  REQUIRE_FALSE(blocker_control.WaitForStart(100ms));
+
+  GuestSchedulerCheckpointRuntimeTestAccess::SetArrivalHook(
+      scheduler, &BlockingGate::Hook, &arrival_gate);
+  auto pause_future = std::async(std::launch::async,
+                                 [&scheduler] { return Pause(scheduler, 2s); });
+  const bool arrival_entered = arrival_gate.WaitUntilEntered(2s);
+  if (!arrival_entered) {
+    arrival_gate.Release();
+  }
+  REQUIRE(arrival_entered);
+  GuestSchedulerCheckpointRuntimeTestAccess::RequestSchedulerSafepoint(
+      scheduler, replay.thread.get(), true);
+  store_and_swap<uint32_t>(
+      memory->TranslateVirtual(shared_address + kSharedPoisonGate), 1);
+  arrival_gate.Release();
+  REQUIRE(pause_future.wait_for(2s) == std::future_status::ready);
+  PauseResult pause = pause_future.get();
+  GuestSchedulerCheckpointRuntimeTestAccess::SetArrivalHook(scheduler, nullptr,
+                                                            nullptr);
+  REQUIRE(pause.rejection == Rejection::kNone);
+  const auto* participant =
+      FindThread(pause.snapshot, replay.thread->thread_id());
+  REQUIRE(participant);
+  REQUIRE(participant->guest_pc == kReplayFinalA);
+  REQUIRE(participant->resume_kind == ResumeKind::kJitSafepoint);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              pause.snapshot.generation, nullptr) == Rejection::kNone);
+
+  REQUIRE(blocker_control.WaitForStart(2s));
+  REQUIRE(load_and_swap<uint32_t>(
+              memory->TranslateVirtual(shared_address + kSharedPoisonA)) == 0);
+  REQUIRE_FALSE(
+      GuestSchedulerCheckpointRuntimeTestAccess::SchedulerSafepointPending(
+          replay.thread.get()));
+
+  const auto snapshot = recorder->snapshot();
+  size_t replay_safepoint_count = 0;
+  for (const auto& event : snapshot.events) {
+    if (event.kind != Kind::kSafepoint ||
+        event.guest_thread_id != replay.thread->thread_id()) {
+      continue;
+    }
+    ++replay_safepoint_count;
+    REQUIRE(event.reason == GuestSchedulerCaptureReason::kYielded);
+    REQUIRE(event.flags == (kGuestSchedulerCaptureFlagSchedulerRequested |
+                            kGuestSchedulerCaptureFlagCaptureRequested));
+  }
+  REQUIRE(replay_safepoint_count == 1);
+
+  REQUIRE(StopRuntimeThread(blocker, blocker_control));
+  REQUIRE(xe::threading::Wait(replay.thread->wait_handle(), false, 2s) ==
+          xe::threading::WaitResult::kSuccess);
+  REQUIRE(load_and_swap<uint32_t>(memory->TranslateVirtual(
+              shared_address + kSharedPoisonA)) == 0xA1);
+  REQUIRE(replay_control.execute_returned.load(std::memory_order_acquire));
+  memory->SystemHeapFree(shared_address);
 }
 
 TEST_CASE("Guest scheduler checkpoint preserves an exact ready JIT route",

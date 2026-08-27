@@ -75,6 +75,26 @@ static constexpr uint32_t kMaxIrqlPreemptDefers = 4096;
 // Reporting threshold for the lock case, which is never forced.
 static constexpr uint32_t kLockPreemptDeferReport = 65536;
 
+inline void RequestSchedulerSafepoint(XThread* thread) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  thread->scheduler_links().scheduler_safepoint_requested.store(
+      true, std::memory_order_release);
+#endif
+  std::atomic_ref<uint8_t>(thread->thread_state()->context()->preempt_requested)
+      .store(1, std::memory_order_release);
+}
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+inline void RequestCheckpointSafepoint(XThread* thread) {
+  thread->scheduler_links().checkpoint_safepoint_requested.store(
+      true, std::memory_order_release);
+  std::atomic_ref<uint8_t>(thread->thread_state()->context()->preempt_requested)
+      .store(1, std::memory_order_release);
+}
+#endif
+
 // JIT safepoint handler. The cold path cleared the flag, so the deferred
 // cases re-set it to retry at the next safepoint.
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
@@ -87,32 +107,50 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
   if (!self) {
     return;
   }
+  auto* context = self->thread_state()->context();
+  auto& links = self->scheduler_links();
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   auto* scheduler = self->kernel_state()->guest_scheduler();
+  bool scheduler_requested = links.scheduler_safepoint_requested.exchange(
+      false, std::memory_order_acq_rel);
+  bool checkpoint_requested = links.checkpoint_safepoint_requested.exchange(
+      false, std::memory_order_acq_rel);
   const uint32_t exact_guest_pc =
       guest_address && !(guest_address >> 32) && !(guest_address & 3)
           ? static_cast<uint32_t>(guest_address)
           : 0;
-  if (scheduler->TryCheckpointCurrentFiber(self, exact_guest_pc)) {
+  const bool checkpoint_consumed =
+      scheduler->TryCheckpointCurrentFiber(self, exact_guest_pc);
+  checkpoint_requested |= checkpoint_consumed;
+  // A scheduler request may arrive after the first exchange while a checkpoint
+  // keeps this exact JIT safepoint parked. Consume it before returning to guest
+  // code so the scheduler outcome remains ordered at this guest address.
+  scheduler_requested |= links.scheduler_safepoint_requested.exchange(
+      false, std::memory_order_acq_rel);
+  if (!scheduler_requested && (checkpoint_consumed || checkpoint_requested)) {
     return;
   }
+  // Preserve the old behavior for an unclassified legacy writer while every
+  // production scheduler and checkpoint writer uses the ownership bits.
+  uint16_t request_flags = kGuestSchedulerCaptureFlagSchedulerRequested;
+  if (checkpoint_requested ||
+      self->thread_state()->IsGuestExecutionCaptureJitSafepointRequested()) {
+    request_flags |= kGuestSchedulerCaptureFlagCaptureRequested;
+  }
 #endif
-  auto* context = self->thread_state()->context();
-  auto& links = self->scheduler_links();
   // A co-resident fiber would re-enter the recursive lock on this host thread,
   // silently breaking mutual exclusion, so this one is never forced. Report a
   // fiber stuck here instead - it means guest code is spinning under the global
   // lock, which the lock's own holder has to resolve.
   if (xe::global_critical_region::is_held_by_current_thread()) {
-    context->preempt_requested = 1;
+    RequestSchedulerSafepoint(self);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     // Once per episode; the count lands on the terminal outcome.
     if (!links.preempt_defers_lock) {
       self->kernel_state()->guest_scheduler()->NoteCaptureSafepoint(
-          self, CaptureReason::kDeferredLock,
-          kGuestSchedulerCaptureFlagSchedulerRequested, 0);
+          self, CaptureReason::kDeferredLock, request_flags, 0);
     }
 #endif
     if (++links.preempt_defers_lock == kLockPreemptDeferReport) {
@@ -136,13 +174,12 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
   bool forced_at_irql = false;
   if (kpcr->current_irql >= 2) {
     if (++links.preempt_defers_irql < kMaxIrqlPreemptDefers) {
-      context->preempt_requested = 1;
+      RequestSchedulerSafepoint(self);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
       if (links.preempt_defers_irql == 1) {
         self->kernel_state()->guest_scheduler()->NoteCaptureSafepoint(
-            self, CaptureReason::kDeferredIrql,
-            kGuestSchedulerCaptureFlagSchedulerRequested, 0);
+            self, CaptureReason::kDeferredIrql, request_flags, 0);
       }
 #endif
       return;
@@ -171,8 +208,7 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
   self->kernel_state()->guest_scheduler()->NoteCaptureSafepoint(
       self,
       forced_at_irql ? CaptureReason::kForcedIrql : CaptureReason::kYielded,
-      kGuestSchedulerCaptureFlagSchedulerRequested,
-      links.capture_declined_safepoints);
+      request_flags, links.capture_declined_safepoints);
   links.capture_declined_safepoints = 0;
 #endif
   self->kernel_state()->guest_scheduler()->YieldCurrentThread(true,
@@ -346,7 +382,7 @@ GuestScheduler::PauseForCheckpointBarrier(
       }
       for (Cpu& cpu : cpus_) {
         if (cpu.current_thread) {
-          cpu.current_thread->thread_state()->context()->preempt_requested = 1;
+          RequestCheckpointSafepoint(cpu.current_thread);
         }
       }
     }
@@ -607,6 +643,7 @@ void GuestScheduler::RequeueReleasedCheckpointFiberLocked(int cpu_index,
   auto& links = thread->scheduler_links();
   assert_false(links.running || links.queued || links.blocked ||
                links.suspended);
+  links.checkpoint_held_resume_pending = true;
   links.queued = true;
   links.cpu = cpu_index;
   links.preempted = false;
@@ -690,7 +727,7 @@ bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
     return false;
   }
   if (xe::global_critical_region::is_held_by_current_thread()) {
-    thread->thread_state()->context()->preempt_requested = 1;
+    RequestCheckpointSafepoint(thread);
     return true;
   }
   const int cpu_index = t_current_cpu;
@@ -868,7 +905,7 @@ void GuestScheduler::Shutdown() {
         std::lock_guard<std::mutex> lock(lock_);
         for (int i = 0; i < kMaxCpus; ++i) {
           if (XThread* running = cpus_[i].current_thread) {
-            running->thread_state()->context()->preempt_requested = 1;
+            RequestSchedulerSafepoint(running);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
             if (capture_shutdown_requested[i] != running) {
@@ -1238,7 +1275,7 @@ void GuestScheduler::LinkReadyLocked(Cpu& cpu, XThread* thread, bool at_head) {
   if (running && running != thread &&
       prio > ClampPriority(running->priority())) {
     running->scheduler_links().preempted = true;
-    running->thread_state()->context()->preempt_requested = 1;
+    RequestSchedulerSafepoint(running);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     EmitCaptureLocked(CaptureKind::kPreemptRequest, running,
@@ -1442,7 +1479,7 @@ bool GuestScheduler::TerminateThread(XThread* thread) {
     }
     if (links.running) {
       // Force it to a safepoint, where ExitIfTerminated ends it.
-      thread->thread_state()->context()->preempt_requested = 1;
+      RequestSchedulerSafepoint(thread);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
       EmitCaptureLocked(CaptureKind::kTerminate, thread, links.cpu, -1,
@@ -1504,6 +1541,7 @@ void GuestScheduler::SwitchTo(XThread* next) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   const bool capture_first_run = !links.has_run;
+  bool preserve_checkpoint_scheduler_request = false;
 #else
   if (!links.has_run) {
     links.has_run = true;
@@ -1531,6 +1569,9 @@ void GuestScheduler::SwitchTo(XThread* next) {
       XELOGI("GuestScheduler: first run tid={:08X} '{}'", next->thread_id(),
              next->thread_name());
     }
+    preserve_checkpoint_scheduler_request =
+        links.checkpoint_held_resume_pending &&
+        links.scheduler_safepoint_requested.load(std::memory_order_acquire);
     // From this point the native fiber may execute. Its parked block-head
     // route is no longer durable even before the actual context switch.
     links.ClearCheckpointResumeRoute();
@@ -1557,14 +1598,27 @@ void GuestScheduler::SwitchTo(XThread* next) {
             (capture_fresh_quantum ? kGuestSchedulerCaptureFlagFreshQuantum
                                    : 0),
         0);
+    links.scheduler_safepoint_requested.store(
+        preserve_checkpoint_scheduler_request, std::memory_order_release);
+    links.checkpoint_safepoint_requested.store(false,
+                                               std::memory_order_release);
 #endif
+    // Ordinary off-CPU requests are stale because dispatch serves them. A
+    // request raised while an exact checkpoint route was held still needs one
+    // observable safepoint outcome after that route resumes.
+    std::atomic_ref<uint8_t>(next->thread_state()->context()->preempt_requested)
+        .store(
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+            preserve_checkpoint_scheduler_request ? 1 : 0,
+#else
+            0,
+#endif
+            std::memory_order_release);
   }
   stats_.switches.fetch_add(1, std::memory_order_relaxed);
   XThread::SetCurrentThread(next);
   next->guest_object<X_KTHREAD>()->thread_state = KTHREAD_STATE_RUNNING;
-  // A flag raised while this fiber was off-CPU is stale, the dispatcher
-  // already served it. A raise racing this clear is restored by the watchdog.
-  next->thread_state()->context()->preempt_requested = 0;
   // The profiler keys its scope stack by host thread, so without this every
   // fiber dispatched here would nest its scopes inside whichever one ran
   // before it. A yield resumes this line, so the restore below pairs with it.
@@ -1761,6 +1815,12 @@ bool GuestScheduler::YieldCurrentThread(bool quantum_end, bool to_lower
                jit_safepoint_guest_address
 #endif
   );
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (auto hook = checkpoint_yield_test_hook_.load(std::memory_order_acquire)) {
+    hook(checkpoint_yield_test_context_.load(std::memory_order_acquire));
+  }
+#endif
   YieldToScheduler();
   // Terminated while queued.
   ExitIfTerminated();
@@ -1921,7 +1981,7 @@ void GuestScheduler::WakeAll() {
       if (running &&
           cpu.max_blocked_prio > ClampPriority(running->priority())) {
         running->scheduler_links().preempted = true;
-        running->thread_state()->context()->preempt_requested = 1;
+        RequestSchedulerSafepoint(running);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
         EmitCaptureLocked(CaptureKind::kPreemptRequest, running, i, -1,
@@ -1990,7 +2050,7 @@ void GuestScheduler::WakeForSignal(const XObject* object) {
       XThread* running = cpu.current_thread;
       if (running && watcher_prio > ClampPriority(running->priority())) {
         running->scheduler_links().preempted = true;
-        running->thread_state()->context()->preempt_requested = 1;
+        RequestSchedulerSafepoint(running);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
         EmitCaptureLocked(CaptureKind::kPreemptRequest, running, i, -1,
@@ -2622,7 +2682,7 @@ void GuestScheduler::WatchdogLoop() {
     for (int i = 0; i < kMaxCpus; ++i) {
       XThread* running = cpus_[i].current_thread;
       if (running && now >= cpus_[i].quantum_deadline_tick) {
-        running->thread_state()->context()->preempt_requested = 1;
+        RequestSchedulerSafepoint(running);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
         EmitCaptureLocked(CaptureKind::kPreemptRequest, running, i, -1,
