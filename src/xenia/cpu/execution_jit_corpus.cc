@@ -27,6 +27,9 @@ constexpr uint32_t kKnownConfigFlags = JitCorpus::kConfigGuestScheduler;
 constexpr uint32_t kSupportedVersion = 3;
 constexpr uint32_t kSupportedPageSize = 4096;
 constexpr size_t kHeaderSize = 4 * sizeof(uint32_t);
+constexpr uint64_t kEncodedPageRecordSize =
+    2 * sizeof(uint32_t) + JitCorpus::kPageSize;
+constexpr uint64_t kEncodedFunctionRecordSize = 5 * sizeof(uint32_t);
 
 static_assert(JitCorpus::kVersion == kSupportedVersion,
               "review the execution decoder before accepting a new format");
@@ -90,6 +93,34 @@ bool IsSupportedCodePageAddress(uint32_t address) {
   return address >= 0x80040000u && address <= 0x9FFFE000u;
 }
 
+bool ValidateConfigFlags(uint32_t config_flags, std::string* error) {
+  if (config_flags & ~kKnownConfigFlags) {
+    if (error) {
+      error->assign("corpus configuration contains unsupported flags");
+    }
+    return false;
+  }
+  return true;
+}
+
+bool ValidateCodePageAddress(uint32_t address, std::string* error) {
+  if (address & (JitCorpus::kPageSize - 1)) {
+    if (error) {
+      error->assign("corpus contains an unaligned code page");
+    }
+    return false;
+  }
+  if (!IsSupportedCodePageAddress(address)) {
+    if (error) {
+      error->assign(
+          "corpus contains a code page outside the supported XEX executable "
+          "range");
+    }
+    return false;
+  }
+  return true;
+}
+
 bool ValidateFunctionRecord(const JitCorpus::FunctionRecord& function,
                             std::string* error) {
   if (function.flags & ~JitCorpus::kKnownFunctionFlags) {
@@ -143,6 +174,21 @@ bool ValidateFunctionRecord(const JitCorpus::FunctionRecord& function,
   return true;
 }
 
+void AppendU32(std::vector<uint8_t>* output, uint32_t value) {
+  output->push_back(static_cast<uint8_t>(value));
+  output->push_back(static_cast<uint8_t>(value >> 8));
+  output->push_back(static_cast<uint8_t>(value >> 16));
+  output->push_back(static_cast<uint8_t>(value >> 24));
+}
+
+bool FunctionRecordsEqual(const JitCorpus::FunctionRecord& left,
+                          const JitCorpus::FunctionRecord& right) {
+  return left.address == right.address &&
+         left.end_address == right.end_address &&
+         left.host_code_size == right.host_code_size &&
+         left.flags == right.flags;
+}
+
 }  // namespace
 
 bool ExecutionJitCorpus::Decode(const uint8_t* data, size_t data_size,
@@ -183,9 +229,9 @@ bool ExecutionJitCorpus::Decode(const uint8_t* data, size_t data_size,
   if (page_size != kSupportedPageSize) {
     return Fail(output, error, "corpus page size is unsupported");
   }
-  if (config_flags & ~kKnownConfigFlags) {
-    return Fail(output, error,
-                "corpus configuration contains unsupported flags");
+  std::string validation_error;
+  if (!ValidateConfigFlags(config_flags, &validation_error)) {
+    return Fail(output, error, validation_error);
   }
 
   std::vector<PageRecord> pages;
@@ -203,13 +249,8 @@ bool ExecutionJitCorpus::Decode(const uint8_t* data, size_t data_size,
           !reader.ReadBytes(page.data.data(), page.data.size())) {
         return Fail(output, error, "corpus page record is truncated");
       }
-      if (page.address & (JitCorpus::kPageSize - 1)) {
-        return Fail(output, error, "corpus contains an unaligned code page");
-      }
-      if (!IsSupportedCodePageAddress(page.address)) {
-        return Fail(output, error,
-                    "corpus contains a code page outside the supported XEX "
-                    "executable range");
+      if (!ValidateCodePageAddress(page.address, &validation_error)) {
+        return Fail(output, error, validation_error);
       }
       if (pages.size() >= kMaxPageRecords) {
         return Fail(output, error, "corpus exceeds the code-page limit");
@@ -367,6 +408,193 @@ const ExecutionJitCorpus::FunctionRecord* ExecutionJitCorpus::FindFunction(
                        });
   return it != functions_.cend() && it->address == entry_address ? &*it
                                                                  : nullptr;
+}
+
+bool ExecutionJitCorpusBuilder::Fail(std::string_view message,
+                                     std::string* error) {
+  if (!failed_) {
+    failed_ = true;
+    failure_.assign(message);
+  }
+  if (error) {
+    error->assign(failure_);
+  }
+  return false;
+}
+
+bool ExecutionJitCorpusBuilder::CheckUsable(std::string* error) const {
+  if (!failed_) {
+    return true;
+  }
+  if (error) {
+    error->assign(failure_);
+  }
+  return false;
+}
+
+bool ExecutionJitCorpusBuilder::AddCodePage(uint32_t page_address,
+                                            const uint8_t* page_data,
+                                            size_t page_data_size,
+                                            std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!CheckUsable(error)) {
+    return false;
+  }
+  if (page_data_size != JitCorpus::kPageSize) {
+    return Fail("exact corpus code page has an invalid byte size", error);
+  }
+  if (!page_data) {
+    return Fail("exact corpus code page data is null", error);
+  }
+  std::string validation_error;
+  if (!ValidateCodePageAddress(page_address, &validation_error)) {
+    return Fail(validation_error, error);
+  }
+
+  const auto existing_page = pages_.find(page_address);
+  if (existing_page != pages_.cend()) {
+    if (std::equal(existing_page->second.cbegin(), existing_page->second.cend(),
+                   page_data)) {
+      return Fail("exact corpus contains a duplicate code page", error);
+    }
+    return Fail("exact corpus contains conflicting code-page contents", error);
+  }
+  if (pages_.size() >= ExecutionJitCorpus::kMaxPageRecords) {
+    return Fail("exact corpus exceeds the code-page limit", error);
+  }
+
+  CodePage page;
+  std::memcpy(page.data(), page_data, page.size());
+  pages_.emplace(page_address, std::move(page));
+  return true;
+}
+
+bool ExecutionJitCorpusBuilder::AddFunction(const FunctionRecord& function,
+                                            std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!CheckUsable(error)) {
+    return false;
+  }
+  std::string validation_error;
+  if (!ValidateFunctionRecord(function, &validation_error)) {
+    return Fail(validation_error, error);
+  }
+  if (functions_.size() >= ExecutionJitCorpus::kMaxFunctionRecords) {
+    return Fail("exact corpus exceeds the function-count limit", error);
+  }
+  if (!function_addresses_.insert(function.address).second) {
+    return Fail("exact corpus contains a duplicate function definition", error);
+  }
+  functions_.push_back(function);
+  return true;
+}
+
+bool ExecutionJitCorpusBuilder::Encode(std::vector<uint8_t>* output,
+                                       std::string* error) const {
+  if (error) {
+    error->clear();
+  }
+  const auto fail = [output, error](std::string_view message) {
+    if (output) {
+      output->clear();
+    }
+    if (error) {
+      error->assign(message);
+    }
+    return false;
+  };
+  if (!output) {
+    return fail("exact corpus output is null");
+  }
+  output->clear();
+  if (!CheckUsable(error)) {
+    return false;
+  }
+
+  std::string validation_error;
+  if (!ValidateConfigFlags(config_flags_, &validation_error)) {
+    return fail(validation_error);
+  }
+  if (pages_.size() > ExecutionJitCorpus::kMaxPageRecords) {
+    return fail("exact corpus exceeds the code-page limit");
+  }
+  if (functions_.size() > ExecutionJitCorpus::kMaxFunctionRecords) {
+    return fail("exact corpus exceeds the function-count limit");
+  }
+
+  uint64_t encoded_size = kHeaderSize;
+  if (pages_.size() > (ExecutionJitCorpus::kMaxCorpusSize - encoded_size) /
+                          kEncodedPageRecordSize) {
+    return fail("exact corpus exceeds the byte-size limit");
+  }
+  encoded_size += pages_.size() * kEncodedPageRecordSize;
+  if (functions_.size() > (ExecutionJitCorpus::kMaxCorpusSize - encoded_size) /
+                              kEncodedFunctionRecordSize) {
+    return fail("exact corpus exceeds the byte-size limit");
+  }
+  encoded_size += functions_.size() * kEncodedFunctionRecordSize;
+
+  std::vector<uint8_t> encoded;
+  encoded.reserve(static_cast<size_t>(encoded_size));
+  AppendU32(&encoded, JitCorpus::kMagic);
+  AppendU32(&encoded, JitCorpus::kVersion);
+  AppendU32(&encoded, JitCorpus::kPageSize);
+  AppendU32(&encoded, config_flags_);
+  for (const auto& [page_address, page] : pages_) {
+    AppendU32(&encoded, JitCorpus::kTagPage);
+    AppendU32(&encoded, page_address);
+    encoded.insert(encoded.end(), page.cbegin(), page.cend());
+  }
+  for (const FunctionRecord& function : functions_) {
+    AppendU32(&encoded, JitCorpus::kTagFunction);
+    AppendU32(&encoded, function.address);
+    AppendU32(&encoded, function.end_address);
+    AppendU32(&encoded, function.host_code_size);
+    AppendU32(&encoded, function.flags);
+  }
+  if (encoded.size() != encoded_size) {
+    return fail("exact corpus encoded size is inconsistent");
+  }
+
+  ExecutionJitCorpus decoded;
+  if (!ExecutionJitCorpus::Decode(encoded, &decoded, &validation_error)) {
+    return fail(validation_error);
+  }
+  if (decoded.version() != JitCorpus::kVersion ||
+      decoded.config_flags() != config_flags_ ||
+      decoded.page_addresses().size() != pages_.size() ||
+      decoded.functions().size() != functions_.size()) {
+    return fail("exact corpus failed its codec round trip");
+  }
+  for (const auto& [page_address, page] : pages_) {
+    const uint8_t* decoded_page = decoded.FindPageData(page_address);
+    if (!decoded_page ||
+        std::memcmp(decoded_page, page.data(), page.size()) != 0) {
+      return fail("exact corpus code page changed during its codec round trip");
+    }
+  }
+  if (decoded.function_definition_order().size() != functions_.size()) {
+    return fail(
+        "exact corpus definition order changed during its codec round "
+        "trip");
+  }
+  for (size_t i = 0; i < functions_.size(); ++i) {
+    const FunctionRecord& function = functions_[i];
+    const FunctionRecord* decoded_function =
+        decoded.FindFunction(function.address);
+    if (decoded.function_definition_order()[i] != function.address ||
+        !decoded_function ||
+        !FunctionRecordsEqual(*decoded_function, function)) {
+      return fail("exact corpus function changed during its codec round trip");
+    }
+  }
+
+  *output = std::move(encoded);
+  return true;
 }
 
 }  // namespace cpu

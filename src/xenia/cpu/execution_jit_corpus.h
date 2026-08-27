@@ -10,10 +10,14 @@
 #ifndef XENIA_CPU_EXECUTION_JIT_CORPUS_H_
 #define XENIA_CPU_EXECUTION_JIT_CORPUS_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "xenia/cpu/jit_corpus.h"
@@ -85,6 +89,55 @@ class ExecutionJitCorpus {
   std::vector<uint32_t> function_definition_order_;
   uint32_t version_ = 0;
   uint32_t config_flags_ = 0;
+};
+
+// Deterministically encodes an execution-safe exact corpus assembled by a
+// bounded recorder. Code pages are emitted in address order regardless of the
+// order in which they are supplied. Function records are emitted in the order
+// of their successful definitions because frontend translation can observe
+// which static callees and save/restore helpers have already been declared.
+//
+// The builder intentionally has no concept of an "entered function". The
+// caller must add the full translation/declaration closure in captured
+// definition order, including definitions that the selected invocation did not
+// enter. Any failed add poisons the builder so an ignored error cannot produce
+// a silently incomplete corpus.
+class ExecutionJitCorpusBuilder {
+ public:
+  using FunctionRecord = ExecutionJitCorpus::FunctionRecord;
+  using CodePage = std::array<uint8_t, JitCorpus::kPageSize>;
+
+  explicit ExecutionJitCorpusBuilder(uint32_t config_flags)
+      : config_flags_(config_flags) {}
+
+  ExecutionJitCorpusBuilder(const ExecutionJitCorpusBuilder&) = delete;
+  ExecutionJitCorpusBuilder& operator=(const ExecutionJitCorpusBuilder&) =
+      delete;
+
+  bool AddCodePage(uint32_t page_address, const uint8_t* page_data,
+                   size_t page_data_size, std::string* error = nullptr);
+  bool AddFunction(const FunctionRecord& function,
+                   std::string* error = nullptr);
+
+  // On success, output is a canonical little-endian JitCorpus v3 stream that
+  // the strict ExecutionJitCorpus decoder accepts. On failure, output is
+  // cleared. Final decoding is part of encoding so missing extent pages and
+  // any encoder/decoder contract drift fail before bytes reach disk.
+  bool Encode(std::vector<uint8_t>* output, std::string* error = nullptr) const;
+
+  size_t code_page_count() const { return pages_.size(); }
+  size_t function_count() const { return functions_.size(); }
+
+ private:
+  bool Fail(std::string_view message, std::string* error);
+  bool CheckUsable(std::string* error) const;
+
+  std::map<uint32_t, CodePage> pages_;
+  std::vector<FunctionRecord> functions_;
+  std::unordered_set<uint32_t> function_addresses_;
+  uint32_t config_flags_ = 0;
+  bool failed_ = false;
+  std::string failure_;
 };
 
 }  // namespace cpu

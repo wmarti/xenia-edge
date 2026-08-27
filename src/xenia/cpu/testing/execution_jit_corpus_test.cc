@@ -69,6 +69,14 @@ uint32_t FunctionFlags(Function::Behavior behavior,
                                         saverest_index);
 }
 
+ExecutionJitCorpusBuilder::CodePage MakeCodePage(uint8_t seed) {
+  ExecutionJitCorpusBuilder::CodePage page;
+  for (size_t i = 0; i < page.size(); ++i) {
+    page[i] = static_cast<uint8_t>(seed + i * 17);
+  }
+  return page;
+}
+
 std::vector<uint8_t> MakeSpanningCorpus() {
   std::vector<uint8_t> data = MakeHeader();
   // Streaming capture order need not be address order.
@@ -165,6 +173,184 @@ TEST_CASE("execution JIT corpus preserves definition order and metadata",
   REQUIRE(metadata.saverest_type == SaveRestoreType::GPR);
   REQUIRE(metadata.is_restore);
   REQUIRE(metadata.saverest_index == 14);
+}
+
+TEST_CASE(
+    "execution JIT corpus builder round trips the full definition closure",
+    "[execution-jit-corpus][execution-jit-corpus-builder]") {
+  const ExecutionJitCorpusBuilder::CodePage low_page = MakeCodePage(0x11);
+  const ExecutionJitCorpusBuilder::CodePage high_page = MakeCodePage(0x22);
+  const JitCorpus::FunctionRecord helper = {
+      0x83000020, 0x8300002C, 113,
+      FunctionFlags(Function::Behavior::kProlog, SaveRestoreType::FPR, false,
+                    31)};
+  const JitCorpus::FunctionRecord static_callee = {0x83000100, 0x8300010C, 79,
+                                                   0};
+  const JitCorpus::FunctionRecord root = {0x82000000, 0x82000008, 61, 0};
+
+  ExecutionJitCorpusBuilder builder(JitCorpus::kConfigGuestScheduler);
+  std::string error;
+  // Page insertion order is deliberately noncanonical. Definitions retain
+  // successful-definition order, including the helper and static callee that
+  // an invocation recorder may need even when neither was entered.
+  REQUIRE(builder.AddCodePage(0x83000000, high_page.data(), high_page.size(),
+                              &error));
+  REQUIRE(builder.AddCodePage(0x82000000, low_page.data(), low_page.size(),
+                              &error));
+  REQUIRE(builder.AddFunction(helper, &error));
+  REQUIRE(builder.AddFunction(static_callee, &error));
+  REQUIRE(builder.AddFunction(root, &error));
+  REQUIRE(builder.code_page_count() == 2);
+  REQUIRE(builder.function_count() == 3);
+
+  std::vector<uint8_t> encoded;
+  REQUIRE(builder.Encode(&encoded, &error));
+  REQUIRE(error.empty());
+  REQUIRE(encoded.size() ==
+          4 * sizeof(uint32_t) +
+              2 * (2 * sizeof(uint32_t) + JitCorpus::kPageSize) +
+              3 * 5 * sizeof(uint32_t));
+  // Header and records are explicitly little-endian, not native-endian dumps.
+  REQUIRE(encoded[0] == 0x4A);
+  REQUIRE(encoded[1] == 0x58);
+  REQUIRE(encoded[2] == 0x43);
+  REQUIRE(encoded[3] == 0x31);
+  REQUIRE(encoded[4] == JitCorpus::kVersion);
+  REQUIRE(encoded[16] == JitCorpus::kTagPage);
+  REQUIRE(encoded[20] == 0x00);
+  REQUIRE(encoded[21] == 0x00);
+  REQUIRE(encoded[22] == 0x00);
+  REQUIRE(encoded[23] == 0x82);
+  const size_t first_function_offset =
+      4 * sizeof(uint32_t) + 2 * (2 * sizeof(uint32_t) + JitCorpus::kPageSize);
+  REQUIRE(encoded[first_function_offset] == JitCorpus::kTagFunction);
+  REQUIRE(encoded[first_function_offset + 4] == 0x20);
+  REQUIRE(encoded[first_function_offset + 5] == 0x00);
+  REQUIRE(encoded[first_function_offset + 6] == 0x00);
+  REQUIRE(encoded[first_function_offset + 7] == 0x83);
+
+  ExecutionJitCorpus corpus;
+  REQUIRE(ExecutionJitCorpus::Decode(encoded, &corpus, &error));
+  REQUIRE(corpus.config_flags() == JitCorpus::kConfigGuestScheduler);
+  REQUIRE(corpus.page_addresses() ==
+          std::vector<uint32_t>{0x82000000, 0x83000000});
+  REQUIRE(corpus.function_definition_order() ==
+          std::vector<uint32_t>{helper.address, static_callee.address,
+                                root.address});
+  REQUIRE(corpus.FindFunction(helper.address)->host_code_size == 113);
+  REQUIRE(corpus.FindFunction(helper.address)->flags == helper.flags);
+  REQUIRE(corpus.FindFunction(static_callee.address)->host_code_size == 79);
+  REQUIRE(corpus.FindFunction(root.address)->host_code_size == 61);
+
+  ExecutionJitCorpusBuilder canonical_builder(JitCorpus::kConfigGuestScheduler);
+  REQUIRE(canonical_builder.AddCodePage(0x82000000, low_page.data(),
+                                        low_page.size()));
+  REQUIRE(canonical_builder.AddCodePage(0x83000000, high_page.data(),
+                                        high_page.size()));
+  REQUIRE(canonical_builder.AddFunction(helper));
+  REQUIRE(canonical_builder.AddFunction(static_callee));
+  REQUIRE(canonical_builder.AddFunction(root));
+  std::vector<uint8_t> canonical_encoded;
+  REQUIRE(canonical_builder.Encode(&canonical_encoded));
+  REQUIRE(canonical_encoded == encoded);
+}
+
+TEST_CASE("execution JIT corpus builder fails closed on conflicting records",
+          "[execution-jit-corpus][execution-jit-corpus-builder]") {
+  const ExecutionJitCorpusBuilder::CodePage first_page = MakeCodePage(0x11);
+  const ExecutionJitCorpusBuilder::CodePage second_page = MakeCodePage(0x22);
+  const JitCorpus::FunctionRecord function = {0x82000000, 0x82000008, 64, 0};
+
+  SECTION("duplicate page") {
+    ExecutionJitCorpusBuilder builder(0);
+    std::string error;
+    REQUIRE(builder.AddCodePage(0x82000000, first_page.data(),
+                                first_page.size(), &error));
+    REQUIRE_FALSE(builder.AddCodePage(0x82000000, first_page.data(),
+                                      first_page.size(), &error));
+    REQUIRE(error == "exact corpus contains a duplicate code page");
+    std::vector<uint8_t> encoded = {0xAA};
+    REQUIRE_FALSE(builder.Encode(&encoded, &error));
+    REQUIRE(encoded.empty());
+    REQUIRE(error == "exact corpus contains a duplicate code page");
+  }
+
+  SECTION("conflicting page") {
+    ExecutionJitCorpusBuilder builder(0);
+    std::string error;
+    REQUIRE(builder.AddCodePage(0x82000000, first_page.data(),
+                                first_page.size(), &error));
+    REQUIRE_FALSE(builder.AddCodePage(0x82000000, second_page.data(),
+                                      second_page.size(), &error));
+    REQUIRE(error == "exact corpus contains conflicting code-page contents");
+  }
+
+  SECTION("duplicate function") {
+    ExecutionJitCorpusBuilder builder(0);
+    std::string error;
+    REQUIRE(builder.AddFunction(function, &error));
+    REQUIRE_FALSE(builder.AddFunction(function, &error));
+    REQUIRE(error == "exact corpus contains a duplicate function definition");
+  }
+}
+
+TEST_CASE("execution JIT corpus builder rejects invalid closure and bounds",
+          "[execution-jit-corpus][execution-jit-corpus-builder]") {
+  const ExecutionJitCorpusBuilder::CodePage page = MakeCodePage(0x31);
+
+  SECTION("unsupported config") {
+    ExecutionJitCorpusBuilder builder(1u << 31);
+    REQUIRE(builder.AddCodePage(0x82000000, page.data(), page.size()));
+    REQUIRE(builder.AddFunction({0x82000000, 0x82000008, 64, 0}));
+    std::vector<uint8_t> encoded = {0xAA};
+    std::string error;
+    REQUIRE_FALSE(builder.Encode(&encoded, &error));
+    REQUIRE(encoded.empty());
+    REQUIRE(error == "corpus configuration contains unsupported flags");
+  }
+
+  SECTION("missing extent closure") {
+    ExecutionJitCorpusBuilder builder(0);
+    REQUIRE(builder.AddCodePage(0x82000000, page.data(), page.size()));
+    REQUIRE(builder.AddFunction({0x82000FFC, 0x82001004, 64, 0}));
+    std::vector<uint8_t> encoded;
+    std::string error;
+    REQUIRE_FALSE(builder.Encode(&encoded, &error));
+    REQUIRE(encoded.empty());
+    REQUIRE(error == "corpus is missing a page in a function extent");
+  }
+
+  SECTION("invalid extent") {
+    ExecutionJitCorpusBuilder builder(0);
+    std::string error;
+    REQUIRE_FALSE(builder.AddFunction({0x82000008, 0x82000004, 64, 0}, &error));
+    REQUIRE(error == "function record contains an invalid extent");
+  }
+
+  SECTION("invalid metadata") {
+    ExecutionJitCorpusBuilder builder(0);
+    std::string error;
+    REQUIRE_FALSE(
+        builder.AddFunction({0x82000000, 0x82000004, 64, 1u << 31}, &error));
+    REQUIRE(error == "function record contains unsupported flags");
+  }
+
+  SECTION("oversized extent") {
+    ExecutionJitCorpusBuilder builder(0);
+    std::string error;
+    REQUIRE_FALSE(builder.AddFunction(
+        {0x82000000, 0x82000000 + ExecutionJitCorpus::kMaxFunctionSize, 64, 0},
+        &error));
+    REQUIRE(error == "function record extent exceeds the size limit");
+  }
+
+  SECTION("page byte bound") {
+    ExecutionJitCorpusBuilder builder(0);
+    std::string error;
+    REQUIRE_FALSE(
+        builder.AddCodePage(0x82000000, page.data(), page.size() - 1, &error));
+    REQUIRE(error == "exact corpus code page has an invalid byte size");
+  }
 }
 
 TEST_CASE(

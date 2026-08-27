@@ -34,12 +34,6 @@ bool Fail(std::string* error, std::string_view message) {
 
 bool IsPowerOfTwo(uint32_t value) { return value && !(value & (value - 1)); }
 
-void AppendU32(std::vector<uint8_t>* output, uint32_t value) {
-  for (uint32_t i = 0; i < sizeof(value); ++i) {
-    output->push_back(static_cast<uint8_t>(value >> (i * 8)));
-  }
-}
-
 void StoreGuestInstruction(std::array<uint8_t, kGuestPageSize>* page,
                            uint32_t offset, uint32_t instruction) {
   (*page)[offset + 0] = static_cast<uint8_t>(instruction >> 24);
@@ -349,10 +343,7 @@ bool BuildSyntheticGuestInvocationFixture(
   fixture.captured_host_code_size = captured_host_code_size;
   const uint32_t closure_page_count = host_page_size / kGuestPageSize;
 
-  AppendU32(&fixture.corpus_bytes, JitCorpus::kMagic);
-  AppendU32(&fixture.corpus_bytes, JitCorpus::kVersion);
-  AppendU32(&fixture.corpus_bytes, JitCorpus::kPageSize);
-  AppendU32(&fixture.corpus_bytes, 0);
+  ExecutionJitCorpusBuilder corpus_builder(0);
   for (uint32_t i = 0; i < closure_page_count; ++i) {
     std::array<uint8_t, kGuestPageSize> page = {};
     if (!i) {
@@ -361,20 +352,20 @@ bool BuildSyntheticGuestInvocationFixture(
       StoreGuestInstruction(&page, 8, 0x90A30000u);   // stw r5, 0(r3)
       StoreGuestInstruction(&page, 12, 0x4E800020u);  // blr
     }
-    AppendU32(&fixture.corpus_bytes, JitCorpus::kTagPage);
-    AppendU32(
-        &fixture.corpus_bytes,
-        SyntheticGuestInvocationFixture::kCodeAddress + i * kGuestPageSize);
-    fixture.corpus_bytes.insert(fixture.corpus_bytes.end(), page.cbegin(),
-                                page.cend());
+    if (!corpus_builder.AddCodePage(
+            SyntheticGuestInvocationFixture::kCodeAddress + i * kGuestPageSize,
+            page.data(), page.size(), error)) {
+      return false;
+    }
   }
-  AppendU32(&fixture.corpus_bytes, JitCorpus::kTagFunction);
-  AppendU32(&fixture.corpus_bytes,
-            SyntheticGuestInvocationFixture::kCodeAddress);
-  AppendU32(&fixture.corpus_bytes,
-            SyntheticGuestInvocationFixture::kCodeAddress + 12);
-  AppendU32(&fixture.corpus_bytes, captured_host_code_size);
-  AppendU32(&fixture.corpus_bytes, 0);
+  const ExecutionJitCorpus::FunctionRecord function = {
+      SyntheticGuestInvocationFixture::kCodeAddress,
+      SyntheticGuestInvocationFixture::kCodeAddress + 12,
+      captured_host_code_size, 0};
+  if (!corpus_builder.AddFunction(function, error) ||
+      !corpus_builder.Encode(&fixture.corpus_bytes, error)) {
+    return false;
+  }
 
   if (!ExecutionJitCorpus::Decode(fixture.corpus_bytes, &fixture.corpus,
                                   error)) {
