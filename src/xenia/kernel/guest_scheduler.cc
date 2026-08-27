@@ -182,12 +182,7 @@ inline void RequestCheckpointSafepoint(XThread* thread) {
 
 // JIT safepoint handler. The cold path cleared the flag, so the deferred
 // cases re-set it to retry at the next safepoint.
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
 static void PreemptCurrentFiber(void* /*raw_context*/, uint64_t guest_address) {
-#else
-static void PreemptCurrentFiber(void* /*raw_context*/) {
-#endif
   XThread* self = XThread::GetCurrentFiberThread();
   if (!self) {
     return;
@@ -223,6 +218,8 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
       self->thread_state()->IsGuestExecutionCaptureJitSafepointRequested()) {
     request_flags |= kGuestSchedulerCaptureFlagCaptureRequested;
   }
+#else
+  (void)guest_address;
 #endif
   // A co-resident fiber would re-enter the recursive lock on this host thread,
   // silently breaking mutual exclusion, so this one is never forced. Report a

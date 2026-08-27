@@ -227,14 +227,11 @@ struct GuestTrampolineGroup
 };
 
 // Registered by the cooperative scheduler when it starts, null otherwise. A
-// JIT safepoint calls it with the PPCContext once the scheduler has raised the
-// context's preempt_requested flag.
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+// JIT safepoint calls it with the PPCContext and exact guest block-head PC once
+// the scheduler has raised the context's preempt_requested flag. Keeping the PC
+// in the normal-build ABI lets deterministic offline replay authenticate a
+// recorded scheduler boundary without capture instrumentation in the runner.
 extern void (*preempt_yield_handler)(void* raw_context, uint64_t guest_address);
-#else
-extern void (*preempt_yield_handler)(void* raw_context);
-#endif
 
 }  // namespace backend
 }  // namespace cpu

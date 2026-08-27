@@ -2001,31 +2001,32 @@ void X64Emitter::EmitPreemptCheck(uint32_t guest_address) {
         guest_address);
   }
   cmp(byte[GetContextReg() + offsetof(ppc::PPCContext, preempt_requested)], 0);
-  Xbyak::Label& do_yield =
-      AddToTail([&restore, &after](X64Emitter& e, Xbyak::Label& tail) {
-        e.L(tail);
-        e.mov(e.byte[e.GetContextReg() +
-                     offsetof(ppc::PPCContext, preempt_requested)],
-              0);
-        // Saved into the frame rather than pushed, since the unwind info
-        // registered for this function describes a fixed rsp.
-        e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 0], e.rax);
-        e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 8], e.rcx);
-        e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 16], e.rdx);
-        // Null until the scheduler starts, and a stale flag can reach here
-        // after it shuts down, so check before calling.
-        e.mov(e.rax, reinterpret_cast<uint64_t>(
-                         &xe::cpu::backend::preempt_yield_handler));
-        e.mov(e.rcx, e.qword[e.rax]);
-        e.test(e.rcx, e.rcx);
-        e.jz(restore, X64Emitter::T_NEAR);
-        e.call(e.backend()->guest_to_host_thunk());
-        e.L(restore);
-        e.mov(e.rax, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 0]);
-        e.mov(e.rcx, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 8]);
-        e.mov(e.rdx, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 16]);
-        e.jmp(after, X64Emitter::T_NEAR);
-      });
+  Xbyak::Label& do_yield = AddToTail([&restore, &after, guest_address](
+                                         X64Emitter& e, Xbyak::Label& tail) {
+    e.L(tail);
+    e.mov(e.byte[e.GetContextReg() +
+                 offsetof(ppc::PPCContext, preempt_requested)],
+          0);
+    // Saved into the frame rather than pushed, since the unwind info
+    // registered for this function describes a fixed rsp.
+    e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 0], e.rax);
+    e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 8], e.rcx);
+    e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 16], e.rdx);
+    // Null until the scheduler starts, and a stale flag can reach here
+    // after it shuts down, so check before calling.
+    e.mov(e.rax,
+          reinterpret_cast<uint64_t>(&xe::cpu::backend::preempt_yield_handler));
+    e.mov(e.rcx, e.qword[e.rax]);
+    e.test(e.rcx, e.rcx);
+    e.jz(restore, X64Emitter::T_NEAR);
+    e.mov(e.edx, guest_address);
+    e.call(e.backend()->guest_to_host_thunk());
+    e.L(restore);
+    e.mov(e.rax, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 0]);
+    e.mov(e.rcx, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 8]);
+    e.mov(e.rdx, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 16]);
+    e.jmp(after, X64Emitter::T_NEAR);
+  });
   jnz(do_yield, T_NEAR);
   L(after);
 #endif

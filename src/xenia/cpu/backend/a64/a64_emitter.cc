@@ -1596,8 +1596,8 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
       static_cast<uint32_t>(offsetof(ppc::PPCContext, preempt_requested));
   const bool has_vmx = function_has_vmx_;
   const FPCRMode held_mode = fpcr_mode_;
-  Label& do_yield = AddToTail([&after, flag_offset, has_vmx, held_mode](
-                                  A64Emitter& e, Label&) {
+  Label& do_yield = AddToTail([&after, flag_offset, has_vmx, held_mode,
+                               guest_address](A64Emitter& e, Label&) {
     // The yield calls host code, which must run in FPU mode. The runtime mode
     // here is whatever the interrupted block was in - unknowable at emission
     // - so functions that touch VEC128 switch unconditionally (cold path).
@@ -1620,6 +1620,7 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
     // switch above already ran, and the hot path continues assuming
     // held_mode.
     e.cbz(e.x0, restore_held ? rejoin : after);
+    e.mov(e.x1, static_cast<uint64_t>(guest_address));
     e.ldr(e.x9, ptr(e.GetBackendCtxReg(),
                     static_cast<uint32_t>(offsetof(
                         A64BackendContext, guest_to_host_thunk_address))));
