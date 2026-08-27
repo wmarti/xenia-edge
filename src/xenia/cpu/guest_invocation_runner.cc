@@ -435,7 +435,8 @@ bool GuestInvocationRunner::Initialize(
   if (!processor_->Setup(std::move(backend))) {
     return Fail(error, "guest processor initialization failed");
   }
-  if (!CommitAndLoadPages(error) || !CloseAndReopenGuestViews(error)) {
+  if (!CommitAndLoadPages(error) || !CloseAndReopenGuestViews(error) ||
+      !PrepareResetPageCopies(error)) {
     return false;
   }
 
@@ -525,6 +526,21 @@ bool GuestInvocationRunner::CloseAndReopenGuestViews(std::string* error) {
   return true;
 }
 
+bool GuestInvocationRunner::PrepareResetPageCopies(std::string* error) {
+  reset_page_copies_.clear();
+  reset_page_copies_.reserve(plan_.reset_page_addresses.size());
+  for (uint32_t address : plan_.reset_page_addresses) {
+    const uint8_t* initial_data = InitialPageData(address);
+    if (!initial_data) {
+      reset_page_copies_.clear();
+      return Fail(error, "reset page has no initial contents");
+    }
+    reset_page_copies_.push_back(
+        ResetPageCopy{memory_->TranslateVirtual(address), initial_data});
+  }
+  return true;
+}
+
 bool GuestInvocationRunner::ResolveFunctionsInCaptureOrder(std::string* error) {
   root_function_ = nullptr;
   for (uint32_t address : corpus_->function_definition_order()) {
@@ -563,13 +579,8 @@ bool GuestInvocationRunner::WarmAndVerify(std::string* error) {
 }
 
 bool GuestInvocationRunner::ResetInvocation(std::string* error) {
-  for (uint32_t address : plan_.reset_page_addresses) {
-    const uint8_t* initial_data = InitialPageData(address);
-    if (!initial_data) {
-      return Fail(error, "reset page has no initial contents");
-    }
-    std::memcpy(memory_->TranslateVirtual(address), initial_data,
-                kGuestPageSize);
+  for (const ResetPageCopy& copy : reset_page_copies_) {
+    std::memcpy(copy.destination, copy.source, kGuestPageSize);
   }
 
   ppc::RestoreGuestPPCRegisterState(invocation_->input,
@@ -661,28 +672,30 @@ bool GuestInvocationRunner::RunTimed(uint64_t invocation_count,
       code_cache->placement_generation();
 
   const thread_t current_thread = mach_thread_self();
-  uint64_t thread_cpu_start = 0;
-  if (current_thread == MACH_PORT_NULL ||
-      !ReadCurrentThreadCpuNanoseconds(current_thread, &thread_cpu_start)) {
-    if (current_thread != MACH_PORT_NULL) {
-      mach_port_deallocate(mach_task_self(), current_thread);
-    }
+  if (current_thread == MACH_PORT_NULL) {
     return Fail(error, "failed to read current-thread CPU time before replay");
   }
 
+  // Nest the primary CPU interval inside the diagnostic wall interval so the
+  // primary metric does not include either wall-clock query. The wall metric
+  // intentionally includes both THREAD_BASIC_INFO queries and is diagnostic.
   bool timed_calls_succeeded = true;
   const uint64_t wall_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  uint64_t thread_cpu_start = 0;
+  if (!ReadCurrentThreadCpuNanoseconds(current_thread, &thread_cpu_start)) {
+    mach_port_deallocate(mach_task_self(), current_thread);
+    return Fail(error, "failed to read current-thread CPU time before replay");
+  }
   for (uint64_t i = 0; i < invocation_count; ++i) {
     if (!ResetInvocation(error) || !Invoke(error)) {
       timed_calls_succeeded = false;
       break;
     }
   }
-  const uint64_t wall_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-
   uint64_t thread_cpu_end = 0;
   const bool cpu_read_succeeded =
       ReadCurrentThreadCpuNanoseconds(current_thread, &thread_cpu_end);
+  const uint64_t wall_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
   mach_port_deallocate(mach_task_self(), current_thread);
   const uint64_t placement_generation_after =
       code_cache->placement_generation();
@@ -710,10 +723,60 @@ bool GuestInvocationRunner::RunTimed(uint64_t invocation_count,
     return Fail(error, "code placement changed during final verification");
   }
 
+  // Measure reset in a separate post-primary batch. This is a raw diagnostic,
+  // not a value that may be subtracted from the primary reset-plus-call metric:
+  // the two intervals have different cache and execution histories.
+  const thread_t reset_thread = mach_thread_self();
+  if (reset_thread == MACH_PORT_NULL) {
+    return Fail(error,
+                "failed to read current-thread CPU time before reset replay");
+  }
+  bool reset_calls_succeeded = true;
+  const uint64_t reset_wall_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  uint64_t reset_thread_cpu_start = 0;
+  if (!ReadCurrentThreadCpuNanoseconds(reset_thread, &reset_thread_cpu_start)) {
+    mach_port_deallocate(mach_task_self(), reset_thread);
+    return Fail(error,
+                "failed to read current-thread CPU time before reset replay");
+  }
+  for (uint64_t i = 0; i < invocation_count; ++i) {
+    if (!ResetInvocation(error)) {
+      reset_calls_succeeded = false;
+      break;
+    }
+  }
+  uint64_t reset_thread_cpu_end = 0;
+  const bool reset_cpu_read_succeeded =
+      ReadCurrentThreadCpuNanoseconds(reset_thread, &reset_thread_cpu_end);
+  const uint64_t reset_wall_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  mach_port_deallocate(mach_task_self(), reset_thread);
+
+  if (!reset_calls_succeeded) {
+    return false;
+  }
+  if (!reset_cpu_read_succeeded ||
+      reset_thread_cpu_end < reset_thread_cpu_start) {
+    return Fail(error, "current-thread reset CPU interval is invalid");
+  }
+  if (reset_wall_end <= reset_wall_start) {
+    return Fail(error, "reset uptime raw interval is missing or zero");
+  }
+  if (!Invoke(error) || !VerifyCurrentState(error)) {
+    return false;
+  }
+  if (code_cache->placement_generation() != placement_generation_after) {
+    return Fail(error,
+                "code placement changed during reset diagnostic verification");
+  }
+
   GuestInvocationReplayMetrics accepted_metrics;
   accepted_metrics.timed_invocation_count = invocation_count;
   accepted_metrics.thread_cpu_nanoseconds = thread_cpu_end - thread_cpu_start;
   accepted_metrics.uptime_raw_nanoseconds = wall_end - wall_start;
+  accepted_metrics.reset_only_thread_cpu_nanoseconds =
+      reset_thread_cpu_end - reset_thread_cpu_start;
+  accepted_metrics.reset_only_uptime_raw_nanoseconds =
+      reset_wall_end - reset_wall_start;
   accepted_metrics.placement_generation_before = placement_generation_before;
   accepted_metrics.placement_generation_after = placement_generation_after;
   accepted_metrics.reset_page_count_per_invocation =

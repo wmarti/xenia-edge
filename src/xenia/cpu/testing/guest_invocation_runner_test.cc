@@ -216,6 +216,7 @@ TEST_CASE("guest invocation runner executes and verifies a real backend",
   REQUIRE(metrics.timed_invocation_count == 128);
   REQUIRE(metrics.thread_cpu_nanoseconds > 0);
   REQUIRE(metrics.uptime_raw_nanoseconds > 0);
+  REQUIRE(metrics.reset_only_uptime_raw_nanoseconds > 0);
   REQUIRE(metrics.placement_generation_before ==
           metrics.placement_generation_after);
   REQUIRE(metrics.reset_page_count_per_invocation ==

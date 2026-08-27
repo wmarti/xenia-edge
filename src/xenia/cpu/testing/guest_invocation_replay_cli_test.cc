@@ -40,13 +40,15 @@ TEST_CASE("Guest invocation benchmark marker is canonical",
   metrics.reset_bytes_per_invocation = 8192;
   metrics.thread_cpu_nanoseconds = 123456;
   metrics.uptime_raw_nanoseconds = 234567;
+  metrics.reset_only_thread_cpu_nanoseconds = 34567;
+  metrics.reset_only_uptime_raw_nanoseconds = 45678;
   metrics.placement_generation_before = 8;
   metrics.placement_generation_after = 8;
 
   const std::string marker =
       FormatGuestInvocationReplayBenchmarkMarker(provenance, metrics);
   REQUIRE(marker ==
-          "XENIA_GUEST_INVOCATION_BENCHMARK_V1"
+          "XENIA_GUEST_INVOCATION_BENCHMARK_V2"
           "\tartifact_sha256=" +
               std::string(64, '1') + "\tcorpus_sha256=" + std::string(64, '2') +
               "\tcapture_build_sha256=" + std::string(64, '3') +
@@ -57,6 +59,8 @@ TEST_CASE("Guest invocation benchmark marker is canonical",
               "\treset_bytes_per_iteration=8192"
               "\tthread_cpu_ns=123456"
               "\tuptime_raw_ns=234567"
+              "\treset_only_thread_cpu_ns=34567"
+              "\treset_only_uptime_raw_ns=45678"
               "\tplacement_generation_before=8"
               "\tplacement_generation_after=8"
               "\twarm_verified=1"

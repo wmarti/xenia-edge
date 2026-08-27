@@ -203,15 +203,27 @@ containment by itself.
 
 Before each timed invocation, replay restores the full architectural input
 state and copies only pages whose accepted final bytes differ from their input
-bytes, plus any additional pages required by the host reset granularity. The
-marker reports those reset pages and bytes so reset cost is visible rather than
-silently attributed to guest execution.
+bytes, plus any additional pages required by the host reset granularity. Reset
+copy source and destination descriptors are prepared before timing, so the
+repeated path performs no page lookup. The marker reports reset pages and bytes
+and a separately measured reset-only batch after the primary measurement.
 
 The timed metric on macOS is current-thread CPU time from
-`THREAD_BASIC_INFO`; monotonic wall time is diagnostic. Reset/copy work inside
-a repeated batch must be reported explicitly because it dilutes the guest-code
-signal. Captures with excessive reset cost or insufficient guest work are not
-benchmark candidates.
+`THREAD_BASIC_INFO`; monotonic wall time is diagnostic. Boundaries are nested as
+`wall start, CPU start, work, CPU end, wall end`: the primary CPU interval does
+not include the wall-clock queries, while the diagnostic wall interval includes
+both CPU-clock queries. Reset/copy work remains included in the primary
+reset-plus-call metric. Its separate reset-only CPU and wall intervals have a
+different cache and execution history, so they are raw diagnostics only and
+must never be subtracted from the primary metric. Replay invokes and verifies
+the guest again after that diagnostic before accepting any marker. Captures
+with excessive reset cost or insufficient guest work are not benchmark
+candidates.
+
+The strict benchmark-output marker is `XENIA_GUEST_INVOCATION_BENCHMARK_V2`.
+V2 adds the two reset-only interval fields as one atomic schema change; the
+driver rejects V1 and all partially upgraded markers. This replacement is safe
+because no title capture or accepted title benchmark used the earlier marker.
 
 ## Performance acceptance
 

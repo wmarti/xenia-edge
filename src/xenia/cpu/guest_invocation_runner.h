@@ -68,6 +68,8 @@ struct GuestInvocationReplayMetrics {
   uint64_t timed_invocation_count = 0;
   uint64_t thread_cpu_nanoseconds = 0;
   uint64_t uptime_raw_nanoseconds = 0;
+  uint64_t reset_only_thread_cpu_nanoseconds = 0;
+  uint64_t reset_only_uptime_raw_nanoseconds = 0;
   uint64_t placement_generation_before = 0;
   uint64_t placement_generation_after = 0;
   uint64_t reset_page_count_per_invocation = 0;
@@ -98,9 +100,11 @@ class GuestInvocationRunner {
   bool WarmAndVerify(std::string* error = nullptr);
 
   // Measures exactly invocation_count reset-plus-call iterations on macOS.
-  // Verification and clock reads themselves are outside the timed interval.
-  // A separate reset/call/verification is required after the interval before
-  // metrics are accepted.
+  // The primary current-thread CPU interval excludes the diagnostic wall-clock
+  // reads; the wall interval encloses the CPU clock reads. A separate
+  // reset-only diagnostic is measured after the primary interval and is never
+  // subtracted. Both intervals are followed by untimed invocation verification
+  // before metrics are accepted.
   bool RunTimed(uint64_t invocation_count,
                 GuestInvocationReplayMetrics* metrics,
                 std::string* error = nullptr);
@@ -117,6 +121,7 @@ class GuestInvocationRunner {
                   std::string* error);
   bool CommitAndLoadPages(std::string* error);
   bool CloseAndReopenGuestViews(std::string* error);
+  bool PrepareResetPageCopies(std::string* error);
   bool ResolveFunctionsInCaptureOrder(std::string* error);
   bool ResetInvocation(std::string* error);
   bool Invoke(std::string* error);
@@ -132,6 +137,11 @@ class GuestInvocationRunner {
   std::unique_ptr<ThreadState> thread_state_;
   ExactJitCorpusModule* module_ = nullptr;
   Function* root_function_ = nullptr;
+  struct ResetPageCopy {
+    uint8_t* destination = nullptr;
+    const uint8_t* source = nullptr;
+  };
+  std::vector<ResetPageCopy> reset_page_copies_;
   bool warmed_ = false;
 };
 

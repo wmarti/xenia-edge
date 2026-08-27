@@ -2,8 +2,10 @@
 """Fail-closed paired analysis for warmed guest-invocation replay.
 
 Each subprocess must emit exactly one canonical
-XENIA_GUEST_INVOCATION_BENCHMARK_V1 line. The metric is current-thread CPU
-nanoseconds for a fixed invocation batch; reset work is included and reported.
+XENIA_GUEST_INVOCATION_BENCHMARK_V2 line. The metric is current-thread CPU
+nanoseconds for a fixed invocation batch; reset work is included. A separate
+post-primary reset-only batch is reported as a raw diagnostic and is never
+subtracted from the primary metric.
 This tool reports per-invocation CPU cost, not whole-title performance.
 
 Four deterministic phases are collected: A/A and B/B controls, then the real
@@ -29,8 +31,8 @@ import sys
 import tempfile
 
 
-SCHEMA = "xenia-guest-invocation-result-v1"
-METRIC_PREFIX = "XENIA_GUEST_INVOCATION_BENCHMARK_V1"
+SCHEMA = "xenia-guest-invocation-result-v2"
+METRIC_PREFIX = "XENIA_GUEST_INVOCATION_BENCHMARK_V2"
 PAGE_SIZE = 4096
 METRIC_FIELDS = (
     "artifact_sha256",
@@ -43,6 +45,8 @@ METRIC_FIELDS = (
     "reset_bytes_per_iteration",
     "thread_cpu_ns",
     "uptime_raw_ns",
+    "reset_only_thread_cpu_ns",
+    "reset_only_uptime_raw_ns",
     "placement_generation_before",
     "placement_generation_after",
     "warm_verified",
@@ -60,10 +64,12 @@ POSITIVE_FIELDS = frozenset((
     "iterations",
     "thread_cpu_ns",
     "uptime_raw_ns",
+    "reset_only_uptime_raw_ns",
 ))
 NONNEGATIVE_FIELDS = frozenset((
     "reset_pages",
     "reset_bytes_per_iteration",
+    "reset_only_thread_cpu_ns",
     "placement_generation_before",
     "placement_generation_after",
 ))
@@ -190,6 +196,10 @@ def validate_metric(metric, expected, min_thread_cpu_ns):
         metric["thread_cpu_ns"] / metric["iterations"])
     metric["uptime_raw_ns_per_invocation"] = (
         metric["uptime_raw_ns"] / metric["iterations"])
+    metric["reset_only_thread_cpu_ns_per_invocation"] = (
+        metric["reset_only_thread_cpu_ns"] / metric["iterations"])
+    metric["reset_only_uptime_raw_ns_per_invocation"] = (
+        metric["reset_only_uptime_raw_ns"] / metric["iterations"])
     return metric
 
 
@@ -597,6 +607,10 @@ def main(argv=None):
                 "reset_pages_per_invocation": args.reset_pages,
                 "reset_bytes_per_invocation": args.reset_pages * PAGE_SIZE,
                 "reset_included_in_primary": True,
+                "reset_only_diagnostic": "separate_post_primary_batch",
+                "reset_only_subtracted_from_primary": False,
+                "clock_boundary_order": (
+                    "wall_start,cpu_start,work,cpu_end,wall_end"),
                 "pairs_per_phase": args.pairs,
                 "min_thread_cpu_ns_per_batch": minimum_cpu_ns,
                 "max_control_noise_pct": args.max_control_noise_pct,

@@ -175,7 +175,7 @@ std::string GuestInvocationReplaySha256Hex(
 std::string FormatGuestInvocationReplayBenchmarkMarker(
     const GuestInvocationReplayBenchmarkProvenance& provenance,
     const GuestInvocationReplayMetrics& metrics) {
-  std::string marker = "XENIA_GUEST_INVOCATION_BENCHMARK_V1";
+  std::string marker = "XENIA_GUEST_INVOCATION_BENCHMARK_V2";
   marker.reserve(640);
   AppendField(&marker, "artifact_sha256",
               GuestInvocationReplaySha256Hex(provenance.artifact_sha256));
@@ -195,6 +195,10 @@ std::string FormatGuestInvocationReplayBenchmarkMarker(
                     metrics.reset_bytes_per_invocation);
   AppendUint64Field(&marker, "thread_cpu_ns", metrics.thread_cpu_nanoseconds);
   AppendUint64Field(&marker, "uptime_raw_ns", metrics.uptime_raw_nanoseconds);
+  AppendUint64Field(&marker, "reset_only_thread_cpu_ns",
+                    metrics.reset_only_thread_cpu_nanoseconds);
+  AppendUint64Field(&marker, "reset_only_uptime_raw_ns",
+                    metrics.reset_only_uptime_raw_nanoseconds);
   AppendUint64Field(&marker, "placement_generation_before",
                     metrics.placement_generation_before);
   AppendUint64Field(&marker, "placement_generation_after",

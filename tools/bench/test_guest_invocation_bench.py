@@ -31,6 +31,8 @@ def metric_values(**overrides):
         "reset_bytes_per_iteration": 8192,
         "thread_cpu_ns": 100000,
         "uptime_raw_ns": 120000,
+        "reset_only_thread_cpu_ns": 20000,
+        "reset_only_uptime_raw_ns": 30000,
         "placement_generation_before": 7,
         "placement_generation_after": 7,
         "warm_verified": 1,
@@ -69,6 +71,8 @@ def timed_metric(ns_per_invocation):
     )
     values["thread_cpu_ns_per_invocation"] = ns_per_invocation
     values["uptime_raw_ns_per_invocation"] = ns_per_invocation * 1.2
+    values["reset_only_thread_cpu_ns_per_invocation"] = 200.0
+    values["reset_only_uptime_raw_ns_per_invocation"] = 300.0
     return values
 
 
@@ -97,6 +101,15 @@ class MarkerParserTest(unittest.TestCase):
             "diagnostic\n" + metric_line() + "\nmore")
         self.assertEqual(parsed, metric_values())
 
+    def test_rejects_superseded_v1_marker(self):
+        legacy = metric_line().replace(
+            benchmark.METRIC_PREFIX,
+            "XENIA_GUEST_INVOCATION_BENCHMARK_V1",
+            1,
+        )
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.parse_metric(legacy)
+
     def test_rejects_missing_duplicate_and_unknown_marker_fields(self):
         canonical = metric_line()
         parts = canonical.split("\t")
@@ -118,6 +131,7 @@ class MarkerParserTest(unittest.TestCase):
             metric_line(iterations=0),
             metric_line(thread_cpu_ns=0),
             metric_line(uptime_raw_ns=0),
+            metric_line(reset_only_uptime_raw_ns=0),
             metric_line(iterations="0100"),
             metric_line(artifact_sha256="A" * 64),
             metric_line(warm_verified=0),
@@ -136,6 +150,20 @@ class MetricValidationTest(unittest.TestCase):
             benchmark.parse_metric(metric_line()), expected(), 50000)
         self.assertEqual(parsed["thread_cpu_ns_per_invocation"], 1000.0)
         self.assertEqual(parsed["uptime_raw_ns_per_invocation"], 1200.0)
+        self.assertEqual(
+            parsed["reset_only_thread_cpu_ns_per_invocation"], 200.0)
+        self.assertEqual(
+            parsed["reset_only_uptime_raw_ns_per_invocation"], 300.0)
+
+        zero_resolution_reset = benchmark.validate_metric(
+            benchmark.parse_metric(metric_line(reset_only_thread_cpu_ns=0)),
+            expected(),
+            50000,
+        )
+        self.assertEqual(
+            zero_resolution_reset["reset_only_thread_cpu_ns_per_invocation"],
+            0.0,
+        )
 
     def test_rejects_identity_iteration_and_reset_mismatches(self):
         cases = (
@@ -241,6 +269,8 @@ class RunnerTest(unittest.TestCase):
 
             report = json.loads(output.read_text())
             self.assertEqual(result, 0)
+            self.assertEqual(
+                report["schema"], "xenia-guest-invocation-result-v2")
             self.assertEqual(report["verdict"], "improvement")
             self.assertEqual(
                 report["inputs"]["executables"]["a"]
@@ -248,6 +278,8 @@ class RunnerTest(unittest.TestCase):
                 SHA_D,
             )
             self.assertIn("driver_sha256", report["environment"])
+            self.assertFalse(
+                report["measurement"]["reset_only_subtracted_from_primary"])
 
     def test_role_mapping_pins_each_executable_hash(self):
         common = expected()
