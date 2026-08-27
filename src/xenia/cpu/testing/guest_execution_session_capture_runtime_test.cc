@@ -898,6 +898,8 @@ TEST_CASE("session capture runtime pre-arm path only observes sources",
   REQUIRE(harness.runtime);
 
   REQUIRE(harness.runtime->OnSchedulerEvent(SchedulerEvent(1)));
+  ImmediateGuestFunction function(0x82002000, 0x82002100);
+  REQUIRE(function.Call(thread.get(), 0x82003000));
   auto pending = std::make_unique<ThreadState>(environment.processor.get(), 2);
   const auto status = harness.runtime->status();
   REQUIRE(status.state == RuntimeState::kIdle);
