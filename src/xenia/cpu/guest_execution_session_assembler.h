@@ -80,6 +80,8 @@ struct GuestExecutionSessionAssemblerConfig {
   uint64_t session_epoch = 0;
   GuestExecutionSessionBoundaryPolicy boundary;
   GuestExecutionReelLimits limits;
+  GuestExecutionReelCoverageMode coverage_mode =
+      GuestExecutionReelCoverageMode::kInvocationSegments;
   uint64_t maximum_stop_tail_event_count = 0;
   uint64_t maximum_stop_tail_guest_instruction_count = 0;
   uint64_t maximum_stop_tail_ticks = 0;
@@ -231,6 +233,8 @@ struct GuestExecutionSessionAssemblerExternalSinkStatus {
 struct GuestExecutionSessionAssemblerStatus {
   GuestExecutionSessionAssemblerState state =
       GuestExecutionSessionAssemblerState::kIdle;
+  GuestExecutionReelCoverageMode coverage_mode =
+      GuestExecutionReelCoverageMode::kInvocationSegments;
   GuestExecutionSessionAssemblerRejection rejection =
       GuestExecutionSessionAssemblerRejection::kNone;
   GuestExecutionReelStopReason stop_reason =
@@ -267,10 +271,9 @@ struct GuestExecutionSessionAssemblerStatus {
 // every external sink to be held, before any checkpoint is taken. The class
 // never parks a thread itself. Outside participants are not parked, so any
 // host-side write between hold and checkpoint must arrive through a
-// registered kHost sink. Every outer dispatch admitted during the session
-// owns exactly one segment; a segment straddling the start rejects, so
-// segment producers start after recording begins. The instruction-coverage
-// policy is only usable if replay counts guest instructions identically.
+// registered kHost sink. Invocation coverage requires exactly one segment per
+// admitted outer dispatch. Continuous coverage rejects segments and requires
+// participant instruction progress. A segment straddling the start rejects.
 // The adapter must snapshot roster depth, seed and start forwarding host-call
 // callbacks atomically under its own lock. kHold has no wake-up: parked
 // callers poll status(). There is one global open segment, so concurrent root

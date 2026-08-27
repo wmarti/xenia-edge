@@ -234,6 +234,16 @@ GuestExecutionSessionAssemblerConfig MakeConfig(
   return config;
 }
 
+GuestExecutionSessionAssemblerConfig MakeContinuousConfig(
+    GuestExecutionSessionBoundaryKind kind =
+        GuestExecutionSessionBoundaryKind::kManual,
+    uint64_t value = 0) {
+  GuestExecutionSessionAssemblerConfig config = MakeConfig(kind, value);
+  config.coverage_mode =
+      GuestExecutionReelCoverageMode::kContinuousInstructions;
+  return config;
+}
+
 GuestExecutionSessionAssemblerSegmentEnd MakeSegmentEnd(uint64_t ordinal,
                                                         uint64_t start_tick,
                                                         uint64_t end_tick,
@@ -520,6 +530,15 @@ TEST_CASE("session assembler validates configuration and dependencies",
   config = MakeConfig();
   config.boundary.kind = static_cast<GuestExecutionSessionBoundaryKind>(99);
   RequireCreateFails(config, "kind");
+
+  config = MakeContinuousConfig();
+  config.boundary.kind = GuestExecutionSessionBoundaryKind::kSegmentCount;
+  config.boundary.value = 1;
+  RequireCreateFails(config, "segment-count");
+
+  config = MakeConfig();
+  config.coverage_mode = static_cast<GuestExecutionReelCoverageMode>(99);
+  RequireCreateFails(config, "coverage mode");
 }
 
 TEST_CASE("session assembler seeds a fixed roster and freezes it at arming",
@@ -879,6 +898,76 @@ TEST_CASE("session assembler publishes continuous zero-segment coverage",
   }
 }
 
+TEST_CASE("continuous session accepts a segment-free outer return",
+          "[guest-execution-session-assembler]") {
+  Harness harness(MakeContinuousConfig());
+  harness.StartOutside({kA});
+  REQUIRE(harness.Enter(kA) == Action::kContinue);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->OnInstructionCoverage(kA, 10) ==
+          Action::kContinue);
+  ++harness.clock.now;
+  REQUIRE(harness.Leave(kA) == Action::kContinue);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+  REQUIRE(harness.state() == State::kPublishing);
+  REQUIRE(harness.PublishedBundle().manifest.segments.empty());
+  REQUIRE(harness.status().coverage_mode ==
+          GuestExecutionReelCoverageMode::kContinuousInstructions);
+}
+
+TEST_CASE("continuous session accepts nested segment-free host calls",
+          "[guest-execution-session-assembler]") {
+  Harness harness(MakeContinuousConfig());
+  harness.StartOutside({kA});
+  REQUIRE(harness.Enter(kA) == Action::kContinue);
+  REQUIRE(harness.Enter(kA) == Action::kContinue);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->OnInstructionCoverage(kA, 10) ==
+          Action::kContinue);
+  REQUIRE(harness.Leave(kA) == Action::kContinue);
+  REQUIRE(harness.Leave(kA) == Action::kContinue);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+  REQUIRE(harness.PublishedBundle().manifest.segments.empty());
+}
+
+TEST_CASE("continuous session holds a segment-free stop-tail return",
+          "[guest-execution-session-assembler]") {
+  Harness harness(MakeContinuousConfig());
+  harness.StartOutside({kA});
+  REQUIRE(harness.Enter(kA) == Action::kContinue);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->OnInstructionCoverage(kA, 10) ==
+          Action::kContinue);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+  ++harness.clock.now;
+  REQUIRE(harness.Leave(kA) == Action::kHold);
+  const GuestExecutionSessionBundle& bundle = harness.PublishedBundle();
+  REQUIRE(bundle.manifest.participants[0].boundary_arrival_kind ==
+          GuestExecutionSessionBoundaryArrivalKind::kOuterHostCallReturn);
+  REQUIRE(bundle.manifest.segments.empty());
+}
+
+TEST_CASE("continuous session stops on an exact instruction boundary",
+          "[guest-execution-session-assembler]") {
+  Harness harness(MakeContinuousConfig(
+      GuestExecutionSessionBoundaryKind::kGuestInstructionCount, 10));
+  harness.StartOutside({kA});
+  REQUIRE(harness.Enter(kA) == Action::kContinue);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->OnInstructionCoverage(kA, 10) ==
+          Action::kContinue);
+  REQUIRE(harness.state() == State::kStopRequested);
+  ++harness.clock.now;
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kHold);
+  const GuestExecutionSessionBundle& bundle = harness.PublishedBundle();
+  REQUIRE(bundle.manifest.stop_reason ==
+          GuestExecutionSessionStopReason::kRequestedBoundary);
+  REQUIRE(bundle.manifest.segments.empty());
+}
+
 TEST_CASE("continuous session assembler rejects missing participant progress",
           "[guest-execution-session-assembler]") {
   SECTION("only coordinator boundary events") {
@@ -897,11 +986,56 @@ TEST_CASE("continuous session assembler rejects missing participant progress",
     harness.RequireRejected(Rejection::kReelRejected);
   }
 
-  SECTION("legacy segment callbacks are illegal") {
+  SECTION("legacy segment begin is illegal") {
     Harness harness(MakeContinuousConfig());
     harness.StartOutside({kA});
     REQUIRE(harness.Enter(kA) == Action::kContinue);
     REQUIRE(harness.assembler->OnSegmentBegin(kA, 0x82000000, 0x820000FC) ==
+            Action::kReject);
+    harness.RequireRejected(Rejection::kInvalidCall);
+  }
+
+  SECTION("legacy segment end is illegal") {
+    Harness harness(MakeContinuousConfig());
+    harness.StartOutside({kA});
+    REQUIRE(harness.Enter(kA) == Action::kContinue);
+    REQUIRE(harness.assembler->OnSegmentEnd(kA, MakeSegmentEnd(0, 100, 101)) ==
+            Action::kReject);
+    harness.RequireRejected(Rejection::kInvalidCall);
+  }
+
+  SECTION("pre-arm legacy segment begin is illegal") {
+    Harness harness(MakeContinuousConfig());
+    harness.Seed({{kA, 0}});
+    REQUIRE(harness.assembler->OnSegmentBegin(kA, 0x82000000, 0x820000FC) ==
+            Action::kReject);
+    harness.RequireRejected(Rejection::kInvalidCall);
+  }
+
+  SECTION("pre-arm legacy segment end is illegal") {
+    Harness harness(MakeContinuousConfig());
+    harness.Seed({{kA, 0}});
+    REQUIRE(harness.assembler->OnSegmentEnd(kA, MakeSegmentEnd(0, 100, 101)) ==
+            Action::kReject);
+    harness.RequireRejected(Rejection::kInvalidCall);
+  }
+
+  SECTION("stop-tail legacy segment begin is illegal") {
+    Harness harness(MakeContinuousConfig());
+    harness.StartOutside({kA});
+    REQUIRE(harness.Enter(kA) == Action::kContinue);
+    REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+    REQUIRE(harness.assembler->OnSegmentBegin(kA, 0x82000000, 0x820000FC) ==
+            Action::kReject);
+    harness.RequireRejected(Rejection::kInvalidCall);
+  }
+
+  SECTION("stop-tail legacy segment end is illegal") {
+    Harness harness(MakeContinuousConfig());
+    harness.StartOutside({kA});
+    REQUIRE(harness.Enter(kA) == Action::kContinue);
+    REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+    REQUIRE(harness.assembler->OnSegmentEnd(kA, MakeSegmentEnd(0, 100, 101)) ==
             Action::kReject);
     harness.RequireRejected(Rejection::kInvalidCall);
   }

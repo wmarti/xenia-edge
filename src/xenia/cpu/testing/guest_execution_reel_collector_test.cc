@@ -91,6 +91,8 @@ TEST_CASE("guest execution reel validates independent bounded policies",
           "[guest-execution-reel]") {
   GuestExecutionReelConfig config = MakeConfig();
   REQUIRE(MakeCollector(config));
+  REQUIRE(MakeCollector(config)->status().coverage_mode ==
+          GuestExecutionReelCoverageMode::kInvocationSegments);
 
   config.limits.maximum_event_count = 0;
   RequireCreateFails(config, "nonzero");
@@ -136,11 +138,74 @@ TEST_CASE("guest execution reel validates independent bounded policies",
   config.boundary.kind = static_cast<GuestExecutionReelBoundaryKind>(99);
   RequireCreateFails(config, "kind");
 
+  config = MakeConfig();
+  config.coverage_mode = static_cast<GuestExecutionReelCoverageMode>(99);
+  RequireCreateFails(config, "coverage mode");
+
+  config = MakeConfig(GuestExecutionReelBoundaryKind::kSegmentCount, 1);
+  config.coverage_mode =
+      GuestExecutionReelCoverageMode::kContinuousInstructions;
+  RequireCreateFails(config, "segment-count");
+
   config = MakeConfig(GuestExecutionReelBoundaryKind::kGuestMarkerCount, 1);
   config.boundary.marker_source =
       static_cast<GuestExecutionReelMarkerSource>(99);
   config.boundary.marker_identity = 1;
   RequireCreateFails(config, "marker source");
+}
+
+TEST_CASE("guest execution reel retains continuous instruction coverage",
+          "[guest-execution-reel]") {
+  GuestExecutionReelConfig config = MakeConfig();
+  config.coverage_mode =
+      GuestExecutionReelCoverageMode::kContinuousInstructions;
+
+  SECTION("instruction coverage completes without a segment") {
+    std::unique_ptr<GuestExecutionReelCollector> collector =
+        MakeCollector(config);
+    RecordEvents(*collector, 101, 1, 9);
+    REQUIRE(collector->RequestManualStop(102) ==
+            GuestExecutionReelAction::kStop);
+    REQUIRE(collector->Complete(103));
+    REQUIRE(collector->status().accepted_segment_count == 0);
+    REQUIRE(collector->status().guest_instruction_count == 9);
+    REQUIRE(collector->status().coverage_mode ==
+            GuestExecutionReelCoverageMode::kContinuousInstructions);
+  }
+
+  SECTION("control events alone do not establish execution coverage") {
+    std::unique_ptr<GuestExecutionReelCollector> collector =
+        MakeCollector(config);
+    RecordEvents(*collector, 101, 1, 0);
+    REQUIRE(collector->RequestManualStop(102) ==
+            GuestExecutionReelAction::kStop);
+    REQUIRE_FALSE(collector->Complete(103));
+    REQUIRE(collector->status().rejection ==
+            GuestExecutionReelRejection::kIncomplete);
+  }
+
+  SECTION("segment input rejects the continuous reel") {
+    std::unique_ptr<GuestExecutionReelCollector> collector =
+        MakeCollector(config);
+    GuestExecutionReelEventRange range = RecordEvents(*collector, 101);
+    REQUIRE(collector->RecordSegment(PublishedSegment(0, 100, 101), range) ==
+            GuestExecutionReelAction::kReject);
+    REQUIRE(collector->status().rejection ==
+            GuestExecutionReelRejection::kInvalidCall);
+  }
+
+  SECTION("instruction boundary stops exactly without a segment") {
+    config.boundary.kind =
+        GuestExecutionReelBoundaryKind::kGuestInstructionCount;
+    config.boundary.value = 10;
+    std::unique_ptr<GuestExecutionReelCollector> collector =
+        MakeCollector(config);
+    RecordEvents(*collector, 101, 1, 9);
+    RecordEvents(*collector, 102, 1, 1, 0, GuestExecutionReelAction::kStop);
+    REQUIRE(collector->Complete(103));
+    REQUIRE(collector->status().stop_reason ==
+            GuestExecutionReelStopReason::kGuestInstructionCount);
+  }
 }
 
 TEST_CASE("guest execution reel manual window has exact ordered coverage",
@@ -195,6 +260,17 @@ TEST_CASE("guest execution reel refuses empty or mismatched manual completion",
     std::string error;
     REQUIRE_FALSE(collector->Complete(102, &error));
     REQUIRE_FALSE(error.empty());
+    REQUIRE(collector->status().rejection ==
+            GuestExecutionReelRejection::kIncomplete);
+  }
+
+  SECTION("invocation mode requires an accepted segment") {
+    std::unique_ptr<GuestExecutionReelCollector> collector =
+        MakeCollector(MakeConfig());
+    RecordEvents(*collector, 101, 1, 9);
+    REQUIRE(collector->RequestManualStop(102) ==
+            GuestExecutionReelAction::kStop);
+    REQUIRE_FALSE(collector->Complete(103));
     REQUIRE(collector->status().rejection ==
             GuestExecutionReelRejection::kIncomplete);
   }

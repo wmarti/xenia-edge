@@ -44,6 +44,11 @@ enum class GuestExecutionReelMarkerSource : uint32_t {
   kOtherInstrumented = 4,
 };
 
+enum class GuestExecutionReelCoverageMode : uint8_t {
+  kInvocationSegments = 1,
+  kContinuousInstructions = 2,
+};
+
 struct GuestExecutionReelBoundaryPolicy {
   GuestExecutionReelBoundaryKind kind = GuestExecutionReelBoundaryKind::kManual;
   uint64_t value = 0;
@@ -66,6 +71,8 @@ struct GuestExecutionReelLimits {
 struct GuestExecutionReelConfig {
   GuestExecutionReelBoundaryPolicy boundary;
   GuestExecutionReelLimits limits;
+  GuestExecutionReelCoverageMode coverage_mode =
+      GuestExecutionReelCoverageMode::kInvocationSegments;
   uint64_t first_event_sequence = 0;
   uint64_t first_segment_ordinal = 0;
 };
@@ -120,6 +127,8 @@ enum class GuestExecutionReelRejection : uint8_t {
 
 struct GuestExecutionReelStatus {
   GuestExecutionReelState state = GuestExecutionReelState::kRecording;
+  GuestExecutionReelCoverageMode coverage_mode =
+      GuestExecutionReelCoverageMode::kInvocationSegments;
   GuestExecutionReelStopReason stop_reason =
       GuestExecutionReelStopReason::kNone;
   GuestExecutionReelRejection rejection = GuestExecutionReelRejection::kNone;
@@ -180,9 +189,8 @@ class GuestExecutionReelCollector final {
   GuestExecutionReelAction Poll(uint64_t now_tick);
   GuestExecutionReelAction RequestManualStop(uint64_t now_tick);
 
-  // Completes only after a policy requested stop and at least one event and one
-  // accepted segment were retained. The future session owner calls this only
-  // after its final checkpoint and chunks are durable.
+  // Completes only after a policy requested stop and retained coverage matches
+  // the configured mode.
   bool Complete(uint64_t now_tick, std::string* error = nullptr);
 
   GuestExecutionReelStatus status() const;

@@ -63,6 +63,16 @@ bool IsKnownMarkerSource(GuestExecutionReelMarkerSource source) {
   }
 }
 
+bool IsKnownCoverageMode(GuestExecutionReelCoverageMode mode) {
+  switch (mode) {
+    case GuestExecutionReelCoverageMode::kInvocationSegments:
+    case GuestExecutionReelCoverageMode::kContinuousInstructions:
+      return true;
+    default:
+      return false;
+  }
+}
+
 }  // namespace
 
 std::unique_ptr<GuestExecutionReelCollector>
@@ -78,6 +88,16 @@ GuestExecutionReelCollector::Create(const GuestExecutionReelConfig& config,
   }
   if (!IsKnownMarkerSource(config.boundary.marker_source)) {
     Fail(error, "capture reel marker source is invalid");
+    return nullptr;
+  }
+  if (!IsKnownCoverageMode(config.coverage_mode)) {
+    Fail(error, "capture reel coverage mode is invalid");
+    return nullptr;
+  }
+  if (config.coverage_mode ==
+          GuestExecutionReelCoverageMode::kContinuousInstructions &&
+      config.boundary.kind == GuestExecutionReelBoundaryKind::kSegmentCount) {
+    Fail(error, "continuous capture reel cannot use a segment-count boundary");
     return nullptr;
   }
   const GuestExecutionReelLimits& limits = config.limits;
@@ -154,6 +174,7 @@ GuestExecutionReelCollector::Create(const GuestExecutionReelConfig& config,
 GuestExecutionReelCollector::GuestExecutionReelCollector(
     const GuestExecutionReelConfig& config, uint64_t capture_start_tick)
     : config_(config) {
+  status_.coverage_mode = config.coverage_mode;
   status_.capture_start_tick = capture_start_tick;
   status_.last_observed_tick = capture_start_tick;
   status_.first_event_sequence = config.first_event_sequence;
@@ -377,6 +398,13 @@ GuestExecutionReelAction GuestExecutionReelCollector::RecordSegment(
       status_.state == GuestExecutionReelState::kComplete) {
     return current_action;
   }
+  if (config_.coverage_mode ==
+      GuestExecutionReelCoverageMode::kContinuousInstructions) {
+    ++status_.rejected_segment_count;
+    return RejectLocked(GuestExecutionReelRejection::kInvalidCall,
+                        "continuous capture reel received a segment",
+                        segment_status.capture_end_tick);
+  }
 
   if (segment_status.segment_ordinal != status_.next_segment_ordinal) {
     ++status_.rejected_segment_count;
@@ -539,9 +567,16 @@ bool GuestExecutionReelCollector::Complete(uint64_t now_tick,
                  "capture reel completion tick order is invalid", now_tick);
     return Fail(error, status_.message);
   }
-  if (!status_.accepted_event_count || !status_.accepted_segment_count) {
+  const bool has_coverage =
+      config_.coverage_mode ==
+              GuestExecutionReelCoverageMode::kContinuousInstructions
+          ? status_.guest_instruction_count != 0 &&
+                status_.accepted_segment_count == 0 &&
+                status_.rejected_segment_count == 0
+          : status_.accepted_segment_count != 0;
+  if (!status_.accepted_event_count || !has_coverage) {
     RejectLocked(GuestExecutionReelRejection::kIncomplete,
-                 "capture reel has no accepted event and segment coverage",
+                 "capture reel has no accepted event and execution coverage",
                  now_tick);
     return Fail(error, status_.message);
   }

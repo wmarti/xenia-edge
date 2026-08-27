@@ -240,6 +240,7 @@ bool BuildReelConfig(const GuestExecutionSessionAssemblerConfig& config,
   }
   reel_config.boundary.marker_identity = config.boundary.marker_identity;
   reel_config.boundary.value = config.boundary.value;
+  reel_config.coverage_mode = config.coverage_mode;
   if (config.boundary.kind ==
       GuestExecutionSessionBoundaryKind::kCaptureDurationNanoseconds) {
     if (!config.boundary.value ||
@@ -937,6 +938,14 @@ struct GuestExecutionSessionAssembler::Impl {
   }
 
   bool AssembleBundleLocked(GuestExecutionSessionBundle* bundle) {
+    const bool continuous_coverage =
+        config.coverage_mode ==
+        GuestExecutionReelCoverageMode::kContinuousInstructions;
+    if (continuous_coverage != segments.empty()) {
+      RejectLocked(Rejection::kInvalidCall,
+                   "capture session coverage mode and segment shape diverged");
+      return false;
+    }
     GuestExecutionSessionCheckpoint initial;
     initial.global_sequence = 0;
     initial.thread_states = initial_thread_states;
@@ -949,7 +958,7 @@ struct GuestExecutionSessionAssembler::Impl {
         !CollectContentLocked(false, &final_checkpoint.content) ||
         !CollectSessionCodeCorpusLocked(&corpus_digest) ||
         !EncodeCheckpointChunkLocked(initial) ||
-        (segments.empty() && !EncodeCodeCorpusChunkLocked(corpus_digest)) ||
+        (continuous_coverage && !EncodeCodeCorpusChunkLocked(corpus_digest)) ||
         !EncodeEventChunksLocked() ||
         !EncodeCheckpointChunkLocked(final_checkpoint)) {
       return false;
@@ -1741,11 +1750,16 @@ Action GuestExecutionSessionAssembler::OnOuterHostCallEnd(
             Rejection::kInvalidCall,
             "capture session outer host call returned inside a segment");
       }
+      const uint32_t expected_segment_count =
+          impl_->config.coverage_mode ==
+                  GuestExecutionReelCoverageMode::kInvocationSegments
+              ? 1
+              : 0;
       if (participant->dispatch_in_session &&
-          participant->dispatch_segment_count != 1) {
+          participant->dispatch_segment_count != expected_segment_count) {
         return impl_->RejectLocked(
             Rejection::kInvalidCall,
-            "capture session outer dispatch returned without its segment");
+            "capture session outer dispatch segment count is invalid");
       }
       participant->dispatch_in_session = false;
       impl_->outer_return_in_flight = participant;
@@ -1790,6 +1804,12 @@ Action GuestExecutionSessionAssembler::OnSegmentBegin(
   Impl::Participant* participant = impl_->FindParticipantLocked(identity);
   if (!participant) {
     return Action::kReject;
+  }
+  if (impl_->config.coverage_mode ==
+      GuestExecutionReelCoverageMode::kContinuousInstructions) {
+    return impl_->RejectLocked(
+        Rejection::kInvalidCall,
+        "continuous capture session received a segment begin");
   }
   switch (impl_->state) {
     case State::kRecording:
@@ -1859,6 +1879,12 @@ Action GuestExecutionSessionAssembler::OnSegmentEnd(
   Impl::Participant* participant = impl_->FindParticipantLocked(identity);
   if (!participant) {
     return Action::kReject;
+  }
+  if (impl_->config.coverage_mode ==
+      GuestExecutionReelCoverageMode::kContinuousInstructions) {
+    return impl_->RejectLocked(
+        Rejection::kInvalidCall,
+        "continuous capture session received a segment end");
   }
   switch (impl_->state) {
     case State::kRecording:
@@ -2431,6 +2457,7 @@ GuestExecutionSessionAssemblerStatus GuestExecutionSessionAssembler::status()
   std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   GuestExecutionSessionAssemblerStatus result;
   result.state = impl_->state;
+  result.coverage_mode = impl_->config.coverage_mode;
   result.rejection = impl_->rejection;
   result.stop_reason = impl_->stop_reason;
   result.next_event_sequence = impl_->next_event_sequence;
