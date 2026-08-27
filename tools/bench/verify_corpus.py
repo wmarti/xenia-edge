@@ -45,9 +45,10 @@ def describe_exit(code):
     return "fail", None
 
 
-def run_suite(exe, suite, corpus, test_path, skip_file, timeout):
+def run_suite(exe, suite, corpus, test_path, skip_file, runner_args, timeout):
     cmd = [
         exe,
+        *runner_args,
         f"--test_path={test_path}/",
         f"--test_bin_path={corpus}/",
         suite,
@@ -93,6 +94,11 @@ def main():
     ap.add_argument("--label", default="",
                     help="free-form identity for the row, e.g. 'edge@a1b2c3 a64'")
     ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument(
+        "--runner-arg", action="append", default=[],
+        help="argument forwarded to every PPC runner process; use "
+             "--runner-arg=--flag=value for arguments beginning with '--'",
+    )
     ap.add_argument("--suites", nargs="*", default=None,
                     help="restrict to these suites (default: the whole corpus)")
     args = ap.parse_args()
@@ -108,7 +114,7 @@ def main():
     results = []
     for i, suite in enumerate(suites, 1):
         row = run_suite(args.exe, suite, args.corpus, args.test_path,
-                        args.skip_file, args.timeout)
+                        args.skip_file, args.runner_arg, args.timeout)
         results.append(row)
         if row["verdict"] != "pass":
             marker = row["signal"] or row["verdict"]
@@ -119,6 +125,7 @@ def main():
         "label": args.label,
         "exe": args.exe,
         "corpus": str(corpus),
+        "runner_args": args.runner_arg,
         "suites": len(results),
         "cases": sum(r["total"] for r in results),
         "passed": sum(r["passed"] for r in results),
