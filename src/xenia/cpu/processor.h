@@ -38,6 +38,10 @@ namespace cpu {
 constexpr fourcc_t kProcessorSaveSignature = make_fourcc("PROC");
 
 class Breakpoint;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+class GuestInvocationCaptureEventSink;
+#endif
 class JitCorpusWriter;
 class StackWalker;
 class XexModule;
@@ -73,6 +77,20 @@ class Processor {
   ppc::PPCFrontend* frontend() const { return frontend_.get(); }
   backend::Backend* backend() const { return backend_.get(); }
   ExportResolver* export_resolver() const { return export_resolver_; }
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // The owner must install this before guest translation starts and clear it
+  // only after capture callbacks have stopped. The sink serializes and routes
+  // all recorder access; Processor does not own it.
+  void set_guest_invocation_capture_sink(
+      GuestInvocationCaptureEventSink* sink) {
+    guest_invocation_capture_sink_ = sink;
+  }
+  GuestInvocationCaptureEventSink* guest_invocation_capture_sink() const {
+    return guest_invocation_capture_sink_;
+  }
+#endif
 
   bool Setup(std::unique_ptr<backend::Backend> backend);
 
@@ -322,6 +340,11 @@ class Processor {
   // If --jit_corpus_out was given, every compiled function is streamed here for
   // later offline codegen replay.
   std::unique_ptr<JitCorpusWriter> jit_corpus_writer_;
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  GuestInvocationCaptureEventSink* guest_invocation_capture_sink_ = nullptr;
+#endif
 
   // Opt-in capture ordering lock. Recursive because defining a guest function
   // may synchronously demand another function on the same host thread.

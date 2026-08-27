@@ -21,6 +21,10 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/string.h"
 #include "xenia/cpu/cpu_flags.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/guest_invocation_capture.h"
+#endif
 #include "xenia/cpu/hir/label.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_decode_data.h"
@@ -259,7 +263,17 @@ void PPCHIRBuilder::AnnotateLabel(uint32_t address, Label* label) {
 }
 
 Function* PPCHIRBuilder::LookupFunction(uint32_t address) {
-  return frontend_->processor()->LookupFunction(address);
+  Processor* processor = frontend_->processor();
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (auto* capture = processor->guest_invocation_capture_sink()) {
+    // The dependency must precede the source's successful-definition event.
+    // Report the lookup even if declaration fails so the recorder rejects an
+    // incomplete closure rather than silently producing an unsafe artifact.
+    capture->OnFunctionDependency(function_->address(), address);
+  }
+#endif
+  return processor->LookupFunction(address);
 }
 
 Label* PPCHIRBuilder::LookupLabel(uint32_t address) {

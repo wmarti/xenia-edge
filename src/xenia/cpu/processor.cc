@@ -35,6 +35,10 @@
 #include "xenia/cpu/breakpoint.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/export_resolver.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/guest_invocation_capture.h"
+#endif
 #include "xenia/cpu/jit_corpus.h"
 #include "xenia/cpu/module.h"
 #include "xenia/cpu/ppc/ppc_decode_data.h"
@@ -694,6 +698,14 @@ bool Processor::DemandFunction(Function* function) {
       function->set_status(Symbol::Status::kFailed);
       return false;
     }
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    if (guest_invocation_capture_sink_) {
+      guest_invocation_capture_sink_->OnFunctionDefined(
+          function->address(), function->end_address());
+    }
+#endif
 
     // Before we give the symbol back to the rest, let the debugger know.
     OnFunctionDefined(function);
