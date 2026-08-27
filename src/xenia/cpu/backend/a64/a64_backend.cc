@@ -31,6 +31,10 @@
 #endif
 #include "xenia/cpu/backend/a64/a64_assembler.h"
 #include "xenia/cpu/backend/a64/a64_code_cache.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
+#endif
 #include "xenia/cpu/backend/a64/a64_emitter.h"
 #include "xenia/cpu/backend/a64/a64_function.h"
 #include "xenia/cpu/backend/a64/a64_sequences.h"
@@ -1022,6 +1026,10 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
                 backend_context->stackpoint_head,
                 static_cast<uint32_t>(guest_context->r[1]));
             if (sync_node) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+              CaptureGuestInvocationUnwindOrLongjmp(guest_context);
+#endif
               backend_context->pending_stackpoint_sync_node = sync_node;
               return host_address;
             }
@@ -1608,6 +1616,10 @@ bool A64Backend::ResetGuestInvocationReplayState(void* ctx) {
   bctx->spin_wait_spins = 0;
   bctx->spin_wait_site = 0;
   bctx->spin_wait_armed = 0;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  bctx->guest_invocation_capture_host_entry_depth = 0;
+#endif
   bctx->spin_wait_reset_tick = 0;
 
   ppc_context->preempt_requested = 0;

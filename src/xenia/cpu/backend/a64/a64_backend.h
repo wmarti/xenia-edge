@@ -161,6 +161,13 @@ struct A64BackendContext {
   unsigned int spin_wait_site;
   unsigned int spin_wait_armed;
   uint64_t spin_wait_reset_tick;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Number of active host-initiated entries using this PPC context. Ordinary
+  // guest-to-guest calls bypass A64Function::CallImpl, so a value above zero
+  // there identifies host callback or asynchronous reentry.
+  alignas(uint32_t) uint32_t guest_invocation_capture_host_entry_depth;
+#endif
 };
 
 // Default FPCR for FPU mode (round to nearest, no flush to zero).

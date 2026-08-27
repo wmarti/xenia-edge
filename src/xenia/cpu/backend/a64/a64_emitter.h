@@ -367,6 +367,10 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   XexModule* guest_module_ = nullptr;
   uint64_t feature_flags_ = 0;
   uint32_t current_guest_function_ = 0;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  uint32_t current_guest_function_end_ = 0;
+#endif
 
   Xbyak_aarch64::Label* epilog_label_ = nullptr;
 

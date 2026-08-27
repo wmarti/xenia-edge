@@ -19,6 +19,11 @@
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #include "xenia/cpu/backend/a64/a64_code_cache.h"
 #include "xenia/cpu/backend/a64/a64_function.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
+#include "xenia/cpu/guest_invocation_artifact.h"
+#endif
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
@@ -97,6 +102,10 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
   sequence_samples_.clear();
 
   current_guest_function_ = function->address();
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  current_guest_function_end_ = function->end_address();
+#endif
 
   // Reset state.
   stack_size_ = StackLayout::GUEST_STACK_SIZE;
@@ -282,6 +291,16 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   // ========================================================================
   code_offsets.body = getSize();
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // The prolog has saved host bookkeeping, but no guest HIR has executed yet.
+  // CallNativeSafe preserves every guest-allocatable GPR and vector register
+  // while the callback snapshots the fully materialized PPC context.
+  mov(x1, static_cast<uint64_t>(current_guest_function_));
+  mov(x2, static_cast<uint64_t>(current_guest_function_end_));
+  CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationFunctionEntry));
+#endif
+
   // FTrace: log guest function entry when the backend was built with
   // function tracing available (gated at runtime by the trace_func flag).
   if (IsTracingFunc()) {
@@ -417,6 +436,14 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   // ========================================================================
   L(*epilog_label_);
   epilog_label_ = nullptr;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Use the return boundary saved by this frame's prolog, not the mutable PPC
+  // LR. A function may legally change LR before taking its normal return path.
+  mov(x1, static_cast<uint64_t>(current_guest_function_));
+  ldr(x2, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+  CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationFunctionExit));
+#endif
   // FTrace: log the guest return value (r3) on normal return.
   if (IsTracingFunc()) {
     mov(x1, static_cast<uint64_t>(current_guest_function_));
@@ -833,6 +860,15 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     return;
   }
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (instr->flags & hir::CALL_TAIL) {
+    mov(x1, static_cast<uint64_t>(current_guest_function_));
+    mov(x2, static_cast<uint64_t>(function->address()));
+    CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationTailCall));
+  }
+#endif
+
   auto fn = static_cast<A64Function*>(function);
 
   if (fn->machine_code()) {
@@ -1067,6 +1103,18 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
     }
   }
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (instr->flags & hir::CALL_TAIL) {
+    // x0-x18 are caller-saved. Round-trip the target through the callback's
+    // return value so w16 and any future scratch assignment are both safe.
+    mov(w2, target_w);
+    mov(x1, static_cast<uint64_t>(current_guest_function_));
+    CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationTailCall));
+    mov(target_w, w0);
+  }
+#endif
+
   // Load host code address from indirection table.
   if (code_cache_->has_indirection_table()) {
     // Must leave the guest address in w16 for the resolve thunk to read.
@@ -1167,6 +1215,16 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
 
 void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
   EnsureFpuFpcrModeForTransition();
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  uint32_t dependency_flags = ppc::kGuestInvocationDependencyExternOrBuiltin;
+  if (function->behavior() == Function::Behavior::kExtern) {
+    dependency_flags |= ppc::kGuestInvocationDependencyKernelExport;
+  }
+  mov(x1, static_cast<uint64_t>(dependency_flags));
+  CallNativeSafe(
+      reinterpret_cast<void*>(&CaptureGuestInvocationUnsupportedDependency));
+#endif
   bool undefined = true;
   if (function->behavior() == Function::Behavior::kBuiltin) {
     auto builtin_function = static_cast<const BuiltinFunction*>(function);
