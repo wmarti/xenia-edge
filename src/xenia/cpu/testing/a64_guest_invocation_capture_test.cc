@@ -12,10 +12,12 @@
 #if XE_ARCH_ARM64 && defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -193,6 +195,32 @@ class RecordingCaptureSink final : public GuestInvocationCaptureEventSink {
   std::vector<CaptureEvent> events;
   std::function<void(const CaptureEvent&)> memory_observer;
   std::function<void(const CaptureEvent&)> unsupported_observer;
+};
+
+class SyntheticCaptureClock final : public ppc::GuestInvocationRecorderClock {
+ public:
+  uint64_t NowTicks() const override { return now; }
+
+  uint64_t now = 100;
+};
+
+class MemoryCapturePageReader final
+    : public ppc::GuestInvocationRecorderPageReader {
+ public:
+  explicit MemoryCapturePageReader(Memory& memory) : memory_(memory) {}
+
+  bool ReadPage(uint32_t page_address,
+                std::array<uint8_t, 4096>* output) override {
+    std::memcpy(output->data(), memory_.TranslateVirtual(page_address),
+                output->size());
+    read_addresses.push_back(page_address);
+    return true;
+  }
+
+  std::vector<uint32_t> read_addresses;
+
+ private:
+  Memory& memory_;
 };
 
 ppc::GuestPPCRegisterState MakeRegisterState(uint64_t seed) {
@@ -752,6 +780,177 @@ TEST_CASE("A64_CAPTURE_ROUND_TRIPS_INDIRECT_TAIL_TARGET",
   REQUIRE(events[2].address == kTargetAddress);
   REQUIRE(events[3].kind == CaptureEventKind::kExit);
   REQUIRE(events[3].address == kTargetAddress);
+}
+
+TEST_CASE("A64_CAPTURE_COORDINATOR_ACCEPTS_EMITTED_INVOCATION",
+          "[backend][guest-invocation-capture]") {
+  constexpr uint32_t kRootAddress = 0x80000000;
+  constexpr uint32_t kRootEndAddress = kRootAddress + 0x0C;
+  constexpr uint32_t kPageSize = 4096;
+  constexpr uint32_t kWordOffset = 0x180;
+  constexpr uint32_t kInitialWord = 0x10203040;
+  constexpr uint32_t kFinalWord = 0xA1B2C3D4;
+  constexpr uint64_t kSegmentOrdinal = 23;
+  constexpr uint64_t kCaptureStartTick = 100;
+  constexpr uint64_t kCaptureEndTick = 200;
+
+  TestFunction test(
+      [](hir::HIRBuilder& builder) {
+        hir::Value* address = LoadGPR(builder, 4);
+        StoreGPR(builder, 3,
+                 builder.ZeroExtend(builder.Load(address, hir::INT32_TYPE),
+                                    hir::INT64_TYPE));
+        builder.Store(address, builder.LoadConstantUint32(kFinalWord));
+        StoreGPR(builder, 5, builder.LoadConstantUint64(kFinalWord));
+        builder.Return();
+      },
+      kRootEndAddress);
+  REQUIRE(test.processors.size() == 1);
+  Processor* processor = test.processors[0].get();
+
+  const uint32_t data_page = test.memory->SystemHeapAlloc(kPageSize, kPageSize);
+  REQUIRE(data_page != 0);
+  const uint32_t data_address = data_page + kWordOffset;
+  std::array<uint8_t, kPageSize> initial_page = {};
+  for (size_t i = 0; i < initial_page.size(); ++i) {
+    initial_page[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
+  }
+  std::memcpy(initial_page.data() + kWordOffset, &kInitialWord,
+              sizeof(kInitialWord));
+  std::array<uint8_t, kPageSize> expected_dirty_page = initial_page;
+  std::memcpy(expected_dirty_page.data() + kWordOffset, &kFinalWord,
+              sizeof(kFinalWord));
+  std::memcpy(test.memory->TranslateVirtual(data_page), initial_page.data(),
+              initial_page.size());
+
+  ppc::GuestInvocationRecorderSelection selection;
+  selection.root_address = kRootAddress;
+  selection.root_end_address = kRootEndAddress;
+  selection.occurrence = 1;
+  ppc::GuestInvocationRecorderLimits limits;
+  limits.max_attempts = 4;
+  limits.max_duration_ticks = 1000;
+  limits.max_page_count = 4;
+  limits.max_access_count = 16;
+  limits.max_call_depth = 2;
+  limits.max_event_count = 64;
+  limits.max_function_count = 4;
+
+  MemoryCapturePageReader page_reader(*test.memory);
+  SyntheticCaptureClock clock;
+  std::optional<ppc::GuestInvocationRecorderResult> published_result;
+  uint32_t publication_count = 0;
+  uint64_t published_ordinal = 0;
+  uint64_t published_start_tick = 0;
+  uint64_t published_end_tick = 0;
+  std::string error;
+  std::unique_ptr<GuestInvocationCaptureCoordinator> coordinator =
+      GuestInvocationCaptureCoordinator::Create(
+          kSegmentOrdinal, selection, limits, page_reader, clock,
+          [&](uint64_t ordinal, uint64_t start_tick, uint64_t end_tick,
+              const ppc::GuestInvocationRecorderResult& result, std::string*) {
+            ++publication_count;
+            published_ordinal = ordinal;
+            published_start_tick = start_tick;
+            published_end_tick = end_tick;
+            published_result = result;
+            return true;
+          },
+          &error);
+  REQUIRE(coordinator);
+  REQUIRE(error.empty());
+
+  ppc::GuestInvocationRecorderIdentity expected_owner = {};
+  ppc::GuestPPCRegisterState final_input = {};
+  ppc::GuestPPCRegisterState final_output = {};
+  processor->set_guest_invocation_capture_sink(coordinator.get());
+  test.Run(
+      [&](ppc::PPCContext* context) {
+        context->r[3] = 0x0303030303030303ull;
+        context->r[4] = data_address;
+        context->r[5] = 0x0505050505050505ull;
+        expected_owner = {reinterpret_cast<uintptr_t>(context),
+                          context->thread_id};
+      },
+      [&](ppc::PPCContext* context) {
+        REQUIRE(coordinator->status().recorder_state ==
+                ppc::GuestInvocationRecorderState::kWaitingForDiscoveryAttempt);
+        Function* function = processor->ResolveFunction(kRootAddress);
+        REQUIRE(function != nullptr);
+
+        context->r[4] = data_address;
+        REQUIRE(function->Call(context->thread_state,
+                               static_cast<uint32_t>(context->lr)));
+        REQUIRE(coordinator->status().recorder_state ==
+                ppc::GuestInvocationRecorderState::kWaitingForFinalAttempt);
+
+        std::memcpy(test.memory->TranslateVirtual(data_page),
+                    initial_page.data(), initial_page.size());
+        context->r[3] = 0x1313131313131313ull;
+        context->r[4] = data_address;
+        context->r[5] = 0x1515151515151515ull;
+        context->ctr = 0x1717171717171717ull;
+        context->v[7] = vec128i(0x21222324, 0x31323334, 0x41424344, 0x51525354);
+        final_input = ppc::CaptureGuestPPCRegisterState(*context);
+        clock.now = kCaptureEndTick;
+        REQUIRE(function->Call(context->thread_state,
+                               static_cast<uint32_t>(context->lr)));
+        final_output = ppc::CaptureGuestPPCRegisterState(*context);
+        REQUIRE(final_output.gpr[3] == kInitialWord);
+        REQUIRE(final_output.gpr[5] == kFinalWord);
+
+        REQUIRE(function->Call(context->thread_state,
+                               static_cast<uint32_t>(context->lr)));
+        REQUIRE(coordinator->Poll());
+      });
+  processor->set_guest_invocation_capture_sink(nullptr);
+
+  REQUIRE(publication_count == 1);
+  REQUIRE(published_result);
+  REQUIRE(published_ordinal == kSegmentOrdinal);
+  REQUIRE(published_start_tick == kCaptureStartTick);
+  REQUIRE(published_end_tick == kCaptureEndTick);
+  const GuestInvocationCaptureStatus status = coordinator->status();
+  REQUIRE(status.state == GuestInvocationCaptureState::kPublished);
+  REQUIRE(status.recorder_state ==
+          ppc::GuestInvocationRecorderState::kComplete);
+  REQUIRE(status.accepted_segment_count == 1);
+  REQUIRE(status.rejected_segment_count == 0);
+  REQUIRE(status.capture_start_tick == kCaptureStartTick);
+  REQUIRE(status.capture_end_tick == kCaptureEndTick);
+  REQUIRE(status.message.empty());
+
+  const ppc::GuestInvocationRecorderResult& result = *published_result;
+  REQUIRE(result.owner == expected_owner);
+  REQUIRE(result.attempt_count == 3);
+  REQUIRE((result.touched_page_addresses == std::vector<uint32_t>{data_page}));
+  REQUIRE((result.translation_dependencies ==
+           std::vector<ppc::GuestInvocationRecorderFunction>{
+               {kRootAddress, kRootEndAddress}}));
+  REQUIRE((result.entered_functions ==
+           std::vector<ppc::GuestInvocationRecorderFunction>{
+               {kRootAddress, kRootEndAddress}}));
+  const ppc::GuestFunctionInvocation& invocation = result.invocation;
+  REQUIRE(invocation.function_address == kRootAddress);
+  REQUIRE(invocation.function_end_address == kRootEndAddress);
+  REQUIRE(invocation.entry_address == kRootAddress);
+  REQUIRE(invocation.expected_return_address == 0xBCBCBCBC);
+  REQUIRE(invocation.dependency_flags == 0);
+  REQUIRE(invocation.input == final_input);
+  REQUIRE(invocation.expected_output == final_output);
+  REQUIRE(invocation.input_data_pages.size() == 1);
+  REQUIRE(invocation.input_data_pages[0].guest_address == data_page);
+  REQUIRE(invocation.input_data_pages[0].data == initial_page);
+  REQUIRE(invocation.expected_dirty_pages.size() == 1);
+  REQUIRE(invocation.expected_dirty_pages[0].guest_address == data_page);
+  REQUIRE(invocation.expected_dirty_pages[0].data == expected_dirty_page);
+  REQUIRE((page_reader.read_addresses ==
+           std::vector<uint32_t>{data_page, data_page}));
+  REQUIRE(std::memcmp(test.memory->TranslateVirtual(data_page),
+                      expected_dirty_page.data(),
+                      expected_dirty_page.size()) == 0);
+
+  test.memory->SystemHeapFree(data_page);
 }
 
 TEST_CASE("A64_CAPTURE_MEMORY_HELPER_VALIDATES_LOGICAL_RANGES",

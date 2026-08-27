@@ -27,7 +27,8 @@ class TestModule : public Module {
   TestModule(Processor* processor, const std::string_view name,
              std::function<bool(uint32_t)> contains_address,
              std::function<bool(hir::HIRBuilder&)> generate,
-             bool skip_cf_simplification = false);
+             bool skip_cf_simplification = false,
+             uint32_t function_end_address = 0);
   ~TestModule() override;
 
   const std::string& name() const override { return name_; }
@@ -45,6 +46,7 @@ class TestModule : public Module {
   std::string name_;
   std::function<bool(uint32_t)> contains_address_;
   std::function<bool(hir::HIRBuilder&)> generate_;
+  uint32_t function_end_address_ = 0;
 
   std::unique_ptr<hir::HIRBuilder> builder_;
   std::unique_ptr<compiler::Compiler> compiler_;

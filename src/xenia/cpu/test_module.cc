@@ -27,11 +27,13 @@ namespace passes = xe::cpu::compiler::passes;
 TestModule::TestModule(Processor* processor, const std::string_view name,
                        std::function<bool(uint32_t)> contains_address,
                        std::function<bool(hir::HIRBuilder&)> generate,
-                       bool skip_cf_simplification)
+                       bool skip_cf_simplification,
+                       uint32_t function_end_address)
     : Module(processor),
       name_(name),
       contains_address_(contains_address),
-      generate_(generate) {
+      generate_(generate),
+      function_end_address_(function_end_address) {
   builder_.reset(new HIRBuilder());
   compiler_.reset(new Compiler(processor));
   assembler_ = processor->backend()->CreateAssembler();
@@ -85,6 +87,9 @@ Symbol::Status TestModule::DeclareFunction(uint32_t address,
   Symbol::Status status = Module::DeclareFunction(address, out_function);
   if (status == Symbol::Status::kNew) {
     auto function = static_cast<GuestFunction*>(*out_function);
+    if (function_end_address_) {
+      function->set_end_address(function_end_address_);
+    }
 
     // Reset() all caching when we leave.
     xe::make_reset_scope(compiler_);
