@@ -28,6 +28,7 @@
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
+#include "xenia/base/logging.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/guest_execution_continuous_event.h"
 #include "xenia/cpu/guest_execution_marker_controller.h"
@@ -2739,6 +2740,30 @@ bool GuestExecutionSessionTitleCaptureRuntime::AttachRuntime(
 void GuestExecutionSessionTitleCaptureRuntime::Shutdown() noexcept {
   if (!impl_) {
     return;
+  }
+  if (impl_->wiring) {
+    const GuestExecutionSessionCaptureRuntimeStatus runtime_status =
+        impl_->wiring->runtime().status();
+    const GuestExecutionMarkerControllerStatus marker_status =
+        impl_->wiring->marker_controller()->status();
+    XELOGI(
+        "Guest execution session capture status before detach: "
+        "runtime_state={} runtime_rejection={} marker_state={} "
+        "marker_rejection={} matching_markers={} warmup_markers={} "
+        "ignored_markers={} arm_ordinal={} stop_ordinal={} "
+        "emitted_boundaries={} acknowledged_boundaries={} queued_events={} "
+        "processed_events={} published={} diagnostic={}",
+        static_cast<uint32_t>(runtime_status.state),
+        static_cast<uint32_t>(runtime_status.rejection),
+        static_cast<uint32_t>(marker_status.state),
+        static_cast<uint32_t>(marker_status.rejection),
+        marker_status.matching_marker_count, marker_status.warmup_marker_count,
+        marker_status.ignored_marker_count, marker_status.arm_marker_ordinal,
+        marker_status.stop_marker_ordinal, marker_status.emitted_boundary_count,
+        marker_status.acknowledged_boundary_count,
+        runtime_status.queued_event_count, runtime_status.processed_event_count,
+        runtime_status.canonical_output_published,
+        runtime_status.message.empty() ? "none" : runtime_status.message);
   }
   impl_->wiring.reset();
   impl_->provider.reset();
