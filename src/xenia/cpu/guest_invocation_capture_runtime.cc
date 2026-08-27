@@ -29,6 +29,7 @@
 #include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/guest_invocation_capture_bundle.h"
+#include "xenia/cpu/guest_invocation_capture_page_reader.h"
 #include "xenia/cpu/guest_invocation_capture_runtime_config.h"
 #include "xenia/cpu/guest_invocation_replay_cli.h"
 #include "xenia/cpu/guest_invocation_replay_config.h"
@@ -113,36 +114,41 @@ GuestInvocationCaptureRuntimeConfig CurrentConfig() {
 
 }  // namespace
 
+bool GuestInvocationCapturePageReader::ReadPage(
+    uint32_t page_address, std::array<uint8_t, 4096>* output) {
+  static_assert(JitCorpus::kPageSize == 4096);
+  if (!output || (page_address & (JitCorpus::kPageSize - 1)) ||
+      page_address >
+          std::numeric_limits<uint32_t>::max() - (JitCorpus::kPageSize - 1) ||
+      !memory_.virtual_membase()) {
+    return false;
+  }
+
+  BaseHeap* const first_heap = memory_.LookupHeap(page_address);
+  BaseHeap* const last_heap =
+      memory_.LookupHeap(page_address + JitCorpus::kPageSize - 1);
+  if (!first_heap || first_heap != last_heap) {
+    return false;
+  }
+
+  // Keep the allocation metadata stable through the copy. Guest memory
+  // protection, decommit and release operations use this same recursive global
+  // critical region, so none can invalidate the checked host range between the
+  // query and memcpy.
+  auto global_lock = xe::global_critical_region::AcquireDirect();
+  HeapAllocationInfo allocation_info = {};
+  if (!first_heap->QueryRegionInfo(page_address, &allocation_info) ||
+      !(allocation_info.state & kMemoryAllocationCommit) ||
+      !(allocation_info.protect & kMemoryProtectRead)) {
+    return false;
+  }
+
+  const void* const translated_page = memory_.TranslateVirtual(page_address);
+  std::memcpy(output->data(), translated_page, output->size());
+  return true;
+}
+
 struct GuestInvocationCaptureRuntime::Impl {
-  class PageReader final : public ppc::GuestInvocationRecorderPageReader {
-   public:
-    explicit PageReader(Memory& memory) : memory_(memory) {}
-
-    bool ReadPage(uint32_t page_address,
-                  std::array<uint8_t, JitCorpus::kPageSize>* output) override {
-      if (!output || (page_address & (JitCorpus::kPageSize - 1)) ||
-          page_address > std::numeric_limits<uint32_t>::max() -
-                             (JitCorpus::kPageSize - 1)) {
-        return false;
-      }
-      BaseHeap* first_heap = memory_.LookupHeap(page_address);
-      BaseHeap* last_heap =
-          memory_.LookupHeap(page_address + JitCorpus::kPageSize - 1);
-      if (!first_heap || first_heap != last_heap) {
-        return false;
-      }
-      const void* translated_page = memory_.TranslateVirtual(page_address);
-      if (!translated_page) {
-        return false;
-      }
-      std::memcpy(output->data(), translated_page, output->size());
-      return true;
-    }
-
-   private:
-    Memory& memory_;
-  };
-
   class HostClock final : public ppc::GuestInvocationRecorderClock {
    public:
     uint64_t NowTicks() const override { return Clock::QueryHostTickCount(); }
@@ -285,7 +291,7 @@ struct GuestInvocationCaptureRuntime::Impl {
   ppc::GuestInvocationRecorderSelection selection;
   GuestInvocationReplayConfig replay_config;
   GuestInvocationReplaySha256 capture_build_sha256 = {};
-  PageReader page_reader;
+  GuestInvocationCapturePageReader page_reader;
   HostClock clock;
   std::unique_ptr<GuestInvocationCaptureCoordinator> coordinator;
   bool attached = false;
