@@ -1836,7 +1836,6 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   assert_not_null(current_thread);
 
   auto guest_function = code_cache->LookupFunction(ex->pc());
-  assert_not_null(guest_function);
 
   auto context = current_thread->thread_state()->context();
 
@@ -1850,9 +1849,14 @@ bool Emulator::ExceptionCallback(Exception* ex) {
       current_thread->thread_id()));
   crash_msg.append(
       fmt::format("Thread Handle: 0x{:08X}\n", current_thread->handle()));
-  crash_msg.append(
-      fmt::format("PC: 0x{:08X}\n",
-                  guest_function->MapMachineCodeToGuestAddress(ex->pc())));
+  if (guest_function) {
+    crash_msg.append(
+        fmt::format("PC: 0x{:08X}\n",
+                    guest_function->MapMachineCodeToGuestAddress(ex->pc())));
+  } else {
+    crash_msg.append(fmt::format(
+        "PC: unavailable (unmapped host JIT address 0x{:016X})\n", ex->pc()));
+  }
   if (ex->code() == Exception::Code::kAccessViolation) {
     const char* op_str = "unknown";
     if (ex->access_violation_operation() ==
