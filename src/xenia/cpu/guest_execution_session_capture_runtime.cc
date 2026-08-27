@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -25,9 +26,11 @@
 
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/guest_execution_continuous_event.h"
+#include "xenia/cpu/guest_execution_marker_controller.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
+#include "xenia/gpu/command_processor.h"
 #include "xenia/kernel/guest_scheduler.h"
 
 namespace xe {
@@ -454,6 +457,336 @@ const char* AsyncFailureMessage(AsyncFailure failure) {
 
 }  // namespace
 
+struct GuestExecutionSessionCaptureRuntimePm4Wiring::MarkerBridge final
+    : GuestExecutionMarkerBoundarySink {
+  bool OnMarkerBoundary(
+      const GuestExecutionMarkerBoundary& boundary) noexcept override {
+    GuestExecutionSessionCaptureRuntime* target =
+        runtime.load(std::memory_order_acquire);
+    if (!target ||
+        boundary.marker_source != GuestExecutionSessionMarkerSource::kPm4Swap ||
+        boundary.marker_identity != gpu::kPm4SwapMarkerOpcode) {
+      return false;
+    }
+    switch (boundary.kind) {
+      case GuestExecutionMarkerBoundaryKind::kArm:
+        return target->RequestStart();
+      case GuestExecutionMarkerBoundaryKind::kStop:
+        // OnArmedMarker queued the same PM4 marker first. The validated marker
+        // count policy turns that event into the runtime stop request.
+        return true;
+    }
+    return false;
+  }
+
+  bool OnArmedMarker(const gpu::Pm4MarkerEvent& event) noexcept override {
+    GuestExecutionSessionCaptureRuntime* target =
+        runtime.load(std::memory_order_acquire);
+    if (!target || event.source != gpu::Pm4MarkerSource::kPm4Swap ||
+        event.opcode != gpu::kPm4SwapMarkerOpcode) {
+      return false;
+    }
+    return target->OnGuestMarker(GuestExecutionSessionMarkerSource::kPm4Swap,
+                                 event.opcode);
+  }
+
+  std::atomic<GuestExecutionSessionCaptureRuntime*> runtime{nullptr};
+};
+
+struct GuestExecutionSessionCaptureRuntimePm4Wiring::Lifetime {
+  std::unique_ptr<MarkerBridge> marker_bridge;
+  std::shared_ptr<GuestExecutionMarkerController> marker_controller;
+  std::unique_ptr<GuestExecutionSessionCaptureRuntimePm4ExternalSink>
+      external_sink;
+  std::shared_ptr<GuestExecutionSessionCaptureRuntime> runtime;
+};
+
+GuestExecutionSessionCaptureRuntimePm4ExternalSink::
+    GuestExecutionSessionCaptureRuntimePm4ExternalSink(
+        gpu::CommandProcessor& command_processor,
+        std::shared_ptr<GuestExecutionMarkerController> marker_controller)
+    : command_processor_(command_processor),
+      marker_controller_(std::move(marker_controller)) {}
+
+GuestExecutionSessionCaptureRuntimePm4ExternalSink::
+    ~GuestExecutionSessionCaptureRuntimePm4ExternalSink() {
+  std::string ignored;
+  AbortAndDetach(&ignored);
+}
+
+bool GuestExecutionSessionCaptureRuntimePm4ExternalSink::Activate(
+    std::string* error) noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (attached_ || terminally_detached_) {
+    return Fail(error, "PM4 runtime external sink activation is not valid");
+  }
+  if (!marker_controller_->Begin()) {
+    return Fail(error, "PM4 runtime external sink controller could not begin");
+  }
+  if (!command_processor_.AttachPm4MarkerSink(marker_controller_)) {
+    return Fail(error,
+                "PM4 runtime external sink could not attach its controller");
+  }
+  attached_ = true;
+  return IsSourceHealthyLocked(error);
+}
+
+bool GuestExecutionSessionCaptureRuntimePm4ExternalSink::IsSourceHealthyLocked(
+    std::string* error) const noexcept {
+  if (terminally_detached_) {
+    return true;
+  }
+  if (!attached_) {
+    return Fail(error, "PM4 runtime external sink is not attached");
+  }
+  const gpu::Pm4MarkerDispatcherStatus source =
+      command_processor_.pm4_marker_dispatcher_status();
+  if (source.shut_down || source.sink_failed ||
+      source.source_advanced_while_held ||
+      (!source.sink_attached && !source.sink_held)) {
+    return Fail(error, "PM4 runtime external sink source integrity was lost");
+  }
+  const GuestExecutionMarkerControllerStatus controller =
+      marker_controller_->status();
+  if (controller.state == GuestExecutionMarkerControllerState::kFailed) {
+    return Fail(
+        error, "PM4 runtime marker controller rejected with code " +
+                   std::to_string(static_cast<uint32_t>(controller.rejection)));
+  }
+  return true;
+}
+
+bool GuestExecutionSessionCaptureRuntimePm4ExternalSink::Hold(
+    gpu::Pm4MarkerHoldToken* token, std::string* error) noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!token || terminally_detached_ || !attached_) {
+    return Fail(error, "PM4 runtime external sink cannot be held");
+  }
+  if (!command_processor_.HoldPm4MarkerSink(marker_controller_, token) ||
+      !*token) {
+    return Fail(error, "PM4 runtime external sink hold failed");
+  }
+  return true;
+}
+
+bool GuestExecutionSessionCaptureRuntimePm4ExternalSink::
+    AcknowledgeArmAndResumeAfterStart(const gpu::Pm4MarkerHoldToken& token,
+                                      std::string* error) noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!token || terminally_detached_ || !attached_ ||
+      !IsSourceHealthyLocked(error)) {
+    return false;
+  }
+  const GuestExecutionMarkerControllerStatus controller =
+      marker_controller_->status();
+  if (controller.state != GuestExecutionMarkerControllerState::kArmed ||
+      controller.emitted_boundary_count != 1 ||
+      controller.acknowledged_boundary_count != 0 ||
+      !marker_controller_->AcknowledgeBoundary(1)) {
+    return Fail(error,
+                "PM4 runtime external sink arm boundary is not canonical");
+  }
+  if (!command_processor_.ResumePm4MarkerSink(marker_controller_, token)) {
+    return Fail(error, "PM4 runtime external sink resume failed");
+  }
+  return true;
+}
+
+bool GuestExecutionSessionCaptureRuntimePm4ExternalSink::IsSourceHealthy(
+    std::string* error) const noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return IsSourceHealthyLocked(error);
+}
+
+bool GuestExecutionSessionCaptureRuntimePm4ExternalSink::SealAndDetach(
+    const gpu::Pm4MarkerHoldToken& token, std::string* error) noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!token || terminally_detached_ || !attached_ ||
+      !IsSourceHealthyLocked(error)) {
+    return false;
+  }
+  const GuestExecutionMarkerControllerStatus controller =
+      marker_controller_->status();
+  bool acknowledge_stop = false;
+  if (controller.state == GuestExecutionMarkerControllerState::kStopped) {
+    if (controller.emitted_boundary_count != 2 ||
+        controller.acknowledged_boundary_count != 1 ||
+        !controller.stop_marker_ordinal ||
+        controller.stop_marker_ordinal != token.last_ordinal) {
+      return Fail(error,
+                  "PM4 runtime stop boundary does not match the source seal");
+    }
+    acknowledge_stop = true;
+  } else if (controller.state != GuestExecutionMarkerControllerState::kArmed ||
+             controller.emitted_boundary_count != 1 ||
+             controller.acknowledged_boundary_count != 1) {
+    return Fail(error,
+                "PM4 runtime controller is not at a terminal rendezvous");
+  }
+  if (!command_processor_.SealAndDetachHeldPm4MarkerSink(marker_controller_,
+                                                         token)) {
+    return Fail(error, "PM4 runtime external sink terminal attestation failed");
+  }
+  attached_ = false;
+  terminally_detached_ = true;
+  if (acknowledge_stop && !marker_controller_->AcknowledgeBoundary(2)) {
+    return Fail(error, "PM4 runtime stop boundary acknowledgement failed");
+  }
+  return true;
+}
+
+bool GuestExecutionSessionCaptureRuntimePm4ExternalSink::AbortAndDetach(
+    std::string* error) noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (terminally_detached_ || !attached_) {
+    return true;
+  }
+  if (command_processor_.DetachPm4MarkerSink(marker_controller_)) {
+    attached_ = false;
+    terminally_detached_ = true;
+    return true;
+  }
+  const gpu::Pm4MarkerDispatcherStatus source =
+      command_processor_.pm4_marker_dispatcher_status();
+  if (source.shut_down && !source.sink_attached && !source.sink_held) {
+    attached_ = false;
+    terminally_detached_ = true;
+    return true;
+  }
+  return Fail(error, "PM4 runtime external sink abort detach failed");
+}
+
+GuestExecutionSessionCaptureRuntimePm4Wiring::
+    GuestExecutionSessionCaptureRuntimePm4Wiring(
+        std::unique_ptr<Lifetime> lifetime) noexcept
+    : lifetime_(std::move(lifetime)) {}
+
+GuestExecutionSessionCaptureRuntimePm4Wiring::
+    ~GuestExecutionSessionCaptureRuntimePm4Wiring() {
+  Lifetime& lifetime = *lifetime_;
+  if (lifetime.runtime && lifetime.runtime->IsControlWorkerThread()) {
+    std::terminate();
+  }
+  if (lifetime.runtime) {
+    lifetime.runtime->Shutdown();
+  }
+  const bool detached = !lifetime.external_sink ||
+                        lifetime.external_sink->AbortAndDetach(nullptr);
+  if (lifetime.marker_bridge) {
+    lifetime.marker_bridge->runtime.store(nullptr, std::memory_order_release);
+  }
+  if (!detached) {
+    // The command processor still owns a controller with this raw callback.
+    // Preserve callback storage rather than allowing a teardown UAF.
+    lifetime_.release();
+  }
+}
+
+GuestExecutionSessionCaptureRuntime&
+GuestExecutionSessionCaptureRuntimePm4Wiring::runtime() noexcept {
+  return *lifetime_->runtime;
+}
+
+const GuestExecutionSessionCaptureRuntime&
+GuestExecutionSessionCaptureRuntimePm4Wiring::runtime() const noexcept {
+  return *lifetime_->runtime;
+}
+
+const std::shared_ptr<GuestExecutionMarkerController>&
+GuestExecutionSessionCaptureRuntimePm4Wiring::marker_controller()
+    const noexcept {
+  return lifetime_->marker_controller;
+}
+
+std::unique_ptr<GuestExecutionSessionCaptureRuntimePm4Wiring>
+GuestExecutionSessionCaptureRuntimePm4Wiring::CreateAndAttach(
+    Processor& processor, kernel::GuestScheduler& scheduler,
+    gpu::CommandProcessor& command_processor,
+    const GuestExecutionSessionCaptureRuntimeConfig& runtime_config,
+    const GuestExecutionSessionCaptureRuntimeDependencies& dependencies,
+    const GuestExecutionMarkerControllerConfig& marker_config,
+    const GuestExecutionMarkerClock& marker_clock, std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  const GuestExecutionSessionBoundaryPolicy& boundary =
+      runtime_config.assembler.boundary;
+  if (dependencies.pm4_external_sink ||
+      runtime_config.assembler.pm4_marker_sink_ordinal ==
+          GuestExecutionSessionAssembler::kNoExternalSink ||
+      boundary.kind != GuestExecutionSessionBoundaryKind::kGuestMarkerCount ||
+      boundary.value != marker_config.stop_marker_count ||
+      boundary.marker_source != GuestExecutionSessionMarkerSource::kPm4Swap ||
+      marker_config.marker_source !=
+          GuestExecutionSessionMarkerSource::kPm4Swap ||
+      boundary.marker_identity != gpu::kPm4SwapMarkerOpcode ||
+      marker_config.marker_identity != gpu::kPm4SwapMarkerOpcode) {
+    Fail(error,
+         "PM4 runtime wiring requires one matching PM4 marker-count policy");
+    return nullptr;
+  }
+
+  std::unique_ptr<MarkerBridge> marker_bridge;
+  std::unique_ptr<GuestExecutionSessionCaptureRuntimePm4ExternalSink>
+      external_sink;
+  std::unique_ptr<Lifetime> lifetime;
+  std::unique_ptr<GuestExecutionSessionCaptureRuntimePm4Wiring> wiring;
+  try {
+    marker_bridge = std::make_unique<MarkerBridge>();
+  } catch (...) {
+    Fail(error, "PM4 runtime wiring could not allocate its marker bridge");
+    return nullptr;
+  }
+  std::shared_ptr<GuestExecutionMarkerController> marker_controller =
+      GuestExecutionMarkerController::Create(marker_config, marker_clock,
+                                             *marker_bridge, error);
+  if (!marker_controller) {
+    return nullptr;
+  }
+  try {
+    external_sink =
+        std::unique_ptr<GuestExecutionSessionCaptureRuntimePm4ExternalSink>(
+            new GuestExecutionSessionCaptureRuntimePm4ExternalSink(
+                command_processor, marker_controller));
+  } catch (...) {
+    Fail(error, "PM4 runtime wiring could not allocate its source adapter");
+    return nullptr;
+  }
+
+  // Complete every potentially throwing owner allocation before creating the
+  // observer-retained runtime. No failure after this point can orphan a live
+  // runtime with raw pointers to already-destroyed composition objects.
+  try {
+    lifetime = std::make_unique<Lifetime>();
+    wiring = std::unique_ptr<GuestExecutionSessionCaptureRuntimePm4Wiring>(
+        new GuestExecutionSessionCaptureRuntimePm4Wiring(std::move(lifetime)));
+  } catch (...) {
+    Fail(error, "PM4 runtime wiring could not allocate its owner");
+    return nullptr;
+  }
+  wiring->lifetime_->marker_bridge = std::move(marker_bridge);
+  wiring->lifetime_->marker_controller = std::move(marker_controller);
+  wiring->lifetime_->external_sink = std::move(external_sink);
+
+  GuestExecutionSessionCaptureRuntimeDependencies runtime_dependencies =
+      dependencies;
+  runtime_dependencies.pm4_external_sink =
+      wiring->lifetime_->external_sink.get();
+  std::shared_ptr<GuestExecutionSessionCaptureRuntime> runtime =
+      GuestExecutionSessionCaptureRuntime::CreateAndAttach(
+          processor, scheduler, runtime_config, runtime_dependencies, error);
+  if (!runtime) {
+    return nullptr;
+  }
+  wiring->lifetime_->runtime = std::move(runtime);
+  wiring->lifetime_->marker_bridge->runtime.store(
+      wiring->lifetime_->runtime.get(), std::memory_order_release);
+  if (!wiring->lifetime_->external_sink->Activate(error)) {
+    return nullptr;
+  }
+  return wiring;
+}
+
 struct GuestExecutionSessionCaptureRuntime::Impl {
   Impl(Processor& processor, kernel::GuestScheduler& scheduler,
        const GuestExecutionSessionCaptureRuntimeConfig& config,
@@ -752,6 +1085,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     if (!dependencies.pm4_external_sink) {
       return true;
     }
+    if (external_sink_terminally_detached.load(std::memory_order_acquire)) {
+      return true;
+    }
     if (external_sink_hold_token) {
       return true;
     }
@@ -814,7 +1150,8 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   }
 
   bool CheckExternalSinkHealth(std::string* error) {
-    if (!dependencies.pm4_external_sink) {
+    if (!dependencies.pm4_external_sink ||
+        external_sink_terminally_detached.load(std::memory_order_acquire)) {
       return true;
     }
     std::string source_error;
@@ -825,6 +1162,48 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     return Fail(error, source_error.empty()
                            ? "capture runtime PM4 external source was lost"
                            : std::move(source_error));
+  }
+
+  bool SealAndDetachExternalSink(std::string* error) {
+    if (!dependencies.pm4_external_sink ||
+        external_sink_terminally_detached.load(std::memory_order_acquire)) {
+      return true;
+    }
+    if (!external_sink_hold_token) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      return Fail(error,
+                  "capture runtime cannot seal an unheld PM4 external sink");
+    }
+    std::string source_error;
+    if (!dependencies.pm4_external_sink->SealAndDetach(
+            *external_sink_hold_token, &source_error)) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      return Fail(error, source_error.empty()
+                             ? "capture runtime PM4 terminal source seal failed"
+                             : std::move(source_error));
+    }
+    external_sink_hold_token.reset();
+    external_sink_held.store(false, std::memory_order_release);
+    external_sink_terminally_detached.store(true, std::memory_order_release);
+    return true;
+  }
+
+  bool AbortAndDetachExternalSink(std::string* error) noexcept {
+    if (!dependencies.pm4_external_sink ||
+        external_sink_terminally_detached.load(std::memory_order_acquire)) {
+      return true;
+    }
+    std::string source_error;
+    if (!dependencies.pm4_external_sink->AbortAndDetach(&source_error)) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      return Fail(error, source_error.empty()
+                             ? "capture runtime PM4 abort detach failed"
+                             : std::move(source_error));
+    }
+    external_sink_hold_token.reset();
+    external_sink_held.store(false, std::memory_order_release);
+    external_sink_terminally_detached.store(true, std::memory_order_release);
+    return true;
   }
 
   void EndProvider(bool accepted) noexcept {
@@ -879,8 +1258,16 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     capture_gate.store(false, std::memory_order_release);
     session_active.store(false, std::memory_order_release);
     WaitForCallbacks();
+    std::string detach_error;
+    const bool source_detached = AbortAndDetachExternalSink(&detach_error);
     std::string barrier_error;
-    CancelActiveBarrier(&barrier_error);
+    if (source_detached) {
+      CancelActiveBarrier(&barrier_error);
+    } else {
+      barrier_error =
+          "capture runtime retained its checkpoint because the PM4 source "
+          "could not be detached";
+    }
     EndProvider(false);
     deferred_publisher.Clear();
     if (assembler) {
@@ -894,6 +1281,12 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
           message += "; ";
         }
         message += barrier_error;
+      }
+      if (!detach_error.empty()) {
+        if (!message.empty()) {
+          message += "; ";
+        }
+        message += detach_error;
       }
       status_message = std::move(message);
     }
@@ -1006,6 +1399,13 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     }
 
     capture_gate.store(true, std::memory_order_release);
+    // Open the marker source while the guest checkpoint is still held. Guest
+    // execution cannot otherwise outrun Resume and produce a swap in the held
+    // generation.
+    if (!ResumeExternalSinkAfterStart(&error)) {
+      Reject(RuntimeRejection::kExternalSinkControl, std::move(error));
+      return;
+    }
     CheckpointSnapshot final;
     const CheckpointRejection finalize_result =
         checkpoint_controller->Finalize(provisional.generation, &final);
@@ -1033,10 +1433,6 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       return;
     }
     initial_scheduler_checkpoint = std::move(final);
-    if (!ResumeExternalSinkAfterStart(&error)) {
-      Reject(RuntimeRejection::kExternalSinkControl, std::move(error));
-      return;
-    }
     if (shutdown_requested.load(std::memory_order_acquire)) {
       return;
     }
@@ -1278,6 +1674,15 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       return;
     }
 
+    // This ticketed handoff is the final authority over the PM4 source. It
+    // drains and removes the held controller before guest execution resumes;
+    // source Shutdown or later swaps are therefore either observed before the
+    // seal (and reject it) or wholly outside the captured session.
+    if (!SealAndDetachExternalSink(&error)) {
+      Reject(RuntimeRejection::kExternalSinkControl, std::move(error));
+      return;
+    }
+
     CheckpointSnapshot final;
     const CheckpointRejection finalize_result =
         checkpoint_controller->Finalize(provisional.generation, &final);
@@ -1473,8 +1878,16 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       capture_gate.store(false, std::memory_order_release);
       session_active.store(false, std::memory_order_release);
       WaitForCallbacks();
+      std::string detach_error;
+      const bool source_detached = AbortAndDetachExternalSink(&detach_error);
       std::string barrier_error;
-      CancelActiveBarrier(&barrier_error);
+      if (source_detached) {
+        CancelActiveBarrier(&barrier_error);
+      } else {
+        barrier_error =
+            "capture runtime retained its checkpoint because the PM4 source "
+            "could not be detached";
+      }
       EndProvider(false);
       deferred_publisher.Clear();
       if (assembler) {
@@ -1490,6 +1903,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
         }
         if (!barrier_error.empty()) {
           status_message += "; " + barrier_error;
+        }
+        if (!detach_error.empty()) {
+          status_message += "; " + detach_error;
         }
       }
       SetState(RuntimeState::kShutdown);
@@ -1547,6 +1963,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   std::atomic<bool> provider_armed{false};
   bool external_sink_registered = false;
   std::atomic<bool> external_sink_held{false};
+  std::atomic<bool> external_sink_terminally_detached{false};
   std::atomic<bool> external_sink_control_failed{false};
   std::optional<gpu::Pm4MarkerHoldToken> external_sink_hold_token;
   std::atomic<uint64_t> external_sink_attested_generation{0};
@@ -1658,8 +2075,16 @@ bool GuestExecutionSessionCaptureRuntime::Attach(std::string* error) {
   return true;
 }
 
+bool GuestExecutionSessionCaptureRuntime::IsControlWorkerThread()
+    const noexcept {
+  return impl_->IsWorkerThread();
+}
+
 bool GuestExecutionSessionCaptureRuntime::RequestStart() noexcept {
-  std::lock_guard<std::mutex> lock(impl_->control_mutex);
+  std::unique_lock<std::mutex> lock(impl_->control_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return false;
+  }
   if (impl_->start_requested ||
       impl_->shutdown_requested.load(std::memory_order_acquire) ||
       IsTerminal(impl_->state_atomic.load(std::memory_order_acquire))) {
@@ -1783,6 +2208,8 @@ GuestExecutionSessionCaptureRuntime::status() const {
   result.external_sink_registered = impl_->external_sink_registered;
   result.external_sink_held =
       impl_->external_sink_held.load(std::memory_order_relaxed);
+  result.external_sink_terminally_detached =
+      impl_->external_sink_terminally_detached.load(std::memory_order_relaxed);
   result.external_sink_control_failed =
       impl_->external_sink_control_failed.load(std::memory_order_relaxed);
   result.external_sink_attested_generation =

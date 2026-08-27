@@ -795,6 +795,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
                                          frontbuffer_height);
   }
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  auto capture_marker_lease = COMMAND_PROCESSOR::BeginPm4SwapMarker();
+#endif
+
   COMMAND_PROCESSOR::IssueSwap(frontbuffer_ptr, frontbuffer_width,
                                frontbuffer_height);
 
@@ -804,8 +809,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   // The guest packet executed and IssueSwap returned. This marker does not
-  // imply that a host drawable was presented.
-  COMMAND_PROCESSOR::NotifyPm4SwapMarker();
+  // imply that a host drawable was presented. Its source-order lease was taken
+  // immediately before IssueSwap, so a control-thread hold cannot overtake it.
+  COMMAND_PROCESSOR::CompletePm4SwapMarker(std::move(capture_marker_lease));
 #endif
 
   // Apply host frame rate limiting (separate from guest vblank timing)

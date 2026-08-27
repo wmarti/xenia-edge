@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -28,6 +29,9 @@
 #include "xenia/kernel/guest_scheduler_checkpoint.h"
 
 namespace xe {
+namespace gpu {
+class CommandProcessor;
+}
 namespace kernel {
 class GuestScheduler;
 }
@@ -35,6 +39,10 @@ class GuestScheduler;
 namespace cpu {
 
 class Processor;
+class GuestExecutionMarkerController;
+class GuestExecutionMarkerClock;
+struct GuestExecutionMarkerControllerConfig;
+class GuestExecutionSessionCaptureRuntimePm4Wiring;
 
 enum class GuestExecutionSessionCaptureRuntimeState : uint8_t {
   kIdle,
@@ -167,9 +175,11 @@ class GuestExecutionSessionCaptureRuntimeCheckpointController {
 // must acknowledge the marker controller's arm boundary while the source is
 // still held, then resume using exactly that token. False leaves it held.
 // IsSourceHealthy covers dispatcher loss and marker-controller rejection after
-// attach. The owner must keep this object and its callback target alive through
-// runtime Shutdown. If control fails while status is unheld, the owner must
-// terminally detach the source before destroying either dependency.
+// attach. SealAndDetach validates the final hold token and atomically removes
+// the source before the runtime releases its stop checkpoint or publishes.
+// AbortAndDetach drains/removes the source on every rejected or cancelled path.
+// The owner must keep this object and its callback target alive through runtime
+// Shutdown.
 class GuestExecutionSessionCaptureRuntimeExternalSink {
  public:
   virtual ~GuestExecutionSessionCaptureRuntimeExternalSink() = default;
@@ -179,6 +189,47 @@ class GuestExecutionSessionCaptureRuntimeExternalSink {
   virtual bool AcknowledgeArmAndResumeAfterStart(
       const gpu::Pm4MarkerHoldToken& token, std::string* error) noexcept = 0;
   virtual bool IsSourceHealthy(std::string* error) const noexcept = 0;
+  virtual bool SealAndDetach(const gpu::Pm4MarkerHoldToken& token,
+                             std::string* error) noexcept = 0;
+  virtual bool AbortAndDetach(std::string* error) noexcept = 0;
+};
+
+// Production control path joining the session runtime to one command
+// processor and its real marker controller. The owning PM4 wiring below
+// activates it only after the runtime callback target exists.
+class GuestExecutionSessionCaptureRuntimePm4ExternalSink final
+    : public GuestExecutionSessionCaptureRuntimeExternalSink {
+ public:
+  ~GuestExecutionSessionCaptureRuntimePm4ExternalSink() override;
+  GuestExecutionSessionCaptureRuntimePm4ExternalSink(
+      const GuestExecutionSessionCaptureRuntimePm4ExternalSink&) = delete;
+  GuestExecutionSessionCaptureRuntimePm4ExternalSink& operator=(
+      const GuestExecutionSessionCaptureRuntimePm4ExternalSink&) = delete;
+
+  bool Hold(gpu::Pm4MarkerHoldToken* token,
+            std::string* error) noexcept override;
+  bool AcknowledgeArmAndResumeAfterStart(const gpu::Pm4MarkerHoldToken& token,
+                                         std::string* error) noexcept override;
+  bool IsSourceHealthy(std::string* error) const noexcept override;
+  bool SealAndDetach(const gpu::Pm4MarkerHoldToken& token,
+                     std::string* error) noexcept override;
+  bool AbortAndDetach(std::string* error) noexcept override;
+
+ private:
+  friend class GuestExecutionSessionCaptureRuntimePm4Wiring;
+
+  GuestExecutionSessionCaptureRuntimePm4ExternalSink(
+      gpu::CommandProcessor& command_processor,
+      std::shared_ptr<GuestExecutionMarkerController> marker_controller);
+
+  bool Activate(std::string* error) noexcept;
+  bool IsSourceHealthyLocked(std::string* error) const noexcept;
+
+  gpu::CommandProcessor& command_processor_;
+  std::shared_ptr<GuestExecutionMarkerController> marker_controller_;
+  mutable std::mutex mutex_;
+  bool attached_ = false;
+  bool terminally_detached_ = false;
 };
 
 struct GuestExecutionSessionCaptureRuntimeDependencies {
@@ -206,6 +257,7 @@ struct GuestExecutionSessionCaptureRuntimeStatus {
   bool provider_armed = false;
   bool external_sink_registered = false;
   bool external_sink_held = false;
+  bool external_sink_terminally_detached = false;
   bool external_sink_control_failed = false;
   // Most recent successful Hold attestation. These remain observable after a
   // start resume and are replaced by the terminal-stop hold.
@@ -284,15 +336,57 @@ class GuestExecutionSessionCaptureRuntime final
 
  private:
   friend class GuestExecutionSessionCaptureRuntimeTestAccess;
+  friend class GuestExecutionSessionCaptureRuntimePm4Wiring;
 
   struct Impl;
 
   explicit GuestExecutionSessionCaptureRuntime(std::unique_ptr<Impl> impl);
   bool Attach(std::string* error);
+  bool IsControlWorkerThread() const noexcept;
   void SetRequestStartPrequeueTestHook(void (*hook)(void*),
                                        void* context) noexcept;
 
   std::unique_ptr<Impl> impl_;
+};
+
+// Complete production PM4 capture composition. It installs the no-allocation
+// marker bridge before exposing the begun controller to the command processor,
+// and owns the runtime/source lifetime order as one unit. Destroy it from a
+// non-control-worker thread while Processor, GuestScheduler, CommandProcessor,
+// and every object in dependencies are still alive. Like std::thread, violating
+// the non-worker destruction precondition terminates instead of returning with
+// callbacks that can access torn-down caller-owned state.
+class GuestExecutionSessionCaptureRuntimePm4Wiring final {
+ public:
+  static std::unique_ptr<GuestExecutionSessionCaptureRuntimePm4Wiring>
+  CreateAndAttach(
+      Processor& processor, kernel::GuestScheduler& scheduler,
+      gpu::CommandProcessor& command_processor,
+      const GuestExecutionSessionCaptureRuntimeConfig& runtime_config,
+      const GuestExecutionSessionCaptureRuntimeDependencies& dependencies,
+      const GuestExecutionMarkerControllerConfig& marker_config,
+      const GuestExecutionMarkerClock& marker_clock,
+      std::string* error = nullptr);
+
+  ~GuestExecutionSessionCaptureRuntimePm4Wiring();
+  GuestExecutionSessionCaptureRuntimePm4Wiring(
+      const GuestExecutionSessionCaptureRuntimePm4Wiring&) = delete;
+  GuestExecutionSessionCaptureRuntimePm4Wiring& operator=(
+      const GuestExecutionSessionCaptureRuntimePm4Wiring&) = delete;
+
+  GuestExecutionSessionCaptureRuntime& runtime() noexcept;
+  const GuestExecutionSessionCaptureRuntime& runtime() const noexcept;
+  const std::shared_ptr<GuestExecutionMarkerController>& marker_controller()
+      const noexcept;
+
+ private:
+  struct MarkerBridge;
+  struct Lifetime;
+
+  explicit GuestExecutionSessionCaptureRuntimePm4Wiring(
+      std::unique_ptr<Lifetime> lifetime) noexcept;
+
+  std::unique_ptr<Lifetime> lifetime_;
 };
 
 }  // namespace cpu

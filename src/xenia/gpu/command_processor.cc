@@ -285,6 +285,12 @@ bool CommandProcessor::ResumePm4MarkerSink(
   return pm4_marker_dispatcher_.ResumeSink(sink, token);
 }
 
+bool CommandProcessor::SealAndDetachHeldPm4MarkerSink(
+    const std::shared_ptr<Pm4MarkerSink>& sink,
+    const Pm4MarkerHoldToken& token) {
+  return pm4_marker_dispatcher_.SealAndDetachHeldSink(sink, token);
+}
+
 bool CommandProcessor::DetachPm4MarkerSink(
     const std::shared_ptr<Pm4MarkerSink>& sink) {
   return pm4_marker_dispatcher_.DetachSink(sink);
@@ -299,9 +305,14 @@ Pm4MarkerDispatcherStatus CommandProcessor::pm4_marker_dispatcher_status()
   return pm4_marker_dispatcher_.status();
 }
 
-void CommandProcessor::NotifyPm4SwapMarker() {
+Pm4MarkerDispatchLease CommandProcessor::BeginPm4SwapMarker() {
   static_assert(kPm4SwapMarkerOpcode == uint32_t(xenos::PM4_XE_SWAP));
-  pm4_marker_dispatcher_.NotifyPm4Swap(Clock::QueryHostTickCount());
+  return pm4_marker_dispatcher_.BeginPm4Swap();
+}
+
+void CommandProcessor::CompletePm4SwapMarker(Pm4MarkerDispatchLease lease) {
+  pm4_marker_dispatcher_.CompletePm4Swap(std::move(lease),
+                                         Clock::QueryHostTickCount());
 }
 #endif
 

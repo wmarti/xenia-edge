@@ -211,6 +211,9 @@ class CommandProcessor {
                          Pm4MarkerHoldToken* token);
   bool ResumePm4MarkerSink(const std::shared_ptr<Pm4MarkerSink>& sink,
                            const Pm4MarkerHoldToken& token);
+  bool SealAndDetachHeldPm4MarkerSink(
+      const std::shared_ptr<Pm4MarkerSink>& sink,
+      const Pm4MarkerHoldToken& token);
   bool DetachPm4MarkerSink(const std::shared_ptr<Pm4MarkerSink>& sink);
   uint64_t pm4_marker_count() const noexcept {
     return pm4_marker_dispatcher_.marker_count();
@@ -570,7 +573,8 @@ class CommandProcessor {
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-  void NotifyPm4SwapMarker();
+  Pm4MarkerDispatchLease BeginPm4SwapMarker();
+  void CompletePm4SwapMarker(Pm4MarkerDispatchLease lease);
 #endif
 
   Memory* memory_ = nullptr;

@@ -73,6 +73,32 @@ struct Pm4MarkerDispatcherStatus {
   bool shut_down = false;
 };
 
+class Pm4MarkerDispatcher;
+
+// One PM4 swap occurrence admitted immediately before IssueSwap. The ticket
+// remains live through IssueSwap and marker delivery, so source control cannot
+// overtake an occurrence that has already reached the swap boundary.
+class Pm4MarkerDispatchLease {
+ public:
+  Pm4MarkerDispatchLease() = default;
+  ~Pm4MarkerDispatchLease();
+  Pm4MarkerDispatchLease(Pm4MarkerDispatchLease&& other) noexcept;
+  Pm4MarkerDispatchLease& operator=(Pm4MarkerDispatchLease&& other) noexcept;
+  Pm4MarkerDispatchLease(const Pm4MarkerDispatchLease&) = delete;
+  Pm4MarkerDispatchLease& operator=(const Pm4MarkerDispatchLease&) = delete;
+
+ private:
+  friend class Pm4MarkerDispatcher;
+
+  void Reset() noexcept;
+
+  Pm4MarkerDispatcher* dispatcher_ = nullptr;
+  std::shared_ptr<class Pm4MarkerSink> sink_;
+  Pm4MarkerEvent event_;
+  uint64_t ticket_ = 0;
+  bool ticket_live_ = false;
+};
+
 class Pm4MarkerSink {
  public:
   virtual ~Pm4MarkerSink() = default;
@@ -101,6 +127,11 @@ class Pm4MarkerDispatcher {
   // resume and leaves the sink held.
   bool ResumeSink(const std::shared_ptr<Pm4MarkerSink>& sink,
                   const Pm4MarkerHoldToken& token);
+  // Atomically validates the held-generation attestation and terminally
+  // detaches the sink. Success proves that source shutdown and every admitted
+  // marker are wholly before or after the publication cutoff.
+  bool SealAndDetachHeldSink(const std::shared_ptr<Pm4MarkerSink>& sink,
+                             const Pm4MarkerHoldToken& token);
   // Terminal removal of either an attached or held sink. This invalidates any
   // outstanding hold token.
   bool DetachSink(const std::shared_ptr<Pm4MarkerSink>& sink);
@@ -111,14 +142,23 @@ class Pm4MarkerDispatcher {
   bool sink_failed() const;
   Pm4MarkerDispatcherStatus status() const;
 
+  Pm4MarkerDispatchLease BeginPm4Swap() noexcept;
+  void CompletePm4Swap(Pm4MarkerDispatchLease lease,
+                       uint64_t host_tick) noexcept;
   void NotifyPm4Swap(uint64_t host_tick) noexcept;
   void Shutdown() noexcept;
 
  private:
   friend class Pm4MarkerDispatcherTestAccess;
+  friend class Pm4MarkerDispatchLease;
 
   void SetPostOrdinalAssignmentHookForTesting(void (*hook)(void*),
                                               void* context);
+  void SetPostTicketAssignmentHookForTesting(void (*hook)(void*, uint64_t),
+                                             void* context);
+  void RunPostTicketAssignmentHook(uint64_t ticket) const;
+  void CompleteLease(Pm4MarkerDispatchLease* lease, uint64_t host_tick,
+                     bool deliver) noexcept;
 
   mutable std::mutex mutex_;
   std::condition_variable dispatch_condition_;
@@ -134,6 +174,8 @@ class Pm4MarkerDispatcher {
   bool shut_down_ = false;
   void (*post_ordinal_assignment_hook_)(void*) = nullptr;
   void* post_ordinal_assignment_context_ = nullptr;
+  void (*post_ticket_assignment_hook_)(void*, uint64_t) = nullptr;
+  void* post_ticket_assignment_context_ = nullptr;
   std::atomic<uint64_t> marker_count_{0};
   std::atomic<uint64_t> next_admission_ticket_{0};
   uint64_t serving_admission_ticket_ = 0;

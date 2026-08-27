@@ -840,6 +840,8 @@ class FakeCheckpointController final
 enum class ExternalSinkOperation : uint8_t {
   kHold,
   kResumeAfterStart,
+  kSealAndDetach,
+  kAbortAndDetach,
 };
 
 struct ExternalSinkObservation {
@@ -858,6 +860,9 @@ class FakeExternalSink final
     std::lock_guard<std::mutex> lock(mutex_);
     RecordOperationLocked(ExternalSinkOperation::kHold);
     ++hold_count_;
+    if (!attached_) {
+      return Fail(error, "test PM4 external sink held after detach");
+    }
     if (fail_hold_call && hold_count_ == fail_hold_call) {
       return Fail(error, "test PM4 external sink hold failed");
     }
@@ -890,10 +895,64 @@ class FakeExternalSink final
   }
 
   bool IsSourceHealthy(std::string* error) const noexcept override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!attached_) {
+      return true;
+    }
     if (!healthy.load()) {
       return Fail(error, "test PM4 external source was lost");
     }
     return true;
+  }
+
+  bool SealAndDetach(const gpu::Pm4MarkerHoldToken& token,
+                     std::string* error) noexcept override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    RecordOperationLocked(ExternalSinkOperation::kSealAndDetach);
+    if (produce_swap_during_seal) {
+      ++last_ordinal_;
+      healthy.store(false);
+    }
+    if (!attached_ || !held_ || token != hold_token_ || !healthy.load()) {
+      return Fail(error, "test PM4 external sink terminal seal failed");
+    }
+    held_ = false;
+    attached_ = false;
+    hold_token_ = {};
+    return true;
+  }
+
+  bool AbortAndDetach(std::string* error) noexcept override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!attached_) {
+      return true;
+    }
+    RecordOperationLocked(ExternalSinkOperation::kAbortAndDetach);
+    if (fail_abort_detach) {
+      return Fail(error, "test PM4 external sink abort detach failed");
+    }
+    held_ = false;
+    attached_ = false;
+    hold_token_ = {};
+    return true;
+  }
+
+  void ShutdownSource() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (attached_) {
+      healthy.store(false);
+    }
+  }
+
+  void ProduceSwap() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!attached_) {
+      return;
+    }
+    ++last_ordinal_;
+    if (held_) {
+      healthy.store(false);
+    }
   }
 
   std::vector<ExternalSinkOperation> operations() const {
@@ -911,8 +970,15 @@ class FakeExternalSink final
     return held_;
   }
 
+  bool attached() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return attached_;
+  }
+
   uint32_t fail_hold_call = 0;
   bool fail_resume = false;
+  bool fail_abort_detach = false;
+  bool produce_swap_during_seal = false;
   std::atomic<bool> healthy{true};
   const FakeCheckpointController* checkpoint = nullptr;
   const FakeProvider* provider = nullptr;
@@ -942,6 +1008,7 @@ class FakeExternalSink final
   uint64_t last_ordinal_ = 0;
   gpu::Pm4MarkerHoldToken hold_token_;
   bool held_ = false;
+  bool attached_ = true;
 };
 
 struct RuntimeHarness {
@@ -1700,28 +1767,156 @@ TEST_CASE("session capture runtime rendezvouses its PM4 external sink",
   REQUIRE(status.state == RuntimeState::kComplete);
   REQUIRE(status.canonical_output_published);
   REQUIRE(status.external_sink_registered);
-  REQUIRE(status.external_sink_held);
+  REQUIRE_FALSE(status.external_sink_held);
+  REQUIRE(status.external_sink_terminally_detached);
   REQUIRE_FALSE(status.external_sink_control_failed);
-  REQUIRE(harness.external_sink.held());
+  REQUIRE_FALSE(harness.external_sink.held());
+  REQUIRE_FALSE(harness.external_sink.attached());
   REQUIRE(harness.external_sink.operations() ==
           std::vector<ExternalSinkOperation>{
               ExternalSinkOperation::kHold,
               ExternalSinkOperation::kResumeAfterStart,
-              ExternalSinkOperation::kHold});
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kSealAndDetach});
   const auto observations = harness.external_sink.observations();
-  REQUIRE(observations.size() == 3);
+  REQUIRE(observations.size() == 4);
   REQUIRE(observations[0].checkpoint_pause_count == 1);
   REQUIRE(observations[0].checkpoint_finalize_count == 0);
   REQUIRE(observations[0].provider_begin_count == 0);
   REQUIRE(observations[0].provider_seal_count == 0);
   REQUIRE(observations[1].checkpoint_pause_count == 1);
-  REQUIRE(observations[1].checkpoint_finalize_count == 1);
+  REQUIRE(observations[1].checkpoint_finalize_count == 0);
   REQUIRE(observations[1].provider_begin_count == 1);
   REQUIRE(observations[1].provider_seal_count == 0);
   REQUIRE(observations[2].checkpoint_pause_count == 2);
   REQUIRE(observations[2].checkpoint_finalize_count == 1);
   REQUIRE(observations[2].provider_seal_count == 0);
+  REQUIRE(observations[3].checkpoint_pause_count == 2);
+  REQUIRE(observations[3].checkpoint_finalize_count == 1);
+  REQUIRE(observations[3].provider_seal_count == 1);
   REQUIRE(harness.publisher.calls.load() == 1);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture resumes PM4 before releasing the start checkpoint",
+          "[guest-execution-session-capture-runtime][concurrency]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 8,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kManual, 0, true);
+  REQUIRE(harness.runtime);
+
+  harness.checkpoint.BlockNextFinalize();
+  REQUIRE(harness.runtime->RequestStart());
+  const bool finalize_entered = harness.checkpoint.WaitForFinalize();
+  if (!finalize_entered) {
+    harness.checkpoint.ReleaseFinalize();
+  }
+  REQUIRE(finalize_entered);
+  REQUIRE_FALSE(harness.external_sink.held());
+  REQUIRE(harness.external_sink.operations() ==
+          std::vector<ExternalSinkOperation>{
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kResumeAfterStart});
+
+  harness.external_sink.ProduceSwap();
+  REQUIRE(harness.external_sink.healthy.load());
+  harness.checkpoint.ReleaseFinalize();
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  REQUIRE(harness.runtime->status().state == RuntimeState::kComplete);
+  REQUIRE(harness.runtime->status().canonical_output_published);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime seals PM4 before publication and shutdown",
+          "[guest-execution-session-capture-runtime][concurrency]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 8,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kManual, 0, true);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  harness.publisher.Block();
+  REQUIRE(harness.runtime->RequestStop());
+  const bool publish_entered = harness.publisher.WaitForPublish();
+  if (!publish_entered) {
+    harness.publisher.Release();
+  }
+  REQUIRE(publish_entered);
+
+  const auto publishing = harness.runtime->status();
+  REQUIRE(publishing.state == RuntimeState::kPublishing);
+  REQUIRE(publishing.external_sink_terminally_detached);
+  REQUIRE_FALSE(publishing.external_sink_held);
+  REQUIRE_FALSE(harness.external_sink.attached());
+  REQUIRE(harness.checkpoint.finalize_count.load() == 2);
+  harness.external_sink.ProduceSwap();
+  harness.external_sink.ShutdownSource();
+  harness.publisher.Release();
+
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto complete = harness.runtime->status();
+  REQUIRE(complete.state == RuntimeState::kComplete);
+  REQUIRE(complete.canonical_output_published);
+  REQUIRE_FALSE(complete.external_sink_control_failed);
+  REQUIRE(harness.publisher.calls.load() == 1);
+
+  // Once the terminal ticket has detached the source, later title work and
+  // command-processor shutdown cannot retroactively invalidate the bundle.
+  harness.external_sink.ProduceSwap();
+  harness.external_sink.ShutdownSource();
+  REQUIRE(harness.runtime->status().state == RuntimeState::kComplete);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rejects a swap before terminal PM4 seal",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 8,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kManual, 0, true);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  harness.external_sink.produce_swap_during_seal = true;
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kExternalSinkControl);
+  REQUIRE(status.external_sink_control_failed);
+  REQUIRE(status.external_sink_terminally_detached);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.checkpoint.finalize_count.load() == 1);
+  REQUIRE(harness.publisher.calls.load() == 0);
+  REQUIRE(harness.external_sink.operations() ==
+          std::vector<ExternalSinkOperation>{
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kResumeAfterStart,
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kSealAndDetach,
+              ExternalSinkOperation::kAbortAndDetach});
 
   harness.runtime->Shutdown();
   thread.reset();
@@ -1745,7 +1940,8 @@ TEST_CASE("session capture runtime rejects PM4 source loss after resume",
   const auto status = harness.runtime->status();
   REQUIRE(status.state == RuntimeState::kRejected);
   REQUIRE(status.rejection == RuntimeRejection::kExternalSinkControl);
-  REQUIRE(status.external_sink_held);
+  REQUIRE_FALSE(status.external_sink_held);
+  REQUIRE(status.external_sink_terminally_detached);
   REQUIRE(status.external_sink_control_failed);
   REQUIRE_FALSE(status.canonical_output_published);
   REQUIRE(status.message.find("test PM4 external source was lost") !=
@@ -1754,7 +1950,8 @@ TEST_CASE("session capture runtime rejects PM4 source loss after resume",
           std::vector<ExternalSinkOperation>{
               ExternalSinkOperation::kHold,
               ExternalSinkOperation::kResumeAfterStart,
-              ExternalSinkOperation::kHold});
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kAbortAndDetach});
   REQUIRE(harness.publisher.calls.load() == 0);
 
   harness.runtime->Shutdown();
@@ -1776,14 +1973,16 @@ TEST_CASE("session capture runtime rejects a PM4 external sink hold failure",
   const auto status = harness.runtime->status();
   REQUIRE(status.state == RuntimeState::kRejected);
   REQUIRE(status.rejection == RuntimeRejection::kExternalSinkControl);
-  REQUIRE(status.external_sink_held);
+  REQUIRE_FALSE(status.external_sink_held);
+  REQUIRE(status.external_sink_terminally_detached);
   REQUIRE(status.external_sink_control_failed);
   REQUIRE_FALSE(status.canonical_output_published);
   REQUIRE(status.message.find("test PM4 external sink hold failed") !=
           std::string::npos);
   REQUIRE(harness.external_sink.operations() ==
-          std::vector<ExternalSinkOperation>{ExternalSinkOperation::kHold,
-                                             ExternalSinkOperation::kHold});
+          std::vector<ExternalSinkOperation>{
+              ExternalSinkOperation::kHold, ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kAbortAndDetach});
   REQUIRE(harness.publisher.calls.load() == 0);
 
   harness.runtime->Shutdown();
@@ -1805,7 +2004,8 @@ TEST_CASE("session capture runtime rejects a PM4 external sink resume failure",
   const auto status = harness.runtime->status();
   REQUIRE(status.state == RuntimeState::kRejected);
   REQUIRE(status.rejection == RuntimeRejection::kExternalSinkControl);
-  REQUIRE(status.external_sink_held);
+  REQUIRE_FALSE(status.external_sink_held);
+  REQUIRE(status.external_sink_terminally_detached);
   REQUIRE(status.external_sink_control_failed);
   REQUIRE_FALSE(status.canonical_output_published);
   REQUIRE(status.message.find("test PM4 external sink resume failed") !=
@@ -1813,10 +2013,47 @@ TEST_CASE("session capture runtime rejects a PM4 external sink resume failure",
   REQUIRE(harness.external_sink.operations() ==
           std::vector<ExternalSinkOperation>{
               ExternalSinkOperation::kHold,
-              ExternalSinkOperation::kResumeAfterStart});
+              ExternalSinkOperation::kResumeAfterStart,
+              ExternalSinkOperation::kAbortAndDetach});
   REQUIRE(harness.publisher.calls.load() == 0);
 
   harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture retains its checkpoint when PM4 detach fails",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 8,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kManual, 0, true, 0, 0, true);
+  REQUIRE(harness.runtime);
+  harness.external_sink.fail_abort_detach = true;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kExternalSinkControl);
+  REQUIRE(status.external_sink_held);
+  REQUIRE_FALSE(status.external_sink_terminally_detached);
+  REQUIRE(status.external_sink_control_failed);
+  REQUIRE(status.checkpoint_generation == 1);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(status.message.find("test PM4 external sink abort detach failed") !=
+          std::string::npos);
+  REQUIRE(status.message.find("retained its checkpoint") != std::string::npos);
+  REQUIRE(harness.checkpoint.finalize_count.load() == 0);
+  REQUIRE(harness.checkpoint.cancel_count.load() == 0);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  harness.external_sink.fail_abort_detach = false;
+  std::string cleanup_error;
+  REQUIRE(harness.external_sink.AbortAndDetach(&cleanup_error));
+  REQUIRE(cleanup_error.empty());
   thread.reset();
 }
 
@@ -1838,14 +2075,16 @@ TEST_CASE("session capture runtime rejects a stop PM4 sink hold failure",
   const auto status = harness.runtime->status();
   REQUIRE(status.state == RuntimeState::kRejected);
   REQUIRE(status.rejection == RuntimeRejection::kExternalSinkControl);
-  REQUIRE(status.external_sink_held);
+  REQUIRE_FALSE(status.external_sink_held);
+  REQUIRE(status.external_sink_terminally_detached);
   REQUIRE(status.external_sink_control_failed);
   REQUIRE_FALSE(status.canonical_output_published);
   REQUIRE(harness.external_sink.operations() ==
           std::vector<ExternalSinkOperation>{
               ExternalSinkOperation::kHold,
               ExternalSinkOperation::kResumeAfterStart,
-              ExternalSinkOperation::kHold, ExternalSinkOperation::kHold});
+              ExternalSinkOperation::kHold, ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kAbortAndDetach});
   REQUIRE(harness.publisher.calls.load() == 0);
 
   harness.runtime->Shutdown();
@@ -1867,7 +2106,7 @@ TEST_CASE("session capture runtime verifies its PM4 sink ordinal",
   thread.reset();
 }
 
-TEST_CASE("session capture runtime holds its PM4 sink during idle shutdown",
+TEST_CASE("session capture runtime detaches its PM4 sink during idle shutdown",
           "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;
   auto thread = environment.MakeThread(1);
@@ -1880,11 +2119,15 @@ TEST_CASE("session capture runtime holds its PM4 sink during idle shutdown",
   harness.runtime->Shutdown();
   const auto status = harness.runtime->status();
   REQUIRE(status.state == RuntimeState::kShutdown);
-  REQUIRE(status.external_sink_held);
+  REQUIRE_FALSE(status.external_sink_held);
+  REQUIRE(status.external_sink_terminally_detached);
   REQUIRE_FALSE(status.external_sink_control_failed);
-  REQUIRE(harness.external_sink.held());
+  REQUIRE_FALSE(harness.external_sink.held());
+  REQUIRE_FALSE(harness.external_sink.attached());
   REQUIRE(harness.external_sink.operations() ==
-          std::vector<ExternalSinkOperation>{ExternalSinkOperation::kHold});
+          std::vector<ExternalSinkOperation>{
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kAbortAndDetach});
   REQUIRE(harness.publisher.calls.load() == 0);
   thread.reset();
 }

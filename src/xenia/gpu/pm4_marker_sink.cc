@@ -24,6 +24,41 @@ thread_local Pm4MarkerDispatcher* active_marker_dispatcher = nullptr;
 
 }  // namespace
 
+Pm4MarkerDispatchLease::~Pm4MarkerDispatchLease() {
+  if (dispatcher_ && ticket_live_) {
+    dispatcher_->CompleteLease(this, 0, false);
+  }
+}
+
+Pm4MarkerDispatchLease::Pm4MarkerDispatchLease(
+    Pm4MarkerDispatchLease&& other) noexcept {
+  *this = std::move(other);
+}
+
+Pm4MarkerDispatchLease& Pm4MarkerDispatchLease::operator=(
+    Pm4MarkerDispatchLease&& other) noexcept {
+  if (this != &other) {
+    if (dispatcher_ && ticket_live_) {
+      dispatcher_->CompleteLease(this, 0, false);
+    }
+    dispatcher_ = other.dispatcher_;
+    sink_ = std::move(other.sink_);
+    event_ = other.event_;
+    ticket_ = other.ticket_;
+    ticket_live_ = other.ticket_live_;
+    other.Reset();
+  }
+  return *this;
+}
+
+void Pm4MarkerDispatchLease::Reset() noexcept {
+  dispatcher_ = nullptr;
+  sink_.reset();
+  event_ = {};
+  ticket_ = 0;
+  ticket_live_ = false;
+}
+
 bool Pm4MarkerDispatcher::AttachSink(std::shared_ptr<Pm4MarkerSink> sink) {
   if (!sink) {
     return false;
@@ -36,6 +71,7 @@ bool Pm4MarkerDispatcher::AttachSink(std::shared_ptr<Pm4MarkerSink> sink) {
   }
   const uint64_t ticket =
       next_admission_ticket_.fetch_add(1, std::memory_order_acq_rel);
+  RunPostTicketAssignmentHook(ticket);
   std::unique_lock<std::mutex> lock(mutex_);
   dispatch_condition_.wait(
       lock, [this, ticket]() { return serving_admission_ticket_ == ticket; });
@@ -68,6 +104,7 @@ bool Pm4MarkerDispatcher::HoldSink(const std::shared_ptr<Pm4MarkerSink>& sink,
   }
   const uint64_t ticket =
       next_admission_ticket_.fetch_add(1, std::memory_order_acq_rel);
+  RunPostTicketAssignmentHook(ticket);
   std::unique_lock<std::mutex> lock(mutex_);
   dispatch_condition_.wait(
       lock, [this, ticket]() { return serving_admission_ticket_ == ticket; });
@@ -110,6 +147,7 @@ bool Pm4MarkerDispatcher::ResumeSink(const std::shared_ptr<Pm4MarkerSink>& sink,
   }
   const uint64_t ticket =
       next_admission_ticket_.fetch_add(1, std::memory_order_acq_rel);
+  RunPostTicketAssignmentHook(ticket);
   std::unique_lock<std::mutex> lock(mutex_);
   dispatch_condition_.wait(
       lock, [this, ticket]() { return serving_admission_ticket_ == ticket; });
@@ -132,6 +170,38 @@ bool Pm4MarkerDispatcher::ResumeSink(const std::shared_ptr<Pm4MarkerSink>& sink,
   return resumed;
 }
 
+bool Pm4MarkerDispatcher::SealAndDetachHeldSink(
+    const std::shared_ptr<Pm4MarkerSink>& sink,
+    const Pm4MarkerHoldToken& token) {
+  if (!sink || !token) {
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (dispatching_ && dispatch_thread_ == std::this_thread::get_id()) {
+      return false;
+    }
+  }
+  const uint64_t ticket =
+      next_admission_ticket_.fetch_add(1, std::memory_order_acq_rel);
+  RunPostTicketAssignmentHook(ticket);
+  std::unique_lock<std::mutex> lock(mutex_);
+  dispatch_condition_.wait(
+      lock, [this, ticket]() { return serving_admission_ticket_ == ticket; });
+  bool detached = false;
+  if (!sink_ && held_sink_ == sink && token == hold_token_ && !shut_down_ &&
+      !sink_failed_ && !source_advanced_while_held_ &&
+      marker_count_.load(std::memory_order_relaxed) == token.last_ordinal) {
+    held_sink_.reset();
+    hold_token_ = {};
+    detached = true;
+  }
+  ++serving_admission_ticket_;
+  lock.unlock();
+  dispatch_condition_.notify_all();
+  return detached;
+}
+
 bool Pm4MarkerDispatcher::DetachSink(
     const std::shared_ptr<Pm4MarkerSink>& sink) {
   if (!sink) {
@@ -145,6 +215,7 @@ bool Pm4MarkerDispatcher::DetachSink(
   }
   const uint64_t ticket =
       next_admission_ticket_.fetch_add(1, std::memory_order_acq_rel);
+  RunPostTicketAssignmentHook(ticket);
   std::unique_lock<std::mutex> lock(mutex_);
   dispatch_condition_.wait(
       lock, [this, ticket]() { return serving_admission_ticket_ == ticket; });
@@ -181,29 +252,29 @@ Pm4MarkerDispatcherStatus Pm4MarkerDispatcher::status() const {
   return result;
 }
 
-void Pm4MarkerDispatcher::NotifyPm4Swap(uint64_t host_tick) noexcept {
-  if (active_marker_dispatcher == this) {
+Pm4MarkerDispatchLease Pm4MarkerDispatcher::BeginPm4Swap() noexcept {
+  Pm4MarkerDispatchLease lease;
+  {
     std::lock_guard<std::mutex> lock(mutex_);
-    const uint64_t last = marker_count_.load(std::memory_order_relaxed);
-    if (last != std::numeric_limits<uint64_t>::max()) {
-      marker_count_.store(last + 1, std::memory_order_release);
+    if (active_marker_dispatcher == this ||
+        (dispatching_ && dispatch_thread_ == std::this_thread::get_id())) {
+      const uint64_t last = marker_count_.load(std::memory_order_relaxed);
+      if (last != std::numeric_limits<uint64_t>::max()) {
+        marker_count_.store(last + 1, std::memory_order_release);
+      }
+      sink_failed_ = true;
+      return lease;
     }
-    sink_failed_ = true;
-    return;
   }
-  // The ticket is the first source-admission operation. A hold takes a ticket
-  // from this same order and cannot return until every earlier Notify call and
-  // callback has completed.
+  // Taking the ticket is the semantic source occurrence. CompletePm4Swap keeps
+  // this ticket live through IssueSwap and the callback, so a later Hold cannot
+  // close admission in the middle of one guest swap.
   const uint64_t ticket =
       next_admission_ticket_.fetch_add(1, std::memory_order_acq_rel);
-  const uint64_t observed_hold_epoch =
-      hold_epoch_.load(std::memory_order_acquire);
-  const bool observed_admission_open =
-      admission_open_.load(std::memory_order_acquire);
+  RunPostTicketAssignmentHook(ticket);
   Pm4MarkerEvent event;
   event.source = Pm4MarkerSource::kPm4Swap;
   event.opcode = kPm4SwapMarkerOpcode;
-  event.host_tick = host_tick;
 
   std::shared_ptr<Pm4MarkerSink> sink;
   {
@@ -219,33 +290,32 @@ void Pm4MarkerDispatcher::NotifyPm4Swap(uint64_t host_tick) noexcept {
       ++serving_admission_ticket_;
       lock.unlock();
       dispatch_condition_.notify_all();
-      return;
+      return lease;
     }
     event.ordinal = last + 1;
     marker_count_.store(event.ordinal, std::memory_order_release);
     if (post_ordinal_assignment_hook_) {
       post_ordinal_assignment_hook_(post_ordinal_assignment_context_);
     }
-    const bool crossed_hold =
-        observed_hold_epoch != hold_epoch_.load(std::memory_order_relaxed);
-    if (!observed_admission_open || crossed_hold || held_sink_) {
+    // Admission is decided only when this ticket reaches service. Snapshotting
+    // it before service lets an earlier Attach or Resume falsely poison a
+    // later occurrence.
+    if (held_sink_) {
       if (sink_ || held_sink_) {
         sink_failed_ = true;
-        if (held_sink_ || crossed_hold ||
-            (!observed_admission_open && observed_hold_epoch)) {
-          source_advanced_while_held_ = true;
-        }
+        source_advanced_while_held_ = true;
       }
       ++serving_admission_ticket_;
       lock.unlock();
       dispatch_condition_.notify_all();
-      return;
+      return lease;
     }
-    if (!sink_ || sink_failed_ || shut_down_) {
+    if (!sink_ || !admission_open_.load(std::memory_order_relaxed) ||
+        sink_failed_ || shut_down_) {
       ++serving_admission_ticket_;
       lock.unlock();
       dispatch_condition_.notify_all();
-      return;
+      return lease;
     }
     event.sink_generation = sink_generation_;
     sink = sink_;
@@ -253,9 +323,25 @@ void Pm4MarkerDispatcher::NotifyPm4Swap(uint64_t host_tick) noexcept {
     dispatch_thread_ = std::this_thread::get_id();
   }
 
+  lease.dispatcher_ = this;
+  lease.sink_ = std::move(sink);
+  lease.event_ = event;
+  lease.ticket_ = ticket;
+  lease.ticket_live_ = true;
+  return lease;
+}
+
+void Pm4MarkerDispatcher::CompleteLease(Pm4MarkerDispatchLease* lease,
+                                        uint64_t host_tick,
+                                        bool deliver) noexcept {
+  if (!lease || lease->dispatcher_ != this || !lease->ticket_live_) {
+    return;
+  }
+  lease->event_.host_tick = host_tick;
+
   Pm4MarkerDispatcher* previous_dispatcher = active_marker_dispatcher;
   active_marker_dispatcher = this;
-  const bool accepted = sink->OnPm4Marker(event);
+  const bool accepted = deliver && lease->sink_->OnPm4Marker(lease->event_);
   active_marker_dispatcher = previous_dispatcher;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -266,7 +352,17 @@ void Pm4MarkerDispatcher::NotifyPm4Swap(uint64_t host_tick) noexcept {
     }
     ++serving_admission_ticket_;
   }
+  lease->Reset();
   dispatch_condition_.notify_all();
+}
+
+void Pm4MarkerDispatcher::CompletePm4Swap(Pm4MarkerDispatchLease lease,
+                                          uint64_t host_tick) noexcept {
+  CompleteLease(&lease, host_tick, true);
+}
+
+void Pm4MarkerDispatcher::NotifyPm4Swap(uint64_t host_tick) noexcept {
+  CompletePm4Swap(BeginPm4Swap(), host_tick);
 }
 
 void Pm4MarkerDispatcher::Shutdown() noexcept {
@@ -279,6 +375,7 @@ void Pm4MarkerDispatcher::Shutdown() noexcept {
   }
   const uint64_t ticket =
       next_admission_ticket_.fetch_add(1, std::memory_order_acq_rel);
+  RunPostTicketAssignmentHook(ticket);
   std::shared_ptr<Pm4MarkerSink> sink;
   {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -290,11 +387,26 @@ void Pm4MarkerDispatcher::Shutdown() noexcept {
       sink = sink_ ? std::move(sink_) : std::move(held_sink_);
       hold_token_ = {};
     }
-    ++serving_admission_ticket_;
+    if (sink) {
+      dispatching_ = true;
+      dispatch_thread_ = std::this_thread::get_id();
+    } else {
+      ++serving_admission_ticket_;
+    }
   }
   dispatch_condition_.notify_all();
   if (sink) {
+    Pm4MarkerDispatcher* previous_dispatcher = active_marker_dispatcher;
+    active_marker_dispatcher = this;
     sink->OnPm4MarkerSourceShutdown();
+    active_marker_dispatcher = previous_dispatcher;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      dispatching_ = false;
+      dispatch_thread_ = {};
+      ++serving_admission_ticket_;
+    }
+    dispatch_condition_.notify_all();
   }
 }
 
@@ -303,6 +415,26 @@ void Pm4MarkerDispatcher::SetPostOrdinalAssignmentHookForTesting(
   std::lock_guard<std::mutex> lock(mutex_);
   post_ordinal_assignment_hook_ = hook;
   post_ordinal_assignment_context_ = context;
+}
+
+void Pm4MarkerDispatcher::SetPostTicketAssignmentHookForTesting(
+    void (*hook)(void*, uint64_t), void* context) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  post_ticket_assignment_hook_ = hook;
+  post_ticket_assignment_context_ = context;
+}
+
+void Pm4MarkerDispatcher::RunPostTicketAssignmentHook(uint64_t ticket) const {
+  void (*hook)(void*, uint64_t) = nullptr;
+  void* context = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    hook = post_ticket_assignment_hook_;
+    context = post_ticket_assignment_context_;
+  }
+  if (hook) {
+    hook(context, ticket);
+  }
 }
 
 }  // namespace gpu

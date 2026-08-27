@@ -16,6 +16,7 @@
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -34,6 +35,11 @@ class Pm4MarkerDispatcherTestAccess {
   static void SetPostOrdinalAssignmentHook(Pm4MarkerDispatcher& dispatcher,
                                            void (*hook)(void*), void* context) {
     dispatcher.SetPostOrdinalAssignmentHookForTesting(hook, context);
+  }
+  static void SetPostTicketAssignmentHook(Pm4MarkerDispatcher& dispatcher,
+                                          void (*hook)(void*, uint64_t),
+                                          void* context) {
+    dispatcher.SetPostTicketAssignmentHookForTesting(hook, context);
   }
 };
 
@@ -75,6 +81,35 @@ class ReentrantDetachSink final
   uint32_t event_count = 0;
   uint32_t shutdown_count = 0;
   bool detach_result = true;
+};
+
+class BlockingShutdownSink final : public Pm4MarkerSink {
+ public:
+  bool OnPm4Marker(const Pm4MarkerEvent&) noexcept override { return true; }
+
+  void OnPm4MarkerSourceShutdown() noexcept override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    entered_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, [this]() { return released_; });
+  }
+
+  bool WaitUntilEntered(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, timeout, [this]() { return entered_; });
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
+    condition_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool entered_ = false;
+  bool released_ = false;
 };
 
 class AtomicMarkerClock final : public cpu::GuestExecutionMarkerClock {
@@ -185,6 +220,53 @@ class OrdinalAssignmentBlocker {
   std::condition_variable condition_;
   bool entered_ = false;
   bool released_ = false;
+};
+
+class TicketAssignmentBlocker {
+ public:
+  explicit TicketAssignmentBlocker(uint64_t target_ticket)
+      : target_ticket_(target_ticket) {}
+
+  static void Hook(void* context, uint64_t ticket) {
+    auto& self = *static_cast<TicketAssignmentBlocker*>(context);
+    std::unique_lock<std::mutex> lock(self.mutex_);
+    self.seen_ = true;
+    self.last_ticket_seen_ = std::max(self.last_ticket_seen_, ticket);
+    self.condition_.notify_all();
+    if (ticket != self.target_ticket_) {
+      return;
+    }
+    self.entered_ = true;
+    self.condition_.notify_all();
+    self.condition_.wait(lock, [&self]() { return self.released_; });
+  }
+
+  bool WaitUntilEntered(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, timeout, [this]() { return entered_; });
+  }
+
+  bool WaitUntilSeen(uint64_t ticket, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, timeout, [this, ticket]() {
+      return seen_ && last_ticket_seen_ >= ticket;
+    });
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
+    condition_.notify_all();
+  }
+
+ private:
+  const uint64_t target_ticket_;
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool entered_ = false;
+  bool released_ = false;
+  uint64_t last_ticket_seen_ = 0;
+  bool seen_ = false;
 };
 
 struct RealControllerHarness {
@@ -334,6 +416,174 @@ TEST_CASE("PM4 resume requires the exact hold attestation",
   REQUIRE(dispatcher.status().sink_attached);
 }
 
+TEST_CASE("PM4 ticket service admits a marker after an overlapping attach",
+          "[pm4-marker-source][concurrency]") {
+  Pm4MarkerDispatcher dispatcher;
+  auto sink = std::make_shared<RecordingSink>();
+  TicketAssignmentBlocker blocker(0);
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(
+      dispatcher, &TicketAssignmentBlocker::Hook, &blocker);
+
+  bool attach_result = false;
+  std::thread attach([&]() { attach_result = dispatcher.AttachSink(sink); });
+  const bool attach_ticket_entered = blocker.WaitUntilEntered(2s);
+  if (!attach_ticket_entered) {
+    blocker.Release();
+    attach.join();
+  }
+  REQUIRE(attach_ticket_entered);
+
+  std::thread producer([&]() { dispatcher.NotifyPm4Swap(10); });
+  const bool marker_ticket_seen = blocker.WaitUntilSeen(1, 2s);
+  if (!marker_ticket_seen) {
+    blocker.Release();
+    attach.join();
+    producer.join();
+  }
+  REQUIRE(marker_ticket_seen);
+  blocker.Release();
+  attach.join();
+  producer.join();
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(dispatcher,
+                                                             nullptr, nullptr);
+
+  REQUIRE(attach_result);
+  REQUIRE_FALSE(dispatcher.sink_failed());
+  REQUIRE(sink->events.size() == 1);
+  REQUIRE(sink->events[0].ordinal == 1);
+  REQUIRE(sink->events[0].sink_generation == 1);
+}
+
+TEST_CASE("PM4 ticket service admits a marker after an overlapping resume",
+          "[pm4-marker-source][concurrency]") {
+  Pm4MarkerDispatcher dispatcher;
+  auto sink = std::make_shared<RecordingSink>();
+  REQUIRE(dispatcher.AttachSink(sink));
+  Pm4MarkerHoldToken token;
+  REQUIRE(dispatcher.HoldSink(sink, &token));
+
+  TicketAssignmentBlocker blocker(2);
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(
+      dispatcher, &TicketAssignmentBlocker::Hook, &blocker);
+  bool resume_result = false;
+  std::thread resume(
+      [&]() { resume_result = dispatcher.ResumeSink(sink, token); });
+  const bool resume_ticket_entered = blocker.WaitUntilEntered(2s);
+  if (!resume_ticket_entered) {
+    blocker.Release();
+    resume.join();
+  }
+  REQUIRE(resume_ticket_entered);
+
+  std::thread producer([&]() { dispatcher.NotifyPm4Swap(20); });
+  const bool marker_ticket_seen = blocker.WaitUntilSeen(3, 2s);
+  if (!marker_ticket_seen) {
+    blocker.Release();
+    resume.join();
+    producer.join();
+  }
+  REQUIRE(marker_ticket_seen);
+  blocker.Release();
+  resume.join();
+  producer.join();
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(dispatcher,
+                                                             nullptr, nullptr);
+
+  REQUIRE(resume_result);
+  REQUIRE_FALSE(dispatcher.sink_failed());
+  REQUIRE(sink->events.size() == 1);
+  REQUIRE(sink->events[0].ordinal == 1);
+  REQUIRE(sink->events[0].sink_generation == 2);
+}
+
+TEST_CASE("PM4 semantic occurrence lease cannot be overtaken by hold",
+          "[pm4-marker-source][concurrency]") {
+  Pm4MarkerDispatcher dispatcher;
+  auto sink = std::make_shared<RecordingSink>();
+  REQUIRE(dispatcher.AttachSink(sink));
+
+  TicketAssignmentBlocker blocker(1);
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(
+      dispatcher, &TicketAssignmentBlocker::Hook, &blocker);
+  std::atomic<bool> lease_acquired{false};
+  std::atomic<bool> complete_lease{false};
+  std::thread producer([&]() {
+    auto lease = dispatcher.BeginPm4Swap();
+    lease_acquired.store(true, std::memory_order_release);
+    while (!complete_lease.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    dispatcher.CompletePm4Swap(std::move(lease), 30);
+  });
+  const bool marker_ticket_entered = blocker.WaitUntilEntered(2s);
+  if (!marker_ticket_entered) {
+    blocker.Release();
+    complete_lease.store(true, std::memory_order_release);
+    producer.join();
+  }
+  REQUIRE(marker_ticket_entered);
+
+  Pm4MarkerHoldToken token;
+  std::atomic<bool> hold_returned{false};
+  bool hold_result = false;
+  std::thread holder([&]() {
+    hold_result = dispatcher.HoldSink(sink, &token);
+    hold_returned.store(true, std::memory_order_release);
+  });
+  const bool hold_ticket_seen = blocker.WaitUntilSeen(2, 2s);
+  if (!hold_ticket_seen) {
+    blocker.Release();
+    complete_lease.store(true, std::memory_order_release);
+    producer.join();
+    holder.join();
+  }
+  REQUIRE(hold_ticket_seen);
+  blocker.Release();
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!lease_acquired.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  const bool acquired_before_timeout =
+      lease_acquired.load(std::memory_order_acquire);
+  if (!acquired_before_timeout) {
+    complete_lease.store(true, std::memory_order_release);
+    producer.join();
+    holder.join();
+  }
+  REQUIRE(acquired_before_timeout);
+  REQUIRE_FALSE(hold_returned.load(std::memory_order_acquire));
+  complete_lease.store(true, std::memory_order_release);
+  producer.join();
+  holder.join();
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(dispatcher,
+                                                             nullptr, nullptr);
+
+  REQUIRE(hold_result);
+  REQUIRE(token.last_ordinal == 1);
+  REQUIRE(sink->events.size() == 1);
+  REQUIRE(sink->events[0].host_tick == 30);
+  REQUIRE_FALSE(dispatcher.sink_failed());
+}
+
+TEST_CASE("PM4 nested semantic occurrence fails closed without deadlocking",
+          "[pm4-marker-source]") {
+  Pm4MarkerDispatcher dispatcher;
+  auto sink = std::make_shared<RecordingSink>();
+  REQUIRE(dispatcher.AttachSink(sink));
+
+  auto outer = dispatcher.BeginPm4Swap();
+  auto nested = dispatcher.BeginPm4Swap();
+  dispatcher.CompletePm4Swap(std::move(nested), 35);
+  dispatcher.CompletePm4Swap(std::move(outer), 36);
+
+  REQUIRE(dispatcher.marker_count() == 2);
+  REQUIRE(dispatcher.sink_failed());
+  REQUIRE(sink->events.size() == 1);
+  REQUIRE(sink->events[0].ordinal == 1);
+  REQUIRE(sink->events[0].host_tick == 36);
+}
+
 TEST_CASE("PM4 marker source rejects detach from its callback",
           "[pm4-marker-source]") {
   Pm4MarkerDispatcher dispatcher;
@@ -432,6 +682,184 @@ TEST_CASE("PM4 production while held permanently prevents resume",
   REQUIRE(harness.dispatcher.marker_count() == 4);
   REQUIRE(harness.dispatcher.status().sink_held);
   REQUIRE(harness.boundary_sink.armed_marker_count() == 0);
+}
+
+TEST_CASE("PM4 terminal seal orders the next swap outside the session",
+          "[pm4-marker-source][concurrency]") {
+  Pm4MarkerDispatcher dispatcher;
+  auto sink = std::make_shared<RecordingSink>();
+  REQUIRE(dispatcher.AttachSink(sink));
+  Pm4MarkerHoldToken token;
+  REQUIRE(dispatcher.HoldSink(sink, &token));
+
+  TicketAssignmentBlocker blocker(2);
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(
+      dispatcher, &TicketAssignmentBlocker::Hook, &blocker);
+  bool seal_result = false;
+  std::thread sealer(
+      [&]() { seal_result = dispatcher.SealAndDetachHeldSink(sink, token); });
+  const bool seal_ticket_entered = blocker.WaitUntilEntered(2s);
+  if (!seal_ticket_entered) {
+    blocker.Release();
+    sealer.join();
+  }
+  REQUIRE(seal_ticket_entered);
+
+  std::thread producer([&]() { dispatcher.NotifyPm4Swap(40); });
+  const bool marker_ticket_seen = blocker.WaitUntilSeen(3, 2s);
+  if (!marker_ticket_seen) {
+    blocker.Release();
+    sealer.join();
+    producer.join();
+  }
+  REQUIRE(marker_ticket_seen);
+  blocker.Release();
+  sealer.join();
+  producer.join();
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(dispatcher,
+                                                             nullptr, nullptr);
+
+  REQUIRE(seal_result);
+  REQUIRE(dispatcher.marker_count() == 1);
+  REQUIRE_FALSE(dispatcher.sink_failed());
+  REQUIRE_FALSE(dispatcher.status().sink_attached);
+  REQUIRE_FALSE(dispatcher.status().sink_held);
+  REQUIRE(sink->events.empty());
+}
+
+TEST_CASE("PM4 swap ordered before terminal seal rejects publication",
+          "[pm4-marker-source][concurrency]") {
+  Pm4MarkerDispatcher dispatcher;
+  auto sink = std::make_shared<RecordingSink>();
+  REQUIRE(dispatcher.AttachSink(sink));
+  Pm4MarkerHoldToken token;
+  REQUIRE(dispatcher.HoldSink(sink, &token));
+
+  TicketAssignmentBlocker blocker(2);
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(
+      dispatcher, &TicketAssignmentBlocker::Hook, &blocker);
+  std::thread producer([&]() { dispatcher.NotifyPm4Swap(50); });
+  const bool marker_ticket_entered = blocker.WaitUntilEntered(2s);
+  if (!marker_ticket_entered) {
+    blocker.Release();
+    producer.join();
+  }
+  REQUIRE(marker_ticket_entered);
+
+  bool seal_result = true;
+  std::thread sealer(
+      [&]() { seal_result = dispatcher.SealAndDetachHeldSink(sink, token); });
+  const bool seal_ticket_seen = blocker.WaitUntilSeen(3, 2s);
+  if (!seal_ticket_seen) {
+    blocker.Release();
+    producer.join();
+    sealer.join();
+  }
+  REQUIRE(seal_ticket_seen);
+  blocker.Release();
+  producer.join();
+  sealer.join();
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(dispatcher,
+                                                             nullptr, nullptr);
+
+  REQUIRE_FALSE(seal_result);
+  const auto status = dispatcher.status();
+  REQUIRE(status.sink_held);
+  REQUIRE(status.sink_failed);
+  REQUIRE(status.source_advanced_while_held);
+  REQUIRE(status.marker_count == 1);
+  REQUIRE(sink->events.empty());
+}
+
+TEST_CASE("PM4 terminal seal fences source shutdown",
+          "[pm4-marker-source][concurrency]") {
+  Pm4MarkerDispatcher dispatcher;
+  auto sink = std::make_shared<RecordingSink>();
+  REQUIRE(dispatcher.AttachSink(sink));
+  Pm4MarkerHoldToken token;
+  REQUIRE(dispatcher.HoldSink(sink, &token));
+
+  TicketAssignmentBlocker blocker(2);
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(
+      dispatcher, &TicketAssignmentBlocker::Hook, &blocker);
+  bool seal_result = false;
+  std::thread sealer(
+      [&]() { seal_result = dispatcher.SealAndDetachHeldSink(sink, token); });
+  const bool seal_ticket_entered = blocker.WaitUntilEntered(2s);
+  if (!seal_ticket_entered) {
+    blocker.Release();
+    sealer.join();
+  }
+  REQUIRE(seal_ticket_entered);
+
+  std::thread shutdown([&]() { dispatcher.Shutdown(); });
+  const bool shutdown_ticket_seen = blocker.WaitUntilSeen(3, 2s);
+  if (!shutdown_ticket_seen) {
+    blocker.Release();
+    sealer.join();
+    shutdown.join();
+  }
+  REQUIRE(shutdown_ticket_seen);
+  blocker.Release();
+  sealer.join();
+  shutdown.join();
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(dispatcher,
+                                                             nullptr, nullptr);
+
+  REQUIRE(seal_result);
+  REQUIRE(dispatcher.status().shut_down);
+  REQUIRE(sink->shutdown_count == 0);
+  REQUIRE_FALSE(dispatcher.sink_failed());
+}
+
+TEST_CASE("PM4 source shutdown callback drains before terminal seal fails",
+          "[pm4-marker-source][concurrency]") {
+  Pm4MarkerDispatcher dispatcher;
+  auto sink = std::make_shared<BlockingShutdownSink>();
+  REQUIRE(dispatcher.AttachSink(sink));
+  Pm4MarkerHoldToken token;
+  REQUIRE(dispatcher.HoldSink(sink, &token));
+
+  std::thread shutdown([&]() { dispatcher.Shutdown(); });
+  const bool shutdown_entered = sink->WaitUntilEntered(2s);
+  if (!shutdown_entered) {
+    sink->Release();
+    shutdown.join();
+  }
+  REQUIRE(shutdown_entered);
+
+  TicketAssignmentBlocker blocker(3);
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(
+      dispatcher, &TicketAssignmentBlocker::Hook, &blocker);
+  std::atomic<bool> seal_returned{false};
+  bool seal_result = true;
+  std::thread sealer([&]() {
+    seal_result = dispatcher.SealAndDetachHeldSink(sink, token);
+    seal_returned.store(true, std::memory_order_release);
+  });
+  const bool seal_ticket_entered = blocker.WaitUntilEntered(2s);
+  if (!seal_ticket_entered) {
+    blocker.Release();
+    sink->Release();
+    shutdown.join();
+    sealer.join();
+  }
+  REQUIRE(seal_ticket_entered);
+  blocker.Release();
+  std::this_thread::sleep_for(10ms);
+  const bool seal_returned_before_shutdown_release =
+      seal_returned.load(std::memory_order_acquire);
+  sink->Release();
+  shutdown.join();
+  sealer.join();
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(dispatcher,
+                                                             nullptr, nullptr);
+
+  REQUIRE_FALSE(seal_returned_before_shutdown_release);
+  REQUIRE_FALSE(seal_result);
+  REQUIRE(dispatcher.status().shut_down);
+  REQUIRE_FALSE(dispatcher.status().sink_attached);
+  REQUIRE_FALSE(dispatcher.status().sink_held);
 }
 
 TEST_CASE("PM4 hold drains the callback and its stop boundary",
