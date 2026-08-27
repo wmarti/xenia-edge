@@ -47,6 +47,12 @@ struct GuestExecutionSessionBundleLimits {
   uint64_t maximum_bundle_bytes = 32ull * 1024ull * 1024ull * 1024ull;
 };
 
+// Applies the same complete codec, reference, digest, size and closure checks
+// used before publication, without touching the filesystem.
+bool ValidateGuestExecutionSessionBundle(
+    const GuestExecutionSessionBundle& bundle, std::string* error = nullptr,
+    GuestExecutionSessionBundleLimits limits = {});
+
 // Validates every codec, session invariant, reference, byte count and digest
 // before creating anything. The output and sibling `<name>.part` must not
 // exist. Fixed, generated names are written exclusively into the same-parent

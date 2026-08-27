@@ -658,6 +658,16 @@ bool ReadBundleInternal(const std::filesystem::path& requested_directory,
 
 }  // namespace
 
+bool ValidateGuestExecutionSessionBundle(
+    const GuestExecutionSessionBundle& bundle, std::string* error,
+    GuestExecutionSessionBundleLimits limits) {
+  if (error) {
+    error->clear();
+  }
+  ValidatedBundle validated;
+  return ValidateBundle(bundle, limits, &validated, error);
+}
+
 bool WriteGuestExecutionSessionBundle(
     const std::filesystem::path& output_directory,
     const GuestExecutionSessionBundle& bundle, std::string* error,
