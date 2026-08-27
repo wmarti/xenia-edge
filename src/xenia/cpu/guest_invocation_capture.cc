@@ -153,6 +153,7 @@ bool GuestInvocationCaptureCoordinator::FinishCallbackLocked(
     ClearFastStateLocked();
     capture_end_tick_ = clock_.NowTicks();
     message_ = "completed capture has no recorder result";
+    XELOGE("Guest invocation capture publication failed: {}", message_);
     segment_handler_ = {};
     return false;
   }
@@ -169,6 +170,7 @@ bool GuestInvocationCaptureCoordinator::FinishCallbackLocked(
     message_ = publication_error.empty()
                    ? std::string(kMissingPublicationDiagnostic)
                    : std::move(publication_error);
+    XELOGE("Guest invocation capture publication failed: {}", message_);
     segment_handler_ = {};
     return false;
   }
