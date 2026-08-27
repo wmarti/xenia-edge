@@ -2952,6 +2952,7 @@ TEST_CASE("scheduler event bridge authenticates every cooperative wait kind",
   REQUIRE(harness.assembler->Arm(&harness.error));
   REQUIRE(harness.assembler->RequestStart(&harness.error));
   REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kContinue);
+  REQUIRE(harness.assembler->OnInstructionCoverage(kA, 1) == Action::kContinue);
 
   std::vector<kernel::GuestSchedulerCaptureEvent> expected;
   uint64_t sequence = 100;
