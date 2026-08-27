@@ -388,6 +388,14 @@ bool ReadCurrentThreadCpuNanoseconds(thread_t thread,
 
 }  // namespace
 
+#if XE_PLATFORM_MAC
+bool ReadGuestInvocationReplayThreadCpuNanoseconds(uint32_t thread_port,
+                                                   uint64_t* cpu_nanoseconds) {
+  return ReadCurrentThreadCpuNanoseconds(static_cast<thread_t>(thread_port),
+                                         cpu_nanoseconds);
+}
+#endif  // XE_PLATFORM_MAC
+
 bool HashGuestInvocationReplayA64CodeShape(
     const std::vector<GuestInvocationReplayCodeShapeFunction>& functions,
     GuestInvocationReplayCodeShape* output, std::string* error) {

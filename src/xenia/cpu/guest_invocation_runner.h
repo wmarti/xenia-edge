@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "xenia/base/platform.h"
 #include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
 
@@ -24,6 +25,13 @@ namespace xe {
 class Memory;
 
 namespace cpu {
+
+#if XE_PLATFORM_MAC
+// User plus system time of one Mach thread port from THREAD_BASIC_INFO. This
+// is the only CPU accounting accepted by timed replay; wall time is diagnostic.
+bool ReadGuestInvocationReplayThreadCpuNanoseconds(uint32_t thread_port,
+                                                   uint64_t* cpu_nanoseconds);
+#endif  // XE_PLATFORM_MAC
 
 class ExactJitCorpusModule;
 class Function;

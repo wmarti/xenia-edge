@@ -1,0 +1,680 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2026 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#include "xenia/cpu/guest_execution_session_runner.h"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "xenia/base/memory.h"
+#include "xenia/base/platform.h"
+#include "xenia/cpu/testing/util.h"
+
+#include "third_party/catch/include/catch.hpp"
+
+namespace xe {
+namespace cpu {
+namespace test {
+
+namespace {
+
+constexpr uint32_t kCodeAddress = 0x82040000u;
+constexpr uint32_t kDataAddress = 0x10000000u;
+constexpr uint32_t kReturnAddress = 0x83000000u;
+constexpr uint32_t kFunctionEndAddress = kCodeAddress + 28;
+constexpr uint32_t kMutationOffset = 0x100;
+constexpr uint64_t kLoopCount = 0x40000;
+constexpr uint64_t kEpoch = 0x1122334455667788ull;
+constexpr uint32_t kGuestPageSize = GuestExecutionSessionCodec::kGuestPageSize;
+
+const std::array<uint8_t, 4> kMutationBytes = {0xDE, 0xAD, 0xBE, 0xEF};
+
+GuestExecutionSessionSha256 Identity(uint8_t seed) {
+  GuestExecutionSessionSha256 digest = {};
+  for (size_t i = 0; i < digest.size(); ++i) {
+    digest[i] = static_cast<uint8_t>(seed + i);
+  }
+  return digest;
+}
+
+GuestExecutionSessionSha256 AddBlob(GuestExecutionSessionBundle* bundle,
+                                    std::vector<uint8_t> bytes) {
+  const GuestExecutionSessionSha256 digest =
+      GuestExecutionSessionCodec::HashBytes(bytes);
+  for (const GuestExecutionSessionContentBlob& blob : bundle->content_blobs) {
+    if (blob.sha256 == digest) {
+      return digest;
+    }
+  }
+  GuestExecutionSessionContentBlob blob;
+  blob.sha256 = digest;
+  blob.bytes = std::move(bytes);
+  bundle->content_blobs.push_back(std::move(blob));
+  return digest;
+}
+
+void StoreGuestInstruction(std::array<uint8_t, kGuestPageSize>* page,
+                           uint32_t offset, uint32_t instruction) {
+  (*page)[offset + 0] = static_cast<uint8_t>(instruction >> 24);
+  (*page)[offset + 1] = static_cast<uint8_t>(instruction >> 16);
+  (*page)[offset + 2] = static_cast<uint8_t>(instruction >> 8);
+  (*page)[offset + 3] = static_cast<uint8_t>(instruction);
+}
+
+// lwz/addi/stw on the shared word, then a CTR loop that leaves real guest
+// work in r7 without touching CR or XER.
+std::vector<uint8_t> EncodeCorpus(uint32_t host_page_size) {
+  ExecutionJitCorpusBuilder builder(0);
+  std::string error;
+  for (uint32_t i = 0; i < host_page_size / kGuestPageSize; ++i) {
+    std::array<uint8_t, kGuestPageSize> page = {};
+    if (!i) {
+      StoreGuestInstruction(&page, 0, 0x80A30000u);   // lwz r5, 0(r3)
+      StoreGuestInstruction(&page, 4, 0x38A50001u);   // addi r5, r5, 1
+      StoreGuestInstruction(&page, 8, 0x90A30000u);   // stw r5, 0(r3)
+      StoreGuestInstruction(&page, 12, 0x3CC00004u);  // lis r6, 4
+      StoreGuestInstruction(&page, 16, 0x7CC903A6u);  // mtctr r6
+      StoreGuestInstruction(&page, 20, 0x38E70003u);  // addi r7, r7, 3
+      StoreGuestInstruction(&page, 24, 0x4200FFFCu);  // bdnz -4
+      StoreGuestInstruction(&page, 28, 0x4E800020u);  // blr
+    }
+    REQUIRE(builder.AddCodePage(kCodeAddress + i * kGuestPageSize, page.data(),
+                                page.size(), &error));
+  }
+  REQUIRE(
+      builder.AddFunction({kCodeAddress, kFunctionEndAddress, 64, 0}, &error));
+  std::vector<uint8_t> bytes;
+  REQUIRE(builder.Encode(&bytes, &error));
+  REQUIRE(error.empty());
+  return bytes;
+}
+
+ppc::GuestInvocationPage MakeDataPage(uint32_t address, uint8_t seed) {
+  ppc::GuestInvocationPage page;
+  page.guest_address = address;
+  for (size_t i = 0; i < page.data.size(); ++i) {
+    page.data[i] = static_cast<uint8_t>(seed + i * 13);
+  }
+  return page;
+}
+
+void StoreWord(std::array<uint8_t, kGuestPageSize>* data, uint32_t value) {
+  (*data)[0] = static_cast<uint8_t>(value >> 24);
+  (*data)[1] = static_cast<uint8_t>(value >> 16);
+  (*data)[2] = static_cast<uint8_t>(value >> 8);
+  (*data)[3] = static_cast<uint8_t>(value);
+}
+
+std::vector<ppc::GuestInvocationPage> MakeDataPages(uint32_t host_page_size,
+                                                    uint32_t initial_word,
+                                                    bool mutated) {
+  std::vector<ppc::GuestInvocationPage> pages;
+  for (uint32_t i = 0; i < host_page_size / kGuestPageSize; ++i) {
+    pages.push_back(MakeDataPage(kDataAddress + i * kGuestPageSize,
+                                 static_cast<uint8_t>(0x20 + i)));
+  }
+  StoreWord(&pages.front().data, initial_word);
+  if (mutated) {
+    std::copy(kMutationBytes.cbegin(), kMutationBytes.cend(),
+              pages.front().data.begin() + kMutationOffset);
+  }
+  return pages;
+}
+
+ppc::GuestFunctionInvocation MakeSegment(uint32_t host_page_size,
+                                         uint32_t initial_word,
+                                         uint64_t r7_seed, bool mutated) {
+  ppc::GuestFunctionInvocation invocation;
+  invocation.function_address = kCodeAddress;
+  invocation.function_end_address = kFunctionEndAddress;
+  invocation.entry_address = kCodeAddress;
+  invocation.expected_return_address = kReturnAddress;
+  invocation.input.link_register = kReturnAddress;
+  invocation.input.gpr[3] = kDataAddress;
+  invocation.input.gpr[7] = r7_seed;
+  invocation.expected_output = invocation.input;
+  invocation.expected_output.gpr[5] = initial_word + 1;
+  invocation.expected_output.gpr[6] = kLoopCount;
+  invocation.expected_output.gpr[7] = r7_seed + 3 * kLoopCount;
+  invocation.expected_output.count_register = 0;
+  invocation.input_data_pages =
+      MakeDataPages(host_page_size, initial_word, mutated);
+  invocation.expected_dirty_pages.push_back(
+      invocation.input_data_pages.front());
+  StoreWord(&invocation.expected_dirty_pages.front().data, initial_word + 1);
+  return invocation;
+}
+
+std::vector<uint8_t> EncodeArtifact(
+    const ppc::GuestFunctionInvocation& invocation,
+    const GuestExecutionSessionSha256& corpus_sha256,
+    const GuestExecutionSessionSha256& replay_config_sha256) {
+  ppc::GuestInvocationArtifact artifact;
+  artifact.capture_build_sha256 = Identity(0x10);
+  artifact.code_corpus_sha256 = corpus_sha256;
+  artifact.replay_config_sha256 = replay_config_sha256;
+  artifact.invocations.push_back(invocation);
+  std::vector<uint8_t> bytes;
+  std::string error;
+  REQUIRE(ppc::GuestInvocationArtifactCodec::Encode(artifact, &bytes, &error));
+  return bytes;
+}
+
+std::vector<uint8_t> EncodeState(const ppc::GuestPPCRegisterState& state) {
+  std::vector<uint8_t> bytes;
+  std::string error;
+  REQUIRE(ppc::GuestPPCRegisterStateCodec::Encode(state, &bytes, &error));
+  return bytes;
+}
+
+GuestExecutionSessionEvent ControlEvent(uint32_t owner,
+                                        GuestExecutionSessionEventKind kind) {
+  GuestExecutionSessionEvent event;
+  event.thread_ordinal = owner;
+  event.kind = kind;
+  event.disposition =
+      owner == kGuestExecutionSessionNoThread
+          ? GuestExecutionSessionEventDisposition::kReplayCaptured
+          : GuestExecutionSessionEventDisposition::kValidateDeterministic;
+  return event;
+}
+
+GuestExecutionSessionChunkReference Reference(
+    GuestExecutionSessionChunkKind kind, uint32_t ordinal,
+    uint64_t first_sequence, uint64_t last_sequence, uint32_t count,
+    const std::vector<uint8_t>& bytes) {
+  GuestExecutionSessionChunkReference reference;
+  reference.kind = kind;
+  reference.ordinal = ordinal;
+  reference.first_event_sequence = first_sequence;
+  reference.last_event_sequence = last_sequence;
+  reference.record_count = count;
+  reference.encoded_size = bytes.size();
+  reference.encoded_sha256 = GuestExecutionSessionCodec::HashBytes(bytes);
+  return reference;
+}
+
+enum class ExtraEvent {
+  kNone,
+  kCoverageInsideSegment,
+  kKernelExportInsideSegment,
+  kMutationInsideSegment,
+  kMutationBetweenSegments,
+};
+
+struct BundleOptions {
+  uint32_t host_page_size = 16 * 1024;
+  // Records the second participant's segment before the first one's.
+  bool swap_order = false;
+  // Begins the second segment before the first one ends.
+  bool overlap_segments = false;
+  ExtraEvent extra = ExtraEvent::kNone;
+  bool corrupt_replay_config = false;
+  bool drop_last_initial_page = false;
+};
+
+// Two participants share one data word: participant 0 increments 41 to 42 and
+// participant 1 then increments 42 to 43. The recorded order is the only
+// order in which both captured segment inputs can be observed.
+GuestExecutionSessionBundle MakeSessionBundle(const BundleOptions& options) {
+  GuestExecutionSessionBundle bundle;
+  const GuestExecutionSessionSha256 replay_config_sha256 = Identity(0x20);
+  const std::vector<uint8_t> corpus_bytes =
+      EncodeCorpus(options.host_page_size);
+  const GuestExecutionSessionSha256 corpus_sha256 =
+      AddBlob(&bundle, corpus_bytes);
+  const bool mutated = options.extra == ExtraEvent::kMutationBetweenSegments;
+  const ppc::GuestFunctionInvocation segment_0 =
+      MakeSegment(options.host_page_size, 41, 0, false);
+  const ppc::GuestFunctionInvocation segment_1 =
+      MakeSegment(options.host_page_size, 42, 0x1000, mutated);
+  const GuestExecutionSessionSha256 artifact_config_sha256 =
+      options.corrupt_replay_config ? Identity(0x21) : replay_config_sha256;
+  const GuestExecutionSessionSha256 segment_0_sha256 =
+      AddBlob(&bundle,
+              EncodeArtifact(segment_0, corpus_sha256, artifact_config_sha256));
+  const GuestExecutionSessionSha256 segment_1_sha256 =
+      AddBlob(&bundle,
+              EncodeArtifact(segment_1, corpus_sha256, artifact_config_sha256));
+  const std::vector<uint8_t> initial_state_0 = EncodeState(segment_0.input);
+  const std::vector<uint8_t> initial_state_1 = EncodeState(segment_1.input);
+  const uint64_t state_size = initial_state_0.size();
+  const GuestExecutionSessionSha256 initial_0 =
+      AddBlob(&bundle, initial_state_0);
+  const GuestExecutionSessionSha256 initial_1 =
+      AddBlob(&bundle, initial_state_1);
+  const GuestExecutionSessionSha256 final_0 =
+      AddBlob(&bundle, EncodeState(segment_0.expected_output));
+  const GuestExecutionSessionSha256 final_1 =
+      AddBlob(&bundle, EncodeState(segment_1.expected_output));
+
+  GuestExecutionSessionCheckpointChunk initial;
+  initial.session_epoch = kEpoch;
+  initial.ordinal = 0;
+  initial.checkpoint.global_sequence = 0;
+  initial.checkpoint.thread_states = {{0, state_size, initial_0},
+                                      {1, state_size, initial_1}};
+  const std::vector<ppc::GuestInvocationPage>& initial_pages =
+      segment_0.input_data_pages;
+  for (size_t i = 0; i < initial_pages.size(); ++i) {
+    if (options.drop_last_initial_page && i + 1 == initial_pages.size()) {
+      break;
+    }
+    const ppc::GuestInvocationPage& page = initial_pages[i];
+    initial.checkpoint.content.push_back(
+        {GuestExecutionSessionContentKind::kGuestPage, page.guest_address,
+         kGuestPageSize,
+         AddBlob(&bundle,
+                 std::vector<uint8_t>(page.data.cbegin(), page.data.cend()))});
+  }
+
+  const uint32_t first_thread = options.swap_order ? 1 : 0;
+  const uint32_t second_thread = options.swap_order ? 0 : 1;
+  const GuestExecutionSessionSha256 first_segment_sha256 =
+      options.swap_order ? segment_1_sha256 : segment_0_sha256;
+  const GuestExecutionSessionSha256 second_segment_sha256 =
+      options.swap_order ? segment_0_sha256 : segment_1_sha256;
+
+  GuestExecutionSessionEventChunk events;
+  events.session_epoch = kEpoch;
+  events.ordinal = 1;
+  auto push = [&](GuestExecutionSessionEvent event) {
+    event.global_sequence = events.events.size() + 1;
+    events.events.push_back(event);
+    return event.global_sequence;
+  };
+  auto push_mutation = [&]() {
+    GuestExecutionSessionEvent mutation =
+        ControlEvent(kGuestExecutionSessionNoThread,
+                     GuestExecutionSessionEventKind::kMemoryMutation);
+    mutation.mutation_source = GuestExecutionSessionMutationSource::kGpu;
+    mutation.payload_kind = GuestExecutionSessionPayloadKind::kGuestBytes;
+    mutation.guest_address = kDataAddress + kMutationOffset;
+    mutation.byte_count = kMutationBytes.size();
+    mutation.payload_size = kMutationBytes.size();
+    mutation.payload_sha256 = AddBlob(
+        &bundle,
+        std::vector<uint8_t>(kMutationBytes.cbegin(), kMutationBytes.cend()));
+    push(mutation);
+  };
+
+  const uint64_t first_begin = push(ControlEvent(
+      first_thread, GuestExecutionSessionEventKind::kSegmentBegin));
+  uint64_t guest_instruction_count = 0;
+  switch (options.extra) {
+    case ExtraEvent::kCoverageInsideSegment: {
+      GuestExecutionSessionEvent coverage = ControlEvent(
+          first_thread, GuestExecutionSessionEventKind::kInstructionCoverage);
+      coverage.guest_instruction_delta = 8;
+      guest_instruction_count = 8;
+      push(coverage);
+      break;
+    }
+    case ExtraEvent::kKernelExportInsideSegment: {
+      GuestExecutionSessionEvent external = ControlEvent(
+          first_thread, GuestExecutionSessionEventKind::kKernelExport);
+      external.disposition =
+          GuestExecutionSessionEventDisposition::kReplayCaptured;
+      external.payload_kind =
+          GuestExecutionSessionPayloadKind::kLittleEndianUnsignedInteger;
+      external.payload_size = 8;
+      external.payload_sha256 = AddBlob(&bundle, std::vector<uint8_t>(8, 0x5A));
+      push(external);
+      break;
+    }
+    case ExtraEvent::kMutationInsideSegment:
+      push_mutation();
+      break;
+    default:
+      break;
+  }
+  uint64_t second_begin = 0;
+  if (options.overlap_segments) {
+    second_begin = push(ControlEvent(
+        second_thread, GuestExecutionSessionEventKind::kSegmentBegin));
+  }
+  const uint64_t first_end = push(
+      ControlEvent(first_thread, GuestExecutionSessionEventKind::kSegmentEnd));
+  if (options.extra == ExtraEvent::kMutationBetweenSegments) {
+    push_mutation();
+  }
+  if (!options.overlap_segments) {
+    second_begin = push(ControlEvent(
+        second_thread, GuestExecutionSessionEventKind::kSegmentBegin));
+  }
+  const uint64_t second_end = push(
+      ControlEvent(second_thread, GuestExecutionSessionEventKind::kSegmentEnd));
+  const uint64_t request =
+      push(ControlEvent(kGuestExecutionSessionNoThread,
+                        GuestExecutionSessionEventKind::kBoundaryRequest));
+  const uint64_t held =
+      push(ControlEvent(kGuestExecutionSessionNoThread,
+                        GuestExecutionSessionEventKind::kBoundaryHeld));
+
+  GuestExecutionSessionCheckpointChunk final;
+  final.session_epoch = kEpoch;
+  final.ordinal = 2;
+  final.checkpoint.global_sequence = held;
+  final.checkpoint.thread_states = {{0, state_size, final_0},
+                                    {1, state_size, final_1}};
+  const ppc::GuestInvocationPage& final_page =
+      segment_1.expected_dirty_pages.front();
+  final.checkpoint.content.push_back(
+      {GuestExecutionSessionContentKind::kGuestPage, final_page.guest_address,
+       kGuestPageSize,
+       AddBlob(&bundle, std::vector<uint8_t>(final_page.data.cbegin(),
+                                             final_page.data.cend()))});
+
+  bundle.chunks.resize(3);
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      initial, &bundle.chunks[0], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
+      events, &bundle.chunks[1], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final, &bundle.chunks[2], &error));
+
+  GuestExecutionSessionManifest& manifest = bundle.manifest;
+  manifest.session_epoch = kEpoch;
+  manifest.first_event_sequence = 1;
+  manifest.last_event_sequence = held;
+  manifest.capture_start_tick = 100;
+  manifest.stop_request_tick = 700;
+  manifest.capture_end_tick = 800;
+  manifest.capture_tick_frequency = 1000000000;
+  manifest.capture_build_sha256 = Identity(0x10);
+  manifest.replay_config_sha256 = replay_config_sha256;
+  manifest.title_identity_sha256 = Identity(0x30);
+  manifest.module_identity_sha256 = Identity(0x40);
+  manifest.accepted_segment_count = 2;
+  manifest.accepted_event_count = held;
+  manifest.stop_reason = GuestExecutionSessionStopReason::kManualRequest;
+  manifest.stop_request_event_sequence = request;
+  manifest.stop_request_accepted_segment_count = 2;
+  manifest.stop_request_guest_instruction_count = guest_instruction_count;
+  manifest.maximum_stop_tail_event_count = 4;
+  manifest.maximum_stop_tail_guest_instruction_count = 4;
+  manifest.maximum_stop_tail_ticks = 200;
+
+  manifest.participants.resize(2);
+  for (uint32_t ordinal = 0; ordinal < 2; ++ordinal) {
+    GuestExecutionSessionParticipant& participant =
+        manifest.participants[ordinal];
+    participant.ordinal = ordinal;
+    participant.guest_thread_id = 0x100 + ordinal;
+    participant.capture_instance_id = 0x1000 + ordinal;
+    participant.boundary_arrival_kind =
+        GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside;
+    const bool first = ordinal == first_thread;
+    participant.first_event_sequence = first ? first_begin : second_begin;
+    participant.last_event_sequence = first ? first_end : second_end;
+    participant.held_after_event_sequence = request;
+    participant.initial_state_size = state_size;
+    participant.initial_state_sha256 = ordinal ? initial_1 : initial_0;
+  }
+  manifest.segments.push_back({0, first_thread, first_begin, first_end,
+                               kCodeAddress, kFunctionEndAddress, corpus_sha256,
+                               first_segment_sha256});
+  manifest.segments.push_back({1, second_thread, second_begin, second_end,
+                               kCodeAddress, kFunctionEndAddress, corpus_sha256,
+                               second_segment_sha256});
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                bundle.chunks[0]));
+  manifest.chunks.push_back(Reference(GuestExecutionSessionChunkKind::kEvents,
+                                      1, 1, held, static_cast<uint32_t>(held),
+                                      bundle.chunks[1]));
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 2, held, held, 1,
+                bundle.chunks[2]));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  return bundle;
+}
+
+}  // namespace
+
+TEST_CASE("guest execution session planner resolves segments and event roles",
+          "[guest-execution-session-runner]") {
+  const BundleOptions options;
+  const GuestExecutionSessionBundle bundle = MakeSessionBundle(options);
+  GuestExecutionSessionReplayPlan plan;
+  std::string error;
+  REQUIRE(BuildGuestExecutionSessionReplayPlan(bundle, options.host_page_size,
+                                               &plan, &error));
+  REQUIRE(error.empty());
+  REQUIRE(plan.participants.size() == 2);
+  REQUIRE(plan.segments.size() == 2);
+  REQUIRE(plan.events.size() == 6);
+  REQUIRE(plan.checkpoints.size() == 2);
+  REQUIRE(plan.eager_function_count == 1);
+  REQUIRE(plan.eager_guest_code_bytes == 32);
+  REQUIRE(plan.captured_host_code_bytes == 64);
+
+  using Role = GuestExecutionSessionReplayEventRole;
+  const std::vector<Role> expected_roles = {
+      Role::kSegmentBegin, Role::kSegmentEnd,      Role::kSegmentBegin,
+      Role::kSegmentEnd,   Role::kBoundaryControl, Role::kBoundaryControl,
+  };
+  for (size_t i = 0; i < expected_roles.size(); ++i) {
+    REQUIRE(plan.events[i].role == expected_roles[i]);
+    REQUIRE(plan.events[i].checkpoint_index ==
+            kGuestExecutionSessionReplayNoIndex);
+  }
+  REQUIRE(plan.events[0].segment_index == 0);
+  REQUIRE(plan.events[1].segment_index == 0);
+  REQUIRE(plan.events[2].segment_index == 1);
+  REQUIRE(plan.events[3].segment_index == 1);
+  REQUIRE(plan.participants[0].event_indices == std::vector<uint32_t>{0, 1});
+  REQUIRE(plan.participants[1].event_indices == std::vector<uint32_t>{2, 3});
+  REQUIRE(plan.participants[0].segment_count == 1);
+  REQUIRE(plan.participants[1].segment_count == 1);
+  REQUIRE(plan.participants[1].initial_state.gpr[7] == 0x1000);
+  REQUIRE(plan.participants[1].initial_state_blob);
+  REQUIRE(plan.participants[1].initial_state_blob->size() ==
+          ppc::GuestPPCRegisterStateCodec::kEncodedSize);
+  REQUIRE(plan.coordinator_event_indices == std::vector<uint32_t>{4, 5});
+  REQUIRE(plan.segments[0].thread_ordinal == 0);
+  REQUIRE(plan.segments[1].thread_ordinal == 1);
+  REQUIRE(plan.segments[1].invocation.input.gpr[7] == 0x1000);
+
+  const uint32_t closure_page_count = options.host_page_size / kGuestPageSize;
+  REQUIRE(plan.pages.size() == 2 * closure_page_count);
+  REQUIRE(plan.pages.front().guest_address == kDataAddress);
+  REQUIRE_FALSE(plan.pages.front().code);
+  REQUIRE(plan.pages.back().code);
+  REQUIRE(plan.reset_page_addresses == std::vector<uint32_t>{kDataAddress});
+  REQUIRE(plan.protection_granules ==
+          std::vector<GuestInvocationReplayProtectionGranule>{
+              {kDataAddress, options.host_page_size, true},
+              {kCodeAddress, options.host_page_size, false}});
+
+  SECTION("a reordered tape plans and is rejected only by execution") {
+    BundleOptions swapped = options;
+    swapped.swap_order = true;
+    const GuestExecutionSessionBundle swapped_bundle =
+        MakeSessionBundle(swapped);
+    REQUIRE(BuildGuestExecutionSessionReplayPlan(
+        swapped_bundle, options.host_page_size, &plan, &error));
+    REQUIRE(plan.segments[0].thread_ordinal == 1);
+    REQUIRE(plan.participants[1].event_indices == std::vector<uint32_t>{0, 1});
+  }
+
+  SECTION("a quiescent asynchronous mutation is injected by the coordinator") {
+    BundleOptions mutated = options;
+    mutated.extra = ExtraEvent::kMutationBetweenSegments;
+    const GuestExecutionSessionBundle mutated_bundle =
+        MakeSessionBundle(mutated);
+    REQUIRE(BuildGuestExecutionSessionReplayPlan(
+        mutated_bundle, options.host_page_size, &plan, &error));
+    REQUIRE(plan.events.size() == 7);
+    REQUIRE(plan.events[2].role == Role::kAsynchronousMutation);
+    REQUIRE(plan.coordinator_event_indices == std::vector<uint32_t>{2, 5, 6});
+    REQUIRE(plan.reset_page_addresses == std::vector<uint32_t>{kDataAddress});
+  }
+}
+
+TEST_CASE("guest execution session planner rejects sessions without a hook",
+          "[guest-execution-session-runner]") {
+  GuestExecutionSessionReplayPlan plan;
+  std::string error;
+  BundleOptions options;
+
+  SECTION("instruction coverage needs counters") {
+    options.extra = ExtraEvent::kCoverageInsideSegment;
+    REQUIRE_FALSE(BuildGuestExecutionSessionReplayPlan(
+        MakeSessionBundle(options), options.host_page_size, &plan, &error));
+    REQUIRE(error ==
+            "instruction coverage events require guest instruction counters "
+            "that timed replay does not provide");
+  }
+
+  SECTION("kernel export injection is absent") {
+    options.extra = ExtraEvent::kKernelExportInsideSegment;
+    REQUIRE_FALSE(BuildGuestExecutionSessionReplayPlan(
+        MakeSessionBundle(options), options.host_page_size, &plan, &error));
+    REQUIRE(error ==
+            "participant event kind 5 has no replay hook in this runner");
+  }
+
+  SECTION("asynchronous mutation inside a running segment") {
+    options.extra = ExtraEvent::kMutationInsideSegment;
+    REQUIRE_FALSE(BuildGuestExecutionSessionReplayPlan(
+        MakeSessionBundle(options), options.host_page_size, &plan, &error));
+    REQUIRE(error == "asynchronous mutation overlaps a running segment");
+  }
+
+  SECTION("concurrent segments need recorded scheduling") {
+    options.overlap_segments = true;
+    REQUIRE_FALSE(BuildGuestExecutionSessionReplayPlan(
+        MakeSessionBundle(options), options.host_page_size, &plan, &error));
+    REQUIRE(error ==
+            "segment begin at sequence 2 overlaps an open segment; concurrent "
+            "segments are not replayable without recorded scheduling");
+  }
+
+  SECTION("segment provenance must bind the session configuration") {
+    options.corrupt_replay_config = true;
+    REQUIRE_FALSE(BuildGuestExecutionSessionReplayPlan(
+        MakeSessionBundle(options), options.host_page_size, &plan, &error));
+    REQUIRE(error ==
+            "segment artifact replay configuration differs from the session");
+  }
+
+  SECTION("segment pages must come from the initial checkpoint") {
+    options.drop_last_initial_page = true;
+    REQUIRE_FALSE(BuildGuestExecutionSessionReplayPlan(
+        MakeSessionBundle(options), options.host_page_size, &plan, &error));
+    REQUIRE(error ==
+            "segment input page is absent from the initial checkpoint");
+  }
+
+  REQUIRE(plan.participants.empty());
+  REQUIRE(plan.events.empty());
+  REQUIRE(plan.pages.empty());
+}
+
+// This backend fixture is mechanism coverage only until it has been built and
+// run on an Apple A64 host.
+TEST_CASE("guest execution session runner replays persistent participants",
+          "[guest-execution-session-runner][backend]") {
+  BundleOptions options;
+  options.host_page_size = static_cast<uint32_t>(xe::memory::page_size());
+  const GuestExecutionSessionBundle bundle = MakeSessionBundle(options);
+  GuestExecutionSessionRunner::Options runner_options;
+  // Two 262,144-iteration segments per repetition; the floor is well below
+  // that so the gate proves only that it is enforced, not the title budget.
+  runner_options.minimum_participant_cpu_nanoseconds_per_repetition = 1000;
+
+  auto backend = testing::CreateBackend();
+  if (!backend) {
+    WARN("No executable host backend is available");
+    return;
+  }
+
+  std::string error;
+  std::unique_ptr<GuestExecutionSessionRunner> runner =
+      GuestExecutionSessionRunner::Create(bundle, std::move(backend),
+                                          runner_options, &error);
+#if !XE_PLATFORM_MAC || !XE_ARCH_ARM64
+  REQUIRE_FALSE(runner);
+  REQUIRE(error == "guest execution session replay runner requires Apple A64");
+  return;
+#else
+  REQUIRE(runner);
+  REQUIRE(error.empty());
+  REQUIRE(runner->WarmAndVerify(&error));
+  REQUIRE(error.empty());
+  const GuestExecutionSessionReplayMetrics& warmup = runner->warmup_metrics();
+  REQUIRE(warmup.repetition_count == 1);
+  REQUIRE(warmup.consumed_event_count_per_repetition == 6);
+  REQUIRE(warmup.participants.size() == 2);
+  REQUIRE(warmup.participants[0].consumed_event_count == 2);
+  REQUIRE(warmup.participants[1].consumed_event_count == 2);
+  REQUIRE(warmup.in_interval_verification_count == 4);
+  REQUIRE(warmup.code_shape.function_count == 1);
+
+  GuestExecutionSessionReplayMetrics metrics;
+  REQUIRE(runner->RunTimed(8, &metrics, &error));
+  REQUIRE(error.empty());
+  REQUIRE(metrics.repetition_count == 8);
+  REQUIRE(metrics.consumed_event_count_per_repetition == 6);
+  REQUIRE(metrics.intermediate_checkpoint_count == 0);
+  REQUIRE(metrics.in_interval_verification_count == 0);
+  REQUIRE(metrics.in_interval_verification_thread_cpu_nanoseconds == 0);
+  REQUIRE(
+      metrics.participant_thread_cpu_nanoseconds >=
+      8 * runner_options.minimum_participant_cpu_nanoseconds_per_repetition);
+  REQUIRE(metrics.uptime_raw_nanoseconds > 0);
+  REQUIRE(metrics.placement_generation_before ==
+          metrics.placement_generation_after);
+  REQUIRE(metrics.reset_page_count_per_repetition == 1);
+  REQUIRE(metrics.reset_bytes_per_repetition == kGuestPageSize);
+  REQUIRE(metrics.code_shape == warmup.code_shape);
+  REQUIRE(metrics.participants.size() == 2);
+  REQUIRE(metrics.participants[0].consumed_event_count == 16);
+  REQUIRE(metrics.participants[1].consumed_event_count == 16);
+
+  SECTION("a quiescent asynchronous mutation reaches the next segment") {
+    BundleOptions mutated = options;
+    mutated.extra = ExtraEvent::kMutationBetweenSegments;
+    const GuestExecutionSessionBundle mutated_bundle =
+        MakeSessionBundle(mutated);
+    std::unique_ptr<GuestExecutionSessionRunner> mutated_runner =
+        GuestExecutionSessionRunner::Create(
+            mutated_bundle, testing::CreateBackend(), runner_options, &error);
+    REQUIRE(mutated_runner);
+    REQUIRE(mutated_runner->WarmAndVerify(&error));
+    REQUIRE(error.empty());
+    REQUIRE(mutated_runner->RunTimed(2, &metrics, &error));
+    REQUIRE(metrics.consumed_event_count_per_repetition == 7);
+  }
+
+  SECTION("a reordered tape rejects at the first real segment entry") {
+    BundleOptions swapped = options;
+    swapped.swap_order = true;
+    const GuestExecutionSessionBundle swapped_bundle =
+        MakeSessionBundle(swapped);
+    std::unique_ptr<GuestExecutionSessionRunner> swapped_runner =
+        GuestExecutionSessionRunner::Create(
+            swapped_bundle, testing::CreateBackend(), runner_options, &error);
+    REQUIRE(swapped_runner);
+    REQUIRE_FALSE(swapped_runner->WarmAndVerify(&error));
+    REQUIRE(error == "segment input page differs from live guest memory");
+  }
+#endif  // !XE_PLATFORM_MAC || !XE_ARCH_ARM64
+}
+
+}  // namespace test
+}  // namespace cpu
+}  // namespace xe
