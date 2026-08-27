@@ -130,6 +130,24 @@ bool GuestExecutionMarkerController::EmitBoundaryLocked(
   return true;
 }
 
+bool GuestExecutionMarkerController::EmitArmedMarkerLocked(
+    const gpu::Pm4MarkerEvent& event) {
+  in_callback_ = true;
+  callback_thread_ = std::this_thread::get_id();
+  const bool accepted = boundary_sink_.OnArmedMarker(event);
+  in_callback_ = false;
+  if (IsTerminalLocked()) {
+    return false;
+  }
+  if (!accepted) {
+    FailLocked(
+        GuestExecutionMarkerControllerRejection::kArmedMarkerSinkRejected);
+    return false;
+  }
+  ++status_.forwarded_marker_count;
+  return true;
+}
+
 bool GuestExecutionMarkerController::Begin() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   if (!EnterLocked()) {
@@ -227,12 +245,23 @@ bool GuestExecutionMarkerController::OnPm4Marker(
       return true;
     }
     case GuestExecutionMarkerControllerState::kArmed: {
+      // Acknowledging the arm boundary is the owner's proof that the session
+      // start rendezvous is complete. Forwarding even one marker before that
+      // point would leave an unrecorded prefix in the claimed window.
+      if (!status_.acknowledged_boundary_count) {
+        FailLocked(GuestExecutionMarkerControllerRejection::
+                       kArmBoundaryUnacknowledged);
+        return false;
+      }
       const uint64_t now = clock_.NowTicks();
       if (now < status_.arm_tick) {
         FailLocked(GuestExecutionMarkerControllerRejection::kClockRegressed);
         return false;
       }
       ++status_.markers_since_arm;
+      if (!EmitArmedMarkerLocked(event)) {
+        return false;
+      }
       GuestExecutionSessionStopReason stop_reason =
           GuestExecutionSessionStopReason::kRequestedBoundary;
       if (status_.markers_since_arm >= config_.stop_marker_count) {

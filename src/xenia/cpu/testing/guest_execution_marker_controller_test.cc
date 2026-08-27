@@ -41,15 +41,26 @@ class RecordingBoundarySink final : public GuestExecutionMarkerBoundarySink {
   bool OnMarkerBoundary(
       const GuestExecutionMarkerBoundary& boundary) noexcept override {
     boundaries.push_back(boundary);
-    if (reenter) {
-      reentry_result = reenter->RequestStop();
+    if (reenter_boundary) {
+      reentry_result = reenter_boundary->RequestStop();
     }
-    return accept;
+    return accept_boundaries;
+  }
+
+  bool OnArmedMarker(const gpu::Pm4MarkerEvent& event) noexcept override {
+    armed_markers.push_back(event);
+    if (reenter_marker) {
+      reentry_result = reenter_marker->RequestStop();
+    }
+    return accept_markers;
   }
 
   std::vector<GuestExecutionMarkerBoundary> boundaries;
-  bool accept = true;
-  GuestExecutionMarkerController* reenter = nullptr;
+  std::vector<gpu::Pm4MarkerEvent> armed_markers;
+  bool accept_boundaries = true;
+  bool accept_markers = true;
+  GuestExecutionMarkerController* reenter_boundary = nullptr;
+  GuestExecutionMarkerController* reenter_marker = nullptr;
   bool reentry_result = true;
 };
 
@@ -87,6 +98,7 @@ struct Harness {
     REQUIRE(controller->status().state ==
             GuestExecutionMarkerControllerState::kArmed);
     REQUIRE(sink.boundaries.size() == 1);
+    REQUIRE(sink.armed_markers.empty());
   }
 
   FakeClock clock;
@@ -260,6 +272,8 @@ TEST_CASE("Guest marker controller stops at consecutive markers",
   REQUIRE(status.stop_marker_ordinal == 9);
   REQUIRE(status.markers_since_arm == 1);
   REQUIRE(harness.sink.boundaries.size() == 2);
+  REQUIRE(harness.sink.armed_markers ==
+          std::vector<gpu::Pm4MarkerEvent>{SwapMarker(9)});
   const GuestExecutionMarkerBoundary& stop = harness.sink.boundaries[1];
   REQUIRE(stop.sequence == 2);
   REQUIRE(stop.kind == GuestExecutionMarkerBoundaryKind::kStop);
@@ -285,31 +299,32 @@ TEST_CASE("Guest marker controller rejects an unacknowledged arm as overflow",
   REQUIRE_FALSE(harness.controller->OnPm4Marker(SwapMarker(9)));
   GuestExecutionMarkerControllerStatus status = harness.controller->status();
   REQUIRE(status.state == GuestExecutionMarkerControllerState::kFailed);
-  REQUIRE(
-      status.rejection ==
-      GuestExecutionMarkerControllerRejection::kOutstandingBoundaryOverflow);
+  REQUIRE(status.rejection ==
+          GuestExecutionMarkerControllerRejection::kArmBoundaryUnacknowledged);
   REQUIRE(status.stop_marker_ordinal == 0);
   REQUIRE(harness.sink.boundaries.size() == 1);
+  REQUIRE(harness.sink.armed_markers.empty());
   // Acknowledging late does not revive a failed controller.
   REQUIRE(harness.controller->AcknowledgeBoundary(1));
   REQUIRE_FALSE(harness.controller->OnPm4Marker(SwapMarker(10)));
   REQUIRE(harness.sink.boundaries.size() == 1);
 }
 
-TEST_CASE("Guest marker controller honors a wider outstanding bound",
+TEST_CASE("Guest marker controller gates markers on the arm acknowledgement",
           "[guest-execution-marker]") {
   GuestExecutionMarkerControllerConfig config;
   config.max_outstanding_boundaries = 2;
   Harness harness(config);
   harness.ArmAtOrdinal(8);
   harness.clock.now += 33;
-  REQUIRE(harness.controller->OnPm4Marker(SwapMarker(9)));
-  REQUIRE(harness.controller->status().state ==
-          GuestExecutionMarkerControllerState::kStopped);
-  REQUIRE(harness.sink.boundaries.size() == 2);
-  REQUIRE_FALSE(harness.controller->AcknowledgeBoundary(2));
-  REQUIRE(harness.controller->AcknowledgeBoundary(1));
-  REQUIRE(harness.controller->AcknowledgeBoundary(2));
+  REQUIRE_FALSE(harness.controller->OnPm4Marker(SwapMarker(9)));
+  const GuestExecutionMarkerControllerStatus status =
+      harness.controller->status();
+  REQUIRE(status.state == GuestExecutionMarkerControllerState::kFailed);
+  REQUIRE(status.rejection ==
+          GuestExecutionMarkerControllerRejection::kArmBoundaryUnacknowledged);
+  REQUIRE(harness.sink.boundaries.size() == 1);
+  REQUIRE(harness.sink.armed_markers.empty());
 }
 
 TEST_CASE("Guest marker controller stops at the selected marker count",
@@ -333,6 +348,9 @@ TEST_CASE("Guest marker controller stops at the selected marker count",
   REQUIRE(harness.sink.boundaries[1].markers_since_arm == 3);
   REQUIRE(harness.sink.boundaries[1].stop_reason ==
           GuestExecutionSessionStopReason::kRequestedBoundary);
+  REQUIRE(harness.sink.armed_markers ==
+          std::vector<gpu::Pm4MarkerEvent>{SwapMarker(9), SwapMarker(10),
+                                           SwapMarker(11)});
 }
 
 TEST_CASE("Guest marker controller stops at the next marker on request",
@@ -354,6 +372,8 @@ TEST_CASE("Guest marker controller stops at the next marker on request",
   REQUIRE(harness.sink.boundaries[1].markers_since_arm == 2);
   REQUIRE(harness.sink.boundaries[1].stop_reason ==
           GuestExecutionSessionStopReason::kManualRequest);
+  REQUIRE(harness.sink.armed_markers ==
+          std::vector<gpu::Pm4MarkerEvent>{SwapMarker(9), SwapMarker(10)});
 }
 
 TEST_CASE("Guest marker controller aborts on a request before arming",
@@ -370,13 +390,14 @@ TEST_CASE("Guest marker controller aborts on a request before arming",
   REQUIRE(harness.controller->status().state ==
           GuestExecutionMarkerControllerState::kAborted);
   REQUIRE(harness.sink.boundaries.empty());
+  REQUIRE(harness.sink.armed_markers.empty());
   REQUIRE_FALSE(harness.controller->Begin());
 }
 
 TEST_CASE("Guest marker controller fails closed when the sink rejects",
           "[guest-execution-marker]") {
   Harness harness;
-  harness.sink.accept = false;
+  harness.sink.accept_boundaries = false;
   harness.clock.now = 100;
   REQUIRE(harness.controller->Begin());
   REQUIRE(harness.controller->OnPm4Marker(SwapMarker(1)));
@@ -396,7 +417,7 @@ TEST_CASE("Guest marker controller fails closed when the sink rejects",
 TEST_CASE("Guest marker controller fails closed on sink reentry",
           "[guest-execution-marker]") {
   Harness harness;
-  harness.sink.reenter = harness.controller.get();
+  harness.sink.reenter_boundary = harness.controller.get();
   harness.clock.now = 100;
   REQUIRE(harness.controller->Begin());
   REQUIRE(harness.controller->OnPm4Marker(SwapMarker(1)));
@@ -407,6 +428,44 @@ TEST_CASE("Guest marker controller fails closed on sink reentry",
   REQUIRE(status.state == GuestExecutionMarkerControllerState::kFailed);
   REQUIRE(status.rejection ==
           GuestExecutionMarkerControllerRejection::kCallbackReentry);
+}
+
+TEST_CASE("Guest marker controller fails closed when an armed marker rejects",
+          "[guest-execution-marker]") {
+  GuestExecutionMarkerControllerConfig config;
+  config.stop_marker_count = 3;
+  Harness harness(config);
+  harness.ArmAtOrdinal(8);
+  REQUIRE(harness.controller->AcknowledgeBoundary(1));
+  harness.sink.accept_markers = false;
+  REQUIRE_FALSE(harness.controller->OnPm4Marker(SwapMarker(9)));
+  const GuestExecutionMarkerControllerStatus status =
+      harness.controller->status();
+  REQUIRE(status.state == GuestExecutionMarkerControllerState::kFailed);
+  REQUIRE(status.rejection ==
+          GuestExecutionMarkerControllerRejection::kArmedMarkerSinkRejected);
+  REQUIRE(status.forwarded_marker_count == 0);
+  REQUIRE(harness.sink.armed_markers ==
+          std::vector<gpu::Pm4MarkerEvent>{SwapMarker(9)});
+  REQUIRE(harness.sink.boundaries.size() == 1);
+}
+
+TEST_CASE("Guest marker controller rejects armed marker sink reentry",
+          "[guest-execution-marker]") {
+  GuestExecutionMarkerControllerConfig config;
+  config.stop_marker_count = 3;
+  Harness harness(config);
+  harness.ArmAtOrdinal(8);
+  REQUIRE(harness.controller->AcknowledgeBoundary(1));
+  harness.sink.reenter_marker = harness.controller.get();
+  REQUIRE_FALSE(harness.controller->OnPm4Marker(SwapMarker(9)));
+  REQUIRE_FALSE(harness.sink.reentry_result);
+  const GuestExecutionMarkerControllerStatus status =
+      harness.controller->status();
+  REQUIRE(status.state == GuestExecutionMarkerControllerState::kFailed);
+  REQUIRE(status.rejection ==
+          GuestExecutionMarkerControllerRejection::kCallbackReentry);
+  REQUIRE(status.forwarded_marker_count == 0);
 }
 
 TEST_CASE("Guest marker controller rejects ordinal regression",

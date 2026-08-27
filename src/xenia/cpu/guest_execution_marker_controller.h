@@ -53,8 +53,10 @@ enum class GuestExecutionMarkerControllerRejection : uint8_t {
   // The warmup elapsed without one matching marker, so the marker counter
   // never advanced and the title is not treated as live.
   kMarkerCounterStalled,
+  kArmBoundaryUnacknowledged,
   kOutstandingBoundaryOverflow,
   kBoundarySinkRejected,
+  kArmedMarkerSinkRejected,
   kMarkerSourceLost,
 };
 
@@ -91,14 +93,17 @@ class GuestExecutionMarkerClock {
   virtual uint64_t NowTicks() const noexcept = 0;
 };
 
-// Runs on the marker source thread with the controller lock held. It must not
-// block, allocate or call back into the controller. Returning false fails the
-// controller closed.
+// Runs on the marker source thread with the controller lock held. Neither
+// callback may block, allocate or call back into the controller. Once the arm
+// boundary is acknowledged, every matching marker is delivered exactly once
+// through OnArmedMarker before any stop boundary for that marker. Returning
+// false fails the controller closed.
 class GuestExecutionMarkerBoundarySink {
  public:
   virtual ~GuestExecutionMarkerBoundarySink() = default;
   virtual bool OnMarkerBoundary(
       const GuestExecutionMarkerBoundary& boundary) noexcept = 0;
+  virtual bool OnArmedMarker(const gpu::Pm4MarkerEvent& event) noexcept = 0;
 };
 
 struct GuestExecutionMarkerControllerConfig {
@@ -111,8 +116,8 @@ struct GuestExecutionMarkerControllerConfig {
   // The stop boundary is this many matching markers after the arm marker.
   uint64_t stop_marker_count = 1;
   // Boundaries handed off but not yet acknowledged when the next one is due.
-  // With the default, a stop marker arriving before the arm was acknowledged
-  // is an overflow rather than an interval whose start was never captured.
+  // The arm boundary must always be acknowledged before any later matching
+  // marker; this separate bound applies to all other boundary handoffs.
   uint64_t max_outstanding_boundaries = 1;
 };
 
@@ -129,6 +134,7 @@ struct GuestExecutionMarkerControllerStatus {
   uint64_t arm_marker_ordinal = 0;
   uint64_t stop_marker_ordinal = 0;
   uint64_t markers_since_arm = 0;
+  uint64_t forwarded_marker_count = 0;
   uint64_t emitted_boundary_count = 0;
   uint64_t acknowledged_boundary_count = 0;
   bool stop_requested = false;
@@ -180,6 +186,7 @@ class GuestExecutionMarkerController final : public gpu::Pm4MarkerSink {
                           const gpu::Pm4MarkerEvent& event,
                           uint64_t controller_tick,
                           GuestExecutionSessionStopReason stop_reason);
+  bool EmitArmedMarkerLocked(const gpu::Pm4MarkerEvent& event);
 
   // Recursive so a boundary sink that reenters reaches the explicit reentry
   // rejection instead of deadlocking on the source thread.
