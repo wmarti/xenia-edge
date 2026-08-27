@@ -451,9 +451,11 @@ class GuestExecutionSessionCodec {
   }
 
   // Fully decodes and binds each supplied chunk to the corresponding manifest
-  // reference. Exact chunk order, global event continuity, initial/final
-  // checkpoints, participant state, content-address metadata and reject-event
-  // dispositions are all verified before success.
+  // reference. Zero-segment continuous order is initial checkpoint, code
+  // corpus, canonical event chunks, optional continuous overlay chunks, final
+  // checkpoint. Segmented version-2 order omits the session-level corpus.
+  // Global event continuity, participant state, content-address metadata and
+  // reject-event dispositions are all verified before success.
   static bool ValidateSession(
       const GuestExecutionSessionManifest& manifest,
       const std::vector<std::vector<uint8_t>>& encoded_chunks,

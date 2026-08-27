@@ -183,10 +183,18 @@ void ReplaceContinuousEvents(
 
 std::vector<GuestExecutionContinuousEvent> DecodeContinuousEvents(
     const GuestExecutionSessionBundle& bundle) {
+  const auto reference = std::find_if(
+      bundle.manifest.chunks.cbegin(), bundle.manifest.chunks.cend(),
+      [](const GuestExecutionSessionChunkReference& chunk) {
+        return chunk.kind == GuestExecutionSessionChunkKind::kContinuousEvents;
+      });
+  REQUIRE(reference != bundle.manifest.chunks.cend());
+  const size_t chunk_index =
+      static_cast<size_t>(reference - bundle.manifest.chunks.cbegin());
   std::vector<GuestExecutionContinuousEvent> events;
   std::string error;
-  REQUIRE(GuestExecutionContinuousEventCodec::Decode(bundle.chunks[2], &events,
-                                                     &error));
+  REQUIRE(GuestExecutionContinuousEventCodec::Decode(bundle.chunks[chunk_index],
+                                                     &events, &error));
   REQUIRE(error.empty());
   return events;
 }
@@ -221,6 +229,15 @@ void ReplaceCanonicalEvents(GuestExecutionSessionBundle* bundle,
 void SplitContinuousEvents(GuestExecutionSessionBundle* bundle,
                            size_t split_index) {
   REQUIRE(bundle);
+  const auto reference = std::find_if(
+      bundle->manifest.chunks.cbegin(), bundle->manifest.chunks.cend(),
+      [](const GuestExecutionSessionChunkReference& chunk) {
+        return chunk.kind == GuestExecutionSessionChunkKind::kContinuousEvents;
+      });
+  REQUIRE(reference != bundle->manifest.chunks.cend());
+  const size_t continuous_index =
+      static_cast<size_t>(reference - bundle->manifest.chunks.cbegin());
+  REQUIRE(continuous_index + 2 == bundle->chunks.size());
   std::vector<GuestExecutionContinuousEvent> events =
       DecodeContinuousEvents(*bundle);
   REQUIRE(split_index > 0);
@@ -239,28 +256,40 @@ void SplitContinuousEvents(GuestExecutionSessionBundle* bundle,
                                                      &error));
 
   GuestExecutionSessionCheckpointChunk final;
-  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(bundle->chunks[3],
-                                                            &final, &error));
-  final.ordinal = 4;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+      bundle->chunks.back(), &final, &error));
+  final.ordinal = static_cast<uint32_t>(continuous_index + 2);
   std::vector<uint8_t> final_bytes;
   REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(final, &final_bytes,
                                                             &error));
 
-  bundle->chunks = {std::move(bundle->chunks[0]), std::move(bundle->chunks[1]),
-                    std::move(first_bytes), std::move(second_bytes),
-                    std::move(final_bytes)};
-  bundle->manifest.chunks = {
-      bundle->manifest.chunks[0], bundle->manifest.chunks[1],
-      ReferenceFor(GuestExecutionSessionChunkKind::kContinuousEvents, 2,
+  std::vector<std::vector<uint8_t>> chunks;
+  std::vector<GuestExecutionSessionChunkReference> references;
+  chunks.reserve(bundle->chunks.size() + 1);
+  references.reserve(bundle->manifest.chunks.size() + 1);
+  for (size_t i = 0; i < continuous_index; ++i) {
+    chunks.push_back(std::move(bundle->chunks[i]));
+    references.push_back(bundle->manifest.chunks[i]);
+  }
+  chunks.push_back(std::move(first_bytes));
+  references.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kContinuousEvents,
+                   static_cast<uint32_t>(continuous_index),
                    first.front().global_sequence, first.back().global_sequence,
-                   static_cast<uint32_t>(first.size()), bundle->chunks[2]),
-      ReferenceFor(GuestExecutionSessionChunkKind::kContinuousEvents, 3,
-                   second.front().global_sequence,
-                   second.back().global_sequence,
-                   static_cast<uint32_t>(second.size()), bundle->chunks[3]),
-      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 4,
+                   static_cast<uint32_t>(first.size()), chunks.back()));
+  chunks.push_back(std::move(second_bytes));
+  references.push_back(ReferenceFor(
+      GuestExecutionSessionChunkKind::kContinuousEvents,
+      static_cast<uint32_t>(continuous_index + 1),
+      second.front().global_sequence, second.back().global_sequence,
+      static_cast<uint32_t>(second.size()), chunks.back()));
+  chunks.push_back(std::move(final_bytes));
+  references.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, final.ordinal,
                    final.checkpoint.global_sequence,
-                   final.checkpoint.global_sequence, 1, bundle->chunks[4])};
+                   final.checkpoint.global_sequence, 1, chunks.back()));
+  bundle->chunks = std::move(chunks);
+  bundle->manifest.chunks = std::move(references);
 }
 
 void RemoveContinuousEvents(GuestExecutionSessionBundle* bundle) {
@@ -512,13 +541,19 @@ GuestExecutionSessionBundle MakePendingExternBundle(
   return bundle;
 }
 
-GuestExecutionSessionBundle MakeContinuousBundle(bool include_code = true,
-                                                 bool code_matches = true) {
+GuestExecutionSessionBundle MakeContinuousBundle(
+    bool include_code = true, bool code_matches = true,
+    uint32_t function_address = 0x82000000,
+    uint32_t function_end_address = 0x820000FC, bool include_overlay = false) {
   GuestExecutionSessionBundle bundle;
+  const std::vector<uint8_t> initial_state_bytes =
+      ThreadCheckpointBytes(0, 7, 0x82000040, 1);
+  const std::vector<uint8_t> final_state_bytes =
+      ThreadCheckpointBytes(0, 7, 0x82000044, 2);
   const GuestExecutionSessionSha256 initial_state =
-      AddBlob(&bundle, Bytes(64, 0x10));
+      AddBlob(&bundle, initial_state_bytes);
   const GuestExecutionSessionSha256 final_state =
-      AddBlob(&bundle, Bytes(64, 0x20));
+      AddBlob(&bundle, final_state_bytes);
   const std::vector<uint8_t> corpus_page = Bytes(JitCorpus::kPageSize, 0x30);
   const std::vector<uint8_t> checkpoint_code =
       code_matches ? corpus_page : Bytes(JitCorpus::kPageSize, 0x31);
@@ -527,7 +562,8 @@ GuestExecutionSessionBundle MakeContinuousBundle(bool include_code = true,
     code = AddBlob(&bundle, checkpoint_code);
   }
   ExecutionJitCorpusBuilder builder(JitCorpus::kConfigGuestScheduler);
-  ExecutionJitCorpus::FunctionRecord function = {0x82000000, 0x820000FC, 64, 0};
+  ExecutionJitCorpus::FunctionRecord function = {function_address,
+                                                 function_end_address, 64, 0};
   std::vector<uint8_t> corpus_bytes;
   std::string error;
   REQUIRE(builder.AddCodePage(0x82000000, corpus_page.data(),
@@ -541,7 +577,8 @@ GuestExecutionSessionBundle MakeContinuousBundle(bool include_code = true,
   GuestExecutionSessionCheckpointChunk initial;
   initial.session_epoch = kEpoch;
   initial.ordinal = 0;
-  initial.checkpoint.thread_states.push_back({0, 64, initial_state});
+  initial.checkpoint.thread_states.push_back(
+      {0, initial_state_bytes.size(), initial_state});
   if (include_code) {
     initial.checkpoint.content.push_back(
         {GuestExecutionSessionContentKind::kGuestCode, 0x82000000,
@@ -583,22 +620,51 @@ GuestExecutionSessionBundle MakeContinuousBundle(bool include_code = true,
 
   GuestExecutionSessionCheckpointChunk final_checkpoint;
   final_checkpoint.session_epoch = kEpoch;
-  final_checkpoint.ordinal = 3;
+  final_checkpoint.ordinal = include_overlay ? 4 : 3;
   final_checkpoint.checkpoint.global_sequence = 5;
-  final_checkpoint.checkpoint.thread_states.push_back({0, 64, final_state});
+  final_checkpoint.checkpoint.thread_states.push_back(
+      {0, final_state_bytes.size(), final_state});
   if (include_code) {
     final_checkpoint.checkpoint.content = initial.checkpoint.content;
   }
 
-  bundle.chunks.resize(4);
+  std::vector<GuestExecutionContinuousEvent> continuous_events;
+  if (include_overlay) {
+    for (const GuestExecutionSessionEvent& event : events.events) {
+      GuestExecutionContinuousEvent continuous;
+      continuous.global_sequence = event.global_sequence;
+      continuous.kind = event.kind;
+      if (event.thread_ordinal != kGuestExecutionSessionNoThread) {
+        continuous.actor = {event.thread_ordinal, 7};
+      }
+      continuous_events.push_back(continuous);
+    }
+    GuestExecutionContinuousEvent& held_continuous = continuous_events.back();
+    held_continuous.subject = {0, 7};
+    held_continuous.checkpoint.kind =
+        GuestExecutionContinuousCheckpointReferenceKind::kThreadState;
+    held_continuous.checkpoint.checkpoint_global_sequence = 5;
+    held_continuous.checkpoint.state_size = final_state_bytes.size();
+    held_continuous.checkpoint.state_sha256 = final_state;
+    const std::optional<ppc::GuestPPCThreadCheckpointBinding> final_binding =
+        DecodeCheckpointBinding(final_state_bytes);
+    REQUIRE(final_binding.has_value());
+    held_continuous.checkpoint.binding = *final_binding;
+  }
+
+  bundle.chunks.resize(include_overlay ? 5 : 4);
   REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
       initial, &bundle.chunks[0], &error));
   REQUIRE(GuestExecutionSessionCodec::EncodeCodeCorpusChunk(
       code_corpus, &bundle.chunks[1], &error));
   REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
       events, &bundle.chunks[2], &error));
+  if (include_overlay) {
+    REQUIRE(GuestExecutionContinuousEventCodec::Encode(
+        continuous_events, &bundle.chunks[3], &error));
+  }
   REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
-      final_checkpoint, &bundle.chunks[3], &error));
+      final_checkpoint, &bundle.chunks.back(), &error));
 
   GuestExecutionSessionManifest& manifest = bundle.manifest;
   manifest.session_epoch = kEpoch;
@@ -627,7 +693,7 @@ GuestExecutionSessionBundle MakeContinuousBundle(bool include_code = true,
   participant.first_event_sequence = 1;
   participant.last_event_sequence = 4;
   participant.held_after_event_sequence = 4;
-  participant.initial_state_size = 64;
+  participant.initial_state_size = initial_state_bytes.size();
   participant.initial_state_sha256 = initial_state;
   manifest.participants.push_back(participant);
   manifest.chunks.push_back(
@@ -638,9 +704,14 @@ GuestExecutionSessionBundle MakeContinuousBundle(bool include_code = true,
                    bundle.chunks[1]));
   manifest.chunks.push_back(ReferenceFor(
       GuestExecutionSessionChunkKind::kEvents, 2, 1, 5, 5, bundle.chunks[2]));
+  if (include_overlay) {
+    manifest.chunks.push_back(
+        ReferenceFor(GuestExecutionSessionChunkKind::kContinuousEvents, 3, 1, 5,
+                     5, bundle.chunks[3]));
+  }
   manifest.chunks.push_back(
-      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 3, 5, 5, 1,
-                   bundle.chunks[3]));
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint,
+                   final_checkpoint.ordinal, 5, 5, 1, bundle.chunks.back()));
   REQUIRE(GuestExecutionSessionCodec::ValidateSession(manifest, bundle.chunks,
                                                       &error));
   std::reverse(bundle.content_blobs.begin(), bundle.content_blobs.end());
@@ -817,6 +888,7 @@ TEST_CASE("session bundle bounds aggregate decoded overlay state",
 TEST_CASE("session bundle preserves the legacy path without an overlay",
           "[guest-execution-session-bundle]") {
   GuestExecutionSessionBundle bundle = MakeBundle();
+  REQUIRE(GuestExecutionSessionCodec::kVersion == 2);
   GuestExecutionSessionEventChunk events;
   std::string error;
   REQUIRE(GuestExecutionSessionCodec::DecodeEventChunk(bundle.chunks[1],
@@ -832,6 +904,12 @@ TEST_CASE("session bundle preserves the legacy path without an overlay",
       events.events.back().global_sequence,
       static_cast<uint32_t>(events.events.size()), bundle.chunks[1]);
   RemoveContinuousEvents(&bundle);
+  CHECK(std::none_of(
+      bundle.manifest.chunks.cbegin(), bundle.manifest.chunks.cend(),
+      [](const GuestExecutionSessionChunkReference& chunk) {
+        return chunk.kind == GuestExecutionSessionChunkKind::kCodeCorpus ||
+               chunk.kind == GuestExecutionSessionChunkKind::kContinuousEvents;
+      }));
   REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
   CHECK(error.empty());
 }
@@ -914,6 +992,60 @@ TEST_CASE("continuous session bundle closes exact corpus code",
   std::string error;
   GuestExecutionSessionBundle bundle = MakeContinuousBundle();
   REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+
+  SECTION("overlay checkpoint binds to the exact corpus function") {
+    bundle = MakeContinuousBundle(true, true, 0x82000000, 0x820000FC, true);
+    REQUIRE(bundle.manifest.segments.empty());
+    REQUIRE(bundle.manifest.chunks.size() == 5);
+    CHECK(bundle.manifest.chunks[0].kind ==
+          GuestExecutionSessionChunkKind::kCheckpoint);
+    CHECK(bundle.manifest.chunks[1].kind ==
+          GuestExecutionSessionChunkKind::kCodeCorpus);
+    CHECK(bundle.manifest.chunks[2].kind ==
+          GuestExecutionSessionChunkKind::kEvents);
+    CHECK(bundle.manifest.chunks[3].kind ==
+          GuestExecutionSessionChunkKind::kContinuousEvents);
+    CHECK(bundle.manifest.chunks[4].kind ==
+          GuestExecutionSessionChunkKind::kCheckpoint);
+    REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    CHECK(error.empty());
+  }
+
+  SECTION("page-covered route without its owning corpus function rejects") {
+    bundle = MakeContinuousBundle(true, true, 0x82000100, 0x820001FC, true);
+    REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                        bundle.chunks, &error));
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    CHECK(error.find("owning function is absent") != std::string::npos);
+  }
+
+  SECTION("owning corpus function extent mismatch rejects") {
+    bundle = MakeContinuousBundle(true, true, 0x82000000, 0x820000F8, true);
+    REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                        bundle.chunks, &error));
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    CHECK(error.find("owning function extent differs") != std::string::npos);
+  }
+
+  SECTION("corpus and split overlay retain canonical chunk order") {
+    bundle = MakeContinuousBundle(true, true, 0x82000000, 0x820000FC, true);
+    SplitContinuousEvents(&bundle, 3);
+    REQUIRE(bundle.manifest.chunks.size() == 6);
+    CHECK(bundle.manifest.chunks[0].kind ==
+          GuestExecutionSessionChunkKind::kCheckpoint);
+    CHECK(bundle.manifest.chunks[1].kind ==
+          GuestExecutionSessionChunkKind::kCodeCorpus);
+    CHECK(bundle.manifest.chunks[2].kind ==
+          GuestExecutionSessionChunkKind::kEvents);
+    CHECK(bundle.manifest.chunks[3].kind ==
+          GuestExecutionSessionChunkKind::kContinuousEvents);
+    CHECK(bundle.manifest.chunks[4].kind ==
+          GuestExecutionSessionChunkKind::kContinuousEvents);
+    CHECK(bundle.manifest.chunks[5].kind ==
+          GuestExecutionSessionChunkKind::kCheckpoint);
+    REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    CHECK(error.empty());
+  }
 
   SECTION("missing initial guest code rejects") {
     bundle = MakeContinuousBundle(false);

@@ -688,6 +688,11 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
   uint64_t total_checkpoint_thread_states = 0;
   uint32_t code_corpus_chunk_count = 0;
   uint64_t chunk_bytes = 0;
+  // Segmented version-2 sessions are checkpoint, canonical events, optional
+  // continuous overlay, checkpoint. Zero-segment continuous sessions insert
+  // their single mandatory code corpus immediately after the initial
+  // checkpoint. In both shapes all canonical event chunks precede all overlay
+  // chunks, and the final checkpoint closes the sequence.
   for (size_t i = 0; i < manifest.chunks.size(); ++i) {
     const GuestExecutionSessionChunkReference& chunk = manifest.chunks[i];
     if (!IsKnownChunkKind(chunk.kind) || chunk.ordinal != i ||

@@ -38,7 +38,10 @@ enum class GuestExecutionContinuousCheckpointReferenceKind : uint32_t {
 // Content-addressed reference to one GuestPPCThreadCheckpointCodec blob. The
 // binding is an independent producer declaration: validation must match the
 // decoded blob to it and close its owning extent to captured code before a
-// replay may attach the state to a ThreadState.
+// replay may attach the state to a ThreadState. A zero-segment continuous
+// bundle additionally binds the owning entry and end exactly to its mandatory
+// session-level code corpus; segmented version-2 bundles retain their legacy
+// per-segment corpus contract.
 struct GuestExecutionContinuousCheckpointReference {
   GuestExecutionContinuousCheckpointReferenceKind kind =
       GuestExecutionContinuousCheckpointReferenceKind::kNone;

@@ -475,6 +475,48 @@ bool ValidateContinuousCodeClosure(
                 "continuous session code corpus is invalid: " + corpus_error);
   }
 
+  // A zero-segment session has one mandatory session-level corpus. Close every
+  // resumable overlay route to an exact function record in that corpus, not
+  // merely to a captured page containing the declared extent. Segmented
+  // version-2 sessions retain their per-segment corpus contract and are not
+  // retroactively interpreted as one union corpus here.
+  GuestExecutionContinuousEventLimits continuous_limits;
+  continuous_limits.maximum_encoded_bytes = limits.maximum_chunk_bytes;
+  continuous_limits.maximum_records = limits.maximum_events_per_chunk;
+  for (size_t chunk_index = 0; chunk_index < bundle.chunks.size();
+       ++chunk_index) {
+    if (bundle.manifest.chunks[chunk_index].kind !=
+        GuestExecutionSessionChunkKind::kContinuousEvents) {
+      continue;
+    }
+    std::vector<GuestExecutionContinuousEvent> events;
+    if (!GuestExecutionContinuousEventCodec::Decode(
+            bundle.chunks[chunk_index], &events, error, continuous_limits)) {
+      return false;
+    }
+    for (const GuestExecutionContinuousEvent& event : events) {
+      if (event.checkpoint.kind !=
+          GuestExecutionContinuousCheckpointReferenceKind::kThreadState) {
+        continue;
+      }
+      const ppc::GuestPPCThreadCheckpointBinding& binding =
+          event.checkpoint.binding;
+      const ExecutionJitCorpus::FunctionRecord* function =
+          corpus.FindFunction(binding.owning_function_address);
+      if (!function) {
+        return Fail(
+            error,
+            "zero-segment continuous checkpoint owning function is absent "
+            "from the session code corpus");
+      }
+      if (function->end_address != binding.owning_function_end_address) {
+        return Fail(error,
+                    "zero-segment continuous checkpoint owning function extent "
+                    "differs from the session code corpus");
+      }
+    }
+  }
+
   std::map<uint64_t, GuestExecutionSessionContentReference> initial_code;
   for (const GuestExecutionSessionContentReference& content :
        initial.checkpoint.content) {
