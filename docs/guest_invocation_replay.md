@@ -2,7 +2,10 @@
 
 This document defines the narrow first step from compile-only JIT corpora to
 repeatable offline execution of code captured from a real title. The target is
-CPU optimization measurement, not a general save-state format.
+CPU optimization measurement, not a general save-state format. A single
+invocation is a verified segment primitive, not the campaign endpoint; the
+arbitrary-duration capture-session contract and current TODO are defined in
+`guest_execution_replay.md`.
 
 ## What v1 proves
 
@@ -27,32 +30,53 @@ The replay consumer is implemented as isolated commits: strict artifact and
 execution-corpus codecs, exact replay module, architectural reset, Apple/A64
 warmed runner, canonical configuration fingerprint, bounded workload planning,
 single-invocation CLI, current-thread CPU timing, paired fail-closed driver and
-copyright-free synthetic fixtures. This is not yet a real-title replay result;
-the linked end-to-end gate and recorder producer remain open.
+copyright-free synthetic fixtures. The platform-neutral recorder, exact corpus
+encoder, atomic bundle writer, serialized coordinator, Processor/PPC
+translation-closure plumbing, A64 control-flow hooks and one-segment application
+runtime are also integrated. This is not yet a real-title replay result: the A64
+memory hooks and linked capture-build end-to-end gate remain open.
 
-- [ ] Finish adversarial hardening and the serialized Release validation matrix:
-      `./xb format --all`, Python driver tests, full CPU tests, exactly 169,048
-      PPC corpus cases, one valid linked replay, and actual omitted-page and
-      `0x7F` child failures with no accepted marker.
+- [x] Pass the current linked single-binary Release matrix: `./xb format --all`,
+      Python verifier tests, 367 CPU cases / 93,768 assertions, the exact current
+      570-suite / 169,515-case PPC source closure under
+      `--guest_scheduler=false`, one valid linked replay, and actual omitted-page
+      and `0x7F` child failures with no accepted marker.
+- [ ] Complete the distinct-binary paired-driver fault/attestation matrix after
+      the first capture-build implementation changes the linked executable hash.
 - [x] Add a deterministic exact-corpus builder that retains the complete
       translation/declaration closure required by executed functions, including
       static callees and helper/save-restore metadata that translation looks up
       even when that function is not entered during the selected invocation.
-- [ ] Add the bounded platform-neutral recorder state machine: explicit root and
+- [x] Add the bounded platform-neutral recorder state machine: explicit root and
       occurrence selection, convergence across attempts, pointer-free entry/exit
       state, page/granule closure, call-stack checks, dependency flags and strict
       count/size/deadline rejection.
-- [ ] Add build-only A64 boundary, translation-dependency and pre-memory-access
-      hooks. Reject extern/kernel, MMIO, clock, atomic/reservation, recursion,
-      tail/longjmp imbalance, async reentry, self-modifying code and cross-thread
-      writes instead of truncating or approximating the capture.
+- [x] Add the serialized capture event coordinator, exactly-once reentrant-safe
+      publication and Processor/PPC definition/dependency plumbing. Normal-build
+      linked tests remain green; capture-build linkage is part of the next gate.
+- [x] Add build-only A64 entry, return, direct/indirect tail-call,
+      extern/kernel-transition, unwind/longjmp and asynchronous-host-reentry
+      hooks with focused full-state and ordering tests.
+- [ ] Add build-only A64 pre-memory-access hooks. Reject MMIO, clock,
+      atomic/reservation, self-modifying code and cross-thread writes instead of
+      truncating or approximating the capture.
 - [x] Add a reusable writer for one accepted invocation and exact corpus. It
       validates and round-trips the payloads, records the capture-build and
       canonical-config hashes, never replaces output or staging, and publishes
       through one same-parent directory rename.
-- [ ] Wire the bounded recorder to hash its running executable and call the
-      bundle writer. Captured title bytes remain local benchmark inputs and must
-      never be committed.
+- [x] Wire the bounded recorder after per-title configuration and before guest
+      translation, hash its running executable, build the exact successful-
+      definition-order corpus and call the atomic bundle writer. Configuration
+      is strict, `guest_scheduler=false` is mandatory, output is never replaced,
+      and the sink is detached only after guest callbacks stop.
+      Captured title bytes remain local benchmark inputs and must never be
+      committed.
+- [ ] Generalize the current one-accepted-segment producer into a user-selected
+      bounded execution session (manual start/stop, guest marker count or
+      duration) with ordered segment metadata, shared content-addressed pages
+      and code, and explicit rejection and coverage accounting. The stable event
+      sink is intentionally session-generic; the current bundle is only the
+      verified single-segment primitive.
 - [ ] Pass the recorder's synthetic positive and negative matrix before enabling
       a bounded GTA capture. For each accepted title invocation, require exact
       baseline offline output parity and stable code shape before collecting CPU
@@ -199,6 +223,20 @@ collected with a bounded convergence loop:
 
 Capture attempts, pages, bytes and accepted samples all have explicit limits.
 Hitting a limit rejects the sample instead of truncating it.
+
+The producer exists only in an Apple ARM64 Release build configured with
+`./xb build --config release --enable-guest-invocation-capture`. Capture is
+armed only when all of these transient options are supplied together:
+`--guest_invocation_capture_output`,
+`--guest_invocation_capture_root_address`,
+`--guest_invocation_capture_root_end_address` and
+`--guest_invocation_capture_occurrence`. Addresses are exactly eight hexadecimal
+digits (an optional `0x` prefix is accepted), occurrence is 1-based, and the
+output directory and its `.part` sibling must not exist. The launch must also
+pass `--guest_scheduler=false` and satisfy every canonical timed-replay control;
+the producer validates the effective post-title configuration and refuses to
+launch the title on any mismatch. Optional transient count and duration limits
+use the `guest_invocation_capture_max_*` prefix.
 
 The legacy `Memory::Save` stream is not used as an intermediate capture format.
 It is implicit, unversioned at the memory layer and tied to native heap-page
@@ -382,15 +420,18 @@ Results from a handful of functions are weighted by measured live execution
 counts only when that provenance matches the captured title and scenario.
 Unweighted results remain per-invocation results.
 
-## Path to continuous gameplay segments
+## Path to bounded gameplay intervals
 
-A fixed-work multi-thread gameplay replay remains a later layer. The current
-legacy save-state path is not its foundation yet: its kernel stream layout is
-misaligned, failure cleanup is unsafe, thread and clock state are incomplete,
-and GPU state is not preserved.
+Multi-thread gameplay replay is now an active campaign layer, specified in
+`guest_execution_replay.md`. The current legacy save-state path is not silently
+treated as its foundation: its kernel stream layout is misaligned, failure
+cleanup is unsafe, thread and clock state are incomplete, and GPU state is not
+preserved. The interval layer therefore requires explicit checkpoints,
+scheduling and external-event records with fail-closed mutation accounting.
 
-That layer starts only after save/restore is versioned, fail-closed and covered
-by synthetic round-trip tests. Its first fidelity reference uses the same Metal
+Its new checkpoint and event codecs must be versioned, fail-closed and covered
+by synthetic round-trip tests; the work does not wait for or silently import the
+legacy save-state stream. Its first fidelity reference uses the same Metal
 backend and measures guest CPU threads only. Null GPU and no-op APU modes are
 admitted only if their untimed work and end-state digests match the Metal
 reference.

@@ -82,6 +82,27 @@ option(XENIA_ENABLE_PROFILER "Enable profiler (UI is Debug-only)" OFF)
 option(XENIA_ENABLE_ITRACE "Enable JIT per-instruction tracing to the log (slow)" OFF)
 option(XENIA_ENABLE_DTRACE "Enable JIT per-operation data tracing to the log (very slow)" OFF)
 option(XENIA_ENABLE_FTRACE "Enable JIT per-function-call tracing to the log" OFF)
+option(
+  XENIA_ENABLE_GUEST_INVOCATION_CAPTURE
+  "Enable bounded guest-invocation capture hooks in Apple A64 Release builds"
+  OFF)
+
+if(XENIA_ENABLE_GUEST_INVOCATION_CAPTURE)
+  if(NOT APPLE OR NOT XE_TARGET_AARCH64)
+    message(FATAL_ERROR
+      "Guest-invocation capture is supported only for Apple A64 builds")
+  endif()
+  if(XENIA_ENABLE_PROFILER OR XENIA_ENABLE_ITRACE OR XENIA_ENABLE_DTRACE OR
+     XENIA_ENABLE_FTRACE)
+    message(FATAL_ERROR
+      "Guest-invocation capture cannot be combined with profiler or JIT trace instrumentation")
+  endif()
+endif()
+
+# Keep this numeric definition consistent in every translation unit. Normal,
+# Debug and Checked builds compile the capture ownership and hot callbacks out.
+add_compile_definitions(
+  XE_ENABLE_GUEST_INVOCATION_CAPTURE=$<IF:$<AND:$<BOOL:${XENIA_ENABLE_GUEST_INVOCATION_CAPTURE}>,$<CONFIG:Release>>,1,0>)
 
 if(XENIA_ENABLE_PROFILER)
   # UI is Debug-only — shutdown dump spams the log otherwise.

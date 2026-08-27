@@ -788,7 +788,8 @@ def download_slang():
 def run_cmake_configure(cc=None, generator=None, build_tests=False,
                         disable_lto=False, enable_profiler=False,
                         enable_itrace=False, enable_dtrace=False,
-                        enable_ftrace=False, build_misc=False,
+                        enable_ftrace=False,
+                        enable_guest_invocation_capture=False, build_misc=False,
                         target_arch=None, config=None):
     """Runs `cmake` to (re)configure build/ from the source root.
 
@@ -799,8 +800,10 @@ def run_cmake_configure(cc=None, generator=None, build_tests=False,
     (faster Release link, at the cost of LTO's whole-program opts);
     enable_profiler toggles -DXENIA_ENABLE_PROFILER=ON (microprofile
     instrumentation; UI overlay only in Debug, profile.html dump on
-    shutdown otherwise); build_misc toggles -DXENIA_BUILD_MISC=ON (trace
-    viewers and dumps, shader compiler, vfs-dump, demos).
+    shutdown otherwise); enable_guest_invocation_capture toggles the dedicated
+    Apple ARM64 Release-only bounded capture hooks; build_misc toggles
+    -DXENIA_BUILD_MISC=ON (trace viewers and dumps, shader compiler, vfs-dump,
+    demos).
     target_arch enables cross-compilation on
     Windows (arm64↔x64 via the MSVC cross-compiler) and macOS
     (arm64↔x86_64 via clang's -arch and CMAKE_OSX_ARCHITECTURES) into a
@@ -895,6 +898,10 @@ def run_cmake_configure(cc=None, generator=None, build_tests=False,
     args += [f"-DXENIA_ENABLE_ITRACE={'ON' if enable_itrace else 'OFF'}"]
     args += [f"-DXENIA_ENABLE_DTRACE={'ON' if enable_dtrace else 'OFF'}"]
     args += [f"-DXENIA_ENABLE_FTRACE={'ON' if enable_ftrace else 'OFF'}"]
+    args += [
+        "-DXENIA_ENABLE_GUEST_INVOCATION_CAPTURE="
+        f"{'ON' if enable_guest_invocation_capture else 'OFF'}"
+    ]
     args += [f"-DXENIA_BUILD_MISC={'ON' if build_misc else 'OFF'}"]
     if config:
         args += [f"-DCMAKE_BUILD_TYPE={config.title()}"]
@@ -1173,6 +1180,13 @@ class BaseBuildCommand(Command):
             help="Enables JIT per-function-call tracing to the log (sets "
                  "-DXENIA_ENABLE_FTRACE=ON). For debugging only.")
         self.parser.add_argument(
+            "--enable-guest-invocation-capture",
+            dest="enable_guest_invocation_capture", action="store_true",
+            default=False,
+            help="Enables bounded guest-invocation capture hooks (sets "
+                 "-DXENIA_ENABLE_GUEST_INVOCATION_CAPTURE=ON). Apple ARM64 "
+                 "Release builds only.")
+        self.parser.add_argument(
             "--build-misc", dest="build_misc", action="store_true",
             default=False,
             help="Enables building the misc subprojects (sets "
@@ -1186,6 +1200,14 @@ class BaseBuildCommand(Command):
 
     def execute(self, args, pass_args, cwd):
         target_arch = args.get("target_arch")
+        if (args["enable_guest_invocation_capture"] and
+                args["config"] != "release"):
+            print_error("Guest-invocation capture requires --config release.")
+            return 1
+        if (args["enable_guest_invocation_capture"] and args["no_configure"]):
+            print_error("Guest-invocation capture cannot be enabled while "
+                        "skipping CMake configuration.")
+            return 1
         if not args["no_configure"]:
             print("- running cmake configure...")
             ret = run_cmake_configure(
@@ -1196,6 +1218,8 @@ class BaseBuildCommand(Command):
                 enable_itrace=args["enable_itrace"],
                 enable_dtrace=args["enable_dtrace"],
                 enable_ftrace=args["enable_ftrace"],
+                enable_guest_invocation_capture=
+                    args["enable_guest_invocation_capture"],
                 build_misc=args["build_misc"],
                 target_arch=target_arch,
                 config=args["config"],

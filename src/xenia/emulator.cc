@@ -21,6 +21,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
 #include "xenia/base/exception_handler.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/mapped_memory.h"
@@ -30,12 +31,19 @@
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/guest_invocation_capture_runtime.h"
+#include "xenia/cpu/processor.h"
+#endif
 #include "xenia/cpu/thread_state.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/guest_scheduler.h"
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/kernel/kernel_flags.h"
+#endif
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
@@ -203,6 +211,79 @@ Emulator::Emulator(const std::filesystem::path& command_line,
 
 Emulator::~Emulator() { Shutdown(); }
 
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+X_STATUS Emulator::InitializeGuestInvocationCapture() {
+  if (!cpu::GuestInvocationCaptureRuntime::IsRequested()) {
+    return X_STATUS_SUCCESS;
+  }
+  if (guest_invocation_capture_) {
+    XELOGE(
+        "Guest invocation capture initialization rejected: capture is "
+        "already active");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  if (!memory_ || !processor_) {
+    XELOGE(
+        "Guest invocation capture initialization rejected: CPU memory and "
+        "processor are not initialized");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  std::string error;
+  std::unique_ptr<cpu::GuestInvocationCaptureRuntime> runtime =
+      cpu::GuestInvocationCaptureRuntime::Create(
+          *memory_, *processor_, cvars::guest_scheduler, &error);
+  if (!runtime) {
+    XELOGE("Guest invocation capture initialization rejected: {}",
+           error.empty() ? "unknown capture configuration error" : error);
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  guest_invocation_capture_ = std::move(runtime);
+  const cpu::ppc::GuestInvocationRecorderSelection& selection =
+      guest_invocation_capture_->selection();
+  XELOGI(
+      "Guest invocation capture armed before title translation: output={} "
+      "root={:08X}-{:08X} occurrence={}",
+      path_to_utf8(guest_invocation_capture_->output_directory()),
+      selection.root_address, selection.root_end_address, selection.occurrence);
+  return X_STATUS_SUCCESS;
+}
+
+void Emulator::ShutdownGuestInvocationCapture() {
+  if (!guest_invocation_capture_) {
+    return;
+  }
+  guest_invocation_capture_->Stop();
+  const cpu::GuestInvocationCaptureStatus status =
+      guest_invocation_capture_->status();
+  switch (status.state) {
+    case cpu::GuestInvocationCaptureState::kPublished:
+      XELOGI("Guest invocation capture finalized: one segment published");
+      break;
+    case cpu::GuestInvocationCaptureState::kRejected:
+    case cpu::GuestInvocationCaptureState::kPublicationFailed:
+      XELOGE(
+          "Guest invocation capture finalized without output: state={} "
+          "rejection={} dependency_flags={:08X} diagnostic={}",
+          static_cast<uint32_t>(status.state),
+          static_cast<uint32_t>(status.rejection),
+          status.rejected_dependency_flags,
+          status.message.empty() ? "missing diagnostic" : status.message);
+      break;
+    case cpu::GuestInvocationCaptureState::kStopped:
+      XELOGW("Guest invocation capture finalized incomplete: {}",
+             status.message.empty() ? "missing diagnostic" : status.message);
+      break;
+    case cpu::GuestInvocationCaptureState::kPublishing:
+    case cpu::GuestInvocationCaptureState::kRecording:
+      XELOGE("Guest invocation capture finalized in an invalid state: {}",
+             static_cast<uint32_t>(status.state));
+      break;
+  }
+  guest_invocation_capture_.reset();
+}
+#endif
+
 void Emulator::Shutdown() {
   XELOGI("Emulator::Shutdown: starting teardown");
 
@@ -235,6 +316,11 @@ void Emulator::Shutdown() {
   audio_media_player_.reset();
 
   kernel_state_.reset();
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Kernel teardown joins guest execution. Detach the non-owning CPU sink only
+  // after callbacks have stopped, but before Processor or Memory destruction.
+  ShutdownGuestInvocationCapture();
+#endif
   file_system_.reset();
   patcher_.reset();
   plugin_loader_.reset();
@@ -470,6 +556,9 @@ X_STATUS Emulator::TerminateTitle() {
   }
 
   kernel_state_->TerminateTitle();
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  ShutdownGuestInvocationCapture();
+#endif
   title_id_ = std::nullopt;
   title_name_ = "";
   title_version_ = "";
@@ -1943,6 +2032,21 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // translated yet, which is the only window where this can be picked up.
   processor_->RefreshTraceCountsEnabled();
 
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  const X_STATUS capture_status = InitializeGuestInvocationCapture();
+  if (XFAILED(capture_status)) {
+    return capture_status;
+  }
+  // Every failure after attachment must disarm the sink so a later launch can
+  // retry safely. This guard performs no allocation and is released only once
+  // the title launch has succeeded.
+  const auto capture_launch_rollback = [this](void*) {
+    ShutdownGuestInvocationCapture();
+  };
+  std::unique_ptr<void, decltype(capture_launch_rollback)> capture_launch_guard(
+      guest_invocation_capture_.get(), capture_launch_rollback);
+#endif
+
   // Expose the HDD content partition. Games that resolve saves/DLC to a raw
   // \Device\Harddisk0\Partition1\Content path via XamContentResolve open it
   // directly, not through the save:/dlc: symlinks. Without this the open lands
@@ -2187,6 +2291,9 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // suspend count without resuming it until the debugger wants.
   main_thread_->Resume();
 
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  capture_launch_guard.release();
+#endif
   return X_STATUS_SUCCESS;
 }
 

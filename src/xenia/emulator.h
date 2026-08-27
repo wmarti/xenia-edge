@@ -40,6 +40,9 @@ class AudioSystem;
 }  // namespace apu
 namespace cpu {
 class ExportResolver;
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+class GuestInvocationCaptureRuntime;
+#endif
 class Processor;
 class ThreadState;
 }  // namespace cpu
@@ -433,6 +436,11 @@ class Emulator {
   X_STATUS CompleteLaunch(const std::filesystem::path& path,
                           const std::string_view module_path);
 
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  X_STATUS InitializeGuestInvocationCapture();
+  void ShutdownGuestInvocationCapture();
+#endif
+
   std::filesystem::path command_line_;
   std::filesystem::path last_launch_path_;  // persists across relaunch
   DiscProvider disc_provider_;
@@ -450,6 +458,11 @@ class Emulator {
   std::unique_ptr<Memory> memory_;
 
   std::unique_ptr<cpu::Processor> processor_;
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Owns the capture sink registered non-owningly with Processor. It must be
+  // detached and stopped before processor_ is destroyed.
+  std::unique_ptr<cpu::GuestInvocationCaptureRuntime> guest_invocation_capture_;
+#endif
   std::unique_ptr<apu::AudioSystem> audio_system_;
   std::unique_ptr<apu::AudioMediaPlayer> audio_media_player_;
   std::unique_ptr<gpu::GraphicsSystem> graphics_system_;
