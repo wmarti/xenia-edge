@@ -568,7 +568,7 @@ class SwitchOutGateObserver final : public GuestSchedulerCaptureObserver {
     return true;
   }
 
-  bool CanDetach() const noexcept override { return false; }
+  bool CanDetach() const noexcept override { return true; }
 
   void SetTargetThread(uint32_t thread_id) {
     target_thread_id_.store(thread_id, std::memory_order_release);
