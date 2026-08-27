@@ -11,6 +11,11 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/guest_execution_capture.h"
+#include "xenia/cpu/processor.h"
+#endif
 #include "xenia/cpu/symbol.h"
 #include "xenia/cpu/thread_state.h"
 
@@ -35,6 +40,54 @@ struct GuestFnScope {
 #define GUEST_FN_SCOPE(address) GuestFnScope guest_fn_scope_(address)
 #else
 #define GUEST_FN_SCOPE(address)
+#endif
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+namespace {
+
+class GuestExecutionCaptureHostCallGuard {
+ public:
+  GuestExecutionCaptureHostCallGuard(GuestFunction& function,
+                                     ThreadState& thread_state,
+                                     uint32_t return_address,
+                                     ThreadState* original_thread_state)
+      : function_(function),
+        thread_state_(thread_state),
+        original_thread_state_(original_thread_state),
+        token_(thread_state.processor()->BeginGuestExecutionCaptureHostCall(
+            thread_state, function, return_address)) {}
+
+  ~GuestExecutionCaptureHostCallGuard() {
+    if (token_) {
+      thread_state_.processor()->EndGuestExecutionCaptureHostCall(
+          token_, thread_state_, function_, outcome_);
+    }
+    if (original_thread_state_ != &thread_state_) {
+      ThreadState::Bind(original_thread_state_);
+    }
+  }
+
+  GuestExecutionCaptureHostCallGuard(
+      const GuestExecutionCaptureHostCallGuard&) = delete;
+  GuestExecutionCaptureHostCallGuard& operator=(
+      const GuestExecutionCaptureHostCallGuard&) = delete;
+
+  void SetResult(bool entered) {
+    outcome_ = entered ? GuestExecutionCaptureHostCallOutcome::kReturnedToHost
+                       : GuestExecutionCaptureHostCallOutcome::kFailedToEnter;
+  }
+
+ private:
+  GuestFunction& function_;
+  ThreadState& thread_state_;
+  ThreadState* original_thread_state_ = nullptr;
+  GuestExecutionCaptureHostCallToken token_;
+  GuestExecutionCaptureHostCallOutcome outcome_ =
+      GuestExecutionCaptureHostCallOutcome::kAbortedByHostUnwind;
+};
+
+}  // namespace
 #endif
 
 Function::Function(Module* module, uint32_t address)
@@ -153,6 +206,18 @@ uint32_t GuestFunction::MapMachineCodeToGuestAddress(
 bool GuestFunction::Call(ThreadState* thread_state, uint32_t return_address) {
   GUEST_FN_SCOPE(address());
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  ThreadState* original_thread_state = ThreadState::Get();
+  if (original_thread_state != thread_state) {
+    ThreadState::Bind(thread_state);
+  }
+  GuestExecutionCaptureHostCallGuard capture_guard(
+      *this, *thread_state, return_address, original_thread_state);
+  const bool result = CallImpl(thread_state, return_address);
+  capture_guard.SetResult(result);
+  return result;
+#else
   ThreadState* original_thread_state = ThreadState::Get();
   if (original_thread_state != thread_state) {
     ThreadState::Bind(thread_state);
@@ -165,6 +230,7 @@ bool GuestFunction::Call(ThreadState* thread_state, uint32_t return_address) {
   }
 
   return result;
+#endif
 }
 
 }  // namespace cpu

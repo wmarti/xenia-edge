@@ -24,6 +24,10 @@
 #include "xenia/cpu/entry_table.h"
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/cpu/function.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/guest_execution_capture.h"
+#endif
 #include "xenia/cpu/module.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
 #include "xenia/cpu/thread_debug_info.h"
@@ -90,6 +94,21 @@ class Processor {
   GuestInvocationCaptureEventSink* guest_invocation_capture_sink() const {
     return guest_invocation_capture_sink_;
   }
+
+  // Orthogonal to the one-invocation event sink above. Registration is
+  // shared-owned and may not be replaced or detached while dispatch callbacks
+  // or successfully begun host-to-guest calls are active.
+  bool AttachGuestExecutionCaptureHostCallObserver(
+      std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer);
+  bool DetachGuestExecutionCaptureHostCallObserver(
+      const std::shared_ptr<GuestExecutionCaptureHostCallObserver>& observer);
+  GuestExecutionCaptureHostCallToken BeginGuestExecutionCaptureHostCall(
+      const ThreadState& thread_state, const GuestFunction& function,
+      uint32_t return_address);
+  bool EndGuestExecutionCaptureHostCall(
+      GuestExecutionCaptureHostCallToken token, const ThreadState& thread_state,
+      const GuestFunction& function,
+      GuestExecutionCaptureHostCallOutcome outcome);
 #endif
 
   bool Setup(std::unique_ptr<backend::Backend> backend);
@@ -344,6 +363,16 @@ class Processor {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   GuestInvocationCaptureEventSink* guest_invocation_capture_sink_ = nullptr;
+
+  // Protects observer registration and short callback acquisition leases. It
+  // is never held while invoking the observer, which may later rendezvous and
+  // block guest execution in a dedicated capture build.
+  std::mutex guest_execution_capture_host_call_observer_mutex_;
+  std::shared_ptr<GuestExecutionCaptureHostCallObserver>
+      guest_execution_capture_host_call_observer_;
+  uint64_t guest_execution_capture_host_call_dispatch_count_ = 0;
+  uint64_t guest_execution_capture_host_call_dispatch_epoch_ = 0;
+  bool guest_execution_capture_host_call_observer_transition_pending_ = false;
 #endif
 
   // Opt-in capture ordering lock. Recursive because defining a guest function

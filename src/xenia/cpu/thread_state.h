@@ -48,6 +48,14 @@ class ThreadState {
   void* backend_data() const { return backend_data_; }
   ppc::PPCContext* context() const { return context_; }
   uint32_t thread_id() const { return thread_id_; }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Process-local identity for one ThreadState lifetime. Unlike a pointer or
+  // guest thread ID, this is not reused after destruction and recreation.
+  uint64_t guest_execution_capture_instance_id() const {
+    return guest_execution_capture_instance_id_;
+  }
+#endif
 
   static void Bind(ThreadState* thread_state);
   static ThreadState* Get();
@@ -62,6 +70,10 @@ class ThreadState {
 
   uint32_t pcr_address_ = 0;
   uint32_t thread_id_ = 0;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  uint64_t guest_execution_capture_instance_id_ = 0;
+#endif
 
   FunctionTraceState function_trace_state_;
 

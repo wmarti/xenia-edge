@@ -9,6 +9,11 @@
 
 #include "xenia/cpu/thread_state.h"
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include <atomic>
+#include <limits>
+#endif
 #include <cstdlib>
 #include <cstring>
 
@@ -20,6 +25,28 @@
 #include "xenia/xbox.h"
 namespace xe {
 namespace cpu {
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+namespace {
+
+std::atomic<uint64_t> next_guest_execution_capture_thread_instance_id{1};
+
+uint64_t AllocateGuestExecutionCaptureThreadInstanceId() {
+  const uint64_t instance_id =
+      next_guest_execution_capture_thread_instance_id.fetch_add(
+          1, std::memory_order_relaxed);
+  // Never permit wraparound to make two ThreadState lifetimes
+  // indistinguishable. Exhausting a 64-bit process-local namespace is
+  // unrecoverable.
+  if (!instance_id || instance_id == std::numeric_limits<uint64_t>::max()) {
+    std::abort();
+  }
+  return instance_id;
+}
+
+}  // namespace
+#endif
 
 thread_local ThreadState* thread_state_ = nullptr;
 
@@ -68,6 +95,11 @@ ThreadState::ThreadState(Processor* processor, uint32_t thread_id,
     : processor_(processor),
       memory_(processor->memory()),
       thread_id_(thread_id) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  guest_execution_capture_instance_id_ =
+      AllocateGuestExecutionCaptureThreadInstanceId();
+#endif
   if (thread_id_ == UINT_MAX) {
     // System thread. Assign the system thread ID with a high bit
     // set so people know what's up.

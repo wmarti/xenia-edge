@@ -12,8 +12,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -140,6 +142,21 @@ Processor::~Processor() {
   frontend_.reset();
   backend_.reset();
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Registration is shared-owned, so even a failed owner-side detach cannot
+  // dangle. Release only after generated guest execution has been destroyed,
+  // and never run an observer destructor under the registration lock.
+  std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer_to_release;
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    observer_to_release =
+        std::move(guest_execution_capture_host_call_observer_);
+  }
+  observer_to_release.reset();
+#endif
+
   if (trace_counts_dump_section_) {
     Profiler::UnregisterDumpSection(trace_counts_dump_section_);
     trace_counts_dump_section_ = 0;
@@ -159,6 +176,154 @@ Processor::~Processor() {
     trace_counts_fallback_ = nullptr;
   }
 }
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+bool Processor::AttachGuestExecutionCaptureHostCallObserver(
+    std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer) {
+  if (!observer) {
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    if (guest_execution_capture_host_call_observer_ ||
+        guest_execution_capture_host_call_dispatch_count_ ||
+        guest_execution_capture_host_call_observer_transition_pending_) {
+      return false;
+    }
+    guest_execution_capture_host_call_observer_transition_pending_ = true;
+  }
+  // The observer owns its state lock. Never invoke it while holding the
+  // Processor registration lock: a later rendezvous implementation may need
+  // to wait here while other guest threads finish dispatch callbacks.
+  const bool observer_can_attach = observer->CanDetach();
+  std::lock_guard<std::mutex> lock(
+      guest_execution_capture_host_call_observer_mutex_);
+  if (guest_execution_capture_host_call_observer_ ||
+      !guest_execution_capture_host_call_observer_transition_pending_) {
+    if (guest_execution_capture_host_call_observer_transition_pending_) {
+      guest_execution_capture_host_call_observer_transition_pending_ = false;
+    }
+    return false;
+  }
+  if (observer_can_attach) {
+    guest_execution_capture_host_call_observer_ = std::move(observer);
+    guest_execution_capture_host_call_dispatch_epoch_ = 0;
+  }
+  guest_execution_capture_host_call_observer_transition_pending_ = false;
+  return observer_can_attach;
+}
+
+bool Processor::DetachGuestExecutionCaptureHostCallObserver(
+    const std::shared_ptr<GuestExecutionCaptureHostCallObserver>& observer) {
+  if (!observer) {
+    return false;
+  }
+  uint64_t dispatch_epoch = 0;
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    if (guest_execution_capture_host_call_observer_ != observer ||
+        guest_execution_capture_host_call_dispatch_count_ ||
+        guest_execution_capture_host_call_observer_transition_pending_) {
+      return false;
+    }
+    guest_execution_capture_host_call_observer_transition_pending_ = true;
+    dispatch_epoch = guest_execution_capture_host_call_dispatch_epoch_;
+  }
+  const bool observer_can_detach = observer->CanDetach();
+  std::lock_guard<std::mutex> lock(
+      guest_execution_capture_host_call_observer_mutex_);
+  if (guest_execution_capture_host_call_observer_ != observer ||
+      !guest_execution_capture_host_call_observer_transition_pending_) {
+    if (guest_execution_capture_host_call_observer_transition_pending_) {
+      guest_execution_capture_host_call_observer_transition_pending_ = false;
+    }
+    return false;
+  }
+  const bool can_detach =
+      observer_can_detach &&
+      !guest_execution_capture_host_call_dispatch_count_ &&
+      guest_execution_capture_host_call_dispatch_epoch_ == dispatch_epoch;
+  if (can_detach) {
+    guest_execution_capture_host_call_observer_ = nullptr;
+  }
+  guest_execution_capture_host_call_observer_transition_pending_ = false;
+  return can_detach;
+}
+
+GuestExecutionCaptureHostCallToken
+Processor::BeginGuestExecutionCaptureHostCall(const ThreadState& thread_state,
+                                              const GuestFunction& function,
+                                              uint32_t return_address) {
+  std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer;
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    if (!guest_execution_capture_host_call_observer_) {
+      return {};
+    }
+    if (guest_execution_capture_host_call_dispatch_count_ ==
+            std::numeric_limits<uint64_t>::max() ||
+        guest_execution_capture_host_call_dispatch_epoch_ ==
+            std::numeric_limits<uint64_t>::max()) {
+      std::abort();
+    }
+    observer = guest_execution_capture_host_call_observer_;
+    ++guest_execution_capture_host_call_dispatch_count_;
+    ++guest_execution_capture_host_call_dispatch_epoch_;
+  }
+  const GuestExecutionCaptureHostCallToken token =
+      observer->OnHostGuestCallBegin(thread_state, function, return_address);
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    if (!guest_execution_capture_host_call_dispatch_count_) {
+      std::abort();
+    }
+    --guest_execution_capture_host_call_dispatch_count_;
+  }
+  return token;
+}
+
+bool Processor::EndGuestExecutionCaptureHostCall(
+    GuestExecutionCaptureHostCallToken token, const ThreadState& thread_state,
+    const GuestFunction& function,
+    GuestExecutionCaptureHostCallOutcome outcome) {
+  if (!token) {
+    return false;
+  }
+  std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer;
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    if (!guest_execution_capture_host_call_observer_) {
+      return false;
+    }
+    if (guest_execution_capture_host_call_dispatch_count_ ==
+            std::numeric_limits<uint64_t>::max() ||
+        guest_execution_capture_host_call_dispatch_epoch_ ==
+            std::numeric_limits<uint64_t>::max()) {
+      std::abort();
+    }
+    observer = guest_execution_capture_host_call_observer_;
+    ++guest_execution_capture_host_call_dispatch_count_;
+    ++guest_execution_capture_host_call_dispatch_epoch_;
+  }
+  const bool result =
+      observer->OnHostGuestCallEnd(token, thread_state, function, outcome);
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_execution_capture_host_call_observer_mutex_);
+    if (!guest_execution_capture_host_call_dispatch_count_) {
+      std::abort();
+    }
+    --guest_execution_capture_host_call_dispatch_count_;
+  }
+  return result;
+}
+#endif
 
 bool Processor::Setup(std::unique_ptr<backend::Backend> backend) {
   // TODO(benvanik): query mode from debugger?
