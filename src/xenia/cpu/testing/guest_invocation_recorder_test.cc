@@ -41,6 +41,7 @@ constexpr uint32_t kReturnAddress = 0x83000000u;
 constexpr uint32_t kDataPageA = 0x10000000u;
 constexpr uint32_t kDataPageB = kDataPageA + 0x1000;
 constexpr uint32_t kDataPageC = kDataPageA + 0x2000;
+constexpr uint32_t kGuestPageSize = 4096;
 constexpr GuestInvocationRecorderIdentity kOwner = {0x1111, 0x2222};
 constexpr GuestInvocationRecorderIdentity kOther = {0x3333, 0x4444};
 
@@ -92,6 +93,14 @@ class FakePageReader final : public GuestInvocationRecorderPageReader {
     std::array<uint8_t, 4096>& page = pages[page_address];
     for (size_t i = 0; i < page.size(); ++i) {
       page[i] = static_cast<uint8_t>(seed + i * 17);
+    }
+  }
+
+  void AddPages(uint32_t first_page_address, uint32_t page_count,
+                uint8_t seed) {
+    for (uint32_t i = 0; i < page_count; ++i) {
+      AddPage(first_page_address + i * kGuestPageSize,
+              static_cast<uint8_t>(seed + i));
     }
   }
 
@@ -152,7 +161,8 @@ std::unique_ptr<GuestInvocationRecorder> MakeRecorder(
   REQUIRE(recorder);
   REQUIRE(error.empty());
   if (define_root) {
-    REQUIRE(recorder->OnFunctionDefined(kRootAddress, kRootEndAddress));
+    REQUIRE(recorder->OnFunctionDefined(selection.root_address,
+                                        selection.root_end_address));
   }
   return recorder;
 }
@@ -212,6 +222,39 @@ void RequireRejected(const GuestInvocationRecorder& recorder,
   REQUIRE(recorder.result() == nullptr);
 }
 
+void RequireClosedGranuleCapture(uint32_t host_page_size) {
+  const uint32_t pages_per_granule = host_page_size / kGuestPageSize;
+  FakePageReader reader;
+  reader.AddPages(kRootAddress, pages_per_granule, 0x20);
+  reader.AddPages(kDataPageA, pages_per_granule, 0x40);
+  FakeClock clock;
+  GuestInvocationRecorderLimits limits = MakeLimits();
+  limits.host_protection_page_size = host_page_size;
+  limits.max_page_count = pages_per_granule;
+  limits.max_code_page_count = pages_per_granule;
+  std::unique_ptr<GuestInvocationRecorder> recorder =
+      MakeRecorder(reader, clock, limits);
+
+  ConvergeOnPage(*recorder);
+  EnterRoot(*recorder, MakeState(30));
+  Access(*recorder, kDataPageA);
+  ExitRoot(*recorder, MakeState(31));
+
+  REQUIRE(recorder->state() == GuestInvocationRecorderState::kComplete);
+  const GuestInvocationRecorderResult* result = recorder->result();
+  REQUIRE(result);
+  REQUIRE(result->code_pages.size() == pages_per_granule);
+  REQUIRE(result->invocation.input_data_pages.size() == pages_per_granule);
+  REQUIRE(
+      (result->touched_page_addresses == std::vector<uint32_t>{kDataPageA}));
+  for (uint32_t i = 0; i < pages_per_granule; ++i) {
+    REQUIRE(result->code_pages[i].guest_address ==
+            kRootAddress + i * kGuestPageSize);
+    REQUIRE(result->invocation.input_data_pages[i].guest_address ==
+            kDataPageA + i * kGuestPageSize);
+  }
+}
+
 }  // namespace
 
 TEST_CASE("guest invocation recorder validates explicit selection and limits",
@@ -245,6 +288,22 @@ TEST_CASE("guest invocation recorder validates explicit selection and limits",
                                             reader, clock, &error));
     REQUIRE(error.empty());
   }
+  SECTION("host protection granule is a bounded power of two") {
+    for (uint32_t invalid_size : {0u, 2048u, 12288u, 128u * 1024}) {
+      GuestInvocationRecorderLimits limits = MakeLimits();
+      limits.host_protection_page_size = invalid_size;
+      REQUIRE_FALSE(GuestInvocationRecorder::Create(MakeSelection(), limits,
+                                                    reader, clock, &error));
+      REQUIRE_FALSE(error.empty());
+    }
+    for (uint32_t valid_size : {4096u, 8192u, 16384u, 32768u, 65536u}) {
+      GuestInvocationRecorderLimits limits = MakeLimits();
+      limits.host_protection_page_size = valid_size;
+      REQUIRE(GuestInvocationRecorder::Create(MakeSelection(), limits, reader,
+                                              clock, &error));
+      REQUIRE(error.empty());
+    }
+  }
   SECTION("three attempts are the minimum") {
     GuestInvocationRecorderLimits limits = MakeLimits();
     limits.max_attempts = 2;
@@ -266,6 +325,234 @@ TEST_CASE("guest invocation recorder validates explicit selection and limits",
     REQUIRE_FALSE(GuestInvocationRecorder::Create(MakeSelection(), limits,
                                                   reader, clock, &error));
     REQUIRE_FALSE(error.empty());
+  }
+}
+
+TEST_CASE("guest invocation recorder closes host protection granules",
+          "[guest-invocation-recorder]") {
+  SECTION("4 KiB") { RequireClosedGranuleCapture(4 * 1024); }
+  SECTION("16 KiB") { RequireClosedGranuleCapture(16 * 1024); }
+  SECTION("64 KiB") { RequireClosedGranuleCapture(64 * 1024); }
+}
+
+TEST_CASE("guest invocation recorder closes boundary-spanning ranges",
+          "[guest-invocation-recorder]") {
+  SECTION("function spans two host granules") {
+    constexpr uint32_t kBoundaryRoot = 0x82043F00u;
+    constexpr uint32_t kBoundaryRootEnd = 0x820440FCu;
+    FakePageReader reader;
+    FakeClock clock;
+    GuestInvocationRecorderSelection selection = MakeSelection();
+    selection.root_address = kBoundaryRoot;
+    selection.root_end_address = kBoundaryRootEnd;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits, selection);
+
+    auto attempt = [&] {
+      REQUIRE(recorder->OnFunctionEntry(kOwner, kBoundaryRoot, kBoundaryRootEnd,
+                                        MakeState(1)));
+      REQUIRE(recorder->OnFunctionExit(kOwner, kBoundaryRoot, kReturnAddress,
+                                       MakeState(2)));
+    };
+    attempt();
+    attempt();
+    attempt();
+
+    REQUIRE(recorder->state() == GuestInvocationRecorderState::kComplete);
+    REQUIRE(recorder->result());
+    REQUIRE(recorder->result()->code_pages.size() == 8);
+    for (uint32_t i = 0; i < 8; ++i) {
+      REQUIRE(recorder->result()->code_pages[i].guest_address ==
+              0x82040000u + i * kGuestPageSize);
+    }
+  }
+
+  SECTION("access spans two host granules") {
+    FakePageReader reader;
+    reader.AddPages(kDataPageA, 8, 0x10);
+    FakeClock clock;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    limits.max_page_count = 8;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+
+    auto attempt = [&] {
+      EnterRoot(*recorder);
+      REQUIRE(
+          recorder->OnMemoryAccess(kOwner, kDataPageA + 0x3FF8, 16,
+                                   GuestInvocationRecorderMemoryAccess::kRead));
+      ExitRoot(*recorder);
+    };
+    attempt();
+    attempt();
+    attempt();
+
+    REQUIRE(recorder->state() == GuestInvocationRecorderState::kComplete);
+    const GuestInvocationRecorderResult* result = recorder->result();
+    REQUIRE(result);
+    REQUIRE(result->invocation.input_data_pages.size() == 8);
+    REQUIRE((result->touched_page_addresses ==
+             std::vector<uint32_t>{kDataPageA + 0x3000, kDataPageA + 0x4000}));
+    for (uint32_t i = 0; i < 8; ++i) {
+      REQUIRE(result->invocation.input_data_pages[i].guest_address ==
+              kDataPageA + i * kGuestPageSize);
+    }
+  }
+}
+
+TEST_CASE("guest invocation recorder fails closed on granule hazards",
+          "[guest-invocation-recorder]") {
+  FakeClock clock;
+
+  SECTION("code closure exceeds its bound") {
+    FakePageReader reader;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    limits.max_code_page_count = 3;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits, MakeSelection(), false);
+    REQUIRE_FALSE(recorder->OnFunctionDefined(kRootAddress, kRootEndAddress));
+    RequireRejected(*recorder, GuestInvocationRecorderRejection::kPageLimit,
+                    kGuestInvocationDependencyPageDiscoveryOverflow);
+  }
+
+  SECTION("data closure exceeds its bound") {
+    FakePageReader reader;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    limits.max_page_count = 3;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    EnterRoot(*recorder);
+    REQUIRE_FALSE(recorder->OnMemoryAccess(
+        kOwner, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kRead));
+    RequireRejected(*recorder, GuestInvocationRecorderRejection::kPageLimit,
+                    kGuestInvocationDependencyPageDiscoveryOverflow);
+  }
+
+  SECTION("code closure sibling is unreadable") {
+    FakePageReader reader;
+    reader.failed_pages.insert(kRootAddress + kGuestPageSize);
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits, MakeSelection(), false);
+    REQUIRE_FALSE(recorder->OnFunctionDefined(kRootAddress, kRootEndAddress));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kPageReadFailure,
+                    kGuestInvocationDependencyUnsupportedMappingOrProtection);
+  }
+
+  SECTION("data closure sibling is unreadable") {
+    FakePageReader reader;
+    reader.AddPage(kDataPageA, 1);
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    ConvergeOnPage(*recorder);
+    REQUIRE_FALSE(recorder->OnFunctionEntry(kOwner, kRootAddress,
+                                            kRootEndAddress, MakeState(3)));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kPageReadFailure,
+                    kGuestInvocationDependencyUnsupportedMappingOrProtection);
+  }
+
+  SECTION("data access enters a closure-only code sibling") {
+    FakePageReader reader;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    EnterRoot(*recorder);
+    REQUIRE_FALSE(
+        recorder->OnMemoryAccess(kOwner, kRootAddress + kGuestPageSize, 4,
+                                 GuestInvocationRecorderMemoryAccess::kRead));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kUnsupportedDependency,
+                    kGuestInvocationDependencyUnsupportedMappingOrProtection);
+  }
+
+  SECTION("write enters a closure-only code sibling") {
+    FakePageReader reader;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    EnterRoot(*recorder);
+    REQUIRE_FALSE(
+        recorder->OnMemoryAccess(kOwner, kRootAddress + kGuestPageSize, 4,
+                                 GuestInvocationRecorderMemoryAccess::kWrite));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kSelfModifyingCode,
+                    kGuestInvocationDependencySelfModifyingCode);
+  }
+
+  SECTION("data aliases a code granule") {
+    FakePageReader reader;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    EnterRoot(*recorder);
+    REQUIRE_FALSE(recorder->OnMemoryAccess(
+        kOwner, 0x92040000u, 4, GuestInvocationRecorderMemoryAccess::kRead));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kUnsupportedDependency,
+                    kGuestInvocationDependencyPhysicalAlias);
+  }
+
+  SECTION("cross-thread write touches a data closure sibling") {
+    FakePageReader reader;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    EnterRoot(*recorder);
+    Access(*recorder, kDataPageA);
+    REQUIRE_FALSE(recorder->OnMemoryAccess(
+        kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kCrossThreadMutation,
+                    kGuestInvocationDependencyCrossThreadMutation);
+  }
+
+  SECTION("cross-thread watches share the data closure bound") {
+    FakePageReader reader;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    limits.max_page_count = 4;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    EnterRoot(*recorder);
+    REQUIRE(
+        recorder->OnMemoryAccess(kOther, kDataPageA + 0x10000, 4,
+                                 GuestInvocationRecorderMemoryAccess::kWrite));
+    REQUIRE_FALSE(recorder->OnMemoryAccess(
+        kOwner, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kRead));
+    RequireRejected(*recorder, GuestInvocationRecorderRejection::kPageLimit,
+                    kGuestInvocationDependencyPageDiscoveryOverflow);
+  }
+
+  SECTION("untouched closure sibling changes during the final attempt") {
+    FakePageReader reader;
+    reader.AddPages(kDataPageA, 4, 1);
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    ConvergeOnPage(*recorder);
+    EnterRoot(*recorder);
+    Access(*recorder, kDataPageA);
+    reader.pages[kDataPageB][0] ^= 1;
+    REQUIRE_FALSE(recorder->OnFunctionExit(kOwner, kRootAddress, kReturnAddress,
+                                           MakeState(4)));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kCrossThreadMutation,
+                    kGuestInvocationDependencyCrossThreadMutation);
   }
 }
 
@@ -1001,9 +1288,9 @@ TEST_CASE("guest invocation recorder fails closed on snapshot and page hazards",
   SECTION("unreported final code change") {
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
-    ConvergeOnPage(*recorder, kRootAddress);
+    ConvergeOnPage(*recorder, kDataPageA);
     EnterRoot(*recorder);
-    Access(*recorder, kRootAddress);
+    Access(*recorder, kDataPageA);
     reader.pages[kRootAddress][0] ^= 1;
     REQUIRE_FALSE(recorder->OnFunctionExit(kOwner, kRootAddress, kReturnAddress,
                                            MakeState(4)));

@@ -16,6 +16,7 @@
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include "xenia/cpu/guest_invocation_capture.h"
 #endif
@@ -30,6 +31,11 @@ class Processor;
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+
+bool ValidateGuestInvocationCaptureCodePageClosure(
+    const std::vector<ppc::GuestInvocationRecorderFunction>& functions,
+    const std::vector<ppc::GuestInvocationPage>& code_pages,
+    uint32_t host_protection_page_size, std::string* error = nullptr);
 
 // Owns the bounded capture service registered non-owningly with Processor.
 // The emulator creates this after applying per-title configuration and destroys

@@ -68,8 +68,9 @@ DEFINE_CVar(
     "Guest Invocation Capture", true, uint64_t);
 DEFINE_CVar(guest_invocation_capture_max_pages,
             xe::cpu::GuestInvocationCaptureRuntimeConfig::kDefaultMaxPages,
-            "Maximum captured guest data pages.", "Guest Invocation Capture",
-            true, uint32_t);
+            "Maximum supplied guest data pages plus distinct cross-thread "
+            "write pages.",
+            "Guest Invocation Capture", true, uint32_t);
 DEFINE_CVar(guest_invocation_capture_max_accesses,
             xe::cpu::GuestInvocationCaptureRuntimeConfig::kDefaultMaxAccesses,
             "Maximum recorded guest memory accesses.",
@@ -115,6 +116,70 @@ GuestInvocationCaptureRuntimeConfig CurrentConfig() {
 }
 
 }  // namespace
+
+bool ValidateGuestInvocationCaptureCodePageClosure(
+    const std::vector<ppc::GuestInvocationRecorderFunction>& functions,
+    const std::vector<ppc::GuestInvocationPage>& code_pages,
+    uint32_t host_protection_page_size, std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!host_protection_page_size ||
+      (host_protection_page_size & (host_protection_page_size - 1)) ||
+      host_protection_page_size <
+          ppc::GuestInvocationRecorderLimits::kMinimumHostProtectionPageSize ||
+      host_protection_page_size >
+          ppc::GuestInvocationRecorderLimits::kMaximumHostProtectionPageSize) {
+    return Fail(error, "capture host protection page size is unsupported");
+  }
+  if (functions.empty()) {
+    return Fail(error, "capture translation closure is empty");
+  }
+
+  std::unordered_set<uint32_t> supplied_pages;
+  for (const ppc::GuestInvocationPage& page : code_pages) {
+    if (page.guest_address & (JitCorpus::kPageSize - 1)) {
+      return Fail(error, "capture code page is not aligned");
+    }
+    if (!supplied_pages.insert(page.guest_address).second) {
+      return Fail(error, "capture result contains a duplicate code page");
+    }
+  }
+
+  std::unordered_set<uint32_t> required_pages;
+  for (const ppc::GuestInvocationRecorderFunction& function : functions) {
+    if (!function.address || (function.address & 3) ||
+        (function.end_address & 3) || function.end_address < function.address ||
+        uint64_t(function.end_address) - function.address + 4 >
+            ppc::GuestInvocationArtifactCodec::kMaxFunctionSize) {
+      return Fail(error, "capture code closure has an invalid function extent");
+    }
+    const uint32_t first_page = function.address & ~(JitCorpus::kPageSize - 1);
+    const uint32_t last_page =
+        function.end_address & ~(JitCorpus::kPageSize - 1);
+    for (uint64_t function_page = first_page; function_page <= last_page;
+         function_page += JitCorpus::kPageSize) {
+      const uint32_t granule_address = static_cast<uint32_t>(function_page) &
+                                       ~(host_protection_page_size - 1);
+      const uint64_t granule_end =
+          uint64_t(granule_address) + host_protection_page_size;
+      if (granule_end > uint64_t(std::numeric_limits<uint32_t>::max()) + 1) {
+        return Fail(error,
+                    "capture code granule wraps the guest address space");
+      }
+      for (uint64_t closure_page = granule_address; closure_page < granule_end;
+           closure_page += JitCorpus::kPageSize) {
+        required_pages.insert(static_cast<uint32_t>(closure_page));
+      }
+    }
+  }
+  if (required_pages != supplied_pages) {
+    return Fail(error,
+                "capture result does not contain the exact code protection "
+                "granule closure");
+  }
+  return true;
+}
 
 bool GuestInvocationCapturePageReader::ReadPage(
     uint32_t page_address, std::array<uint8_t, 4096>* output) {
@@ -230,13 +295,14 @@ struct GuestInvocationCaptureRuntime::Impl {
     if (result.translation_dependencies.empty()) {
       return Fail(error, "capture result has an empty translation closure");
     }
+    if (!ValidateGuestInvocationCaptureCodePageClosure(
+            result.translation_dependencies, result.code_pages,
+            replay_config.host_protection_page_size, error)) {
+      return false;
+    }
 
     ExecutionJitCorpusBuilder corpus_builder(jit_corpus_config_flags);
-    std::unordered_set<uint32_t> copied_code_pages;
     for (const ppc::GuestInvocationPage& code_page : result.code_pages) {
-      if (!copied_code_pages.insert(code_page.guest_address).second) {
-        return Fail(error, "capture result contains a duplicate code page");
-      }
       if (!corpus_builder.AddCodePage(code_page.guest_address,
                                       code_page.data.data(),
                                       code_page.data.size(), error)) {
@@ -244,7 +310,6 @@ struct GuestInvocationCaptureRuntime::Impl {
       }
     }
     uint32_t root_definition_count = 0;
-    std::unordered_set<uint32_t> required_code_pages;
     for (const ppc::GuestInvocationRecorderFunction& dependency :
          result.translation_dependencies) {
       Function* function = processor.LookupFunction(dependency.address);
@@ -288,20 +353,6 @@ struct GuestInvocationCaptureRuntime::Impl {
                         dependency.address));
       }
 
-      const uint64_t end_exclusive = uint64_t(dependency.end_address) + 4;
-      for (uint64_t page =
-               dependency.address & ~(uint64_t(JitCorpus::kPageSize) - 1);
-           page < end_exclusive; page += JitCorpus::kPageSize) {
-        const uint32_t page_address = static_cast<uint32_t>(page);
-        required_code_pages.insert(page_address);
-        if (!copied_code_pages.contains(page_address)) {
-          return Fail(error,
-                      fmt::format("capture result is missing immutable code "
-                                  "page {:08X}",
-                                  page_address));
-        }
-      }
-
       const ExecutionJitCorpusBuilder::FunctionRecord function_record = {
           dependency.address, dependency.end_address,
           static_cast<uint32_t>(host_code_size),
@@ -317,12 +368,6 @@ struct GuestInvocationCaptureRuntime::Impl {
       return Fail(error,
                   "capture translation closure does not contain one root");
     }
-    if (required_code_pages.size() != copied_code_pages.size()) {
-      return Fail(error,
-                  "capture result contains code outside the translation "
-                  "closure");
-    }
-
     std::vector<uint8_t> exact_corpus_bytes;
     if (!corpus_builder.Encode(&exact_corpus_bytes, error) ||
         !WriteGuestInvocationCaptureBundle(
@@ -375,12 +420,6 @@ GuestInvocationCaptureRuntime::Create(Memory& memory, Processor& processor,
   }
 
   const GuestInvocationCaptureRuntimeConfig config = CurrentConfig();
-  ppc::GuestInvocationRecorderSelection selection;
-  ppc::GuestInvocationRecorderLimits limits;
-  if (!config.BuildRecorderConfiguration(Clock::QueryHostTickFrequency(),
-                                         &selection, &limits, error)) {
-    return nullptr;
-  }
   if (!config.ValidateOutputDirectory(error)) {
     return nullptr;
   }
@@ -389,6 +428,14 @@ GuestInvocationCaptureRuntime::Create(Memory& memory, Processor& processor,
   if (!CaptureCurrentGuestInvocationReplayConfig(*processor.backend(),
                                                  &replay_config, error) ||
       !ValidateGuestInvocationReplayBenchmarkConfig(replay_config, error)) {
+    return nullptr;
+  }
+  ppc::GuestInvocationRecorderSelection selection;
+  ppc::GuestInvocationRecorderLimits limits;
+  if (!config.BuildRecorderConfiguration(
+          Clock::QueryHostTickFrequency(),
+          replay_config.host_protection_page_size, &selection, &limits,
+          error)) {
     return nullptr;
   }
   GuestInvocationReplaySha256 capture_build_sha256 = {};

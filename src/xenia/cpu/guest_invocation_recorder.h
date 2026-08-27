@@ -42,9 +42,14 @@ struct GuestInvocationRecorderSelection {
 
 struct GuestInvocationRecorderLimits {
   static constexpr uint32_t kMaximumCodePageCount = 65536;
+  static constexpr uint32_t kMinimumHostProtectionPageSize = 4096;
+  static constexpr uint32_t kMaximumHostProtectionPageSize = 64 * 1024;
 
   uint32_t max_attempts = 8;
   uint64_t max_duration_ticks = 1;
+  // Aggregate bound for supplied data-granule pages and distinct cross-thread
+  // write backing pages. Captured code granules use max_code_page_count
+  // separately.
   uint32_t max_page_count = 8192;
   // Separate from invocation data pages because definitions are cataloged
   // before the selected translation closure is known.
@@ -53,6 +58,7 @@ struct GuestInvocationRecorderLimits {
   uint32_t max_call_depth = 256;
   uint64_t max_event_count = 2'000'000;
   uint32_t max_function_count = 32768;
+  uint32_t host_protection_page_size = kMinimumHostProtectionPageSize;
 };
 
 struct GuestInvocationRecorderFunction {

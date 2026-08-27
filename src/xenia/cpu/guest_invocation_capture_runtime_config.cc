@@ -65,7 +65,7 @@ bool GuestInvocationCaptureRuntimeConfig::IsRequested() const {
 }
 
 bool GuestInvocationCaptureRuntimeConfig::BuildRecorderConfiguration(
-    uint64_t host_tick_frequency,
+    uint64_t host_tick_frequency, uint32_t host_protection_page_size,
     ppc::GuestInvocationRecorderSelection* selection,
     ppc::GuestInvocationRecorderLimits* limits, std::string* error) const {
   if (error) {
@@ -111,6 +111,7 @@ bool GuestInvocationCaptureRuntimeConfig::BuildRecorderConfiguration(
   parsed_limits.max_call_depth = max_call_depth;
   parsed_limits.max_event_count = max_events;
   parsed_limits.max_function_count = max_functions;
+  parsed_limits.host_protection_page_size = host_protection_page_size;
   *selection = parsed_selection;
   *limits = parsed_limits;
   return true;

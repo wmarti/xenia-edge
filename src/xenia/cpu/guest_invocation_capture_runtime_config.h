@@ -50,7 +50,7 @@ struct GuestInvocationCaptureRuntimeConfig {
   // Converts strict hexadecimal selectors and milliseconds into recorder
   // inputs. Recorder::Create remains the single authority for semantic bounds.
   bool BuildRecorderConfiguration(
-      uint64_t host_tick_frequency,
+      uint64_t host_tick_frequency, uint32_t host_protection_page_size,
       ppc::GuestInvocationRecorderSelection* selection,
       ppc::GuestInvocationRecorderLimits* limits,
       std::string* error = nullptr) const;
