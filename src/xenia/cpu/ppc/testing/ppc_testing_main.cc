@@ -1085,6 +1085,11 @@ bool WriteSyntheticFixture(const std::filesystem::path& executable_path) {
 }
 
 bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  return Reject("candidate build eligibility",
+                "timed replay requires capture instrumentation disabled");
+#endif
   if (cvars::jit_corpus_in.empty()) {
     return Reject("input validation",
                   "--guest_invocation_in requires --jit_corpus_in");
