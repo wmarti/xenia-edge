@@ -735,7 +735,7 @@ class FakeCheckpointController final
     const uint32_t current_pause = ++pause_count;
     {
       std::unique_lock<std::mutex> lock(mutex);
-      if (block_pause_number == current_pause) {
+      if (block_pause_number.load(std::memory_order_acquire) == current_pause) {
         pause_entered = true;
         condition.notify_all();
         condition.wait(lock, [this]() { return release_pause; });
@@ -821,7 +821,7 @@ class FakeCheckpointController final
   bool cancel_always_keeps_active = false;
   uint32_t start_guest_pc = kResumePc;
   uint32_t stop_guest_pc = kResumePc;
-  uint32_t block_pause_number = 0;
+  std::atomic<uint32_t> block_pause_number{0};
   uint32_t cancel_failures = 0;
   std::atomic<uint32_t> pause_count{0};
   std::atomic<uint32_t> finalize_count{0};
