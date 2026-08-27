@@ -47,6 +47,8 @@ struct GuestExecutionContinuousCheckpointReference {
       GuestExecutionContinuousCheckpointReferenceKind::kNone;
   // The sparse checkpoint whose thread-state catalog owns this blob. Zero is
   // the canonical initial checkpoint and is valid when kind is kThreadState.
+  // A boundary-arrival event may name the later final checkpoint; the session
+  // validator closes the reference to that checkpoint's participant catalog.
   uint64_t checkpoint_global_sequence = 0;
   uint64_t state_size = 0;
   GuestExecutionSessionSha256 state_sha256 = {};

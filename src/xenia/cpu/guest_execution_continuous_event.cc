@@ -113,7 +113,6 @@ bool ValidateCheckpointReference(const GuestExecutionContinuousEvent& event,
       return true;
     case GuestExecutionContinuousCheckpointReferenceKind::kThreadState: {
       if (event.subject.participant_ordinal == kGuestExecutionSessionNoThread ||
-          checkpoint.checkpoint_global_sequence > event.global_sequence ||
           checkpoint.state_size !=
               ppc::GuestPPCThreadCheckpointCodec::kEncodedSize ||
           IsZeroHash(checkpoint.state_sha256) ||

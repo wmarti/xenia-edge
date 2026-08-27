@@ -677,9 +677,6 @@ TEST_CASE("continuous event codec enforces canonical checkpoint references",
       static_cast<GuestExecutionContinuousCheckpointReferenceKind>(2);
   RequireEncodeFailure(malformed_events);
   malformed_events = fixture.events;
-  malformed_events.back().checkpoint.checkpoint_global_sequence = 103;
-  RequireEncodeFailure(malformed_events);
-  malformed_events = fixture.events;
   malformed_events.back().checkpoint.state_size = 0;
   RequireEncodeFailure(malformed_events);
   malformed_events = fixture.events;
@@ -717,9 +714,6 @@ TEST_CASE("continuous event codec enforces canonical checkpoint references",
            kGuestExecutionSessionNoThread);
   WriteU32(&malformed, RecordOffset(2, kRecordSubjectThreadIdOffset), 0);
   RequireDecodeFailure(malformed);
-  malformed = encoded;
-  WriteU64(&malformed, RecordOffset(2, kRecordCheckpointSequenceOffset), 103);
-  RequireDecodeFailure(malformed);
   for (uint64_t size :
        {uint64_t{0}, uint64_t{2779}, uint64_t{2781}, UINT64_MAX}) {
     malformed = encoded;
@@ -730,6 +724,20 @@ TEST_CASE("continuous event codec enforces canonical checkpoint references",
   std::fill_n(malformed.begin() + RecordOffset(2, kRecordCheckpointShaOffset),
               GuestExecutionSessionSha256{}.size(), 0);
   RequireDecodeFailure(malformed);
+}
+
+TEST_CASE("continuous arrival may reference a later final checkpoint",
+          "[cpu][guest-execution]") {
+  const Fixture fixture = MakeFixture();
+  std::vector<GuestExecutionContinuousEvent> events = fixture.events;
+  events.back().checkpoint.checkpoint_global_sequence = 103;
+  const std::vector<uint8_t> encoded = EncodeEvents(events);
+  std::vector<GuestExecutionContinuousEvent> decoded;
+  std::string error;
+  REQUIRE(
+      GuestExecutionContinuousEventCodec::Decode(encoded, &decoded, &error));
+  REQUIRE(error.empty());
+  REQUIRE(decoded == events);
 }
 
 TEST_CASE("continuous event participant bindings are exact and dense",
