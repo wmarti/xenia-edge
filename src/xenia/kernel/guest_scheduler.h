@@ -79,9 +79,11 @@ class GuestScheduler {
   // which is not parked yet and just gets dispatched again.
   void ResumeThread(XThread* thread);
 
-  // Re-links a ready thread into its correct priority level after a priority
-  // change. No-op if not queued.
-  void RequeueForPriority(XThread* thread);
+  // Publishes an effective priority change under the scheduler gate. Ready
+  // participants are re-linked before another scheduler transition may
+  // observe the new level; running, blocked and suspended changes share that
+  // same total order.
+  void PublishPriority(XThread* thread, int32_t priority);
 
   // Yields from a spin loop. On a fiber this hands the dispatch thread to the
   // next ready fiber, since a co-resident holder can only run if we yield.

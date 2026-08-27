@@ -157,7 +157,7 @@ Arming and disarming happen inside the recorder, not by attaching or detaching.
 | `kReready` | `RereadyBlocked` per released waiter | `cpu` poller, `target_cpu` home; reason `kPolled`, `kSignalEpoch`, `kDeadline`, `kUserApc`, `kBackstop`; `AtHead`; `value` wait kind; the same wait identity plus decision-time epochs, uptime and APC state |
 | `kParkSuspended` | `ParkSuspended` | `cpu` |
 | `kResume` | `ResumeThread` unparking a suspended thread | `cpu` |
-| `kRequeuePriority` | `RequeueForPriority` | `cpu`; `priority` new level, `value` old level |
+| `kPriorityChange` | `PublishPriority` | `cpu` owner or -1 before first enqueue; `priority` new level, `value` old level; a ready participant is re-linked at the new level in the same locked transaction |
 | `kMigrate` | `RunLoop` honoring an affinity change | `cpu` from, `target_cpu` to; `AtHead` |
 | `kExit` | `NotifyThreadExited` | `cpu` |
 | `kTerminate` | `TerminateThread` | `cpu`; reason `kDetached`, `kPreemptRequested`, `kReadied`, `kNeverRan`, `kDeferredToDispatcher` |
@@ -219,7 +219,10 @@ refer to `src/xenia/kernel/guest_scheduler.cc` at the base commit.
   1153-1237 (`kReready`).
 - Suspend and resume: `ParkSuspended` 386-405 (`kParkSuspended`),
   `ResumeThread` 370-384 (`kResume`).
-- Priority requeue: `RequeueForPriority` 526-539 (`kRequeuePriority`).
+- Effective priority publication: `PublishPriority` (`kPriorityChange`) records
+  every real change under the scheduler lock. Ready participants are re-linked
+  there; blocked-priority caches are repaired there; running and suspended
+  changes retain their prior scheduling semantics.
 - Migration: `RunLoop` 1265-1284 (`kMigrate`); the blocked-then-moved case is
   covered by `kReready` with `target_cpu != cpu`.
 - Termination: `TerminateThread` 581-643 (`kTerminate`), `NotifyThreadExited`
@@ -232,10 +235,6 @@ refer to `src/xenia/kernel/guest_scheduler.cc` at the base commit.
 
 ## Paths still unobserved
 
-- Priority changes of a running or blocked thread (`XThread::PublishPriority`)
-  reach the scheduler only through `RequeueForPriority`, which is a no-op
-  unless the thread is queued. The next event for that participant carries the
-  new level, but the mutation instant is not recorded.
 - Affinity changes (`XThread::SetActiveCpu`) are observed only when the
   scheduler acts on them (`kMigrate`, `kReready` to another CPU).
 - The idle loop's decision to sleep, the `repoll_now` and `ready_event` pokes,

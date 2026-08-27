@@ -2738,7 +2738,7 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
         kernel::GuestSchedulerCaptureEventKind::kReready,
         kernel::GuestSchedulerCaptureEventKind::kParkSuspended,
         kernel::GuestSchedulerCaptureEventKind::kResume,
-        kernel::GuestSchedulerCaptureEventKind::kRequeuePriority,
+        kernel::GuestSchedulerCaptureEventKind::kPriorityChange,
         kernel::GuestSchedulerCaptureEventKind::kMigrate,
     };
     uint64_t sequence = 100;
@@ -2859,6 +2859,24 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
     REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, safepoint,
                                     &harness.error) == Action::kReject);
     REQUIRE(harness.error.find("safepoint provenance") != std::string::npos);
+  }
+
+  SECTION("pre-enqueue priority mutation has no CPU owner") {
+    kernel::GuestSchedulerCaptureEvent priority_change = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kPriorityChange);
+    priority_change.cpu = -1;
+    priority_change.value = 7;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, priority_change,
+                                    &harness.error) == Action::kContinue);
+  }
+
+  SECTION("priority mutation cannot name a target CPU") {
+    kernel::GuestSchedulerCaptureEvent priority_change = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kPriorityChange);
+    priority_change.target_cpu = 1;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, priority_change,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("priority-change CPU") != std::string::npos);
   }
 
   SECTION("wait provenance fails closed") {

@@ -1367,28 +1367,70 @@ void GuestScheduler::UnlinkLocked(XThread*& head, XThread*& tail,
   }
 }
 
-void GuestScheduler::RequeueForPriority(XThread* thread) {
+void GuestScheduler::PublishPriority(XThread* thread, int32_t priority) {
   std::lock_guard<std::mutex> lock(lock_);
-  auto& links = thread->scheduler_links();
-  if (!links.queued || links.cpu < 0) {
+  const int old_priority = ClampPriority(thread->priority());
+  const int new_priority = ClampPriority(priority);
+  if (new_priority == old_priority) {
     return;
   }
+  auto& links = thread->scheduler_links();
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   RejectCheckpointTopologyChangeLocked();
 #endif
-  Cpu& cpu = cpus_[links.cpu];
-  int old = links.queued_prio;
-  UnlinkLocked(cpu.ready_head[old], cpu.ready_tail[old], thread);
-  if (!cpu.ready_head[old]) {
-    cpu.ready_summary &= ~(uint32_t(1) << old);
-  }
+  const bool queued = links.queued && links.cpu >= 0;
+  if (queued) {
+    Cpu& cpu = cpus_[links.cpu];
+    const int queued_priority = links.queued_prio;
+    const bool valid_queued_priority =
+        queued_priority >= 0 && queued_priority < 32;
+    if (!valid_queued_priority) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-  EmitCaptureLocked(CaptureKind::kRequeuePriority, thread, links.cpu, -1,
-                    CaptureReason::kNone, 0, static_cast<uint8_t>(old));
+      capture_rejected_ = true;
 #endif
-  LinkReadyLocked(cpu, thread, false);
+      XELOGE(
+          "GuestScheduler: ready tid={:08X} has invalid queue level {}; "
+          "priority publication was refused",
+          thread->thread_id(), queued_priority);
+      return;
+    }
+    const bool consistent_priority = queued_priority == old_priority;
+    if (!consistent_priority) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      capture_rejected_ = true;
+#endif
+      XELOGE(
+          "GuestScheduler: ready tid={:08X} priority {} disagrees with queue "
+          "level {}",
+          thread->thread_id(), old_priority, queued_priority);
+    }
+    UnlinkLocked(cpu.ready_head[queued_priority],
+                 cpu.ready_tail[queued_priority], thread);
+    if (!cpu.ready_head[queued_priority]) {
+      cpu.ready_summary &= ~(uint32_t(1) << queued_priority);
+    }
+  }
+  thread->StorePublishedPriority(new_priority);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  EmitCaptureLocked(CaptureKind::kPriorityChange, thread, links.cpu, -1,
+                    CaptureReason::kNone, 0,
+                    static_cast<uint8_t>(old_priority));
+#endif
+  if (queued) {
+    LinkReadyLocked(cpus_[links.cpu], thread, false);
+  } else if (links.blocked && links.cpu >= 0) {
+    Cpu& cpu = cpus_[links.cpu];
+    int max_priority = -1;
+    for (XThread* blocked = cpu.blocked_head; blocked;
+         blocked = blocked->scheduler_links().ready_next) {
+      max_priority = std::max(max_priority, ClampPriority(blocked->priority()));
+    }
+    cpu.max_blocked_prio = max_priority;
+  }
 }
 
 bool GuestScheduler::ForgetThread(XThread* thread) {

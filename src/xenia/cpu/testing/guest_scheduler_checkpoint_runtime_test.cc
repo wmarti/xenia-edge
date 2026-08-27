@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -153,6 +154,20 @@ class GuestSchedulerCheckpointRuntimeTestAccess final {
     result.checkpoint_jit_safepoint_pc =
         thread->scheduler_links().checkpoint_jit_safepoint_pc;
     return result;
+  }
+
+  static int QueuedPriority(GuestScheduler& scheduler, XThread* thread) {
+    std::lock_guard<std::mutex> lock(scheduler.lock_);
+    return thread->scheduler_links().queued
+               ? thread->scheduler_links().queued_prio
+               : -1;
+  }
+
+  static int BlockedMaxPriority(GuestScheduler& scheduler, int cpu) {
+    std::lock_guard<std::mutex> lock(scheduler.lock_);
+    return cpu >= 0 && cpu < GuestScheduler::kMaxCpus
+               ? scheduler.cpus_[cpu].max_blocked_prio
+               : -1;
   }
 
   static uint8_t DispatchThreadMask(const GuestScheduler& scheduler) {
@@ -907,6 +922,20 @@ bool WaitUntilRunning(GuestScheduler& scheduler, XThread* thread,
   return false;
 }
 
+bool WaitUntilQueued(GuestScheduler& scheduler, XThread* thread,
+                     std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(scheduler,
+                                                                 thread)
+            .queued) {
+      return true;
+    }
+    std::this_thread::yield();
+  }
+  return false;
+}
+
 bool ContainsThread(const GuestSchedulerCheckpointBarrierSnapshot& snapshot,
                     uint32_t thread_id) {
   return std::any_of(snapshot.participants.begin(), snapshot.participants.end(),
@@ -1103,6 +1132,159 @@ TEST_CASE("Guest scheduler reready capture freezes decision-time provenance",
   thread.reset();
   event->ReleaseHandle();
   event.reset();
+}
+
+TEST_CASE("Guest scheduler orders blocked priority mutation before wake",
+          "[guest_scheduler_capture][guest_scheduler_priority][runtime]") {
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(256);
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  auto event =
+      object_ref<XEvent>(new XEvent(environment.emulator()->kernel_state()));
+  event->Initialize(false, false);
+  RereadyWaitControl control;
+  auto thread =
+      object_ref<RereadyWaitRuntimeThread>(new RereadyWaitRuntimeThread(
+          environment.emulator()->kernel_state(), &control, event.get()));
+  thread->set_name("Scheduler blocked priority test");
+  REQUIRE(thread->Create() == X_STATUS_SUCCESS);
+
+  const auto blocked_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!GuestSchedulerCaptureWaitRuntimeTestAccess::IsBlocked(scheduler,
+                                                                thread.get()) &&
+         std::chrono::steady_clock::now() < blocked_deadline) {
+    std::this_thread::yield();
+  }
+  REQUIRE(GuestSchedulerCaptureWaitRuntimeTestAccess::IsBlocked(scheduler,
+                                                                thread.get()));
+  const auto inspection =
+      GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(scheduler,
+                                                               thread.get());
+  const int32_t old_priority = thread->priority();
+  const int32_t new_priority = old_priority == 31 ? 30 : old_priority + 1;
+  thread->SetPriority(new_priority);
+  REQUIRE(thread->priority() == new_priority);
+  REQUIRE(GuestSchedulerCheckpointRuntimeTestAccess::BlockedMaxPriority(
+              scheduler, inspection.cpu) == new_priority);
+  thread->SetPriority(old_priority);
+  REQUIRE(GuestSchedulerCheckpointRuntimeTestAccess::BlockedMaxPriority(
+              scheduler, inspection.cpu) == old_priority);
+  thread->SetPriority(new_priority);
+  REQUIRE(GuestSchedulerCheckpointRuntimeTestAccess::BlockedMaxPriority(
+              scheduler, inspection.cpu) == new_priority);
+
+  event->Set(0, false);
+  REQUIRE(control.WaitForCompletion(2s));
+  scheduler.Shutdown();
+
+  const auto snapshot = recorder->snapshot();
+  REQUIRE(snapshot.rejection == GuestSchedulerCaptureRecorderRejection::kNone);
+  const auto priority_change = std::find_if(
+      snapshot.events.cbegin(), snapshot.events.cend(),
+      [&thread](const GuestSchedulerCaptureEvent& captured) {
+        return captured.kind ==
+                   GuestSchedulerCaptureEventKind::kPriorityChange &&
+               captured.guest_thread_id == thread->thread_id();
+      });
+  REQUIRE(priority_change != snapshot.events.cend());
+  REQUIRE(priority_change->cpu == inspection.cpu);
+  REQUIRE(priority_change->value == old_priority);
+  REQUIRE(priority_change->priority == new_priority);
+  const auto reready = std::find_if(
+      snapshot.events.cbegin(), snapshot.events.cend(),
+      [&thread](const GuestSchedulerCaptureEvent& captured) {
+        return captured.kind == GuestSchedulerCaptureEventKind::kReready &&
+               captured.guest_thread_id == thread->thread_id();
+      });
+  REQUIRE(reready != snapshot.events.cend());
+  REQUIRE(priority_change->sequence < reready->sequence);
+
+  thread->ReclaimExited();
+  thread->ReleaseHandle();
+  thread.reset();
+  event->ReleaseHandle();
+  event.reset();
+}
+
+TEST_CASE("Guest scheduler atomically publishes running and ready priorities",
+          "[guest_scheduler_capture][guest_scheduler_priority][runtime]") {
+  FiberControl running_control;
+  FiberControl ready_control;
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(256);
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  CreatedThread running =
+      CreateRuntimeThread(environment, running_control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(running.status));
+  REQUIRE(running_control.WaitForStart(2s));
+  const int32_t running_old_priority = running.thread->priority();
+  REQUIRE(running_old_priority != 31);
+  running.thread->SetPriority(31);
+
+  CreatedThread ready = CreateRuntimeThread(
+      environment, ready_control, kCpu0CreationFlags | X_CREATE_SUSPENDED);
+  REQUIRE(XSUCCEEDED(ready.status));
+  const int32_t ready_old_priority = ready.thread->priority();
+  const int32_t preenqueue_priority = ready_old_priority >= 30
+                                          ? ready_old_priority - 1
+                                          : ready_old_priority + 1;
+  ready.thread->SetPriority(preenqueue_priority);
+  REQUIRE(XSUCCEEDED(ready.thread->Resume()));
+  REQUIRE(WaitUntilQueued(scheduler, ready.thread.get(), 2s));
+  const int32_t ready_new_priority = preenqueue_priority >= 30
+                                         ? preenqueue_priority - 1
+                                         : preenqueue_priority + 1;
+  ready.thread->SetPriority(ready_new_priority);
+  REQUIRE(GuestSchedulerCheckpointRuntimeTestAccess::QueuedPriority(
+              scheduler, ready.thread.get()) == ready_new_priority);
+  ready.thread->SetPriority(ready_new_priority);
+
+  REQUIRE(StopRuntimeThread(running, running_control));
+  REQUIRE(ready_control.WaitForStart(2s));
+  REQUIRE(StopRuntimeThread(ready, ready_control));
+  scheduler.Shutdown();
+
+  const auto snapshot = recorder->snapshot();
+  REQUIRE(snapshot.rejection == GuestSchedulerCaptureRecorderRejection::kNone);
+  const auto matching_priority_changes =
+      [&snapshot](
+          uint32_t thread_id) -> std::vector<GuestSchedulerCaptureEvent> {
+    std::vector<GuestSchedulerCaptureEvent> matches;
+    std::copy_if(snapshot.events.cbegin(), snapshot.events.cend(),
+                 std::back_inserter(matches),
+                 [thread_id](const GuestSchedulerCaptureEvent& captured) {
+                   return captured.kind ==
+                              GuestSchedulerCaptureEventKind::kPriorityChange &&
+                          captured.guest_thread_id == thread_id;
+                 });
+    return matches;
+  };
+  const auto running_changes =
+      matching_priority_changes(running.thread->thread_id());
+  REQUIRE(running_changes.size() == 1);
+  REQUIRE(running_changes[0].value == running_old_priority);
+  REQUIRE(running_changes[0].priority == 31);
+  REQUIRE(running_changes[0].cpu == 0);
+  REQUIRE(running_changes[0].target_cpu == -1);
+  const auto ready_changes =
+      matching_priority_changes(ready.thread->thread_id());
+  REQUIRE(ready_changes.size() == 2);
+  REQUIRE(ready_changes[0].value == ready_old_priority);
+  REQUIRE(ready_changes[0].priority == preenqueue_priority);
+  REQUIRE(ready_changes[0].cpu == -1);
+  REQUIRE(ready_changes[0].target_cpu == -1);
+  REQUIRE(ready_changes[1].value == preenqueue_priority);
+  REQUIRE(ready_changes[1].priority == ready_new_priority);
+  REQUIRE(ready_changes[1].cpu == 0);
+  REQUIRE(ready_changes[1].target_cpu == -1);
 }
 
 void ThrowBeforeCheckpointSnapshot(void*) { throw std::bad_alloc(); }

@@ -2025,7 +2025,7 @@ dword_result_t KeSetPriorityThread_entry(pointer_t<X_KTHREAD> thread_ptr,
 
   X_KPRCB* prcb = context->TranslateVirtual(thread_ptr->a_prcb_ptr);
   const uint32_t old_irql = xeKeKfAcquireSpinLock(context, &prcb->spin_lock);
-  const uint8_t old_priority = thread_ptr->priority;
+  uint8_t old_priority = 0;
 
   auto thread_ref = XObject::GetNativeObject<XThread>(kernel_state(),
                                                       thread_ptr, ThreadObject);
@@ -2033,8 +2033,9 @@ dword_result_t KeSetPriorityThread_entry(pointer_t<X_KTHREAD> thread_ptr,
   if (!thread_ref) {
     XELOGW("{}: Missing native thread: {}", __func__,
            static_cast<uint8_t>(thread_ptr->header.type));
+    old_priority = thread_ptr->priority;
   } else {
-    thread_ref->SetPriority(new_priority);
+    old_priority = static_cast<uint8_t>(thread_ref->SetPriority(new_priority));
   }
 
   xeKeKfReleaseSpinLock(context, &prcb->spin_lock, old_irql);

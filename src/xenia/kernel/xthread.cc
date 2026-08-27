@@ -9,6 +9,7 @@
 
 #include "xenia/kernel/xthread.h"
 
+#include <algorithm>
 #include <cstdlib>
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
@@ -274,7 +275,7 @@ void XThread::InitializeGuestObject() {
 
   // Sync the host-side priority tracking to match the guest defaults.
   // Games may later override these via KeSetPriorityThread.
-  priority_ = base_prio;
+  priority_.store(base_prio, std::memory_order_relaxed);
   base_priority_ = base_prio;
 
   guest_thread->a_prcb_ptr = kpcrb;
@@ -568,7 +569,7 @@ X_STATUS XThread::Create() {
     XELOGI(
         "GuestScheduler: created tid={:08X} '{}' prio={} cpu={} entry={:08X} "
         "ctx={:08X} suspended={}",
-        thread_id_, thread_name_, priority_,
+        thread_id_, thread_name_, priority(),
         static_cast<uint32_t>(guest_object<X_KTHREAD>()->current_cpu),
         creation_params_.start_address, creation_params_.start_context,
         (creation_params_.creation_flags & X_CREATE_SUSPENDED) ? 1 : 0);
@@ -923,10 +924,11 @@ void XThread::RundownAPCs() {
 int32_t XThread::QueryPriority() {
   // Fiber-backed guest threads have no host thread, so report the guest
   // priority.
-  return thread_ ? thread_->priority() : priority_;
+  return thread_ ? thread_->priority() : priority();
 }
 
 int32_t XThread::QueryBasePriority() {
+  std::lock_guard<std::mutex> lock(priority_mutex_);
   // KiQueryBasePriorityThread, the increment being base minus class base, or
   // +/-16 when the base is saturated.
   auto* kt = guest_object<X_KTHREAD>();
@@ -955,7 +957,15 @@ static int32_t GuestPriorityToHost(int32_t guest_priority) {
 }
 
 void XThread::PublishPriority(int32_t priority) {
-  priority_ = priority;
+  if (fiber_) {
+    kernel_state()->guest_scheduler()->PublishPriority(this, priority);
+    return;
+  }
+  StorePublishedPriority(priority);
+}
+
+void XThread::StorePublishedPriority(int32_t priority) {
+  priority_.store(priority, std::memory_order_relaxed);
   if (is_guest_thread()) {
     guest_object<X_KTHREAD>()->priority = static_cast<uint8_t>(priority);
   }
@@ -963,22 +973,22 @@ void XThread::PublishPriority(int32_t priority) {
   if (!cvars::ignore_thread_priorities && thread_) {
     thread_->set_priority(GuestPriorityToHost(priority));
   }
-  // The ready queue is indexed by priority, so a queued thread has to move.
-  if (GuestScheduler::enabled()) {
-    kernel_state()->guest_scheduler()->RequeueForPriority(this);
-  }
 }
 
-void XThread::SetPriority(int32_t increment) {
-  // Clamp to valid Xenon priority range.  Negative values can arrive via
+int32_t XThread::SetPriority(int32_t increment) {
+  std::lock_guard<std::mutex> lock(priority_mutex_);
+  const int32_t old_priority = priority();
+  // Clamp to the valid Xenon priority range. Negative values can arrive via
   // KeSetBasePriorityThread (signed offset from process base).
-  int32_t clamped = std::max(increment, 0);
+  int32_t clamped = std::clamp(increment, 0, 31);
   base_priority_ = clamped;
   boost_amount_ = 0;
   PublishPriority(clamped);
+  return old_priority;
 }
 
 int32_t XThread::SetBasePriority(int32_t increment) {
+  std::lock_guard<std::mutex> lock(priority_mutex_);
   // Ported from decompiled xeKeSetBasePriorityThread. The base becomes
   // class_base + increment clamped to [process class, max dynamic] and the
   // current priority shifts by the same delta, an |increment| of 16 or more
@@ -1009,7 +1019,7 @@ int32_t XThread::SetBasePriority(int32_t increment) {
   if (kt->saturation_increment) {
     new_cur = new_base;
   } else {
-    new_cur = priority_ - kt->priority_decrement - cur_base + new_base;
+    new_cur = priority() - kt->priority_decrement - cur_base + new_base;
     if (new_cur > max_dyn) {
       new_cur = max_dyn;
     }
@@ -1021,32 +1031,36 @@ int32_t XThread::SetBasePriority(int32_t increment) {
   base_priority_ = new_base;
   kt->priority_decrement = 0;
   boost_amount_ = 0;
-  if (new_cur != priority_) {
+  if (new_cur != priority()) {
     PublishPriority(new_cur);
   }
   return result;
 }
 
 void XThread::OnQuantumEnd() {
+  std::lock_guard<std::mutex> lock(priority_mutex_);
+  const int32_t current_priority = priority();
   // Real-time threads (priority >= 0x12) don't decay on Xenon.
-  if (priority_ >= 18) {
+  if (current_priority >= 18) {
     boost_amount_ = 0;
     return;
   }
   // KiQuantumEnd, boost_amount_ standing in for PriorityDecrement.
-  int32_t decayed = priority_ - boost_amount_ - 1;
+  int32_t decayed = current_priority - boost_amount_ - 1;
   if (decayed < base_priority_) {
     decayed = base_priority_;
   }
   boost_amount_ = 0;
-  if (decayed != priority_) {
+  if (decayed != current_priority) {
     PublishPriority(decayed);
   }
 }
 
 void XThread::BoostOnWake(int32_t increment) {
+  std::lock_guard<std::mutex> lock(priority_mutex_);
+  const int32_t current_priority = priority();
   // Real-time threads (priority >= 0x12) don't boost.
-  if (priority_ >= 18) {
+  if (current_priority >= 18) {
     boost_amount_ = 0;
     return;
   }
@@ -1082,7 +1096,7 @@ void XThread::BoostOnWake(int32_t increment) {
       boosted = max_cap;
     }
     // Only boost UP, never lower.
-    if (boosted > priority_) {
+    if (boosted > current_priority) {
       boost_amount_ = boosted - base_priority_;
       PublishPriority(boosted);
     }
@@ -1365,7 +1379,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
       if (park) {
         zero_delay_spins_ = 0;
         xe::threading::NanoSleep(cvars::zero_delay_park_ns);
-      } else if (priority_ <= xe::threading::ThreadPriority::kBelowNormal) {
+      } else if (priority() <= xe::threading::ThreadPriority::kBelowNormal) {
         xe::threading::NanoSleep(100);
       } else {
         xe::threading::MaybeYield();

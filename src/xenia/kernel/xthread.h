@@ -12,13 +12,13 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "xenia/base/mutex.h"
 #if !XE_PLATFORM_WIN32
 #include <condition_variable>
 #include <csignal>
-#include <mutex>
 #endif
 #if XE_PLATFORM_WIN32
 #include <csetjmp>
@@ -42,6 +42,7 @@ namespace kernel {
 constexpr fourcc_t kThreadSaveSignature = make_fourcc("THRD");
 
 class XEvent;
+class GuestScheduler;
 
 enum IRQL_FLAGS : uint8_t {
   IRQL_PASSIVE = 0,
@@ -464,12 +465,12 @@ class XThread : public XObject, public cpu::Thread {
   // host alertable wait wakes on a queued APC.
   bool HasPendingUserApc();
 
-  int32_t priority() const { return priority_; }
+  int32_t priority() const { return priority_.load(std::memory_order_relaxed); }
   int32_t QueryPriority();
   // KeQueryBasePriorityThread: the base priority as a signed increment relative
   // to the priority-class base, NOT the absolute priority.
   int32_t QueryBasePriority();
-  void SetPriority(int32_t increment);
+  int32_t SetPriority(int32_t increment);
   // KeSetBasePriorityThread: |increment| is a signed offset from the priority-
   // class base, not an absolute priority. Returns the previous increment.
   int32_t SetBasePriority(int32_t increment);
@@ -762,6 +763,8 @@ class XThread : public XObject, public cpu::Thread {
   void OnHostThreadExitCleanup();
 
  protected:
+  friend class GuestScheduler;
+
   bool AllocateStack(uint32_t size);
   void FreeStack();
   void InitializeGuestObject();
@@ -772,6 +775,9 @@ class XThread : public XObject, public cpu::Thread {
   // Publishes a new effective priority to the guest KTHREAD field, the host
   // thread and the scheduler's ready queue. Every change goes through here.
   void PublishPriority(int32_t priority);
+  // Stores the effective priority after GuestScheduler has established its
+  // total order, or directly when the cooperative scheduler is disabled.
+  void StorePublishedPriority(int32_t priority);
 
   xe::threading::WaitHandle* GetWaitHandle() override {
     // Under the cooperative scheduler there is no host thread, so a
@@ -800,7 +806,11 @@ class XThread : public XObject, public cpu::Thread {
   bool main_thread_ = false;  // Entry-point thread
   bool running_ = false;
 
-  int32_t priority_ = 0;       // current effective priority (may be decayed)
+  std::atomic<int32_t> priority_{0};
+  // Current effective priority may be read by external kernel callers while a
+  // cooperative fiber is running. Scheduler decisions additionally serialize
+  // every mutation under GuestScheduler::lock_.
+  std::mutex priority_mutex_;
   int32_t base_priority_ = 0;  // priority floor — decay never goes below this
   int32_t boost_amount_ = 0;   // accumulated priority boost above base
 

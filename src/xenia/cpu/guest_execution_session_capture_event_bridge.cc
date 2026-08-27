@@ -139,7 +139,7 @@ bool IsSupportedKind(CaptureKind kind) {
     case CaptureKind::kReready:
     case CaptureKind::kParkSuspended:
     case CaptureKind::kResume:
-    case CaptureKind::kRequeuePriority:
+    case CaptureKind::kPriorityChange:
     case CaptureKind::kMigrate:
       return true;
     case CaptureKind::kNone:
@@ -427,7 +427,7 @@ bool ValidateSchedulerEvent(const CaptureEvent& event, std::string* error) {
       (event.kind != CaptureKind::kSafepoint &&
        event.kind != CaptureKind::kBlock &&
        event.kind != CaptureKind::kReready &&
-       event.kind != CaptureKind::kRequeuePriority && event.value)) {
+       event.kind != CaptureKind::kPriorityChange && event.value)) {
     return Fail(error, "scheduler capture event has unexpected provenance");
   }
   switch (event.kind) {
@@ -447,6 +447,11 @@ bool ValidateSchedulerEvent(const CaptureEvent& event, std::string* error) {
         return Fail(error, "scheduler migration CPUs are invalid");
       }
       break;
+    case CaptureKind::kPriorityChange:
+      if ((event.cpu != -1 && !IsCpu(event.cpu)) || event.target_cpu != -1) {
+        return Fail(error, "scheduler priority-change CPU is invalid");
+      }
+      break;
     default:
       if (!IsCpu(event.cpu) || event.target_cpu != -1) {
         return Fail(error, "scheduler capture CPU is invalid");
@@ -463,7 +468,7 @@ bool ValidateSchedulerEvent(const CaptureEvent& event, std::string* error) {
       return Fail(error, "scheduler safepoint provenance is invalid");
     }
   }
-  if (event.kind == CaptureKind::kRequeuePriority && event.value > 31) {
+  if (event.kind == CaptureKind::kPriorityChange && event.value > 31) {
     return Fail(error, "scheduler previous priority is invalid");
   }
   if (wait_event && !ValidateWaitState(event, error)) {

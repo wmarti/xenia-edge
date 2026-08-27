@@ -37,7 +37,7 @@ enum class GuestSchedulerCaptureEventKind : uint8_t {
   kReready = 9,
   kParkSuspended = 10,
   kResume = 11,
-  kRequeuePriority = 12,
+  kPriorityChange = 12,
   kMigrate = 13,
   kExit = 14,
   kTerminate = 15,
@@ -161,11 +161,11 @@ struct GuestSchedulerCaptureEvent {
   GuestSchedulerCaptureReason reason = GuestSchedulerCaptureReason::kNone;
   int8_t cpu = -1;
   int8_t target_cpu = -1;
-  // Ready level of the participant at the event, or the new level for
-  // kRequeuePriority.
+  // Effective level of the participant at the event. For kPriorityChange this
+  // is the new level and value is the previous level.
   uint8_t priority = 0;
   // kSafepoint: guest IRQL. kBlock and kReready: XThread::CooperativeWaitKind.
-  // kRequeuePriority: the previous level.
+  // kPriorityChange: the previous level.
   uint8_t value = 0;
   GuestSchedulerCaptureWaitState wait;
 
