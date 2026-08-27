@@ -126,6 +126,16 @@ bool GuestInvocationCapturePageReader::ReadPage(
     return false;
   }
 
+  // Recorder callbacks already hold their coordinator lock. Never wait for
+  // the global critical region here: its contract requires it to be acquired
+  // before all narrower locks, so blocking would permit a lock-order cycle
+  // with a guest thread entering a capture callback from the global region.
+  // A contended snapshot fails closed and rejects only the capture.
+  auto global_lock = xe::global_critical_region::TryAcquire();
+  if (!global_lock.owns_lock()) {
+    return false;
+  }
+
   BaseHeap* const first_heap = memory_.LookupHeap(page_address);
   BaseHeap* const last_heap =
       memory_.LookupHeap(page_address + JitCorpus::kPageSize - 1);
@@ -133,11 +143,9 @@ bool GuestInvocationCapturePageReader::ReadPage(
     return false;
   }
 
-  // Keep the allocation metadata stable through the copy. Guest memory
-  // protection, decommit and release operations use this same recursive global
-  // critical region, so none can invalidate the checked host range between the
+  // Guest memory protection, decommit and release operations use the global
+  // region too, so none can invalidate the checked host range between the
   // query and memcpy.
-  auto global_lock = xe::global_critical_region::AcquireDirect();
   HeapAllocationInfo allocation_info = {};
   if (!first_heap->QueryRegionInfo(page_address, &allocation_info)) {
     return false;

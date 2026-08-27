@@ -13,12 +13,16 @@
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <thread>
 
 #include "third_party/catch/include/catch.hpp"
+#include "xenia/base/mutex.h"
 #include "xenia/memory.h"
 
 namespace xe {
@@ -113,6 +117,67 @@ TEST_CASE("guest invocation capture page reader fails closed",
   REQUIRE_FALSE(reader.ReadPage(kReadablePage + 1, &output));
   REQUIRE_FALSE(reader.ReadPage(std::numeric_limits<uint32_t>::max(), &output));
   REQUIRE_FALSE(reader.ReadPage(kReadablePage, nullptr));
+}
+
+TEST_CASE("guest invocation capture page reader never waits for global region",
+          "[guest-invocation-capture]") {
+  Memory memory;
+  REQUIRE(memory.Initialize());
+  AllocatePage(memory, kReadablePage,
+               kMemoryAllocationReserve | kMemoryAllocationCommit,
+               kMemoryProtectRead);
+  GuestInvocationCapturePageReader reader(memory);
+  std::array<uint8_t, 4096> output = {};
+
+  std::atomic<bool> global_region_held = false;
+  std::atomic<bool> release_global_region = false;
+  std::thread holder([&] {
+    auto global_lock = xe::global_critical_region::AcquireDirect();
+    global_region_held.store(true, std::memory_order_release);
+    while (!release_global_region.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  });
+  const auto holder_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!global_region_held.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < holder_deadline) {
+    std::this_thread::yield();
+  }
+  const bool global_region_held_observed =
+      global_region_held.load(std::memory_order_acquire);
+
+  std::atomic<bool> read_started = false;
+  std::atomic<bool> read_finished = false;
+  bool read_result = true;
+  std::thread reader_thread([&] {
+    read_started.store(true, std::memory_order_release);
+    read_result = reader.ReadPage(kReadablePage, &output);
+    read_finished.store(true, std::memory_order_release);
+  });
+  const auto reader_start_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!read_started.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < reader_start_deadline) {
+    std::this_thread::yield();
+  }
+  const auto reader_finish_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!read_finished.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < reader_finish_deadline) {
+    std::this_thread::yield();
+  }
+  const bool read_finished_while_contended =
+      read_finished.load(std::memory_order_acquire);
+
+  release_global_region.store(true, std::memory_order_release);
+  holder.join();
+  reader_thread.join();
+
+  REQUIRE(global_region_held_observed);
+  REQUIRE(read_started.load(std::memory_order_acquire));
+  REQUIRE(read_finished_while_contended);
+  REQUIRE_FALSE(read_result);
 }
 
 }  // namespace test
