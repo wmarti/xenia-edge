@@ -11,6 +11,11 @@
 
 #include <cstdlib>
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include <thread>
+#endif
+
 #if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID || XE_PLATFORM_MAC
 #include <pthread.h>
 #endif
@@ -575,6 +580,20 @@ X_STATUS XThread::Create() {
 X_STATUS XThread::Exit(int exit_code) {
   // This may only be called on the thread itself.
   assert_true(XThread::GetCurrentThread() == this);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (fiber_) {
+    auto* scheduler = kernel_state()->guest_scheduler();
+    if (!scheduler->ClaimCurrentThreadExit(this)) {
+      while (
+          !scheduler_links_.terminate_pending.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      scheduler->ExitIfTerminated();  // never returns
+      std::abort();
+    }
+  }
+#endif
   // TODO(chrispy): not sure if this order is correct, should it come after
   // apcs?
   auto kthread = guest_object<X_KTHREAD>();
@@ -638,6 +657,24 @@ X_STATUS XThread::Exit(int exit_code) {
 
 X_STATUS XThread::Terminate(int exit_code) {
   // TODO(benvanik): inform the profiler that this thread is exiting.
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  const bool externally_terminated_fiber = fiber_ && !XThread::IsInThread(this);
+  if (externally_terminated_fiber &&
+      !kernel_state()->guest_scheduler()->ClaimExternalTermination(this)) {
+    return X_STATUS_SUCCESS;
+  }
+  if (fiber_ && !externally_terminated_fiber &&
+      !kernel_state()->guest_scheduler()->ClaimCurrentThreadExit(this)) {
+    while (
+        !scheduler_links_.terminate_pending.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    kernel_state()->guest_scheduler()->ExitIfTerminated();  // never returns
+    std::abort();
+  }
+#endif
 
   // Set exit code.
   X_KTHREAD* thread = guest_object<X_KTHREAD>();

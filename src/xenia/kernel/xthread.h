@@ -604,6 +604,18 @@ class XThread : public XObject, public cpu::Thread {
     std::atomic<bool> terminate_pending{false};
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    enum class TerminalOwner : uint8_t {
+      kNone = 0,
+      kExternalTerminate,
+      kCurrentThreadExit,
+      kCheckpointDiscard,
+      kExited,
+    };
+
+    // Serialized by the scheduler lock. This linearizes an external Terminate
+    // against authenticated checkpoint discard before either path mutates the
+    // guest KTHREAD or publishes an actionable resume.
+    TerminalOwner terminal_owner = TerminalOwner::kNone;
     // Set only after an offline replay boundary authenticates this parked
     // fiber. Its next scheduler resume exits on the fiber stack without
     // returning to the JIT safepoint.

@@ -283,6 +283,7 @@ GuestScheduler::PauseForCheckpointBarrier(
   }
   if (!started_.load(std::memory_order_acquire) ||
       !checkpoint_dispatch_ready_.load(std::memory_order_acquire) ||
+      checkpoint_shutdown_requested_.load(std::memory_order_acquire) ||
       shutting_down_.load(std::memory_order_acquire)) {
     return GuestSchedulerCheckpointBarrierRejection::kNotStarted;
   }
@@ -294,6 +295,7 @@ GuestScheduler::PauseForCheckpointBarrier(
       std::lock_guard<std::mutex> lock(lock_);
       if (!started_.load(std::memory_order_acquire) ||
           !checkpoint_dispatch_ready_.load(std::memory_order_acquire) ||
+          checkpoint_shutdown_requested_.load(std::memory_order_acquire) ||
           shutting_down_.load(std::memory_order_acquire)) {
         return GuestSchedulerCheckpointBarrierRejection::kNotStarted;
       }
@@ -412,24 +414,30 @@ GuestScheduler::FinalizeCheckpointBarrierLocked(
     std::span<const GuestSchedulerCheckpointJitRoute> discard_routes) {
   GuestSchedulerCheckpointBarrierRejection rejection =
       GuestSchedulerCheckpointBarrierRejection::kInvalidTopology;
+  const auto return_with_snapshot =
+      [generation, out_final_snapshot](
+          GuestSchedulerCheckpointBarrierRejection snapshot_rejection) {
+        if (out_final_snapshot) {
+          *out_final_snapshot = {};
+          out_final_snapshot->generation = generation;
+          out_final_snapshot->rejection = snapshot_rejection;
+        }
+        return snapshot_rejection;
+      };
   for (const auto& held : checkpoint_held_) {
     if (!held.state.empty() && held.state.generation() != generation) {
-      if (out_final_snapshot) {
-        *out_final_snapshot = {};
-        out_final_snapshot->generation = generation;
-        out_final_snapshot->rejection =
-            GuestSchedulerCheckpointBarrierRejection::kStaleGeneration;
-      }
-      return GuestSchedulerCheckpointBarrierRejection::kStaleGeneration;
+      return return_with_snapshot(
+          GuestSchedulerCheckpointBarrierRejection::kStaleGeneration);
     }
   }
   if (!discard_routes.empty() &&
       !ValidateCheckpointDiscardRoutesLocked(generation, discard_routes)) {
     const auto snapshot = checkpoint_barrier_.snapshot();
     if (!snapshot.active || snapshot.generation != generation) {
-      return snapshot.active
-                 ? GuestSchedulerCheckpointBarrierRejection::kStaleGeneration
-                 : GuestSchedulerCheckpointBarrierRejection::kNotActive;
+      return return_with_snapshot(
+          snapshot.active
+              ? GuestSchedulerCheckpointBarrierRejection::kStaleGeneration
+              : GuestSchedulerCheckpointBarrierRejection::kNotActive);
     }
     checkpoint_barrier_.Reject(
         GuestSchedulerCheckpointBarrierRejection::kInvalidTopology);
@@ -442,7 +450,12 @@ GuestScheduler::FinalizeCheckpointBarrierLocked(
       !discard_routes.empty()) {
     for (const auto& route : discard_routes) {
       auto& links = route.thread->scheduler_links();
+      assert_true(links.terminal_owner ==
+                  XThread::SchedulerLinks::TerminalOwner::kNone);
+      links.terminal_owner =
+          XThread::SchedulerLinks::TerminalOwner::kCheckpointDiscard;
       links.checkpoint_discard_pending.store(true, std::memory_order_release);
+      ++checkpoint_discard_pending_count_;
       if (!links.suspended) {
         continue;
       }
@@ -497,10 +510,7 @@ bool GuestScheduler::ValidateCheckpointDiscardRoutesLocked(
   for (size_t route_index = 0; route_index < routes.size(); ++route_index) {
     const auto& route = routes[route_index];
     if (!route.thread || !route.thread->fiber() || !route.guest_pc ||
-        (route.guest_pc & 3) ||
-        route.thread->guest_object<X_KTHREAD>()->terminated ||
-        route.thread->guest_object<X_KTHREAD>()->thread_state ==
-            KTHREAD_STATE_TERMINATED) {
+        (route.guest_pc & 3)) {
       return false;
     }
     for (size_t earlier = 0; earlier < route_index; ++earlier) {
@@ -529,6 +539,7 @@ bool GuestScheduler::ValidateCheckpointDiscardRoutesLocked(
             ? links.checkpoint_jit_safepoint_pc
             : links.RestorableCheckpointJitSafepointPc(participant_it->state);
     if (!links.has_run || links.cpu != participant_it->cpu ||
+        links.terminal_owner != XThread::SchedulerLinks::TerminalOwner::kNone ||
         links.terminate_pending.load(std::memory_order_relaxed) ||
         links.checkpoint_discard_pending.load(std::memory_order_relaxed) ||
         parked_guest_pc != route.guest_pc) {
@@ -636,6 +647,12 @@ GuestScheduler::FinalizeAndDiscardCheckpointBarrier(
     }
     rejection =
         FinalizeCheckpointBarrierLocked(generation, out_final_snapshot, routes);
+  }
+  if (rejection == GuestSchedulerCheckpointBarrierRejection::kNone) {
+    if (auto hook =
+            checkpoint_discard_test_hook_.load(std::memory_order_acquire)) {
+      hook(checkpoint_discard_test_context_.load(std::memory_order_acquire));
+    }
   }
   for (Cpu& cpu : cpus_) {
     if (cpu.ready_event) {
@@ -794,16 +811,29 @@ void GuestScheduler::Shutdown() {
   }
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  bool drain_checkpoint_discards = false;
   {
     std::lock_guard<std::mutex> lock(lock_);
-    shutting_down_.store(true);
+    checkpoint_shutdown_requested_.store(true, std::memory_order_release);
     const auto snapshot = checkpoint_barrier_.snapshot();
     if (snapshot.active) {
       checkpoint_barrier_.Reject(
           GuestSchedulerCheckpointBarrierRejection::kShutdown);
       FinalizeCheckpointBarrierLocked(snapshot.generation, nullptr);
     }
+    drain_checkpoint_discards = checkpoint_discard_pending_count_ != 0;
   }
+  if (drain_checkpoint_discards) {
+    for (Cpu& cpu : cpus_) {
+      if (cpu.ready_event) {
+        cpu.ready_event->Set();
+      }
+    }
+    std::unique_lock<std::mutex> lock(lock_);
+    checkpoint_discard_condition_.wait(
+        lock, [this]() { return checkpoint_discard_pending_count_ == 0; });
+  }
+  shutting_down_.store(true, std::memory_order_release);
 #else
   shutting_down_.store(true);
 #endif
@@ -1322,21 +1352,65 @@ bool GuestScheduler::ForgetThread(XThread* thread) {
   return reclaimable;
 }
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+bool GuestScheduler::ClaimExternalTermination(XThread* thread) {
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    auto& links = thread->scheduler_links();
+    if (links.terminal_owner != XThread::SchedulerLinks::TerminalOwner::kNone) {
+      return false;
+    }
+    links.terminal_owner =
+        XThread::SchedulerLinks::TerminalOwner::kExternalTerminate;
+    RejectCheckpointTopologyChangeLocked();
+    links.ClearCheckpointResumeRoute();
+  }
+  if (auto hook =
+          checkpoint_terminate_test_hook_.load(std::memory_order_acquire)) {
+    hook(checkpoint_terminate_test_context_.load(std::memory_order_acquire));
+  }
+  return true;
+}
+
+bool GuestScheduler::ClaimCurrentThreadExit(XThread* thread) {
+  std::lock_guard<std::mutex> lock(lock_);
+  auto& links = thread->scheduler_links();
+  if (links.terminal_owner ==
+      XThread::SchedulerLinks::TerminalOwner::kCheckpointDiscard) {
+    return true;
+  }
+  if (links.terminal_owner != XThread::SchedulerLinks::TerminalOwner::kNone) {
+    return false;
+  }
+  links.terminal_owner =
+      XThread::SchedulerLinks::TerminalOwner::kCurrentThreadExit;
+  RejectCheckpointTopologyChangeLocked();
+  links.ClearCheckpointResumeRoute();
+  return true;
+}
+#endif
+
 bool GuestScheduler::TerminateThread(XThread* thread) {
   int wake_cpu = -1;
   {
     std::lock_guard<std::mutex> lock(lock_);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-    RejectCheckpointTopologyChangeLocked();
-#endif
     auto& links = thread->scheduler_links();
+    assert_true(links.terminal_owner ==
+                XThread::SchedulerLinks::TerminalOwner::kExternalTerminate);
+#else
+    auto& links = thread->scheduler_links();
+#endif
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-    links.ClearCheckpointResumeRoute();
-#endif
+    links.terminate_pending.store(true, std::memory_order_release);
+    if (stopped_.load() || shutting_down_.load() || !started_.load()) {
+#else
     links.terminate_pending.store(true, std::memory_order_relaxed);
     if (stopped_.load() || !started_.load()) {
+#endif
       // No dispatcher will ever run it again, detach it and let the caller
       // free the stack, parked frames and all.
       if (links.cpu >= 0) {
@@ -1361,8 +1435,9 @@ bool GuestScheduler::TerminateThread(XThread* thread) {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
       EmitCaptureLocked(CaptureKind::kTerminate, thread, links.cpu, -1,
                         CaptureReason::kDetached, 0, 0);
-#endif
+#else
       assert_false(links.running);
+#endif
       return !links.running;
     }
     if (links.running) {
@@ -1614,10 +1689,10 @@ void GuestScheduler::ExitIfTerminated() {
   if (!self) {
     return;
   }
-  const bool terminate_pending =
-      self->scheduler_links().terminate_pending.load(std::memory_order_relaxed);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  const bool terminate_pending =
+      self->scheduler_links().terminate_pending.load(std::memory_order_acquire);
   if (!terminate_pending &&
       self->scheduler_links().checkpoint_discard_pending.load(
           std::memory_order_acquire) &&
@@ -1626,6 +1701,9 @@ void GuestScheduler::ExitIfTerminated() {
     self->Exit(0);  // never returns
     return;
   }
+#else
+  const bool terminate_pending =
+      self->scheduler_links().terminate_pending.load(std::memory_order_relaxed);
 #endif
   if (!terminate_pending) {
     return;
@@ -1942,7 +2020,18 @@ void GuestScheduler::NotifyThreadExited(XThread* thread) {
   {
     std::lock_guard<std::mutex> lock(lock_);
     RejectCheckpointTopologyChangeLocked();
-    thread->scheduler_links().ClearCheckpointResumeRoute();
+    auto& links = thread->scheduler_links();
+    links.ClearCheckpointResumeRoute();
+    if (links.terminal_owner ==
+        XThread::SchedulerLinks::TerminalOwner::kCheckpointDiscard) {
+      links.checkpoint_discard_pending.store(false, std::memory_order_release);
+      assert_true(checkpoint_discard_pending_count_ != 0);
+      if (checkpoint_discard_pending_count_ != 0) {
+        --checkpoint_discard_pending_count_;
+      }
+      checkpoint_discard_condition_.notify_all();
+    }
+    links.terminal_owner = XThread::SchedulerLinks::TerminalOwner::kExited;
     cpus_[t_current_cpu].exited_thread = thread;
   }
 #else

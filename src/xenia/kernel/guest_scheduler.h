@@ -21,6 +21,7 @@
 #include "xenia/base/threading.h"
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include <condition_variable>
 #include <vector>
 
 #include "xenia/kernel/guest_scheduler_capture_observer.h"
@@ -172,6 +173,18 @@ class GuestScheduler {
   // stack again. Otherwise its dispatcher runs it to a safepoint or wait
   // resume point where it exits and is reclaimed.
   bool TerminateThread(XThread* thread);
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Claims the one terminal action for an externally terminated fiber before
+  // XThread mutates its guest state. False means an earlier terminate, natural
+  // exit or authenticated replay-boundary discard already owns that action.
+  bool ClaimExternalTermination(XThread* thread);
+  // Claims a natural Exit or self-Terminate. An authenticated discard already
+  // owns and authorizes that same current-fiber exit, while an external
+  // termination must finish its bookkeeping first.
+  bool ClaimCurrentThreadExit(XThread* thread);
+#endif
 
   // Ends the calling fiber now if external termination or an authenticated
   // replay-boundary discard marked it, handing it to the dispatcher for
@@ -412,6 +425,16 @@ class GuestScheduler {
   std::atomic<void*> checkpoint_startup_test_context_{nullptr};
   std::atomic<CheckpointTestHook> checkpoint_snapshot_test_hook_{nullptr};
   std::atomic<void*> checkpoint_snapshot_test_context_{nullptr};
+  std::atomic<CheckpointTestHook> checkpoint_discard_test_hook_{nullptr};
+  std::atomic<void*> checkpoint_discard_test_context_{nullptr};
+  std::atomic<CheckpointTestHook> checkpoint_terminate_test_hook_{nullptr};
+  std::atomic<void*> checkpoint_terminate_test_context_{nullptr};
+
+  // Shutdown keeps dispatch alive until every accepted discard has completed
+  // XThread::Exit bookkeeping and reported its final yield.
+  std::atomic<bool> checkpoint_shutdown_requested_{false};
+  std::condition_variable checkpoint_discard_condition_;
+  size_t checkpoint_discard_pending_count_ = 0;
 #endif
 
   KernelState* kernel_state_;

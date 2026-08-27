@@ -84,6 +84,24 @@ class GuestSchedulerCheckpointRuntimeTestAccess final {
                                                    std::memory_order_release);
   }
 
+  static void SetDiscardHook(GuestScheduler& scheduler,
+                             GuestScheduler::CheckpointTestHook hook,
+                             void* context) {
+    scheduler.checkpoint_discard_test_context_.store(context,
+                                                     std::memory_order_release);
+    scheduler.checkpoint_discard_test_hook_.store(hook,
+                                                  std::memory_order_release);
+  }
+
+  static void SetTerminateHook(GuestScheduler& scheduler,
+                               GuestScheduler::CheckpointTestHook hook,
+                               void* context) {
+    scheduler.checkpoint_terminate_test_context_.store(
+        context, std::memory_order_release);
+    scheduler.checkpoint_terminate_test_hook_.store(hook,
+                                                    std::memory_order_release);
+  }
+
   static GuestSchedulerCheckpointBarrierSnapshot Snapshot(
       GuestScheduler& scheduler) {
     return scheduler.checkpoint_barrier_.snapshot();
@@ -1114,10 +1132,205 @@ TEST_CASE("Guest scheduler discards a suspended exact JIT route",
   const std::array<GuestSchedulerCheckpointJitRoute, 1> route = {{
       {suspended.thread.get(), kSafepointPc},
   }};
+  GuestSchedulerCheckpointBarrierSnapshot stale_snapshot;
+  stale_snapshot.generation = 0xFFFFFFFFFFFFFFFFull;
+  stale_snapshot.rejection = Rejection::kNone;
   REQUIRE(scheduler.FinalizeAndDiscardCheckpointBarrier(
-              snapshot.generation, route) == Rejection::kNone);
+              snapshot.generation + 1, route, &stale_snapshot) ==
+          Rejection::kStaleGeneration);
+  REQUIRE(stale_snapshot.generation == snapshot.generation + 1);
+  REQUIRE(stale_snapshot.rejection == Rejection::kStaleGeneration);
+  REQUIRE_FALSE(stale_snapshot.active);
+
+  GuestSchedulerCheckpointBarrierSnapshot discarded_snapshot;
+  REQUIRE(scheduler.FinalizeAndDiscardCheckpointBarrier(
+              snapshot.generation, route, &discarded_snapshot) ==
+          Rejection::kNone);
+  REQUIRE(discarded_snapshot.rejection == Rejection::kNone);
+
+  GuestSchedulerCheckpointBarrierSnapshot duplicate_snapshot;
+  duplicate_snapshot.generation = 0xFFFFFFFFFFFFFFFFull;
+  duplicate_snapshot.rejection = Rejection::kInvalidTopology;
+  REQUIRE(scheduler.FinalizeAndDiscardCheckpointBarrier(
+              snapshot.generation, route, &duplicate_snapshot) ==
+          Rejection::kNotActive);
+  REQUIRE(duplicate_snapshot.generation == snapshot.generation);
+  REQUIRE(duplicate_snapshot.rejection == Rejection::kNotActive);
+  REQUIRE_FALSE(duplicate_snapshot.active);
   REQUIRE(xe::threading::Wait(suspended.thread->wait_handle(), false, 2s) ==
           xe::threading::WaitResult::kSuccess);
+  REQUIRE(control.safepoint_returns.load(std::memory_order_acquire) == 0);
+}
+
+TEST_CASE("Guest scheduler shutdown drains an accepted checkpoint discard",
+          "[guest_scheduler_checkpoint][runtime][continuous_replay]") {
+  BlockingGate finalized_gate;
+  FiberControl control;
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+
+  CreatedThread suspended =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(suspended.status));
+  REQUIRE(control.WaitForStart(2s));
+  REQUIRE(XSUCCEEDED(suspended.thread->Suspend()));
+  suspended.thread->thread_state()->context()->preempt_requested = 1;
+  REQUIRE(WaitUntilSuspended(scheduler, suspended.thread.get(), 2s));
+
+  GuestSchedulerCheckpointBarrierSnapshot snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
+          Rejection::kNone);
+  const std::array<GuestSchedulerCheckpointJitRoute, 1> route = {{
+      {suspended.thread.get(), kSafepointPc},
+  }};
+  GuestSchedulerCheckpointRuntimeTestAccess::SetDiscardHook(
+      scheduler, &BlockingGate::Hook, &finalized_gate);
+  auto finalize_future = std::async(
+      std::launch::async,
+      [&scheduler, &route, generation = snapshot.generation] {
+        return scheduler.FinalizeAndDiscardCheckpointBarrier(generation, route);
+      });
+  const bool finalize_held = finalized_gate.WaitUntilEntered(2s);
+  if (!finalize_held) {
+    finalized_gate.Release();
+  }
+  REQUIRE(finalize_held);
+
+  auto shutdown_future =
+      std::async(std::launch::async, [&scheduler]() { scheduler.Shutdown(); });
+  const bool shutdown_completed_before_finalize_return =
+      shutdown_future.wait_for(2s) == std::future_status::ready;
+  const bool exit_signaled_before_finalize_return =
+      xe::threading::Wait(suspended.thread->wait_handle(), false, 0ms) ==
+      xe::threading::WaitResult::kSuccess;
+  const X_KTHREAD* kthread = suspended.thread->guest_object<X_KTHREAD>();
+  const bool full_exit_state_before_finalize_return =
+      kthread->terminated &&
+      kthread->thread_state == KTHREAD_STATE_TERMINATED &&
+      kthread->header.signal_state == 1 && kthread->exit_status == 0;
+
+  finalized_gate.Release();
+  GuestSchedulerCheckpointRuntimeTestAccess::SetDiscardHook(scheduler, nullptr,
+                                                            nullptr);
+  REQUIRE(shutdown_future.wait_for(2s) == std::future_status::ready);
+  shutdown_future.get();
+  REQUIRE(finalize_future.wait_for(2s) == std::future_status::ready);
+  REQUIRE(finalize_future.get() == Rejection::kNone);
+  REQUIRE(shutdown_completed_before_finalize_return);
+  REQUIRE(exit_signaled_before_finalize_return);
+  REQUIRE(full_exit_state_before_finalize_return);
+  REQUIRE(control.safepoint_returns.load(std::memory_order_acquire) == 0);
+}
+
+TEST_CASE("Guest scheduler checkpoint discard owns a racing terminate",
+          "[guest_scheduler_checkpoint][runtime][continuous_replay]") {
+  BlockingGate finalized_gate;
+  FiberControl control;
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+
+  CreatedThread suspended =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(suspended.status));
+  REQUIRE(control.WaitForStart(2s));
+  REQUIRE(XSUCCEEDED(suspended.thread->Suspend()));
+  suspended.thread->thread_state()->context()->preempt_requested = 1;
+  REQUIRE(WaitUntilSuspended(scheduler, suspended.thread.get(), 2s));
+
+  GuestSchedulerCheckpointBarrierSnapshot snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
+          Rejection::kNone);
+  const std::array<GuestSchedulerCheckpointJitRoute, 1> route = {{
+      {suspended.thread.get(), kSafepointPc},
+  }};
+  GuestSchedulerCheckpointRuntimeTestAccess::SetDiscardHook(
+      scheduler, &BlockingGate::Hook, &finalized_gate);
+  auto finalize_future = std::async(
+      std::launch::async,
+      [&scheduler, &route, generation = snapshot.generation] {
+        return scheduler.FinalizeAndDiscardCheckpointBarrier(generation, route);
+      });
+  const bool finalize_held = finalized_gate.WaitUntilEntered(2s);
+  if (!finalize_held) {
+    finalized_gate.Release();
+  }
+  REQUIRE(finalize_held);
+
+  const X_STATUS terminate_status = suspended.thread->Terminate(0x1357);
+  const bool exit_unsignaled =
+      xe::threading::Wait(suspended.thread->wait_handle(), false, 0ms) ==
+      xe::threading::WaitResult::kTimeout;
+  const bool guest_state_untouched =
+      suspended.thread->guest_object<X_KTHREAD>()->header.signal_state == 0;
+
+  finalized_gate.Release();
+  GuestSchedulerCheckpointRuntimeTestAccess::SetDiscardHook(scheduler, nullptr,
+                                                            nullptr);
+  REQUIRE(XSUCCEEDED(terminate_status));
+  REQUIRE(exit_unsignaled);
+  REQUIRE(guest_state_untouched);
+  REQUIRE(finalize_future.wait_for(2s) == std::future_status::ready);
+  REQUIRE(finalize_future.get() == Rejection::kNone);
+  REQUIRE(xe::threading::Wait(suspended.thread->wait_handle(), false, 2s) ==
+          xe::threading::WaitResult::kSuccess);
+  REQUIRE(suspended.thread->guest_object<X_KTHREAD>()->exit_status == 0);
+  REQUIRE(control.safepoint_returns.load(std::memory_order_acquire) == 0);
+}
+
+TEST_CASE("Guest scheduler terminate owns a racing checkpoint discard",
+          "[guest_scheduler_checkpoint][runtime][continuous_replay]") {
+  BlockingGate terminate_gate;
+  FiberControl control;
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+
+  CreatedThread suspended =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(suspended.status));
+  REQUIRE(control.WaitForStart(2s));
+  REQUIRE(XSUCCEEDED(suspended.thread->Suspend()));
+  suspended.thread->thread_state()->context()->preempt_requested = 1;
+  REQUIRE(WaitUntilSuspended(scheduler, suspended.thread.get(), 2s));
+
+  GuestSchedulerCheckpointBarrierSnapshot snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
+          Rejection::kNone);
+  const std::array<GuestSchedulerCheckpointJitRoute, 1> route = {{
+      {suspended.thread.get(), kSafepointPc},
+  }};
+  GuestSchedulerCheckpointRuntimeTestAccess::SetTerminateHook(
+      scheduler, &BlockingGate::Hook, &terminate_gate);
+  auto terminate_future = std::async(std::launch::async, [&suspended]() {
+    return suspended.thread->Terminate(0x2468);
+  });
+  const bool terminate_held = terminate_gate.WaitUntilEntered(2s);
+  if (!terminate_held) {
+    terminate_gate.Release();
+  }
+  REQUIRE(terminate_held);
+  const bool guest_state_untouched =
+      suspended.thread->guest_object<X_KTHREAD>()->header.signal_state == 0;
+
+  GuestSchedulerCheckpointBarrierSnapshot rejected_snapshot;
+  const Rejection discard_rejection =
+      scheduler.FinalizeAndDiscardCheckpointBarrier(snapshot.generation, route,
+                                                    &rejected_snapshot);
+
+  terminate_gate.Release();
+  GuestSchedulerCheckpointRuntimeTestAccess::SetTerminateHook(scheduler,
+                                                              nullptr, nullptr);
+  REQUIRE(guest_state_untouched);
+  REQUIRE(discard_rejection == Rejection::kTopologyChanged);
+  REQUIRE(rejected_snapshot.generation == snapshot.generation);
+  REQUIRE(rejected_snapshot.rejection == Rejection::kTopologyChanged);
+  REQUIRE(terminate_future.wait_for(2s) == std::future_status::ready);
+  REQUIRE(XSUCCEEDED(terminate_future.get()));
+  REQUIRE(xe::threading::Wait(suspended.thread->wait_handle(), false, 2s) ==
+          xe::threading::WaitResult::kSuccess);
+  REQUIRE(suspended.thread->guest_object<X_KTHREAD>()->exit_status == 0x2468);
   REQUIRE(control.safepoint_returns.load(std::memory_order_acquire) == 0);
 }
 
@@ -1169,14 +1382,34 @@ TEST_CASE(
   REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &incomplete_snapshot) ==
           Rejection::kNone);
   REQUIRE(incomplete_snapshot.quiesced);
-  const std::array<GuestSchedulerCheckpointJitRoute, 1> incomplete_routes = {{
+  const std::array<GuestSchedulerCheckpointJitRoute, 2> duplicate_routes = {{
+      {replay_a.thread.get(), kReplayFinalA},
       {replay_a.thread.get(), kReplayFinalA},
   }};
   GuestSchedulerCheckpointBarrierSnapshot rejected_snapshot;
   REQUIRE(scheduler.FinalizeAndDiscardCheckpointBarrier(
-              incomplete_snapshot.generation, incomplete_routes,
+              incomplete_snapshot.generation, duplicate_routes,
               &rejected_snapshot) == Rejection::kInvalidTopology);
   REQUIRE(rejected_snapshot.rejection == Rejection::kInvalidTopology);
+  REQUIRE(xe::threading::Wait(replay_a.thread->wait_handle(), false, 0ms) ==
+          xe::threading::WaitResult::kTimeout);
+  REQUIRE(xe::threading::Wait(replay_b.thread->wait_handle(), false, 0ms) ==
+          xe::threading::WaitResult::kTimeout);
+
+  REQUIRE(WaitUntilRunning(scheduler, replay_a.thread.get(), 2s));
+  GuestSchedulerCheckpointBarrierSnapshot wrong_pc_snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &wrong_pc_snapshot) ==
+          Rejection::kNone);
+  REQUIRE(wrong_pc_snapshot.quiesced);
+  const std::array<GuestSchedulerCheckpointJitRoute, 2> wrong_pc_routes = {{
+      {replay_a.thread.get(), kReplayFinalA + 4},
+      {replay_b.thread.get(), kReplayFinalB},
+  }};
+  GuestSchedulerCheckpointBarrierSnapshot wrong_pc_rejected_snapshot;
+  REQUIRE(scheduler.FinalizeAndDiscardCheckpointBarrier(
+              wrong_pc_snapshot.generation, wrong_pc_routes,
+              &wrong_pc_rejected_snapshot) == Rejection::kInvalidTopology);
+  REQUIRE(wrong_pc_rejected_snapshot.rejection == Rejection::kInvalidTopology);
   REQUIRE(xe::threading::Wait(replay_a.thread->wait_handle(), false, 0ms) ==
           xe::threading::WaitResult::kTimeout);
   REQUIRE(xe::threading::Wait(replay_b.thread->wait_handle(), false, 0ms) ==
