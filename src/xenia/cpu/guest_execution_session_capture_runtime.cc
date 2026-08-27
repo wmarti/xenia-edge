@@ -617,6 +617,14 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
         return Fail(error,
                     "capture runtime checkpoint and Processor rosters differ");
       }
+      if (checkpoint_participant->preempt_defers_irql ||
+          checkpoint_participant->preempt_defers_lock ||
+          checkpoint_participant->capture_declined_safepoints) {
+        return Fail(
+            error,
+            "capture runtime checkpoint intersects an in-flight scheduler "
+            "preemption episode");
+      }
       for (size_t prior = 0; prior < index; ++prior) {
         if (registry.participants[prior].participant.capture_instance_id ==
                 lifecycle.participant.capture_instance_id ||

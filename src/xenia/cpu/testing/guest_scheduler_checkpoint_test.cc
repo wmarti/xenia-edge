@@ -69,7 +69,7 @@ TEST_CASE("Scheduler checkpoint barrier holds running and preserves passive",
   };
 
   REQUIRE(barrier.Begin(0b11, participants));
-  REQUIRE(barrier.ArriveAtSafepoint(0x101, 0, 0x82002000));
+  REQUIRE(barrier.ArriveAtSafepoint(0x101, 0, 0x82002000, 3, 5, 8));
   REQUIRE(barrier.ArriveAtSafepoint(0x202, 1, 0x82003000));
   REQUIRE(barrier.ConfirmSwitchOut(0x101, 0));
   REQUIRE(barrier.ConfirmSwitchOut(0x202, 1));
@@ -91,6 +91,9 @@ TEST_CASE("Scheduler checkpoint barrier holds running and preserves passive",
   REQUIRE(running_a.guest_pc == 0x82002000);
   REQUIRE(running_a.resume_kind == ResumeKind::kJitSafepoint);
   REQUIRE(running_a.restorable);
+  REQUIRE(running_a.preempt_defers_irql == 3);
+  REQUIRE(running_a.preempt_defers_lock == 5);
+  REQUIRE(running_a.capture_declined_safepoints == 8);
   const auto& running_b = FindParticipant(snapshot, 0x202);
   REQUIRE(running_b.guest_pc == 0x82003000);
   REQUIRE(running_b.resume_kind == ResumeKind::kJitSafepoint);

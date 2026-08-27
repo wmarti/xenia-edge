@@ -1096,6 +1096,61 @@ TEST_CASE("session capture runtime timeout never publishes",
   thread.reset();
 }
 
+TEST_CASE("session capture runtime rejects a partial preemption episode",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+
+  auto& participant = harness.checkpoint.provisional.participants.front();
+  SECTION("IRQL deferral") { participant.preempt_defers_irql = 1; }
+  SECTION("critical-region deferral") { participant.preempt_defers_lock = 1; }
+  SECTION("declined terminal count") {
+    participant.capture_declined_safepoints = 1;
+  }
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
+  REQUIRE(status.message.find("in-flight scheduler preemption episode") !=
+          std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.provider.begin_count.load() == 0);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rejects a partial final preemption episode",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  harness.checkpoint.provisional.participants.front().preempt_defers_irql = 1;
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
+  REQUIRE(status.message.find("in-flight scheduler preemption episode") !=
+          std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.provider.begin_count.load() == 1);
+  REQUIRE(harness.provider.seal_count.load() == 0);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
 TEST_CASE("session capture runtime queue overflow fails closed",
           "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;

@@ -692,10 +692,10 @@ class XThread : public XObject, public cpu::Thread {
     // Consecutive safepoints that declined to preempt because the guest was at
     // IRQL >= 2. Bounds the defer so a guest spinning at DISPATCH_LEVEL on a
     // co-resident holder cannot livelock its dispatch CPU forever.
-    uint32_t preempt_defers_irql = 0;
+    std::atomic<uint32_t> preempt_defers_irql{0};
     // Same, for holding the global critical region. Diagnostic only - yielding
     // there would let a co-resident fiber re-enter the recursive lock.
-    uint32_t preempt_defers_lock = 0;
+    std::atomic<uint32_t> preempt_defers_lock{0};
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     // The byte in PPCContext is only a wakeup trigger. These independent
@@ -705,7 +705,7 @@ class XThread : public XObject, public cpu::Thread {
     std::atomic<bool> checkpoint_safepoint_requested{false};
 
     // Safepoints declined since the last terminal capture safepoint event.
-    uint32_t capture_declined_safepoints = 0;
+    std::atomic<uint32_t> capture_declined_safepoints{0};
 
     // Durable exact-PC metadata exists only while this fiber is parked before
     // a JIT block head. The owning function extent is separate checkpoint

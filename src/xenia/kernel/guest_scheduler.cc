@@ -10,6 +10,7 @@
 #include "xenia/kernel/guest_scheduler.h"
 
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -89,6 +90,21 @@ static bool OnDispatchThread(const char* what) {
 // Clamps a thread's priority to the ready-queue index range [0, 31].
 static int ClampPriority(int32_t priority) {
   return priority < 0 ? 0 : (priority > 31 ? 31 : priority);
+}
+
+static uint32_t SaturatingAdd(std::atomic<uint32_t>& counter,
+                              uint32_t increment) {
+  uint32_t current = counter.load(std::memory_order_relaxed);
+  const uint32_t maximum = std::numeric_limits<uint32_t>::max();
+  while (current != maximum && increment) {
+    const uint32_t next =
+        increment > maximum - current ? maximum : current + increment;
+    if (counter.compare_exchange_weak(current, next, std::memory_order_relaxed,
+                                      std::memory_order_relaxed)) {
+      return next;
+    }
+  }
+  return current;
 }
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
@@ -217,12 +233,13 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     // Once per episode; the count lands on the terminal outcome.
-    if (!links.preempt_defers_lock) {
+    if (!links.preempt_defers_lock.load(std::memory_order_relaxed)) {
       self->kernel_state()->guest_scheduler()->NoteCaptureSafepoint(
           self, CaptureReason::kDeferredLock, request_flags, 0, exact_guest_pc);
     }
 #endif
-    if (++links.preempt_defers_lock == kLockPreemptDeferReport) {
+    if (SaturatingAdd(links.preempt_defers_lock, 1) ==
+        kLockPreemptDeferReport) {
       XELOGW(
           "GuestScheduler: fiber tid={:08X} '{}' has declined {} preemptions "
           "holding the global critical region; co-resident fibers cannot run",
@@ -232,9 +249,12 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
   }
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-  links.capture_declined_safepoints += links.preempt_defers_lock;
+  SaturatingAdd(
+      links.capture_declined_safepoints,
+      links.preempt_defers_lock.exchange(0, std::memory_order_relaxed));
+#else
+  links.preempt_defers_lock.store(0, std::memory_order_relaxed);
 #endif
-  links.preempt_defers_lock = 0;
   // At DISPATCH_LEVEL the console masks the decrementer, but it also runs the
   // lock holder on another core. Here the holder may be a fiber queued behind
   // this one, so honoring the mask indefinitely livelocks. Defer a bounded
@@ -242,11 +262,13 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
   auto* kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
   bool forced_at_irql = false;
   if (kpcr->current_irql >= 2) {
-    if (++links.preempt_defers_irql < kMaxIrqlPreemptDefers) {
+    const uint32_t preempt_defers_irql =
+        SaturatingAdd(links.preempt_defers_irql, 1);
+    if (preempt_defers_irql < kMaxIrqlPreemptDefers) {
       RequestSchedulerSafepoint(self);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-      if (links.preempt_defers_irql == 1) {
+      if (preempt_defers_irql == 1) {
         self->kernel_state()->guest_scheduler()->NoteCaptureSafepoint(
             self, CaptureReason::kDeferredIrql, request_flags, 0,
             exact_guest_pc);
@@ -262,14 +284,17 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
           "GuestScheduler: forcing preemption of tid={:08X} '{}' at IRQL {} "
           "after {} declined safepoints (first time for this thread)",
           self->thread_id(), self->thread_name(), uint32_t(kpcr->current_irql),
-          links.preempt_defers_irql);
+          preempt_defers_irql);
     }
   }
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-  links.capture_declined_safepoints += links.preempt_defers_irql;
+  SaturatingAdd(
+      links.capture_declined_safepoints,
+      links.preempt_defers_irql.exchange(0, std::memory_order_relaxed));
+#else
+  links.preempt_defers_irql.store(0, std::memory_order_relaxed);
 #endif
-  links.preempt_defers_irql = 0;
   // Involuntary quantum end, so no yield to a lower-priority thread - except
   // on the forced path, where the whole point is to reach a holder the strict
   // priority order would keep queued behind us.
@@ -278,8 +303,9 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
   self->kernel_state()->guest_scheduler()->NoteCaptureSafepoint(
       self,
       forced_at_irql ? CaptureReason::kForcedIrql : CaptureReason::kYielded,
-      request_flags, links.capture_declined_safepoints, exact_guest_pc);
-  links.capture_declined_safepoints = 0;
+      request_flags,
+      links.capture_declined_safepoints.exchange(0, std::memory_order_relaxed),
+      exact_guest_pc);
 #endif
   self->kernel_state()->guest_scheduler()->YieldCurrentThread(true,
                                                               forced_at_irql
@@ -356,6 +382,12 @@ void GuestScheduler::AppendCheckpointListLocked(
     participant.cpu = static_cast<int8_t>(thread->scheduler_links().cpu);
     participant.state = state;
     const auto& links = thread->scheduler_links();
+    participant.preempt_defers_irql =
+        links.preempt_defers_irql.load(std::memory_order_relaxed);
+    participant.preempt_defers_lock =
+        links.preempt_defers_lock.load(std::memory_order_relaxed);
+    participant.capture_declined_safepoints =
+        links.capture_declined_safepoints.load(std::memory_order_relaxed);
     if (!links.has_run) {
       participant.resume_kind = GuestSchedulerCheckpointResumeKind::kNotYetRun;
     } else if (state == GuestSchedulerCheckpointParticipantState::kBlocked) {
@@ -427,6 +459,13 @@ GuestScheduler::PauseForCheckpointBarrier(
               GuestSchedulerCheckpointParticipantState::kRunning;
           participant.resume_kind =
               GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+          const auto& links = cpu.current_thread->scheduler_links();
+          participant.preempt_defers_irql =
+              links.preempt_defers_irql.load(std::memory_order_relaxed);
+          participant.preempt_defers_lock =
+              links.preempt_defers_lock.load(std::memory_order_relaxed);
+          participant.capture_declined_safepoints =
+              links.capture_declined_safepoints.load(std::memory_order_relaxed);
           participants.push_back(participant);
         }
         for (int priority = 31; priority >= 0; --priority) {
@@ -814,8 +853,13 @@ bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
           GuestSchedulerCheckpointBarrierRejection::kUnexpectedSafepoint);
       return true;
     }
-    if (!checkpoint_barrier_.ArriveAtSafepoint(thread->thread_id(), cpu_index,
-                                               guest_pc)) {
+    const auto& links = thread->scheduler_links();
+    if (!checkpoint_barrier_.ArriveAtSafepoint(
+            thread->thread_id(), cpu_index, guest_pc,
+            links.preempt_defers_irql.load(std::memory_order_relaxed),
+            links.preempt_defers_lock.load(std::memory_order_relaxed),
+            links.capture_declined_safepoints.load(
+                std::memory_order_relaxed))) {
       return true;
     }
     if (!thread->scheduler_links().SetCheckpointJitSafepoint(guest_pc)) {
@@ -2869,8 +2913,10 @@ void GuestScheduler::WatchdogLoop() {
           i, stall_ticks_[i], running->thread_id(), running->thread_name(),
           uint32_t(context->last_safepoint_pc), uint32_t(context->lr),
           uint32_t(kpcr->current_irql), uint32_t(context->preempt_requested),
-          running->scheduler_links().preempt_defers_irql,
-          running->scheduler_links().preempt_defers_lock,
+          running->scheduler_links().preempt_defers_irql.load(
+              std::memory_order_relaxed),
+          running->scheduler_links().preempt_defers_lock.load(
+              std::memory_order_relaxed),
           cpus_[i].ready_summary);
     }
   }

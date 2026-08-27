@@ -47,6 +47,9 @@ struct GuestSchedulerCheckpointParticipant {
   GuestSchedulerCheckpointResumeKind resume_kind =
       GuestSchedulerCheckpointResumeKind::kNativeContinuation;
   bool restorable = false;
+  uint32_t preempt_defers_irql = 0;
+  uint32_t preempt_defers_lock = 0;
+  uint32_t capture_declined_safepoints = 0;
 
   bool operator==(const GuestSchedulerCheckpointParticipant&) const = default;
 };
@@ -120,7 +123,10 @@ class GuestSchedulerCheckpointBarrier {
   bool Begin(uint8_t dispatch_cpu_mask,
              std::span<const GuestSchedulerCheckpointParticipant> participants,
              uint64_t* out_generation = nullptr);
-  bool ArriveAtSafepoint(uint32_t thread_id, int cpu, uint32_t guest_pc);
+  bool ArriveAtSafepoint(uint32_t thread_id, int cpu, uint32_t guest_pc,
+                         uint32_t preempt_defers_irql = 0,
+                         uint32_t preempt_defers_lock = 0,
+                         uint32_t capture_declined_safepoints = 0);
   bool ConfirmSwitchOut(uint32_t thread_id, int cpu);
   bool AcknowledgeDispatchQuiesced(int cpu);
   void Reject(GuestSchedulerCheckpointBarrierRejection rejection);
