@@ -630,6 +630,11 @@ class XThread : public XObject, public cpu::Thread {
     // Same, for holding the global critical region. Diagnostic only - yielding
     // there would let a co-resident fiber re-enter the recursive lock.
     uint32_t preempt_defers_lock = 0;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    // Safepoints declined since the last terminal capture safepoint event.
+    uint32_t capture_declined_safepoints = 0;
+#endif
   };
   SchedulerLinks& scheduler_links() { return scheduler_links_; }
 

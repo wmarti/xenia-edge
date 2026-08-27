@@ -19,6 +19,10 @@
 #include <unordered_set>
 
 #include "xenia/base/threading.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/kernel/guest_scheduler_capture_observer.h"
+#endif
 
 namespace xe {
 namespace kernel {
@@ -157,6 +161,31 @@ class GuestScheduler {
 
   KernelState* kernel_state() const { return kernel_state_; }
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Installs the shared-owned scheduler capture observer. Rejected once any
+  // thread is queued or dispatched, or after Shutdown, so the observer is
+  // scheduler-lifetime permanent, sees every enqueue, and arms or disarms
+  // capture internally.
+  // Detachment is permitted only before the first dispatch. Shutdown delivers
+  // kShutdown and releases the registration after the dispatch threads have
+  // joined and before leftover fibers are reclaimed.
+  bool AttachCaptureObserver(
+      std::shared_ptr<GuestSchedulerCaptureObserver> observer);
+  bool DetachCaptureObserver(
+      const std::shared_ptr<GuestSchedulerCaptureObserver>& observer);
+
+  // Records the JIT safepoint handler's outcome for the running fiber.
+  // |request_flags| names the pending requests the handler saw; a combined
+  // capture safepoint must add kGuestSchedulerCaptureFlagCaptureRequested.
+  void NoteCaptureSafepoint(XThread* thread,
+                            GuestSchedulerCaptureReason outcome,
+                            uint16_t request_flags, uint32_t declined_count);
+
+  // True once an observer callback returned false and delivery stopped.
+  bool capture_rejected() const;
+#endif
+
  private:
   // Xbox 360 logical CPU count, also the maximum number of dispatch threads.
   static constexpr int kMaxCpus = 6;
@@ -260,6 +289,30 @@ class GuestScheduler {
   // Out-of-line so the yield fast path stays a single relaxed bool load.
   void ReportGlobalLockHazard();
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Assigns the next sequence and delivers under lock_, which the caller
+  // holds. A rejecting observer is latched and receives nothing further.
+  void EmitCaptureLocked(GuestSchedulerCaptureEventKind kind, XThread* thread,
+                         int cpu, int target_cpu,
+                         GuestSchedulerCaptureReason reason, uint16_t flags,
+                         uint8_t value, uint32_t count = 0);
+  // Same, for sites that do not hold lock_.
+  void EmitCapture(GuestSchedulerCaptureEventKind kind, XThread* thread,
+                   int cpu, int target_cpu, GuestSchedulerCaptureReason reason,
+                   uint16_t flags, uint8_t value, uint32_t count = 0);
+  // Delivers kShutdown, closes attachment and drops the registration outside
+  // lock_ so an observer destructor never runs under it.
+  void ReleaseCaptureObserverForShutdown();
+
+  // All guarded by lock_.
+  std::shared_ptr<GuestSchedulerCaptureObserver> capture_observer_;
+  uint64_t capture_sequence_ = 0;
+  bool capture_dispatch_seen_ = false;
+  bool capture_closed_ = false;
+  bool capture_rejected_ = false;
+#endif
+
   KernelState* kernel_state_;
 
   // Preemption timeslice in raw host ticks, calibrated once in EnsureStarted.
@@ -285,7 +338,7 @@ class GuestScheduler {
 
   // Guards every CPU's ready and blocked lists. Never held across a fiber
   // switch.
-  std::mutex lock_;
+  mutable std::mutex lock_;
   Cpu cpus_[kMaxCpus];
 
   // A fiber yielding while it holds the recursive global lock lets a
