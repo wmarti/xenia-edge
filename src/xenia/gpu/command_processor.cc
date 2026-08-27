@@ -10,6 +10,7 @@
 #include "xenia/gpu/command_processor.h"
 
 #include <fstream>
+#include <utility>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/stb/stb_image_write.h"
@@ -246,6 +247,10 @@ void CommandProcessor::Shutdown() {
   // Already stopped if drained early during relaunch (stopped again at
   // teardown).
   if (!worker_thread_) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    pm4_marker_dispatcher_.Shutdown();
+#endif
     return;
   }
 
@@ -255,7 +260,34 @@ void CommandProcessor::Shutdown() {
   write_ptr_index_event_->Set();
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  pm4_marker_dispatcher_.Shutdown();
+#endif
 }
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+bool CommandProcessor::AttachPm4MarkerSink(
+    std::shared_ptr<Pm4MarkerSink> sink) {
+  return pm4_marker_dispatcher_.AttachSink(std::move(sink));
+}
+
+bool CommandProcessor::DetachPm4MarkerSink(
+    const std::shared_ptr<Pm4MarkerSink>& sink) {
+  return pm4_marker_dispatcher_.DetachSink(sink);
+}
+
+bool CommandProcessor::pm4_marker_sink_failed() const {
+  return pm4_marker_dispatcher_.sink_failed();
+}
+
+void CommandProcessor::NotifyPm4SwapMarker() {
+  static_assert(kPm4SwapMarkerOpcode == uint32_t(xenos::PM4_XE_SWAP));
+  pm4_marker_dispatcher_.NotifyPm4Swap(Clock::QueryHostTickCount());
+}
+#endif
 
 void CommandProcessor::InitializeShaderStorage(
     const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,

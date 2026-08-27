@@ -801,6 +801,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
   // Advance the present-frame counter shown in the log prefix.
   logging::IncrementFrameNumber();
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // The guest packet executed and IssueSwap returned. This marker does not
+  // imply that a host drawable was presented.
+  COMMAND_PROCESSOR::NotifyPm4SwapMarker();
+#endif
+
   // Apply host frame rate limiting (separate from guest vblank timing)
   COMMAND_PROCESSOR::ThrottlePresentation();
 

@@ -31,6 +31,11 @@
 #include "xenia/memory.h"
 #include "xenia/ui/presenter.h"
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/gpu/pm4_marker_sink.h"
+#endif
+
 namespace xe {
 
 class ByteStream;
@@ -198,6 +203,16 @@ class CommandProcessor {
   // Called after IssueSwap to limit host frame rate without affecting guest
   // vblank timing.
   void ThrottlePresentation();
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  bool AttachPm4MarkerSink(std::shared_ptr<Pm4MarkerSink> sink);
+  bool DetachPm4MarkerSink(const std::shared_ptr<Pm4MarkerSink>& sink);
+  uint64_t pm4_marker_count() const noexcept {
+    return pm4_marker_dispatcher_.marker_count();
+  }
+  bool pm4_marker_sink_failed() const;
+#endif
 
   // May be called not only from the command processor thread when the command
   // processor is paused, and the termination of this function may be explicitly
@@ -548,6 +563,11 @@ class CommandProcessor {
   // itself, as ground truth for what a replay of it should produce.
   void WriteTraceFrameScreenshot();
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  void NotifyPm4SwapMarker();
+#endif
+
   Memory* memory_ = nullptr;
   kernel::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
@@ -655,6 +675,11 @@ class CommandProcessor {
 
   // For host frame rate limiting at IssueSwap
   uint64_t last_swap_time_ = 0;
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  Pm4MarkerDispatcher pm4_marker_dispatcher_;
+#endif
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
