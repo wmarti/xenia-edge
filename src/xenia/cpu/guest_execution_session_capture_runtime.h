@@ -182,6 +182,9 @@ struct GuestExecutionSessionCaptureRuntimeStatus {
 // publication call. Before RequestStart, scheduler events still pay for
 // permanent observation and sequence validation, and host calls still update
 // the live roster; no assembler, provider or event queue work is performed.
+// Publication decodes every initial and final thread state and binds its
+// exact-PC route to the corresponding scheduler checkpoint held at that
+// boundary; currently only restorable JIT safepoints are representable.
 // CreateAndAttach is the only operation that installs observers, and
 // RequestStart is required to arm a session.
 class GuestExecutionSessionCaptureRuntime final

@@ -667,7 +667,7 @@ class FakeCheckpointController final
         kRunningSafepointsRequeueAtHead;
     CheckpointParticipant participant;
     participant.thread_id = thread_state.thread_id();
-    participant.guest_pc = 0x82001000;
+    participant.guest_pc = kResumePc;
     participant.cpu = 0;
     participant.state =
         kernel::GuestSchedulerCheckpointParticipantState::kRunning;
@@ -687,13 +687,16 @@ class FakeCheckpointController final
         condition.notify_all();
         condition.wait(lock, [this]() { return release_pause; });
       }
+      held_snapshot = provisional;
+      held_snapshot.participants.front().guest_pc =
+          current_pause == 1 ? start_guest_pc : stop_guest_pc;
     }
     if (pause_result != CheckpointRejection::kNone) {
       *snapshot = {};
       snapshot->rejection = pause_result;
       return pause_result;
     }
-    *snapshot = provisional;
+    *snapshot = held_snapshot;
     return CheckpointRejection::kNone;
   }
 
@@ -706,7 +709,7 @@ class FakeCheckpointController final
       condition.notify_all();
       condition.wait(lock, [this]() { return !block_finalize || release; });
     }
-    *snapshot = provisional;
+    *snapshot = held_snapshot;
     snapshot->generation = generation;
     snapshot->active = finalize_keeps_active;
     snapshot->rejection = finalize_result;
@@ -716,7 +719,7 @@ class FakeCheckpointController final
   CheckpointRejection Cancel(uint64_t generation,
                              CheckpointSnapshot* snapshot) override {
     const uint32_t current_cancel = ++cancel_count;
-    *snapshot = provisional;
+    *snapshot = held_snapshot;
     snapshot->generation = generation;
     if (cancel_always_keeps_active || current_cancel <= cancel_failures) {
       snapshot->active = true;
@@ -763,6 +766,8 @@ class FakeCheckpointController final
   bool block_finalize = false;
   bool finalize_keeps_active = false;
   bool cancel_always_keeps_active = false;
+  uint32_t start_guest_pc = kResumePc;
+  uint32_t stop_guest_pc = kResumePc;
   uint32_t block_pause_number = 0;
   uint32_t cancel_failures = 0;
   std::atomic<uint32_t> pause_count{0};
@@ -776,6 +781,7 @@ class FakeCheckpointController final
   bool release = false;
   bool pause_entered = false;
   bool release_pause = false;
+  CheckpointSnapshot held_snapshot;
 };
 
 struct RuntimeHarness {
@@ -1177,6 +1183,83 @@ TEST_CASE("session capture runtime rejects a non-checkpoint state blob",
   const auto status = harness.runtime->status();
   REQUIRE(status.state == RuntimeState::kRejected);
   REQUIRE(status.rejection == RuntimeRejection::kEventBridgeFailure);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime binds initial state to scheduler safepoint",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.start_guest_pc = kResumePc + 4;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kBundleValidation);
+  REQUIRE(status.message.find("initial PPC continuation differs") !=
+          std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime binds final state to scheduler safepoint",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  harness.checkpoint.stop_guest_pc = kResumePc + 4;
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kBundleValidation);
+  REQUIRE(status.message.find("final PPC continuation differs") !=
+          std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rejects an unmodeled scheduler resume route",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.provisional.participants.front().resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+  harness.checkpoint.provisional.participants.front().restorable = true;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kBundleValidation);
+  REQUIRE(status.message.find("initial PPC continuation differs") !=
+          std::string::npos);
   REQUIRE_FALSE(status.canonical_output_published);
   REQUIRE(harness.publisher.calls.load() == 0);
 

@@ -25,6 +25,7 @@
 
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/guest_execution_continuous_event.h"
+#include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/guest_scheduler.h"
@@ -56,8 +57,79 @@ bool IsTerminal(RuntimeState state) {
          state == RuntimeState::kShutdown;
 }
 
+const CheckpointParticipant* FindCheckpointParticipant(
+    const CheckpointSnapshot& checkpoint, uint32_t guest_thread_id);
+
+bool ValidateRuntimeCheckpointStateBindings(
+    const GuestExecutionSessionBundle& bundle,
+    const GuestExecutionSessionCheckpointChunk& checkpoint,
+    const CheckpointSnapshot& scheduler_checkpoint, const char* boundary,
+    std::string* error) {
+  if (checkpoint.checkpoint.thread_states.size() !=
+          bundle.manifest.participants.size() ||
+      scheduler_checkpoint.participants.size() !=
+          bundle.manifest.participants.size()) {
+    return Fail(error, std::string("capture runtime ") + boundary +
+                           " checkpoint roster differs from the bundle");
+  }
+  for (const GuestExecutionSessionThreadStateReference& state :
+       checkpoint.checkpoint.thread_states) {
+    if (state.thread_ordinal >= bundle.manifest.participants.size()) {
+      return Fail(error, std::string("capture runtime ") + boundary +
+                             " checkpoint state ordinal is invalid");
+    }
+    const GuestExecutionSessionParticipant& participant =
+        bundle.manifest.participants[state.thread_ordinal];
+    const auto blob = std::find_if(
+        bundle.content_blobs.cbegin(), bundle.content_blobs.cend(),
+        [&state](const GuestExecutionSessionContentBlob& candidate) {
+          return candidate.sha256 == state.sha256;
+        });
+    if (blob == bundle.content_blobs.cend() ||
+        blob->bytes.size() != state.byte_size) {
+      return Fail(error, std::string("capture runtime ") + boundary +
+                             " checkpoint state blob is missing");
+    }
+    ppc::GuestPPCThreadCheckpoint decoded;
+    std::string decode_error;
+    if (!ppc::GuestPPCThreadCheckpointCodec::Decode(blob->bytes, &decoded,
+                                                    &decode_error)) {
+      return Fail(error, std::string("capture runtime ") + boundary +
+                             " checkpoint state is not a PPC continuation: " +
+                             decode_error);
+    }
+    if (decoded.participant_ordinal != state.thread_ordinal ||
+        decoded.participant_ordinal != participant.ordinal ||
+        decoded.guest_thread_id != participant.guest_thread_id) {
+      return Fail(error, std::string("capture runtime ") + boundary +
+                             " checkpoint state identity differs from the "
+                             "held scheduler roster");
+    }
+    const CheckpointParticipant* scheduler_participant =
+        FindCheckpointParticipant(scheduler_checkpoint,
+                                  decoded.guest_thread_id);
+    if (!scheduler_participant) {
+      return Fail(error, std::string("capture runtime ") + boundary +
+                             " checkpoint state has no held scheduler "
+                             "participant");
+    }
+    if (scheduler_participant->resume_kind !=
+            CheckpointResumeKind::kJitSafepoint ||
+        !scheduler_participant->restorable ||
+        decoded.resume_kind != ppc::GuestPPCThreadResumeKind::kGuestBlockHead ||
+        decoded.resume_pc != scheduler_participant->guest_pc) {
+      return Fail(error, std::string("capture runtime ") + boundary +
+                             " PPC continuation differs from the held "
+                             "scheduler JIT safepoint");
+    }
+  }
+  return true;
+}
+
 bool ValidateRuntimePublicationBundle(
     const GuestExecutionSessionBundle& bundle,
+    const CheckpointSnapshot& initial_scheduler_checkpoint,
+    const CheckpointSnapshot& final_scheduler_checkpoint,
     const GuestExecutionSessionBundleLimits& limits, std::string* error) {
   if (!bundle.manifest.segments.empty()) {
     return Fail(error,
@@ -93,23 +165,32 @@ bool ValidateRuntimePublicationBundle(
                   "checkpoint");
     }
   }
-  if (!saw_canonical_events || !saw_continuous_events ||
-      !ValidateGuestExecutionSessionBundle(bundle, error, limits)) {
-    if (error && error->empty()) {
-      *error =
-          "capture runtime publication lacks an authenticated event "
-          "overlay";
-    }
+  if (!saw_canonical_events || !saw_continuous_events) {
+    return Fail(error,
+                "capture runtime publication lacks an authenticated event "
+                "overlay");
+  }
+  if (!ValidateGuestExecutionSessionBundle(bundle, error, limits)) {
     return false;
   }
 
+  GuestExecutionSessionCheckpointChunk initial_checkpoint;
   GuestExecutionSessionCheckpointChunk final_checkpoint;
   if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
+          bundle.chunks.front(), &initial_checkpoint, error, limits.session) ||
+      !GuestExecutionSessionCodec::DecodeCheckpointChunk(
           bundle.chunks.back(), &final_checkpoint, error, limits.session) ||
       final_checkpoint.checkpoint.global_sequence !=
           bundle.manifest.last_event_sequence ||
-      final_checkpoint.checkpoint.thread_states.size() !=
-          bundle.manifest.participants.size()) {
+      !ValidateRuntimeCheckpointStateBindings(bundle, initial_checkpoint,
+                                              initial_scheduler_checkpoint,
+                                              "initial", error) ||
+      !ValidateRuntimeCheckpointStateBindings(bundle, final_checkpoint,
+                                              final_scheduler_checkpoint,
+                                              "final", error)) {
+    if (error && !error->empty()) {
+      return false;
+    }
     return Fail(error,
                 "capture runtime final checkpoint does not cover its roster");
   }
@@ -809,6 +890,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     if (RejectAsyncFailureIfAny()) {
       return;
     }
+    initial_scheduler_checkpoint = std::move(final);
     SetState(RuntimeState::kRecording);
   }
 
@@ -1017,10 +1099,12 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     if (shutdown_requested.load(std::memory_order_acquire)) {
       return;
     }
-    if (!ValidateRuntimePublicationBundle(
-            *staged, config.assembler.bundle_limits, &error)) {
+    if (!initial_scheduler_checkpoint ||
+        !ValidateRuntimePublicationBundle(
+            *staged, *initial_scheduler_checkpoint, final,
+            config.assembler.bundle_limits, &error)) {
       Reject(RuntimeRejection::kBundleValidation,
-             error.empty() ? "capture runtime staged bundle is invalid"
+             error.empty() ? "capture runtime lacks the held start checkpoint"
                            : std::move(error));
       return;
     }
@@ -1174,6 +1258,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   GuestExecutionSessionCaptureRuntimeCheckpointController*
       checkpoint_controller = nullptr;
   std::unique_ptr<GuestExecutionSessionAssembler> assembler;
+  std::optional<CheckpointSnapshot> initial_scheduler_checkpoint;
 
   std::thread worker;
   std::thread::id worker_id;
