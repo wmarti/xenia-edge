@@ -65,6 +65,8 @@ GuestInvocationCaptureRuntimeConfig MakeCompleteConfig(
   return config;
 }
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
 std::vector<ppc::GuestInvocationPage> MakeCodePages(uint32_t first_page,
                                                     uint32_t page_count) {
   std::vector<ppc::GuestInvocationPage> pages(page_count);
@@ -73,6 +75,7 @@ std::vector<ppc::GuestInvocationPage> MakeCodePages(uint32_t first_page,
   }
   return pages;
 }
+#endif
 
 }  // namespace
 
@@ -120,6 +123,8 @@ TEST_CASE("guest invocation capture runtime configuration is strict",
   REQUIRE(limits.host_protection_page_size == 16 * 1024);
 }
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
 TEST_CASE("guest invocation capture requires exact code granule closure",
           "[guest-invocation-capture]") {
   const std::vector<ppc::GuestInvocationRecorderFunction> functions = {
@@ -172,6 +177,7 @@ TEST_CASE("guest invocation capture requires exact code granule closure",
         functions, MakeCodePages(0x82580000u, 16), 64 * 1024, &error));
   }
 }
+#endif
 
 TEST_CASE("guest invocation capture address parsing fails closed",
           "[guest-invocation-capture]") {

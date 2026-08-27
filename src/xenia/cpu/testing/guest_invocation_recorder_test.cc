@@ -520,6 +520,40 @@ TEST_CASE("guest invocation recorder fails closed on granule hazards",
                     kGuestInvocationDependencyCrossThreadMutation);
   }
 
+  SECTION("data closure discovers a prior cross-thread sibling write") {
+    FakePageReader reader;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    EnterRoot(*recorder);
+    REQUIRE(recorder->OnMemoryAccess(
+        kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
+    REQUIRE_FALSE(recorder->OnMemoryAccess(
+        kOwner, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kRead));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kCrossThreadMutation,
+                    kGuestInvocationDependencyCrossThreadMutation);
+  }
+
+  SECTION("code closure rejects aliased function pages") {
+    constexpr uint32_t kAliasedRootAddress = 0x92040000u;
+    constexpr uint32_t kAliasedRootEndAddress = kAliasedRootAddress + 0xFC;
+    FakePageReader reader;
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits, MakeSelection(), false);
+    REQUIRE(recorder->OnFunctionDependency(kRootAddress, kAliasedRootAddress));
+    Define(*recorder, kAliasedRootAddress, kAliasedRootEndAddress);
+    Define(*recorder, kRootAddress, kRootEndAddress);
+    REQUIRE_FALSE(recorder->OnFunctionEntry(kOwner, kRootAddress,
+                                            kRootEndAddress, MakeState(1)));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kUnsupportedDependency,
+                    kGuestInvocationDependencyPhysicalAlias);
+  }
+
   SECTION("cross-thread watches share the data closure bound") {
     FakePageReader reader;
     GuestInvocationRecorderLimits limits = MakeLimits();
