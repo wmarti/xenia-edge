@@ -998,6 +998,9 @@ bool GuestInvocationRecorder::OnFunctionEntry(
   if (impl_->state == GuestInvocationRecorderState::kComplete) {
     return true;
   }
+  if (!impl_->CheckDeadline()) {
+    return false;
+  }
 
   if (impl_->state == GuestInvocationRecorderState::kWaitingForOccurrence) {
     if (address != impl_->selection.root_address) {
@@ -1137,6 +1140,9 @@ bool GuestInvocationRecorder::OnMemoryAccess(
   }
   if (impl_->state == GuestInvocationRecorderState::kComplete) {
     return true;
+  }
+  if (!impl_->CheckDeadline()) {
+    return false;
   }
   if (!IsValidAccess(access)) {
     if (!impl_->attempt_count) {

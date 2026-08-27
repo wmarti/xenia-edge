@@ -459,6 +459,24 @@ TEST_CASE("guest invocation recorder rejects every resource bound",
     RequireRejected(*recorder,
                     GuestInvocationRecorderRejection::kDeadlineExceeded);
   }
+  SECTION("deadline on ignored function entry") {
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock);
+    clock.now += MakeLimits().max_duration_ticks;
+    REQUIRE_FALSE(recorder->OnFunctionEntry(
+        kOther, kUnrelatedAddress, kUnrelatedEndAddress, MakeState(1)));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kDeadlineExceeded);
+  }
+  SECTION("deadline on pre-attempt write") {
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock);
+    clock.now += MakeLimits().max_duration_ticks;
+    REQUIRE_FALSE(recorder->OnMemoryAccess(
+        kOther, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kWrite));
+    RequireRejected(*recorder,
+                    GuestInvocationRecorderRejection::kDeadlineExceeded);
+  }
   SECTION("attempts") {
     GuestInvocationRecorderLimits limits = MakeLimits();
     limits.max_attempts = 3;
