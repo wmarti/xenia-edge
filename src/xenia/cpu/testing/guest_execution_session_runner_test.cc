@@ -646,6 +646,7 @@ TEST_CASE("guest execution session runner replays persistent participants",
   REQUIRE(metrics.participants[1].consumed_event_count == 16);
 
   SECTION("a quiescent asynchronous mutation reaches the next segment") {
+    runner.reset();
     BundleOptions mutated = options;
     mutated.extra = ExtraEvent::kMutationBetweenSegments;
     const GuestExecutionSessionBundle mutated_bundle =
@@ -661,6 +662,7 @@ TEST_CASE("guest execution session runner replays persistent participants",
   }
 
   SECTION("a reordered tape rejects at the first real segment entry") {
+    runner.reset();
     BundleOptions swapped = options;
     swapped.swap_order = true;
     const GuestExecutionSessionBundle swapped_bundle =
