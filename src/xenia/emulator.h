@@ -42,6 +42,7 @@ namespace cpu {
 class ExportResolver;
 #if XE_ENABLE_GUEST_INVOCATION_CAPTURE
 class GuestInvocationCaptureRuntime;
+class GuestExecutionSessionTitleCaptureRuntime;
 #endif
 class Processor;
 class ThreadState;
@@ -49,6 +50,9 @@ class ThreadState;
 namespace gpu {
 class GraphicsSystem;
 }  // namespace gpu
+namespace kernel {
+class UserModule;
+}  // namespace kernel
 namespace hid {
 class InputDriver;
 class InputSystem;
@@ -439,6 +443,10 @@ class Emulator {
 #if XE_ENABLE_GUEST_INVOCATION_CAPTURE
   X_STATUS InitializeGuestInvocationCapture();
   void ShutdownGuestInvocationCapture();
+  X_STATUS InitializeGuestExecutionSessionCaptureProvider();
+  X_STATUS AttachGuestExecutionSessionCaptureRuntime(
+      const kernel::UserModule& module);
+  void ShutdownGuestExecutionSessionCapture();
 #endif
 
   std::filesystem::path command_line_;
@@ -462,6 +470,10 @@ class Emulator {
   // Owns the capture sink registered non-owningly with Processor. It must be
   // detached and stopped before processor_ is destroyed.
   std::unique_ptr<cpu::GuestInvocationCaptureRuntime> guest_invocation_capture_;
+  // Attaches to Processor before title translation, then owns the concrete
+  // runtime-to-CommandProcessor PM4 composition until title teardown.
+  std::unique_ptr<cpu::GuestExecutionSessionTitleCaptureRuntime>
+      guest_execution_session_capture_;
 #endif
   std::unique_ptr<apu::AudioSystem> audio_system_;
   std::unique_ptr<apu::AudioMediaPlayer> audio_media_player_;

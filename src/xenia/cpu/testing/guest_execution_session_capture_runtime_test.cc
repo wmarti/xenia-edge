@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "third_party/catch/include/catch.hpp"
+#include "xenia/base/cvar.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/function.h"
@@ -33,10 +34,14 @@
 #include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
+#include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/graphics_system.h"
 #include "xenia/gpu/pm4_marker_sink.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/guest_scheduler_capture_observer.h"
 #include "xenia/memory.h"
+
+DECLARE_path(guest_execution_capture_output);
 
 namespace xe {
 namespace kernel {
@@ -59,6 +64,21 @@ class GuestExecutionSessionCaptureRuntimeTestAccess final {
       GuestExecutionSessionCaptureRuntime& runtime, void (*hook)(void*),
       void* context) {
     runtime.SetRequestStartPrequeueTestHook(hook, context);
+  }
+};
+
+class GuestExecutionSessionTitleCaptureRuntimeTestAccess final {
+ public:
+  static std::unique_ptr<GuestExecutionSessionTitleCaptureRuntime> Create(
+      Memory& memory, Processor& processor,
+      const GuestExecutionSessionTitleCaptureConfig& config,
+      const GuestExecutionSessionSha256& capture_build_sha256,
+      const GuestExecutionSessionSha256& replay_config_sha256,
+      std::string* error) {
+    return GuestExecutionSessionTitleCaptureRuntime::
+        CreateAndAttachProviderWithProvenance(memory, processor, config, true,
+                                              capture_build_sha256,
+                                              replay_config_sha256, error);
   }
 };
 
@@ -210,6 +230,31 @@ class RuntimeEnvironment final {
   std::unique_ptr<Memory> memory;
   std::unique_ptr<Processor> processor;
   std::unique_ptr<kernel::GuestScheduler> scheduler;
+};
+
+class TitleCaptureTestGraphicsSystem final : public gpu::GraphicsSystem {
+ public:
+  explicit TitleCaptureTestGraphicsSystem(Memory& memory) { memory_ = &memory; }
+
+  std::string name() const override { return "title-capture-test"; }
+
+ private:
+  std::unique_ptr<gpu::CommandProcessor> CreateCommandProcessor() override {
+    return nullptr;
+  }
+};
+
+class TitleCaptureTestCommandProcessor final : public gpu::CommandProcessor {
+ public:
+  explicit TitleCaptureTestCommandProcessor(gpu::GraphicsSystem& graphics)
+      : gpu::CommandProcessor(&graphics, nullptr) {}
+
+  void TracePlaybackWroteMemory(uint32_t, uint32_t) override {}
+  void RestoreEdramSnapshot(const void*) override {}
+
+ protected:
+  bool SetupContext() override { return true; }
+  void ShutdownContext() override {}
 };
 
 GuestExecutionSessionSha256 Digest(uint8_t seed) {
@@ -2640,6 +2685,61 @@ TEST_CASE("session capture runtime shutdown detaches before dispatch",
       processor_replacement));
 
   thread.reset();
+}
+
+TEST_CASE("title session capture request remains inert without output",
+          "[guest-execution-session-capture-runtime]") {
+  struct OutputRestore {
+    std::filesystem::path value = cvars::guest_execution_capture_output;
+    ~OutputRestore() { cvars::guest_execution_capture_output = value; }
+  } restore;
+
+  cvars::guest_execution_capture_output.clear();
+  REQUIRE_FALSE(GuestExecutionSessionTitleCaptureRuntime::IsRequested());
+  cvars::guest_execution_capture_output = "unused-session-capture";
+  REQUIRE(GuestExecutionSessionTitleCaptureRuntime::IsRequested());
+}
+
+TEST_CASE("title session capture owner detaches before its dependencies",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  GuestExecutionSessionTitleCaptureConfig config;
+  config.output_directory = "unused-title-session-capture";
+  config.warmup_milliseconds = 1;
+  config.maximum_bundle_bytes = 1u << 20;
+  std::string error;
+
+  auto provider_only =
+      GuestExecutionSessionTitleCaptureRuntimeTestAccess::Create(
+          *environment.memory, *environment.processor, config, Digest(0x51),
+          Digest(0x71), &error);
+  REQUIRE(provider_only);
+  REQUIRE(environment.processor->guest_invocation_capture_sink());
+  provider_only.reset();
+  REQUIRE_FALSE(environment.processor->guest_invocation_capture_sink());
+
+  auto capture = GuestExecutionSessionTitleCaptureRuntimeTestAccess::Create(
+      *environment.memory, *environment.processor, config, Digest(0x52),
+      Digest(0x72), &error);
+  REQUIRE(capture);
+  TitleCaptureTestGraphicsSystem graphics(*environment.memory);
+  TitleCaptureTestCommandProcessor command_processor(graphics);
+  REQUIRE(capture->AttachRuntime(*environment.scheduler, command_processor,
+                                 "title=4D5307E6", "module=halo3", &error));
+  REQUIRE(capture->runtime_attached());
+  REQUIRE(command_processor.pm4_marker_dispatcher_status().sink_attached);
+  REQUIRE(environment.processor->guest_invocation_capture_sink());
+
+  capture.reset();
+  const gpu::Pm4MarkerDispatcherStatus source =
+      command_processor.pm4_marker_dispatcher_status();
+  REQUIRE_FALSE(source.sink_attached);
+  REQUIRE_FALSE(source.sink_held);
+  REQUIRE_FALSE(source.shut_down);
+  REQUIRE_FALSE(environment.processor->guest_invocation_capture_sink());
+
+  command_processor.Shutdown();
+  REQUIRE(command_processor.pm4_marker_dispatcher_status().shut_down);
 }
 
 }  // namespace testing

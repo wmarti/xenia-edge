@@ -32,6 +32,7 @@
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
 #if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/guest_execution_session_capture_runtime.h"
 #include "xenia/cpu/guest_invocation_capture_runtime.h"
 #include "xenia/cpu/processor.h"
 #endif
@@ -282,6 +283,82 @@ void Emulator::ShutdownGuestInvocationCapture() {
   }
   guest_invocation_capture_.reset();
 }
+
+X_STATUS Emulator::InitializeGuestExecutionSessionCaptureProvider() {
+  if (!cpu::GuestExecutionSessionTitleCaptureRuntime::IsRequested()) {
+    return X_STATUS_SUCCESS;
+  }
+  if (guest_execution_session_capture_) {
+    XELOGE(
+        "Guest execution session capture initialization rejected: capture is "
+        "already active");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  if (!memory_ || !processor_ || !kernel_state_ || !graphics_system_ ||
+      !graphics_system_->command_processor()) {
+    XELOGE(
+        "Guest execution session capture initialization rejected: title "
+        "dependencies are not initialized");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  std::string error;
+  guest_execution_session_capture_ =
+      cpu::GuestExecutionSessionTitleCaptureRuntime::CreateAndAttachProvider(
+          *memory_, *processor_, cvars::guest_scheduler, &error);
+  if (!guest_execution_session_capture_) {
+    XELOGE("Guest execution session capture initialization rejected: {}",
+           error.empty() ? "unknown capture configuration error" : error);
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  XELOGI(
+      "Guest execution session capture provider armed before title "
+      "translation: output={}",
+      path_to_utf8(guest_execution_session_capture_->output_directory()));
+  return X_STATUS_SUCCESS;
+}
+
+X_STATUS Emulator::AttachGuestExecutionSessionCaptureRuntime(
+    const kernel::UserModule& module) {
+  if (!guest_execution_session_capture_) {
+    return X_STATUS_SUCCESS;
+  }
+  if (!graphics_system_ || !graphics_system_->command_processor() ||
+      !kernel_state_ || !kernel_state_->guest_scheduler() || !module.hash()) {
+    XELOGE(
+        "Guest execution session capture runtime rejected: stable title "
+        "dependencies are missing");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  const std::string title_identity =
+      fmt::format("title={:08X};disc={};file={}", module.title_id(),
+                  module.disc_number(), module.bounding_filename());
+  const std::string module_identity = fmt::format(
+      "hash={:016X};checksum={:08X};timestamp={:08X};entry={:08X};path={}",
+      module.hash().value(), module.mod_checksum(), module.time_date_stamp(),
+      module.entry_point(), module.path());
+  std::string error;
+  if (!guest_execution_session_capture_->AttachRuntime(
+          *kernel_state_->guest_scheduler(),
+          *graphics_system_->command_processor(), title_identity,
+          module_identity, &error)) {
+    XELOGE("Guest execution session capture runtime rejected: {}",
+           error.empty() ? "unknown runtime attachment error" : error);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  XELOGI(
+      "Guest execution session capture PM4 runtime attached before title "
+      "execution");
+  return X_STATUS_SUCCESS;
+}
+
+void Emulator::ShutdownGuestExecutionSessionCapture() {
+  if (!guest_execution_session_capture_) {
+    return;
+  }
+  guest_execution_session_capture_->Shutdown();
+  guest_execution_session_capture_.reset();
+  XELOGI("Guest execution session capture runtime detached");
+}
 #endif
 
 void Emulator::Shutdown() {
@@ -297,6 +374,11 @@ void Emulator::Shutdown() {
   // Note that we delete things in the reverse order they were initialized.
 
   // Give the systems time to shutdown before we delete them.
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // The session owner must drain and detach its PM4 source while the command
+  // processor and scheduler are both still live.
+  ShutdownGuestExecutionSessionCapture();
+#endif
   if (graphics_system_) {
     graphics_system_->Shutdown();
   }
@@ -544,6 +626,9 @@ void Emulator::ShutdownSubsystems() {
     audio_system_->Shutdown();
     audio_system_.reset();
   }
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  ShutdownGuestExecutionSessionCapture();
+#endif
   if (graphics_system_) {
     graphics_system_->Shutdown();
     graphics_system_.reset();
@@ -555,6 +640,9 @@ X_STATUS Emulator::TerminateTitle() {
     return X_STATUS_UNSUCCESSFUL;
   }
 
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  ShutdownGuestExecutionSessionCapture();
+#endif
   kernel_state_->TerminateTitle();
 #if XE_ENABLE_GUEST_INVOCATION_CAPTURE
   ShutdownGuestInvocationCapture();
@@ -1425,6 +1513,10 @@ void Emulator::RelaunchTitle(const std::string& host_path,
   // otherwise TerminateThread corrupts the CV it's blocked on.
   kernel_state_->ShutdownDispatchThread();
 
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  ShutdownGuestExecutionSessionCapture();
+#endif
+
   // Stop the GPU command processor before terminating guest threads so its
   // worker can cleanly run ShutdownContext and free its Vulkan resources.
   if (graphics_system_ && graphics_system_->command_processor()) {
@@ -1483,6 +1575,10 @@ void Emulator::ResetTitle() {
   relaunching_ = true;
 
   kernel_state_->ShutdownDispatchThread();
+
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  ShutdownGuestExecutionSessionCapture();
+#endif
 
   // Stop the GPU command processor before terminating guest threads so its
   // worker can cleanly run ShutdownContext and free its Vulkan resources.
@@ -2037,18 +2133,34 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   processor_->RefreshTraceCountsEnabled();
 
 #if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (cpu::GuestExecutionSessionTitleCaptureRuntime::IsRequested() &&
+      cpu::GuestInvocationCaptureRuntime::IsRequested()) {
+    XELOGE(
+        "Guest capture initialization rejected: invocation and session "
+        "capture cannot be requested together");
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const X_STATUS session_capture_status =
+      InitializeGuestExecutionSessionCaptureProvider();
+  if (XFAILED(session_capture_status)) {
+    return session_capture_status;
+  }
   const X_STATUS capture_status = InitializeGuestInvocationCapture();
   if (XFAILED(capture_status)) {
+    ShutdownGuestExecutionSessionCapture();
     return capture_status;
   }
   // Every failure after attachment must disarm the sink so a later launch can
   // retry safely. This guard performs no allocation and is released only once
   // the title launch has succeeded.
   const auto capture_launch_rollback = [this](void*) {
+    ShutdownGuestExecutionSessionCapture();
     ShutdownGuestInvocationCapture();
   };
   std::unique_ptr<void, decltype(capture_launch_rollback)> capture_launch_guard(
-      guest_invocation_capture_.get(), capture_launch_rollback);
+      guest_invocation_capture_ || guest_execution_session_capture_ ? this
+                                                                    : nullptr,
+      capture_launch_rollback);
 #endif
 
   // Expose the HDD content partition. Games that resolve saves/DLC to a raw
@@ -2271,6 +2383,14 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         cache_root_, title_id_.value(), false,
         [this]() { on_shader_storage_initialization(false); });
   }
+
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  const X_STATUS session_runtime_status =
+      AttachGuestExecutionSessionCaptureRuntime(*module);
+  if (XFAILED(session_runtime_status)) {
+    return session_runtime_status;
+  }
+#endif
 
   auto main_thread = kernel_state_->LaunchModule(module);
   if (!main_thread) {

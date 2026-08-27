@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <condition_variable>
 #include <exception>
 #include <limits>
@@ -24,14 +25,47 @@
 #include <utility>
 #include <vector>
 
+#include "xenia/base/clock.h"
+#include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/guest_execution_continuous_event.h"
 #include "xenia/cpu/guest_execution_marker_controller.h"
+#include "xenia/cpu/guest_execution_session_capture_event_bridge.h"
+#include "xenia/cpu/guest_execution_session_capture_provider.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
+#include "xenia/cpu/guest_invocation_replay_cli.h"
+#include "xenia/cpu/guest_invocation_replay_config.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/kernel/guest_scheduler.h"
+#include "xenia/memory.h"
+
+DEFINE_transient_path(
+    guest_execution_capture_output, "",
+    "New local directory for one scheduler-on guest execution session bundle.",
+    "Guest Execution Session Capture");
+DEFINE_transient_string(
+    guest_execution_capture_marker_source, "pm4_swap",
+    "Marker source for a session capture. The production title path currently "
+    "accepts only pm4_swap.",
+    "Guest Execution Session Capture");
+DEFINE_transient_string(
+    guest_execution_capture_boundary, "guest_marker_count:1",
+    "Session stop boundary. The production title path currently accepts only "
+    "guest_marker_count:<positive count>.",
+    "Guest Execution Session Capture");
+DEFINE_CVar(guest_execution_capture_warmup_ms, 100000,
+            "Warmup before the next PM4 swap arms capture, in milliseconds.",
+            "Guest Execution Session Capture", true, uint64_t);
+DEFINE_CVar(guest_execution_capture_bundle_cap_bytes, 1ull << 30,
+            "Maximum encoded session bundle size in bytes.",
+            "Guest Execution Session Capture", true, uint64_t);
+DEFINE_transient_path(
+    guest_execution_capture_stop_file, "",
+    "Reserved manual-stop path. Manual title capture is not implemented yet.",
+    "Guest Execution Session Capture");
 
 namespace xe {
 namespace cpu {
@@ -58,6 +92,97 @@ bool IsPowerOfTwo(size_t value) { return value && !(value & (value - 1)); }
 bool IsTerminal(RuntimeState state) {
   return state == RuntimeState::kComplete || state == RuntimeState::kRejected ||
          state == RuntimeState::kShutdown;
+}
+
+bool CurrentTitleCaptureConfig(GuestExecutionSessionTitleCaptureConfig* output,
+                               std::string* error) noexcept {
+  if (!output) {
+    return Fail(error, "session title capture config output is missing");
+  }
+  GuestExecutionSessionTitleCaptureConfig config;
+  config.output_directory = cvars::guest_execution_capture_output;
+  config.warmup_milliseconds = cvars::guest_execution_capture_warmup_ms;
+  config.maximum_bundle_bytes = cvars::guest_execution_capture_bundle_cap_bytes;
+  if (config.output_directory.empty()) {
+    return Fail(error, "session title capture output directory is missing");
+  }
+  if (cvars::guest_execution_capture_marker_source != "pm4_swap") {
+    return Fail(error, "session title capture marker source must be pm4_swap");
+  }
+  if (!cvars::guest_execution_capture_stop_file.empty()) {
+    return Fail(error, "manual session title capture is not implemented yet");
+  }
+  constexpr std::string_view kMarkerBoundaryPrefix = "guest_marker_count:";
+  const std::string_view boundary = cvars::guest_execution_capture_boundary;
+  if (!boundary.starts_with(kMarkerBoundaryPrefix)) {
+    return Fail(error,
+                "session title capture requires a guest marker count boundary");
+  }
+  const std::string_view count_text =
+      boundary.substr(kMarkerBoundaryPrefix.size());
+  const char* count_end = count_text.data() + count_text.size();
+  const std::from_chars_result count_result =
+      std::from_chars(count_text.data(), count_end, config.stop_marker_count);
+  if (count_text.empty() || count_result.ec != std::errc() ||
+      count_result.ptr != count_end || !config.stop_marker_count) {
+    return Fail(error,
+                "session title capture marker count is not a positive integer");
+  }
+  *output = std::move(config);
+  return true;
+}
+
+bool ValidateTitleCaptureConfig(
+    const GuestExecutionSessionTitleCaptureConfig& config,
+    std::string* error) noexcept {
+  if (config.output_directory.empty() || !config.warmup_milliseconds ||
+      !config.stop_marker_count || config.maximum_bundle_bytes < (1u << 20) ||
+      config.maximum_bundle_bytes > (32ull << 30)) {
+    return Fail(error, "session title capture configuration is invalid");
+  }
+  return true;
+}
+
+bool TicksFromMilliseconds(uint64_t milliseconds, uint64_t frequency,
+                           uint64_t* output) noexcept {
+  if (!milliseconds || !frequency || !output) {
+    return false;
+  }
+  const uint64_t seconds = milliseconds / 1000;
+  const uint64_t remainder = milliseconds % 1000;
+  if (seconds > std::numeric_limits<uint64_t>::max() / frequency) {
+    return false;
+  }
+  const uint64_t whole_ticks = seconds * frequency;
+  if (remainder >
+      (std::numeric_limits<uint64_t>::max() - whole_ticks) / frequency) {
+    return false;
+  }
+  const uint64_t fractional_ticks = remainder * frequency / 1000;
+  if (!whole_ticks && !fractional_ticks) {
+    return false;
+  }
+  *output = whole_ticks + fractional_ticks;
+  return true;
+}
+
+GuestExecutionSessionBundleLimits MakeTitleCaptureBundleLimits(
+    uint64_t maximum_bundle_bytes) {
+  GuestExecutionSessionBundleLimits limits;
+  limits.maximum_bundle_bytes = maximum_bundle_bytes;
+  limits.maximum_total_content_bytes =
+      std::min(limits.maximum_total_content_bytes, maximum_bundle_bytes);
+  limits.session.maximum_total_chunk_bytes =
+      std::min(limits.session.maximum_total_chunk_bytes, maximum_bundle_bytes);
+  limits.session.maximum_manifest_bytes =
+      std::min(limits.session.maximum_manifest_bytes, maximum_bundle_bytes);
+  limits.session.maximum_chunk_bytes =
+      std::min(limits.session.maximum_chunk_bytes, maximum_bundle_bytes);
+  limits.session.maximum_event_payload_bytes = std::min(
+      limits.session.maximum_event_payload_bytes, maximum_bundle_bytes);
+  limits.session.maximum_content_blob_bytes =
+      std::min(limits.session.maximum_content_blob_bytes, maximum_bundle_bytes);
+  return limits;
 }
 
 const CheckpointParticipant* FindCheckpointParticipant(
@@ -2370,6 +2495,265 @@ bool GuestExecutionSessionCaptureRuntime::OnSchedulerEvent(
 bool GuestExecutionSessionCaptureRuntime::CanDetach() const noexcept {
   return !impl_->session_active.load(std::memory_order_acquire) &&
          impl_->host_call_roster.CanDetach();
+}
+
+struct GuestExecutionSessionTitleCaptureRuntime::Impl {
+  class HostClock final : public ppc::GuestInvocationRecorderClock,
+                          public GuestExecutionMarkerClock {
+   public:
+    uint64_t NowTicks() const noexcept override {
+      return Clock::QueryHostTickCount();
+    }
+  };
+
+  Impl(Processor& processor, GuestExecutionSessionTitleCaptureConfig config,
+       GuestExecutionSessionSha256 capture_build_sha256,
+       GuestExecutionSessionSha256 replay_config_sha256)
+      : processor(processor),
+        config(std::move(config)),
+        capture_build_sha256(capture_build_sha256),
+        replay_config_sha256(replay_config_sha256),
+        bundle_limits(
+            MakeTitleCaptureBundleLimits(this->config.maximum_bundle_bytes)),
+        publisher(this->config.output_directory, bundle_limits) {}
+
+  bool BuildRuntimeConfig(
+      std::string_view title_identity, std::string_view module_identity,
+      GuestExecutionSessionCaptureRuntimeConfig* runtime_config,
+      GuestExecutionMarkerControllerConfig* marker_config,
+      std::string* error) const noexcept {
+    if (!runtime_config || !marker_config || title_identity.empty() ||
+        module_identity.empty()) {
+      return Fail(error, "session title capture identity is missing");
+    }
+    const uint64_t tick_frequency = Clock::QueryHostTickFrequency();
+    uint64_t warmup_ticks = 0;
+    uint64_t rendezvous_ticks = 0;
+    uint64_t maximum_duration_ticks = 0;
+    if (!TicksFromMilliseconds(config.warmup_milliseconds, tick_frequency,
+                               &warmup_ticks) ||
+        !TicksFromMilliseconds(5000, tick_frequency, &rendezvous_ticks) ||
+        !TicksFromMilliseconds(15 * 60 * 1000, tick_frequency,
+                               &maximum_duration_ticks)) {
+      return Fail(error, "session title capture timing overflows host ticks");
+    }
+
+    GuestExecutionSessionCaptureRuntimeConfig prepared;
+    GuestExecutionSessionAssemblerConfig& assembler = prepared.assembler;
+    assembler.session_epoch = Clock::QueryHostTickCount();
+    if (!assembler.session_epoch) {
+      assembler.session_epoch = 1;
+    }
+    assembler.boundary.kind =
+        GuestExecutionSessionBoundaryKind::kGuestMarkerCount;
+    assembler.boundary.value = config.stop_marker_count;
+    assembler.boundary.marker_source =
+        GuestExecutionSessionMarkerSource::kPm4Swap;
+    assembler.boundary.marker_identity = gpu::kPm4SwapMarkerOpcode;
+    assembler.coverage_mode =
+        GuestExecutionReelCoverageMode::kContinuousInstructions;
+    assembler.limits.maximum_segment_count = 1u << 20;
+    assembler.limits.maximum_event_count = 1u << 20;
+    assembler.limits.maximum_guest_instruction_count = 1ull << 32;
+    assembler.limits.maximum_guest_marker_count = config.stop_marker_count;
+    assembler.limits.maximum_duration_ticks = maximum_duration_ticks;
+    assembler.maximum_stop_tail_event_count = 1u << 16;
+    assembler.maximum_stop_tail_guest_instruction_count = 1u << 20;
+    assembler.maximum_stop_tail_ticks = rendezvous_ticks;
+    assembler.maximum_start_rendezvous_ticks = rendezvous_ticks;
+    assembler.capture_tick_frequency = tick_frequency;
+    assembler.maximum_events_per_chunk = 4096;
+    assembler.pm4_marker_sink_ordinal = 0;
+    assembler.capture_build_sha256 = capture_build_sha256;
+    assembler.replay_config_sha256 = replay_config_sha256;
+    try {
+      const std::string title_source =
+          std::string("xenia-title-identity-v1\0", 24) +
+          std::string(title_identity);
+      const std::string module_source =
+          std::string("xenia-module-identity-v1\0", 25) +
+          std::string(module_identity);
+      assembler.title_identity_sha256 = GuestExecutionSessionCodec::HashBytes(
+          reinterpret_cast<const uint8_t*>(title_source.data()),
+          title_source.size());
+      assembler.module_identity_sha256 = GuestExecutionSessionCodec::HashBytes(
+          reinterpret_cast<const uint8_t*>(module_source.data()),
+          module_source.size());
+    } catch (...) {
+      return Fail(error, "session title capture identity allocation failed");
+    }
+    assembler.bundle_limits = bundle_limits;
+
+    GuestExecutionMarkerControllerConfig marker;
+    marker.marker_source = GuestExecutionSessionMarkerSource::kPm4Swap;
+    marker.marker_identity = gpu::kPm4SwapMarkerOpcode;
+    marker.warmup_ticks = warmup_ticks;
+    marker.stop_marker_count = config.stop_marker_count;
+    marker.max_outstanding_boundaries = 1;
+    *runtime_config = std::move(prepared);
+    *marker_config = marker;
+    return true;
+  }
+
+  Processor& processor;
+  const GuestExecutionSessionTitleCaptureConfig config;
+  const GuestExecutionSessionSha256 capture_build_sha256;
+  const GuestExecutionSessionSha256 replay_config_sha256;
+  const GuestExecutionSessionBundleLimits bundle_limits;
+  HostClock clock;
+  std::unique_ptr<GuestExecutionSessionCaptureProvider> provider;
+  GuestExecutionSessionCaptureSchedulerEventBridge event_bridge;
+  GuestExecutionSessionDirectoryPublisher publisher;
+  std::unique_ptr<GuestExecutionSessionCaptureRuntimePm4Wiring> wiring;
+};
+
+bool GuestExecutionSessionTitleCaptureRuntime::IsRequested() noexcept {
+  return !cvars::guest_execution_capture_output.empty();
+}
+
+std::unique_ptr<GuestExecutionSessionTitleCaptureRuntime>
+GuestExecutionSessionTitleCaptureRuntime::CreateAndAttachProvider(
+    Memory& memory, Processor& processor, bool guest_scheduler_enabled,
+    std::string* error) {
+  GuestExecutionSessionTitleCaptureConfig config;
+  if (!CurrentTitleCaptureConfig(&config, error)) {
+    return nullptr;
+  }
+  return CreateAndAttachProvider(memory, processor, config,
+                                 guest_scheduler_enabled, error);
+}
+
+std::unique_ptr<GuestExecutionSessionTitleCaptureRuntime>
+GuestExecutionSessionTitleCaptureRuntime::CreateAndAttachProvider(
+    Memory& memory, Processor& processor,
+    const GuestExecutionSessionTitleCaptureConfig& config,
+    bool guest_scheduler_enabled, std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!guest_scheduler_enabled) {
+    Fail(error, "session title capture requires guest_scheduler=true");
+    return nullptr;
+  }
+  if (!processor.backend()) {
+    Fail(error, "session title capture requires an initialized CPU backend");
+    return nullptr;
+  }
+  if (!ValidateTitleCaptureConfig(config, error)) {
+    return nullptr;
+  }
+
+  GuestInvocationReplayConfig replay_config;
+  GuestExecutionSessionSha256 capture_build_sha256 = {};
+  GuestExecutionSessionSha256 replay_config_sha256 = {};
+  if (!CaptureCurrentGuestInvocationReplayConfig(*processor.backend(),
+                                                 &replay_config, error) ||
+      !ValidateGuestInvocationReplayBenchmarkConfig(replay_config, error) ||
+      !HashGuestInvocationReplayConfig(replay_config, &replay_config_sha256,
+                                       error) ||
+      !HashGuestInvocationReplayFile(filesystem::GetExecutablePath(),
+                                     &capture_build_sha256, error)) {
+    return nullptr;
+  }
+
+  return CreateAndAttachProviderWithProvenance(
+      memory, processor, config, guest_scheduler_enabled, capture_build_sha256,
+      replay_config_sha256, error);
+}
+
+std::unique_ptr<GuestExecutionSessionTitleCaptureRuntime>
+GuestExecutionSessionTitleCaptureRuntime::CreateAndAttachProviderWithProvenance(
+    Memory& memory, Processor& processor,
+    const GuestExecutionSessionTitleCaptureConfig& config,
+    bool guest_scheduler_enabled,
+    const GuestExecutionSessionSha256& capture_build_sha256,
+    const GuestExecutionSessionSha256& replay_config_sha256,
+    std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!guest_scheduler_enabled || !processor.backend() ||
+      !ValidateTitleCaptureConfig(config, error) ||
+      std::none_of(capture_build_sha256.cbegin(), capture_build_sha256.cend(),
+                   [](uint8_t byte) { return byte != 0; }) ||
+      std::none_of(replay_config_sha256.cbegin(), replay_config_sha256.cend(),
+                   [](uint8_t byte) { return byte != 0; })) {
+    if (error && error->empty()) {
+      *error = "session title capture provenance is invalid";
+    }
+    return nullptr;
+  }
+  std::unique_ptr<Impl> impl;
+  try {
+    impl = std::make_unique<Impl>(processor, config, capture_build_sha256,
+                                  replay_config_sha256);
+  } catch (...) {
+    Fail(error, "session title capture owner allocation failed");
+    return nullptr;
+  }
+  GuestExecutionSessionCaptureProviderConfig provider_config;
+  provider_config.jit_corpus_config_flags = JitCorpus::kConfigGuestScheduler;
+  impl->provider = GuestExecutionSessionCaptureProvider::CreateAndAttach(
+      memory, processor, provider_config, error);
+  if (!impl->provider) {
+    return nullptr;
+  }
+  return std::unique_ptr<GuestExecutionSessionTitleCaptureRuntime>(
+      new GuestExecutionSessionTitleCaptureRuntime(std::move(impl)));
+}
+
+GuestExecutionSessionTitleCaptureRuntime::
+    GuestExecutionSessionTitleCaptureRuntime(
+        std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+GuestExecutionSessionTitleCaptureRuntime::
+    ~GuestExecutionSessionTitleCaptureRuntime() {
+  Shutdown();
+}
+
+bool GuestExecutionSessionTitleCaptureRuntime::AttachRuntime(
+    kernel::GuestScheduler& scheduler, gpu::CommandProcessor& command_processor,
+    std::string_view title_identity, std::string_view module_identity,
+    std::string* error) {
+  if (!impl_ || impl_->wiring) {
+    return Fail(error, "session title capture runtime attachment is invalid");
+  }
+  GuestExecutionSessionCaptureRuntimeConfig runtime_config;
+  GuestExecutionMarkerControllerConfig marker_config;
+  if (!impl_->BuildRuntimeConfig(title_identity, module_identity,
+                                 &runtime_config, &marker_config, error)) {
+    return false;
+  }
+  GuestExecutionSessionCaptureRuntimeDependencies dependencies;
+  dependencies.clock = &impl_->clock;
+  dependencies.provider = impl_->provider.get();
+  dependencies.event_bridge = &impl_->event_bridge;
+  dependencies.publisher = &impl_->publisher;
+  impl_->wiring = GuestExecutionSessionCaptureRuntimePm4Wiring::CreateAndAttach(
+      impl_->processor, scheduler, command_processor, runtime_config,
+      dependencies, marker_config, impl_->clock, error);
+  return impl_->wiring != nullptr;
+}
+
+void GuestExecutionSessionTitleCaptureRuntime::Shutdown() noexcept {
+  if (!impl_) {
+    return;
+  }
+  impl_->wiring.reset();
+  impl_->provider.reset();
+  impl_.reset();
+}
+
+bool GuestExecutionSessionTitleCaptureRuntime::runtime_attached()
+    const noexcept {
+  return impl_ && impl_->wiring;
+}
+
+const std::filesystem::path&
+GuestExecutionSessionTitleCaptureRuntime::output_directory() const noexcept {
+  static const std::filesystem::path kEmptyPath;
+  return impl_ ? impl_->config.output_directory : kEmptyPath;
 }
 
 }  // namespace cpu

@@ -16,10 +16,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "xenia/cpu/guest_execution_capture.h"
@@ -29,6 +31,7 @@
 #include "xenia/kernel/guest_scheduler_checkpoint.h"
 
 namespace xe {
+class Memory;
 namespace gpu {
 class CommandProcessor;
 }
@@ -42,7 +45,9 @@ class Processor;
 class GuestExecutionMarkerController;
 class GuestExecutionMarkerClock;
 struct GuestExecutionMarkerControllerConfig;
+class GuestExecutionSessionCaptureProvider;
 class GuestExecutionSessionCaptureRuntimePm4Wiring;
+class GuestExecutionSessionTitleCaptureRuntimeTestAccess;
 
 enum class GuestExecutionSessionCaptureRuntimeState : uint8_t {
   kIdle,
@@ -387,6 +392,64 @@ class GuestExecutionSessionCaptureRuntimePm4Wiring final {
       std::unique_ptr<Lifetime> lifetime) noexcept;
 
   std::unique_ptr<Lifetime> lifetime_;
+};
+
+struct GuestExecutionSessionTitleCaptureConfig {
+  std::filesystem::path output_directory;
+  uint64_t warmup_milliseconds = 100000;
+  uint64_t stop_marker_count = 1;
+  uint64_t maximum_bundle_bytes = 1ull << 30;
+};
+
+// Title-lifetime production composition. Provider attachment is deliberately
+// separate from runtime attachment: the provider must observe definitions made
+// while the executable module loads, while stable title/module identities are
+// not available until that load completes. Shutdown destroys the PM4 wiring
+// before the provider and must run before CommandProcessor, GuestScheduler,
+// Processor, or Memory teardown.
+class GuestExecutionSessionTitleCaptureRuntime final {
+ public:
+  static bool IsRequested() noexcept;
+  static std::unique_ptr<GuestExecutionSessionTitleCaptureRuntime>
+  CreateAndAttachProvider(Memory& memory, Processor& processor,
+                          bool guest_scheduler_enabled,
+                          std::string* error = nullptr);
+  static std::unique_ptr<GuestExecutionSessionTitleCaptureRuntime>
+  CreateAndAttachProvider(Memory& memory, Processor& processor,
+                          const GuestExecutionSessionTitleCaptureConfig& config,
+                          bool guest_scheduler_enabled,
+                          std::string* error = nullptr);
+
+  ~GuestExecutionSessionTitleCaptureRuntime();
+  GuestExecutionSessionTitleCaptureRuntime(
+      const GuestExecutionSessionTitleCaptureRuntime&) = delete;
+  GuestExecutionSessionTitleCaptureRuntime& operator=(
+      const GuestExecutionSessionTitleCaptureRuntime&) = delete;
+
+  bool AttachRuntime(kernel::GuestScheduler& scheduler,
+                     gpu::CommandProcessor& command_processor,
+                     std::string_view title_identity,
+                     std::string_view module_identity,
+                     std::string* error = nullptr);
+  void Shutdown() noexcept;
+  bool runtime_attached() const noexcept;
+  const std::filesystem::path& output_directory() const noexcept;
+
+ private:
+  friend class GuestExecutionSessionTitleCaptureRuntimeTestAccess;
+  struct Impl;
+  explicit GuestExecutionSessionTitleCaptureRuntime(
+      std::unique_ptr<Impl> impl) noexcept;
+  static std::unique_ptr<GuestExecutionSessionTitleCaptureRuntime>
+  CreateAndAttachProviderWithProvenance(
+      Memory& memory, Processor& processor,
+      const GuestExecutionSessionTitleCaptureConfig& config,
+      bool guest_scheduler_enabled,
+      const GuestExecutionSessionSha256& capture_build_sha256,
+      const GuestExecutionSessionSha256& replay_config_sha256,
+      std::string* error);
+
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace cpu
