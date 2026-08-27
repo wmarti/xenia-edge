@@ -13,9 +13,11 @@
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <future>
 #include <memory>
@@ -26,9 +28,11 @@
 #include <utility>
 
 #include "third_party/catch/include/catch.hpp"
+#include "xenia/base/byte_order.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/guest_execution_capture.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/cpu/raw_module.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/guest_scheduler.h"
@@ -151,6 +155,99 @@ using RosterScope = GuestSchedulerCheckpointRosterScope;
 constexpr uint32_t kSafepointPc = 0x82001000;
 constexpr uint32_t kCpu0CreationFlags = uint32_t{1} << 24;
 constexpr uint32_t kCpu1CreationFlags = uint32_t{2} << 24;
+
+constexpr uint32_t kReplayCodeBase = 0x82050000;
+constexpr uint32_t kReplayResumeA = kReplayCodeBase + 0x20;
+constexpr uint32_t kReplayCallerA = kReplayCodeBase + 0x100;
+constexpr uint32_t kReplayFinalA = kReplayCallerA + 20;
+constexpr uint32_t kReplayResumeB = kReplayCodeBase + 0x220;
+constexpr uint32_t kReplayCallerB = kReplayCodeBase + 0x300;
+constexpr uint32_t kReplayFinalB = kReplayCallerB + 28;
+constexpr uint32_t kReplayOuterReturnA = 0x83001000;
+constexpr uint32_t kReplayOuterReturnB = 0x83002000;
+
+constexpr uint32_t kSharedTokenA = 0;
+constexpr uint32_t kSharedTokenB = 4;
+constexpr uint32_t kSharedReachedA = 8;
+constexpr uint32_t kSharedReachedB = 12;
+constexpr uint32_t kSharedPoisonGate = 16;
+constexpr uint32_t kSharedPoisonA = 20;
+constexpr uint32_t kSharedPoisonB = 24;
+
+uint32_t EncodeConditionalBranch(uint32_t opcode, uint32_t from, uint32_t to) {
+  const int32_t displacement = static_cast<int32_t>(to - from);
+  return opcode | (static_cast<uint32_t>(displacement) & 0x0000FFFCu);
+}
+
+void StoreGuestInstruction(Memory* memory, uint32_t address,
+                           uint32_t instruction) {
+  store_and_swap<uint32_t>(memory->TranslateVirtual(address), instruction);
+}
+
+bool WaitForGuestWord(Memory* memory, uint32_t address, uint32_t expected,
+                      std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (load_and_swap<uint32_t>(memory->TranslateVirtual(address)) ==
+        expected) {
+      return true;
+    }
+    std::this_thread::yield();
+  }
+  return false;
+}
+
+bool InstallReplayGuestCode(Emulator* emulator) {
+  Memory* memory = emulator->memory();
+
+  StoreGuestInstruction(memory, kReplayResumeA, 0x38630001u);
+  StoreGuestInstruction(memory, kReplayResumeA + 4, 0x90640000u);
+  StoreGuestInstruction(memory, kReplayResumeA + 8, 0x4E800020u);
+
+  StoreGuestInstruction(memory, kReplayCallerA, 0x80A40004u);
+  StoreGuestInstruction(memory, kReplayCallerA + 4, 0x2C050001u);
+  StoreGuestInstruction(
+      memory, kReplayCallerA + 8,
+      EncodeConditionalBranch(0x40820000u, kReplayCallerA + 8, kReplayCallerA));
+  StoreGuestInstruction(memory, kReplayCallerA + 12, 0x38C00001u);
+  StoreGuestInstruction(memory, kReplayCallerA + 16, 0x90C40008u);
+  StoreGuestInstruction(memory, kReplayFinalA, 0x80E40010u);
+  StoreGuestInstruction(memory, kReplayFinalA + 4, 0x2C070000u);
+  StoreGuestInstruction(
+      memory, kReplayFinalA + 8,
+      EncodeConditionalBranch(0x41820000u, kReplayFinalA + 8, kReplayFinalA));
+  StoreGuestInstruction(memory, kReplayFinalA + 12, 0x390000A1u);
+  StoreGuestInstruction(memory, kReplayFinalA + 16, 0x91040014u);
+  StoreGuestInstruction(memory, kReplayFinalA + 20, 0x7D6803A6u);
+  StoreGuestInstruction(memory, kReplayFinalA + 24, 0x4E800020u);
+
+  StoreGuestInstruction(memory, kReplayResumeB, 0x38630002u);
+  StoreGuestInstruction(memory, kReplayResumeB + 4, 0x4E800020u);
+
+  StoreGuestInstruction(memory, kReplayCallerB, 0x80A40000u);
+  StoreGuestInstruction(memory, kReplayCallerB + 4, 0x2C050001u);
+  StoreGuestInstruction(
+      memory, kReplayCallerB + 8,
+      EncodeConditionalBranch(0x40820000u, kReplayCallerB + 8, kReplayCallerB));
+  StoreGuestInstruction(memory, kReplayCallerB + 12, 0x38C00001u);
+  StoreGuestInstruction(memory, kReplayCallerB + 16, 0x90C40004u);
+  StoreGuestInstruction(memory, kReplayCallerB + 20, 0x38C00001u);
+  StoreGuestInstruction(memory, kReplayCallerB + 24, 0x90C4000Cu);
+  StoreGuestInstruction(memory, kReplayFinalB, 0x80E40010u);
+  StoreGuestInstruction(memory, kReplayFinalB + 4, 0x2C070000u);
+  StoreGuestInstruction(
+      memory, kReplayFinalB + 8,
+      EncodeConditionalBranch(0x41820000u, kReplayFinalB + 8, kReplayFinalB));
+  StoreGuestInstruction(memory, kReplayFinalB + 12, 0x390000B2u);
+  StoreGuestInstruction(memory, kReplayFinalB + 16, 0x91040018u);
+  StoreGuestInstruction(memory, kReplayFinalB + 20, 0x7D6803A6u);
+  StoreGuestInstruction(memory, kReplayFinalB + 24, 0x4E800020u);
+
+  auto module = std::make_unique<cpu::RawModule>(emulator->processor());
+  module->set_name("scheduler-backed-continuous-replay-test");
+  module->SetAddressRange(kReplayCodeBase, 0x1000);
+  return emulator->processor()->AddModule(std::move(module));
+}
 
 class BlockingGate final {
  public:
@@ -326,6 +423,84 @@ class CheckpointRuntimeThread final : public XThread {
   FiberControl* control_;
 };
 
+struct ReplayFiberControl {
+  std::atomic<bool> execute_returned{false};
+};
+
+class ReplayRuntimeThread final : public XThread {
+ public:
+  ReplayRuntimeThread(KernelState* kernel_state, ReplayFiberControl* control,
+                      uint32_t resume_pc, uint32_t outer_return_address)
+      : XThread(kernel_state, 64 * 1024, 0, resume_pc, 0,
+                kCpu0CreationFlags | X_CREATE_SUSPENDED, true, false,
+                kernel_state->GetSystemProcess()),
+        control_(control),
+        resume_pc_(resume_pc),
+        outer_return_address_(outer_return_address) {}
+
+  void Execute() override {
+    const bool succeeded = kernel_state()->processor()->ExecuteRaw(
+        thread_state(), resume_pc_, outer_return_address_);
+    control_->execute_returned.store(true, std::memory_order_release);
+    Exit(succeeded ? 0 : -1);
+  }
+
+ private:
+  ReplayFiberControl* control_;
+  uint32_t resume_pc_;
+  uint32_t outer_return_address_;
+};
+
+struct CreatedReplayThread {
+  CreatedReplayThread() = default;
+  CreatedReplayThread(const CreatedReplayThread&) = delete;
+  CreatedReplayThread& operator=(const CreatedReplayThread&) = delete;
+  CreatedReplayThread(CreatedReplayThread&&) = default;
+  CreatedReplayThread& operator=(CreatedReplayThread&&) = default;
+
+  ~CreatedReplayThread() {
+    if (!thread || XFAILED(status)) {
+      return;
+    }
+    GuestScheduler* scheduler = thread->kernel_state()->guest_scheduler();
+    if (scheduler) {
+      scheduler->Shutdown();
+    }
+    thread->ReclaimExited();
+    thread->ReleaseHandle();
+    thread.reset();
+  }
+
+  object_ref<ReplayRuntimeThread> thread;
+  X_STATUS status = X_STATUS_UNSUCCESSFUL;
+};
+
+CreatedReplayThread CreateReplayRuntimeThread(SchedulerEnvironment& environment,
+                                              ReplayFiberControl& control,
+                                              uint32_t resume_pc,
+                                              uint32_t caller_continuation,
+                                              uint32_t outer_return_address,
+                                              uint32_t shared_address) {
+  CreatedReplayThread result;
+  if (!environment.ready()) {
+    return result;
+  }
+  result.thread = object_ref<ReplayRuntimeThread>(
+      new ReplayRuntimeThread(environment.emulator()->kernel_state(), &control,
+                              resume_pc, outer_return_address));
+  result.thread->set_name("Continuous replay runtime test");
+  result.status = result.thread->Create();
+  if (XFAILED(result.status)) {
+    return result;
+  }
+  auto* context = result.thread->thread_state()->context();
+  context->r[3] = 0;
+  context->r[4] = shared_address;
+  context->r[11] = outer_return_address;
+  context->lr = caller_continuation;
+  return result;
+}
+
 struct CreatedThread {
   CreatedThread() = default;
   CreatedThread(const CreatedThread&) = delete;
@@ -396,6 +571,20 @@ bool WaitUntilSuspended(GuestScheduler& scheduler, XThread* thread,
     if (GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(scheduler,
                                                                  thread)
             .suspended) {
+      return true;
+    }
+    std::this_thread::yield();
+  }
+  return false;
+}
+
+bool WaitUntilRunning(GuestScheduler& scheduler, XThread* thread,
+                      std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(scheduler,
+                                                                 thread)
+            .running) {
       return true;
     }
     std::this_thread::yield();
@@ -902,6 +1091,152 @@ TEST_CASE("Guest scheduler checkpoint preserves an exact suspended JIT route",
               scheduler, suspended.thread.get())
               .checkpoint_jit_safepoint_pc == 0);
   REQUIRE(StopRuntimeThread(suspended, control));
+}
+
+TEST_CASE("Guest scheduler discards a suspended exact JIT route",
+          "[guest_scheduler_checkpoint][runtime][continuous_replay]") {
+  FiberControl control;
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+
+  CreatedThread suspended =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(suspended.status));
+  REQUIRE(control.WaitForStart(2s));
+  REQUIRE(XSUCCEEDED(suspended.thread->Suspend()));
+  suspended.thread->thread_state()->context()->preempt_requested = 1;
+  REQUIRE(WaitUntilSuspended(scheduler, suspended.thread.get(), 2s));
+
+  GuestSchedulerCheckpointBarrierSnapshot snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
+          Rejection::kNone);
+  const std::array<GuestSchedulerCheckpointJitRoute, 1> route = {{
+      {suspended.thread.get(), kSafepointPc},
+  }};
+  REQUIRE(scheduler.FinalizeAndDiscardCheckpointBarrier(
+              snapshot.generation, route) == Rejection::kNone);
+  REQUIRE(xe::threading::Wait(suspended.thread->wait_handle(), false, 2s) ==
+          xe::threading::WaitResult::kSuccess);
+  REQUIRE(control.safepoint_returns.load(std::memory_order_acquire) == 0);
+}
+
+TEST_CASE(
+    "Guest scheduler discards an authenticated continuous replay boundary",
+    "[guest_scheduler_checkpoint][runtime][continuous_replay]") {
+  ReplayFiberControl control_a;
+  ReplayFiberControl control_b;
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  REQUIRE(InstallReplayGuestCode(environment.emulator()));
+  GuestScheduler& scheduler = *environment.scheduler();
+  Memory* memory = environment.emulator()->memory();
+
+  const uint32_t shared_address = memory->SystemHeapAlloc(4096);
+  REQUIRE(shared_address != 0);
+  std::memset(memory->TranslateVirtual(shared_address), 0, 4096);
+
+  CreatedReplayThread replay_a = CreateReplayRuntimeThread(
+      environment, control_a, kReplayResumeA, kReplayCallerA,
+      kReplayOuterReturnA, shared_address);
+  CreatedReplayThread replay_b = CreateReplayRuntimeThread(
+      environment, control_b, kReplayResumeB, kReplayCallerB,
+      kReplayOuterReturnB, shared_address);
+  REQUIRE(XSUCCEEDED(replay_a.status));
+  REQUIRE(XSUCCEEDED(replay_b.status));
+  REQUIRE(kReplayOuterReturnA != 0xBCBCBCBCu);
+  REQUIRE(kReplayOuterReturnB != 0xBCBCBCBCu);
+
+  REQUIRE(XSUCCEEDED(replay_a.thread->Resume()));
+  REQUIRE(WaitForGuestWord(memory, shared_address + kSharedTokenA, 1, 2s));
+
+  replay_b.thread->SetPriority(31);
+  REQUIRE(XSUCCEEDED(replay_b.thread->Resume()));
+  REQUIRE(WaitForGuestWord(memory, shared_address + kSharedTokenB, 1, 2s));
+  REQUIRE(WaitForGuestWord(memory, shared_address + kSharedReachedB, 1, 2s));
+
+  replay_b.thread->SetPriority(0);
+  replay_a.thread->SetPriority(31);
+  REQUIRE(WaitForGuestWord(memory, shared_address + kSharedReachedA, 1, 2s));
+
+  const auto ready_b = GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(
+      scheduler, replay_b.thread.get());
+  REQUIRE(ready_b.queued);
+  REQUIRE_FALSE(ready_b.running);
+  REQUIRE(ready_b.checkpoint_jit_safepoint_pc == kReplayFinalB);
+
+  GuestSchedulerCheckpointBarrierSnapshot incomplete_snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &incomplete_snapshot) ==
+          Rejection::kNone);
+  REQUIRE(incomplete_snapshot.quiesced);
+  const std::array<GuestSchedulerCheckpointJitRoute, 1> incomplete_routes = {{
+      {replay_a.thread.get(), kReplayFinalA},
+  }};
+  GuestSchedulerCheckpointBarrierSnapshot rejected_snapshot;
+  REQUIRE(scheduler.FinalizeAndDiscardCheckpointBarrier(
+              incomplete_snapshot.generation, incomplete_routes,
+              &rejected_snapshot) == Rejection::kInvalidTopology);
+  REQUIRE(rejected_snapshot.rejection == Rejection::kInvalidTopology);
+  REQUIRE(xe::threading::Wait(replay_a.thread->wait_handle(), false, 0ms) ==
+          xe::threading::WaitResult::kTimeout);
+  REQUIRE(xe::threading::Wait(replay_b.thread->wait_handle(), false, 0ms) ==
+          xe::threading::WaitResult::kTimeout);
+
+  REQUIRE(WaitUntilRunning(scheduler, replay_a.thread.get(), 2s));
+  GuestSchedulerCheckpointBarrierSnapshot held_snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &held_snapshot) ==
+          Rejection::kNone);
+  REQUIRE(held_snapshot.quiesced);
+  REQUIRE(held_snapshot.participants.size() == 2);
+
+  const auto* held_a = FindThread(held_snapshot, replay_a.thread->thread_id());
+  const auto* held_b = FindThread(held_snapshot, replay_b.thread->thread_id());
+  REQUIRE(held_a);
+  REQUIRE(held_b);
+  REQUIRE(held_a->state == GuestSchedulerCheckpointParticipantState::kRunning);
+  REQUIRE(held_b->state == GuestSchedulerCheckpointParticipantState::kReady);
+  REQUIRE(held_a->guest_pc == kReplayFinalA);
+  REQUIRE(held_b->guest_pc == kReplayFinalB);
+  REQUIRE(held_a->resume_kind == ResumeKind::kJitSafepoint);
+  REQUIRE(held_b->resume_kind == ResumeKind::kJitSafepoint);
+  REQUIRE(held_a->restorable);
+  REQUIRE(held_b->restorable);
+
+  const auto* context_a = replay_a.thread->thread_state()->context();
+  const auto* context_b = replay_b.thread->thread_state()->context();
+  REQUIRE(context_a->r[3] == 1);
+  REQUIRE(context_b->r[3] == 2);
+  REQUIRE(context_a->r[11] == kReplayOuterReturnA);
+  REQUIRE(context_b->r[11] == kReplayOuterReturnB);
+  REQUIRE(context_a->lr == kReplayCallerA);
+  REQUIRE(context_b->lr == kReplayCallerB);
+
+  store_and_swap<uint32_t>(
+      memory->TranslateVirtual(shared_address + kSharedPoisonGate), 1);
+  const std::array<GuestSchedulerCheckpointJitRoute, 2> routes = {{
+      {replay_a.thread.get(), kReplayFinalA},
+      {replay_b.thread.get(), kReplayFinalB},
+  }};
+  GuestSchedulerCheckpointBarrierSnapshot discarded_snapshot;
+  REQUIRE(scheduler.FinalizeAndDiscardCheckpointBarrier(
+              held_snapshot.generation, routes, &discarded_snapshot) ==
+          Rejection::kNone);
+  REQUIRE(discarded_snapshot.quiesced);
+  REQUIRE_FALSE(discarded_snapshot.active);
+  REQUIRE(discarded_snapshot.rejection == Rejection::kNone);
+
+  REQUIRE(xe::threading::Wait(replay_a.thread->wait_handle(), false, 2s) ==
+          xe::threading::WaitResult::kSuccess);
+  REQUIRE(xe::threading::Wait(replay_b.thread->wait_handle(), false, 2s) ==
+          xe::threading::WaitResult::kSuccess);
+  REQUIRE_FALSE(control_a.execute_returned.load(std::memory_order_acquire));
+  REQUIRE_FALSE(control_b.execute_returned.load(std::memory_order_acquire));
+  REQUIRE(load_and_swap<uint32_t>(
+              memory->TranslateVirtual(shared_address + kSharedPoisonA)) == 0);
+  REQUIRE(load_and_swap<uint32_t>(
+              memory->TranslateVirtual(shared_address + kSharedPoisonB)) == 0);
+
+  memory->SystemHeapFree(shared_address);
 }
 
 }  // namespace testing

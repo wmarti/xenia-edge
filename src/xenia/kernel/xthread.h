@@ -602,6 +602,13 @@ class XThread : public XObject, public cpu::Thread {
     // Set by an external Terminate, exits the fiber at its next
     // ExitIfTerminated check.
     std::atomic<bool> terminate_pending{false};
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    // Set only after an offline replay boundary authenticates this parked
+    // fiber. Its next scheduler resume exits on the fiber stack without
+    // returning to the JIT safepoint.
+    std::atomic<bool> checkpoint_discard_pending{false};
+#endif
     // Absolute raw-tick end of the granted timeslice, 0 = grant fresh at
     // dispatch. Preemption preserves it so the quantum end still arrives.
     uint64_t quantum_deadline_tick = 0;

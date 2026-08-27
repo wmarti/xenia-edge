@@ -36,6 +36,11 @@ class XThread;
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 class GuestSchedulerCheckpointRuntimeTestAccess;
+
+struct GuestSchedulerCheckpointJitRoute {
+  XThread* thread = nullptr;
+  uint32_t guest_pc = 0;
+};
 #endif
 
 // Cooperative, in-kernel scheduler for guest threads.
@@ -168,8 +173,9 @@ class GuestScheduler {
   // resume point where it exits and is reclaimed.
   bool TerminateThread(XThread* thread);
 
-  // Ends the calling fiber now if an external Terminate marked it, handing it
-  // to the dispatcher for reclaim. Returns otherwise.
+  // Ends the calling fiber now if external termination or an authenticated
+  // replay-boundary discard marked it, handing it to the dispatcher for
+  // reclaim. Returns otherwise.
   void ExitIfTerminated();
 
   KernelState* kernel_state() const { return kernel_state_; }
@@ -190,6 +196,14 @@ class GuestScheduler {
   GuestSchedulerCheckpointBarrierRejection FinalizeAndResumeCheckpointBarrier(
       uint64_t generation,
       GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot);
+  // Accepts a quiesced replay boundary only if |routes| names every scheduler
+  // participant exactly once at its durable JIT block-head PC. The fibers stay
+  // parked through that authentication. Accepted fibers are then released to
+  // exit on their own stacks before returning to guest JIT code.
+  GuestSchedulerCheckpointBarrierRejection FinalizeAndDiscardCheckpointBarrier(
+      uint64_t generation,
+      std::span<const GuestSchedulerCheckpointJitRoute> routes,
+      GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot = nullptr);
   GuestSchedulerCheckpointBarrierRejection CancelCheckpointBarrier(
       uint64_t generation,
       GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot = nullptr);
@@ -358,9 +372,13 @@ class GuestScheduler {
   void AppendCheckpointListLocked(
       std::vector<GuestSchedulerCheckpointParticipant>& participants,
       XThread* head, GuestSchedulerCheckpointParticipantState state) const;
+  bool ValidateCheckpointDiscardRoutesLocked(
+      uint64_t generation,
+      std::span<const GuestSchedulerCheckpointJitRoute> routes) const;
   GuestSchedulerCheckpointBarrierRejection FinalizeCheckpointBarrierLocked(
       uint64_t generation,
-      GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot);
+      GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot,
+      std::span<const GuestSchedulerCheckpointJitRoute> discard_routes = {});
   void RequeueReleasedCheckpointFiberLocked(int cpu_index, uint64_t generation);
   void RejectCheckpointTopologyChangeLocked();
 

@@ -408,7 +408,8 @@ GuestScheduler::PauseForCheckpointBarrier(
 GuestSchedulerCheckpointBarrierRejection
 GuestScheduler::FinalizeCheckpointBarrierLocked(
     uint64_t generation,
-    GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot) {
+    GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot,
+    std::span<const GuestSchedulerCheckpointJitRoute> discard_routes) {
   GuestSchedulerCheckpointBarrierRejection rejection =
       GuestSchedulerCheckpointBarrierRejection::kInvalidTopology;
   for (const auto& held : checkpoint_held_) {
@@ -422,9 +423,37 @@ GuestScheduler::FinalizeCheckpointBarrierLocked(
       return GuestSchedulerCheckpointBarrierRejection::kStaleGeneration;
     }
   }
+  if (!discard_routes.empty() &&
+      !ValidateCheckpointDiscardRoutesLocked(generation, discard_routes)) {
+    const auto snapshot = checkpoint_barrier_.snapshot();
+    if (!snapshot.active || snapshot.generation != generation) {
+      return snapshot.active
+                 ? GuestSchedulerCheckpointBarrierRejection::kStaleGeneration
+                 : GuestSchedulerCheckpointBarrierRejection::kNotActive;
+    }
+    checkpoint_barrier_.Reject(
+        GuestSchedulerCheckpointBarrierRejection::kInvalidTopology);
+  }
   if (!checkpoint_barrier_.Finalize(generation, out_final_snapshot,
                                     &rejection)) {
     return rejection;
+  }
+  if (rejection == GuestSchedulerCheckpointBarrierRejection::kNone &&
+      !discard_routes.empty()) {
+    for (const auto& route : discard_routes) {
+      auto& links = route.thread->scheduler_links();
+      links.checkpoint_discard_pending.store(true, std::memory_order_release);
+      if (!links.suspended) {
+        continue;
+      }
+      Cpu& cpu = cpus_[links.cpu];
+      UnlinkLocked(cpu.suspended_head, cpu.suspended_tail, route.thread);
+      links.suspended = false;
+      links.ready_next = nullptr;
+      links.queued = true;
+      links.preempted = false;
+      LinkReadyLocked(cpu, route.thread, true);
+    }
   }
   for (int cpu_index = 0; cpu_index < kMaxCpus; ++cpu_index) {
     auto& held = checkpoint_held_[cpu_index];
@@ -443,6 +472,109 @@ GuestScheduler::FinalizeCheckpointBarrierLocked(
     RequeueReleasedCheckpointFiberLocked(cpu_index, generation);
   }
   return rejection;
+}
+
+bool GuestScheduler::ValidateCheckpointDiscardRoutesLocked(
+    uint64_t generation,
+    std::span<const GuestSchedulerCheckpointJitRoute> routes) const {
+  const auto snapshot = checkpoint_barrier_.snapshot();
+  if (!generation || !snapshot.active || !snapshot.quiesced ||
+      snapshot.generation != generation ||
+      snapshot.rejection != GuestSchedulerCheckpointBarrierRejection::kNone ||
+      routes.empty() || routes.size() != snapshot.participants.size()) {
+    return false;
+  }
+  const auto list_contains = [](XThread* head, const XThread* target) {
+    for (XThread* thread = head; thread;
+         thread = thread->scheduler_links().ready_next) {
+      if (thread == target) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (size_t route_index = 0; route_index < routes.size(); ++route_index) {
+    const auto& route = routes[route_index];
+    if (!route.thread || !route.thread->fiber() || !route.guest_pc ||
+        (route.guest_pc & 3) ||
+        route.thread->guest_object<X_KTHREAD>()->terminated ||
+        route.thread->guest_object<X_KTHREAD>()->thread_state ==
+            KTHREAD_STATE_TERMINATED) {
+      return false;
+    }
+    for (size_t earlier = 0; earlier < route_index; ++earlier) {
+      if (routes[earlier].thread == route.thread) {
+        return false;
+      }
+    }
+
+    const auto participant_it = std::find_if(
+        snapshot.participants.cbegin(), snapshot.participants.cend(),
+        [&route](const auto& participant) {
+          return participant.thread_id == route.thread->thread_id();
+        });
+    if (participant_it == snapshot.participants.cend() ||
+        participant_it->guest_pc != route.guest_pc ||
+        participant_it->resume_kind !=
+            GuestSchedulerCheckpointResumeKind::kJitSafepoint ||
+        !participant_it->restorable) {
+      return false;
+    }
+
+    const auto& links = route.thread->scheduler_links();
+    const uint32_t parked_guest_pc =
+        participant_it->state ==
+                GuestSchedulerCheckpointParticipantState::kRunning
+            ? links.checkpoint_jit_safepoint_pc
+            : links.RestorableCheckpointJitSafepointPc(participant_it->state);
+    if (!links.has_run || links.cpu != participant_it->cpu ||
+        links.terminate_pending.load(std::memory_order_relaxed) ||
+        links.checkpoint_discard_pending.load(std::memory_order_relaxed) ||
+        parked_guest_pc != route.guest_pc) {
+      return false;
+    }
+
+    switch (participant_it->state) {
+      case GuestSchedulerCheckpointParticipantState::kRunning: {
+        if (links.running || links.queued || links.blocked || links.suspended ||
+            participant_it->cpu < 0 || participant_it->cpu >= kMaxCpus) {
+          return false;
+        }
+        const auto& held = checkpoint_held_[participant_it->cpu];
+        if (held.thread != route.thread ||
+            held.state.generation() != generation ||
+            held.state.phase() !=
+                GuestSchedulerCheckpointHeldPhase::kSwitchedOut) {
+          return false;
+        }
+        break;
+      }
+      case GuestSchedulerCheckpointParticipantState::kReady:
+        if (!links.queued || links.running || links.blocked ||
+            links.suspended) {
+          return false;
+        }
+        if (links.queued_prio < 0 || links.queued_prio > 31 ||
+            !list_contains(cpus_[links.cpu].ready_head[links.queued_prio],
+                           route.thread)) {
+          return false;
+        }
+        break;
+      case GuestSchedulerCheckpointParticipantState::kSuspended:
+        if (!links.suspended || links.running || links.queued ||
+            links.blocked) {
+          return false;
+        }
+        if (!list_contains(cpus_[links.cpu].suspended_head, route.thread)) {
+          return false;
+        }
+        break;
+      case GuestSchedulerCheckpointParticipantState::kBlocked:
+        return false;
+    }
+  }
+  return true;
 }
 
 void GuestScheduler::RequeueReleasedCheckpointFiberLocked(int cpu_index,
@@ -478,6 +610,32 @@ GuestScheduler::FinalizeAndResumeCheckpointBarrier(
   {
     std::lock_guard<std::mutex> lock(lock_);
     rejection = FinalizeCheckpointBarrierLocked(generation, out_final_snapshot);
+  }
+  for (Cpu& cpu : cpus_) {
+    if (cpu.ready_event) {
+      cpu.ready_event->Set();
+    }
+  }
+  return rejection;
+}
+
+GuestSchedulerCheckpointBarrierRejection
+GuestScheduler::FinalizeAndDiscardCheckpointBarrier(
+    uint64_t generation,
+    std::span<const GuestSchedulerCheckpointJitRoute> routes,
+    GuestSchedulerCheckpointBarrierSnapshot* out_final_snapshot) {
+  GuestSchedulerCheckpointBarrierRejection rejection;
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    if (routes.empty()) {
+      const auto snapshot = checkpoint_barrier_.snapshot();
+      if (snapshot.active && snapshot.generation == generation) {
+        checkpoint_barrier_.Reject(
+            GuestSchedulerCheckpointBarrierRejection::kInvalidTopology);
+      }
+    }
+    rejection =
+        FinalizeCheckpointBarrierLocked(generation, out_final_snapshot, routes);
   }
   for (Cpu& cpu : cpus_) {
     if (cpu.ready_event) {
@@ -556,6 +714,7 @@ bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
     hook(checkpoint_arrival_test_context_.load(std::memory_order_acquire));
   }
   YieldToScheduler();
+  ExitIfTerminated();
   return true;
 }
 
@@ -908,7 +1067,12 @@ bool GuestScheduler::ParkSuspended(XThread* thread, int cpu_index) {
   // found us not yet parked and parking anyway would strand the thread.
   // Termination overrides suspension, run it so it can exit.
   if (thread->suspend_count() == 0 ||
-      links.terminate_pending.load(std::memory_order_relaxed)) {
+      links.terminate_pending.load(std::memory_order_relaxed)
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      || links.checkpoint_discard_pending.load(std::memory_order_acquire)
+#endif
+  ) {
     return false;
   }
   // Clearing running last, so it is never both unowned and unlisted.
@@ -1447,8 +1611,23 @@ void GuestScheduler::YieldToScheduler() {
 
 void GuestScheduler::ExitIfTerminated() {
   XThread* self = XThread::GetCurrentFiberThread();
-  if (!self || !self->scheduler_links().terminate_pending.load(
-                   std::memory_order_relaxed)) {
+  if (!self) {
+    return;
+  }
+  const bool terminate_pending =
+      self->scheduler_links().terminate_pending.load(std::memory_order_relaxed);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (!terminate_pending &&
+      self->scheduler_links().checkpoint_discard_pending.load(
+          std::memory_order_acquire) &&
+      self->scheduler_links().checkpoint_discard_pending.exchange(
+          false, std::memory_order_acq_rel)) {
+    self->Exit(0);  // never returns
+    return;
+  }
+#endif
+  if (!terminate_pending) {
     return;
   }
   // The wait registration may be newer than the one Terminate abandoned.
