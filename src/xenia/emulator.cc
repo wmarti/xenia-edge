@@ -179,6 +179,13 @@ Emulator::Emulator(const std::filesystem::path& command_line,
       paused_(false),
       restoring_(false),
       restore_fence_() {
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  quick_exit_prepare_registered_ = RegisterQuickExitPrepareCallback(
+      &Emulator::PrepareCaptureForQuickExitThunk, this);
+  if (!quick_exit_prepare_registered_) {
+    XELOGE("Emulator could not register its pre-quick-exit capture fence");
+  }
+#endif
   if (cvars::priority_class != 0) {
     if (SetProcessPriorityClass(cvars::priority_class)) {
       XELOGI("Higher priority class request: Successful. New priority: {}",
@@ -210,12 +217,32 @@ Emulator::Emulator(const std::filesystem::path& command_line,
 #endif
 }
 
-Emulator::~Emulator() { Shutdown(); }
+Emulator::~Emulator() {
+  Shutdown();
+#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (quick_exit_prepare_registered_) {
+    UnregisterQuickExitPrepareCallback(
+        &Emulator::PrepareCaptureForQuickExitThunk, this);
+    quick_exit_prepare_registered_ = false;
+  }
+#endif
+}
 
 #if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+void Emulator::PrepareCaptureForQuickExitThunk(void* context) noexcept {
+  static_cast<Emulator*>(context)->PrepareCaptureForQuickExit();
+}
+
 X_STATUS Emulator::InitializeGuestInvocationCapture() {
+  std::lock_guard<std::recursive_mutex> lock(guest_capture_mutex_);
   if (!cpu::GuestInvocationCaptureRuntime::IsRequested()) {
     return X_STATUS_SUCCESS;
+  }
+  if (!quick_exit_prepare_registered_) {
+    XELOGE(
+        "Guest invocation capture initialization rejected: pre-quick-exit "
+        "capture fence is unavailable");
+    return X_STATUS_UNSUCCESSFUL;
   }
   if (guest_invocation_capture_) {
     XELOGE(
@@ -251,6 +278,11 @@ X_STATUS Emulator::InitializeGuestInvocationCapture() {
 }
 
 void Emulator::ShutdownGuestInvocationCapture() {
+  std::lock_guard<std::recursive_mutex> lock(guest_capture_mutex_);
+  ShutdownGuestInvocationCaptureLocked();
+}
+
+void Emulator::ShutdownGuestInvocationCaptureLocked() {
   if (!guest_invocation_capture_) {
     return;
   }
@@ -285,8 +317,15 @@ void Emulator::ShutdownGuestInvocationCapture() {
 }
 
 X_STATUS Emulator::InitializeGuestExecutionSessionCaptureProvider() {
+  std::lock_guard<std::recursive_mutex> lock(guest_capture_mutex_);
   if (!cpu::GuestExecutionSessionTitleCaptureRuntime::IsRequested()) {
     return X_STATUS_SUCCESS;
+  }
+  if (!quick_exit_prepare_registered_) {
+    XELOGE(
+        "Guest execution session capture initialization rejected: "
+        "pre-quick-exit capture fence is unavailable");
+    return X_STATUS_UNSUCCESSFUL;
   }
   if (guest_execution_session_capture_) {
     XELOGE(
@@ -319,6 +358,7 @@ X_STATUS Emulator::InitializeGuestExecutionSessionCaptureProvider() {
 
 X_STATUS Emulator::AttachGuestExecutionSessionCaptureRuntime(
     const kernel::UserModule& module) {
+  std::lock_guard<std::recursive_mutex> lock(guest_capture_mutex_);
   if (!guest_execution_session_capture_) {
     return X_STATUS_SUCCESS;
   }
@@ -352,12 +392,23 @@ X_STATUS Emulator::AttachGuestExecutionSessionCaptureRuntime(
 }
 
 void Emulator::ShutdownGuestExecutionSessionCapture() {
+  std::lock_guard<std::recursive_mutex> lock(guest_capture_mutex_);
+  ShutdownGuestExecutionSessionCaptureLocked();
+}
+
+void Emulator::ShutdownGuestExecutionSessionCaptureLocked() {
   if (!guest_execution_session_capture_) {
     return;
   }
   guest_execution_session_capture_->Shutdown();
   guest_execution_session_capture_.reset();
   XELOGI("Guest execution session capture runtime detached");
+}
+
+void Emulator::PrepareCaptureForQuickExit() noexcept {
+  std::lock_guard<std::recursive_mutex> lock(guest_capture_mutex_);
+  ShutdownGuestExecutionSessionCaptureLocked();
+  ShutdownGuestInvocationCaptureLocked();
 }
 #endif
 
@@ -640,13 +691,7 @@ X_STATUS Emulator::TerminateTitle() {
     return X_STATUS_UNSUCCESSFUL;
   }
 
-#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
-  ShutdownGuestExecutionSessionCapture();
-#endif
   kernel_state_->TerminateTitle();
-#if XE_ENABLE_GUEST_INVOCATION_CAPTURE
-  ShutdownGuestInvocationCapture();
-#endif
   title_id_ = std::nullopt;
   title_name_ = "";
   title_version_ = "";

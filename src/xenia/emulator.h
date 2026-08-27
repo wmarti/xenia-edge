@@ -441,12 +441,16 @@ class Emulator {
                           const std::string_view module_path);
 
 #if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  static void PrepareCaptureForQuickExitThunk(void* context) noexcept;
+  void PrepareCaptureForQuickExit() noexcept;
   X_STATUS InitializeGuestInvocationCapture();
   void ShutdownGuestInvocationCapture();
+  void ShutdownGuestInvocationCaptureLocked();
   X_STATUS InitializeGuestExecutionSessionCaptureProvider();
   X_STATUS AttachGuestExecutionSessionCaptureRuntime(
       const kernel::UserModule& module);
   void ShutdownGuestExecutionSessionCapture();
+  void ShutdownGuestExecutionSessionCaptureLocked();
 #endif
 
   std::filesystem::path command_line_;
@@ -467,6 +471,8 @@ class Emulator {
 
   std::unique_ptr<cpu::Processor> processor_;
 #if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  std::recursive_mutex guest_capture_mutex_;
+  bool quick_exit_prepare_registered_ = false;
   // Owns the capture sink registered non-owningly with Processor. It must be
   // detached and stopped before processor_ is destroyed.
   std::unique_ptr<cpu::GuestInvocationCaptureRuntime> guest_invocation_capture_;

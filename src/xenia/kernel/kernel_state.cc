@@ -869,8 +869,7 @@ void KernelState::InitXmpVolumePatch() {
 
 void KernelState::TerminateTitle() {
   XELOGI("KernelState::TerminateTitle");
-  xe::FlushLog();
-  std::quick_exit(EXIT_SUCCESS);
+  xe::QuickExit(EXIT_SUCCESS);
 }
 
 void KernelState::ExitToDashboard() {

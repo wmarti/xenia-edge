@@ -77,9 +77,17 @@ void InitializeLogging(const std::string_view app_name);
 void ShutdownLogging();
 void FlushLog();
 
-// Flushes all log sinks immediately.
-// Useful before quick_exit() to ensure logs are written.
-void FlushLog();
+using QuickExitPrepareCallback = void (*)(void* context) noexcept;
+
+// Registers the process owner's synchronous pre-quick-exit drain. The
+// callback runs before logging is shut down and may be entered concurrently;
+// Unregister waits for every admitted callback to return.
+bool RegisterQuickExitPrepareCallback(QuickExitPrepareCallback callback,
+                                      void* context) noexcept;
+bool UnregisterQuickExitPrepareCallback(QuickExitPrepareCallback callback,
+                                        void* context) noexcept;
+void PrepareForQuickExit() noexcept;
+[[noreturn]] void QuickExit(int exit_code) noexcept;
 
 namespace logging {
 

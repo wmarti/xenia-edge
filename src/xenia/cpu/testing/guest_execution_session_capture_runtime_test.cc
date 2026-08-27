@@ -2730,12 +2730,26 @@ TEST_CASE("title session capture owner detaches before its dependencies",
   REQUIRE(command_processor.pm4_marker_dispatcher_status().sink_attached);
   REQUIRE(environment.processor->guest_invocation_capture_sink());
 
-  capture.reset();
+  capture->Shutdown();
+  capture->Shutdown();
+  REQUIRE_FALSE(capture->runtime_attached());
   const gpu::Pm4MarkerDispatcherStatus source =
       command_processor.pm4_marker_dispatcher_status();
   REQUIRE_FALSE(source.sink_attached);
   REQUIRE_FALSE(source.sink_held);
   REQUIRE_FALSE(source.shut_down);
+  REQUIRE_FALSE(environment.processor->guest_invocation_capture_sink());
+
+  auto relaunched = GuestExecutionSessionTitleCaptureRuntimeTestAccess::Create(
+      *environment.memory, *environment.processor, config, Digest(0x53),
+      Digest(0x73), &error);
+  REQUIRE(relaunched);
+  REQUIRE(relaunched->AttachRuntime(*environment.scheduler, command_processor,
+                                    "title=4D5307E6", "module=halo3-relaunch",
+                                    &error));
+  REQUIRE(command_processor.pm4_marker_dispatcher_status().sink_attached);
+  relaunched.reset();
+  REQUIRE_FALSE(command_processor.pm4_marker_dispatcher_status().sink_attached);
   REQUIRE_FALSE(environment.processor->guest_invocation_capture_sink());
 
   command_processor.Shutdown();
