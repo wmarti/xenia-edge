@@ -27,8 +27,9 @@ namespace cpu {
 class GuestExecutionSessionCaptureSchedulerEventBridge final
     : public GuestExecutionSessionCaptureRuntimeEventBridge {
  public:
-  static constexpr uint32_t kSchedulerPayloadVersion = 1;
-  static constexpr size_t kSchedulerPayloadSize = 48;
+  static constexpr uint32_t kSchedulerPayloadVersion = 2;
+  static constexpr size_t kSchedulerPayloadV1Size = 48;
+  static constexpr size_t kSchedulerPayloadSize = 192;
 
   GuestExecutionSessionCaptureSchedulerEventBridge() = default;
   ~GuestExecutionSessionCaptureSchedulerEventBridge() override = default;

@@ -509,8 +509,29 @@ kernel::GuestSchedulerCaptureEvent BridgeSchedulerEvent(
   event.kind = kind;
   event.cpu = 0;
   event.priority = 8;
+  if (kind == kernel::GuestSchedulerCaptureEventKind::kEnqueueReady ||
+      kind == kernel::GuestSchedulerCaptureEventKind::kReready) {
+    event.target_cpu = 0;
+  } else if (kind == kernel::GuestSchedulerCaptureEventKind::kMigrate) {
+    event.target_cpu = 1;
+  }
   if (kind == kernel::GuestSchedulerCaptureEventKind::kYield) {
     event.flags = kernel::kGuestSchedulerCaptureFlagQuantumEnd;
+  } else if (kind == kernel::GuestSchedulerCaptureEventKind::kSafepoint) {
+    event.guest_pc = 0x82000040;
+  } else if (kind == kernel::GuestSchedulerCaptureEventKind::kBlock ||
+             kind == kernel::GuestSchedulerCaptureEventKind::kReready) {
+    event.value = 1;
+    event.wait.handle_count = 1;
+    event.wait.handles[0] = 0x20;
+    event.wait.wait_epoch = 7;
+    event.wait.observed_wait_epoch = 7;
+    event.wait.signal_epochs_before[0] = 7;
+    event.wait.signal_epochs_observed[0] = 7;
+    if (kind == kernel::GuestSchedulerCaptureEventKind::kBlock) {
+      event.flags = kernel::kGuestSchedulerCaptureFlagGated;
+      event.wait.flags = kernel::kGuestSchedulerCaptureWaitFlagGated;
+    }
   }
   return event;
 }
@@ -2504,6 +2525,18 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
       41, kernel::GuestSchedulerCaptureEventKind::kYield, kB);
   REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, yield, &harness.error) ==
           Action::kContinue);
+  kernel::GuestSchedulerCaptureEvent block = BridgeSchedulerEvent(
+      42, kernel::GuestSchedulerCaptureEventKind::kBlock, kB);
+  REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, block, &harness.error) ==
+          Action::kContinue);
+  kernel::GuestSchedulerCaptureEvent reready = BridgeSchedulerEvent(
+      43, kernel::GuestSchedulerCaptureEventKind::kReready, kB);
+  reready.reason = kernel::GuestSchedulerCaptureReason::kSignalEpoch;
+  reready.wait.flags = kernel::kGuestSchedulerCaptureWaitFlagGated;
+  reready.wait.observed_wait_epoch = 8;
+  reready.wait.signal_epochs_observed[0] = 8;
+  REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, reready,
+                                  &harness.error) == Action::kContinue);
   REQUIRE(harness.assembler->RequestStop() == Action::kHold);
   REQUIRE(harness.state() == State::kStopRequested);
   REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kHold);
@@ -2517,7 +2550,7 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
   REQUIRE(harness.publisher.bundles.size() == 1);
 
   GuestExecutionSessionBundle bundle = harness.publisher.bundles.front();
-  const bool finalized = bridge.FinalizeBundle(&bundle, 2, &harness.error);
+  const bool finalized = bridge.FinalizeBundle(&bundle, 4, &harness.error);
   INFO(harness.error);
   REQUIRE(finalized);
   REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &harness.error));
@@ -2531,7 +2564,7 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
       scheduler_overlay.push_back(event);
     }
   }
-  REQUIRE(scheduler_overlay.size() == 2);
+  REQUIRE(scheduler_overlay.size() == 4);
   REQUIRE(scheduler_overlay[0].actor ==
           GuestExecutionContinuousEventIdentity{});
   REQUIRE(scheduler_overlay[0].subject ==
@@ -2539,6 +2572,14 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
   REQUIRE(scheduler_overlay[1].actor ==
           GuestExecutionContinuousEventIdentity{1, kB.guest_thread_id});
   REQUIRE(scheduler_overlay[1].subject ==
+          GuestExecutionContinuousEventIdentity{1, kB.guest_thread_id});
+  REQUIRE(scheduler_overlay[2].actor ==
+          GuestExecutionContinuousEventIdentity{1, kB.guest_thread_id});
+  REQUIRE(scheduler_overlay[2].subject ==
+          GuestExecutionContinuousEventIdentity{1, kB.guest_thread_id});
+  REQUIRE(scheduler_overlay[3].actor ==
+          GuestExecutionContinuousEventIdentity{});
+  REQUIRE(scheduler_overlay[3].subject ==
           GuestExecutionContinuousEventIdentity{1, kB.guest_thread_id});
 
   std::vector<GuestExecutionContinuousEvent> checkpoint_overlay;
@@ -2596,9 +2637,12 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
                   DecodeSchedulerEventPayload(blob->bytes, &decoded,
                                               &harness.error));
       decoded_scheduler_sequences.push_back(decoded.sequence);
+      if (decoded.sequence == 43) {
+        REQUIRE(decoded.wait == reready.wait);
+      }
     }
   }
-  REQUIRE(decoded_scheduler_sequences == std::vector<uint64_t>{40, 41});
+  REQUIRE(decoded_scheduler_sequences == std::vector<uint64_t>{40, 41, 42, 43});
 }
 
 TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
@@ -2674,6 +2718,26 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
     REQUIRE(harness.error.find("not recording") != std::string::npos);
   }
 
+  SECTION("terminate transitions reject") {
+    kernel::GuestSchedulerCaptureEvent event = BridgeSchedulerEvent(
+        9, kernel::GuestSchedulerCaptureEventKind::kTerminate);
+    event.reason = kernel::GuestSchedulerCaptureReason::kPreemptRequested;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, event,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("unsupported or malformed") !=
+            std::string::npos);
+  }
+
+  SECTION("forget transitions reject") {
+    REQUIRE(bridge.OnSchedulerEvent(
+                *harness.assembler,
+                BridgeSchedulerEvent(
+                    9, kernel::GuestSchedulerCaptureEventKind::kForget),
+                &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("unsupported or malformed") !=
+            std::string::npos);
+  }
+
   SECTION("the global shutdown transition rejects without a participant") {
     kernel::GuestSchedulerCaptureEvent shutdown;
     shutdown.sequence = 9;
@@ -2682,6 +2746,62 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
                                     &harness.error) == Action::kReject);
     REQUIRE(harness.error.find("unsupported or malformed") !=
             std::string::npos);
+  }
+
+  SECTION("version 1 scheduler payloads are explicitly non-replayable") {
+    std::vector<uint8_t> payload(
+        GuestExecutionSessionCaptureSchedulerEventBridge::
+            kSchedulerPayloadV1Size,
+        0);
+    const std::string magic = "XEGSCE1";
+    std::copy(magic.cbegin(), magic.cend(), payload.begin());
+    payload[8] = 1;
+    kernel::GuestSchedulerCaptureEvent decoded;
+    REQUIRE_FALSE(
+        GuestExecutionSessionCaptureSchedulerEventBridge::
+            DecodeSchedulerEventPayload(payload, &decoded, &harness.error));
+    REQUIRE(harness.error.find("version 1 is not deterministic-replayable") !=
+            std::string::npos);
+  }
+
+  SECTION("safepoint provenance fails closed") {
+    kernel::GuestSchedulerCaptureEvent safepoint = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kSafepoint);
+    safepoint.reason = kernel::GuestSchedulerCaptureReason::kYielded;
+    safepoint.flags = kernel::kGuestSchedulerCaptureFlagSchedulerRequested;
+    safepoint.guest_pc = 0;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, safepoint,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("safepoint provenance") != std::string::npos);
+  }
+
+  SECTION("wait provenance fails closed") {
+    kernel::GuestSchedulerCaptureEvent block = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kBlock);
+    block.wait.observed_wait_epoch++;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, block,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("wait epochs") != std::string::npos);
+  }
+
+  SECTION("untyped production waits fail closed") {
+    kernel::GuestSchedulerCaptureEvent block = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kBlock);
+    block.value = 0;
+    block.flags = 0;
+    block.wait = {};
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, block,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("wait kind") != std::string::npos);
+  }
+
+  SECTION("unknown participants fail closed") {
+    REQUIRE(bridge.OnSchedulerEvent(
+                *harness.assembler,
+                BridgeSchedulerEvent(
+                    10, kernel::GuestSchedulerCaptureEventKind::kDispatch, kB),
+                &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("unknown participant") != std::string::npos);
   }
 
   SECTION("a source sequence gap rejects permanently") {

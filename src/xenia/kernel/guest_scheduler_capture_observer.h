@@ -13,6 +13,7 @@
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -97,6 +98,35 @@ enum GuestSchedulerCaptureEventFlags : uint16_t {
   kGuestSchedulerCaptureFlagHasDeadline = 1u << 13,
 };
 
+constexpr size_t kGuestSchedulerCaptureMaximumWaitHandles = 8;
+
+enum GuestSchedulerCaptureWaitFlags : uint8_t {
+  kGuestSchedulerCaptureWaitFlagGated = 1u << 0,
+  kGuestSchedulerCaptureWaitFlagAlertable = 1u << 1,
+  kGuestSchedulerCaptureWaitFlagInterruptible = 1u << 2,
+  kGuestSchedulerCaptureWaitFlagUserApcPending = 1u << 3,
+};
+
+// Authenticated state of the cooperative wait at kBlock or kReready. The
+// epoch arrays identify which tracked wait object moved without retaining an
+// XObject pointer. A wait naming more handles than fit remains visible through
+// handle_count and is rejected as non-replayable by the session bridge.
+struct GuestSchedulerCaptureWaitState {
+  uint64_t deadline_ms = 0;
+  uint64_t observed_uptime_ms = 0;
+  uint32_t wait_epoch = 0;
+  uint32_t observed_wait_epoch = 0;
+  uint8_t handle_count = 0;
+  uint8_t flags = 0;
+  std::array<uint32_t, kGuestSchedulerCaptureMaximumWaitHandles> handles = {};
+  std::array<uint32_t, kGuestSchedulerCaptureMaximumWaitHandles>
+      signal_epochs_before = {};
+  std::array<uint32_t, kGuestSchedulerCaptureMaximumWaitHandles>
+      signal_epochs_observed = {};
+
+  bool operator==(const GuestSchedulerCaptureWaitState&) const = default;
+};
+
 // Fixed-size, pointer-free record of one scheduler transition. The sequence
 // is the single global order of scheduler state mutation. Participants are
 // identified by their ThreadState capture instance ID; the guest thread ID is
@@ -109,6 +139,8 @@ struct GuestSchedulerCaptureEvent {
   // kSafepoint kForcedIrql and kYielded: safepoints declined since the
   // participant's previous terminal outcome, both lock and IRQL episodes.
   uint32_t count = 0;
+  // Exact PPC address of kSafepoint. Zero for every other event kind.
+  uint32_t guest_pc = 0;
   uint16_t flags = 0;
   GuestSchedulerCaptureEventKind kind = GuestSchedulerCaptureEventKind::kNone;
   GuestSchedulerCaptureReason reason = GuestSchedulerCaptureReason::kNone;
@@ -120,6 +152,7 @@ struct GuestSchedulerCaptureEvent {
   // kSafepoint: guest IRQL. kBlock and kReready: XThread::CooperativeWaitKind.
   // kRequeuePriority: the previous level.
   uint8_t value = 0;
+  GuestSchedulerCaptureWaitState wait;
 
   bool operator==(const GuestSchedulerCaptureEvent&) const = default;
 };

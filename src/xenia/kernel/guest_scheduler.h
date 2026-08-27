@@ -251,7 +251,8 @@ class GuestScheduler {
   // capture safepoint must add kGuestSchedulerCaptureFlagCaptureRequested.
   void NoteCaptureSafepoint(XThread* thread,
                             GuestSchedulerCaptureReason outcome,
-                            uint16_t request_flags, uint32_t declined_count);
+                            uint16_t request_flags, uint32_t declined_count,
+                            uint32_t guest_pc);
 
   // True once an observer callback returned false and delivery stopped.
   bool capture_rejected() const;
@@ -400,11 +401,15 @@ class GuestScheduler {
   void EmitCaptureLocked(GuestSchedulerCaptureEventKind kind, XThread* thread,
                          int cpu, int target_cpu,
                          GuestSchedulerCaptureReason reason, uint16_t flags,
-                         uint8_t value, uint32_t count = 0);
+                         uint8_t value, uint32_t count = 0,
+                         uint32_t guest_pc = 0,
+                         const GuestSchedulerCaptureWaitState* wait = nullptr);
   // Same, for sites that do not hold lock_.
   void EmitCapture(GuestSchedulerCaptureEventKind kind, XThread* thread,
                    int cpu, int target_cpu, GuestSchedulerCaptureReason reason,
-                   uint16_t flags, uint8_t value, uint32_t count = 0);
+                   uint16_t flags, uint8_t value, uint32_t count = 0,
+                   uint32_t guest_pc = 0,
+                   const GuestSchedulerCaptureWaitState* wait = nullptr);
   // Delivers kShutdown, closes attachment and drops the registration outside
   // lock_ so an observer destructor never runs under it.
   void ReleaseCaptureObserverForShutdown();

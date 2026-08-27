@@ -542,6 +542,13 @@ class XThread : public XObject, public cpu::Thread {
                                   const uint32_t* handles, uint32_t count,
                                   XObject* const* objects = nullptr) {
     auto& links = scheduler_links_;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    for (uint32_t i = 0; i < 8; ++i) {
+      links.capture_wait_signal_epochs[i] = 0;
+    }
+    links.capture_wait_interruptible = false;
+#endif
     links.wait_kind = static_cast<uint8_t>(kind);
     links.wait_handle_count = static_cast<uint8_t>(count > 255 ? 255 : count);
     uint32_t n = count < 8 ? count : 8;
@@ -563,6 +570,13 @@ class XThread : public XObject, public cpu::Thread {
         static_cast<uint8_t>(CooperativeWaitKind::kNone);
     scheduler_links_.wait_handle_count = 0;
     scheduler_links_.wait_gate_count = 0;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    for (uint32_t i = 0; i < 8; ++i) {
+      scheduler_links_.capture_wait_signal_epochs[i] = 0;
+    }
+    scheduler_links_.capture_wait_interruptible = false;
+#endif
   }
   // Summed signal epoch of a tracked multi-wait set; 0 when untracked. Any
   // signal or pulse to any member moves the sum, since both bump the epoch.
@@ -573,6 +587,25 @@ class XThread : public XObject, public cpu::Thread {
     }
     return sum;
   }
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  void CaptureCooperativeWaitObjectEpoch(uint32_t epoch) {
+    for (uint32_t i = 0; i < 8; ++i) {
+      scheduler_links_.capture_wait_signal_epochs[i] = 0;
+    }
+    scheduler_links_.capture_wait_signal_epochs[0] = epoch;
+  }
+  uint32_t CaptureCooperativeWaitSetEpoch() {
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < scheduler_links_.wait_gate_count; ++i) {
+      const uint32_t epoch =
+          scheduler_links_.wait_gate_objects[i]->cooperative_signal_epoch();
+      scheduler_links_.capture_wait_signal_epochs[i] = epoch;
+      sum += epoch;
+    }
+    return sum;
+  }
+#endif
   uint8_t cooperative_wait_set_count() const {
     return scheduler_links_.wait_gate_count;
   }
@@ -645,6 +678,12 @@ class XThread : public XObject, public cpu::Thread {
     // set was too large to track, which just means no gating.
     XObject* wait_gate_objects[8] = {};
     uint8_t wait_gate_count = 0;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    // Per-object epochs sampled immediately before the failed wait poll.
+    uint32_t capture_wait_signal_epochs[8] = {};
+    bool capture_wait_interruptible = false;
+#endif
 
     // Consecutive safepoints that declined to preempt because the guest was at
     // IRQL >= 2. Bounds the defer so a guest spinning at DISPATCH_LEVEL on a

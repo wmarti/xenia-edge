@@ -50,6 +50,11 @@ constexpr uint16_t kKnownCaptureFlags =
     kernel::kGuestSchedulerCaptureFlagAlertable |
     kernel::kGuestSchedulerCaptureFlagInterruptible |
     kernel::kGuestSchedulerCaptureFlagHasDeadline;
+constexpr uint8_t kKnownWaitFlags =
+    kernel::kGuestSchedulerCaptureWaitFlagGated |
+    kernel::kGuestSchedulerCaptureWaitFlagAlertable |
+    kernel::kGuestSchedulerCaptureWaitFlagInterruptible |
+    kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
 
 bool Fail(std::string* error, std::string_view message) {
   if (error) {
@@ -219,6 +224,118 @@ bool IsReasonAllowed(CaptureKind kind, CaptureReason reason) {
   }
 }
 
+bool IsCpu(int8_t cpu) { return cpu >= 0 && cpu < 6; }
+
+bool IsEmptyWaitState(const kernel::GuestSchedulerCaptureWaitState& wait) {
+  return wait == kernel::GuestSchedulerCaptureWaitState{};
+}
+
+bool ValidateWaitState(const CaptureEvent& event, std::string* error) {
+  const auto& wait = event.wait;
+  if (wait.handle_count > kernel::kGuestSchedulerCaptureMaximumWaitHandles ||
+      (wait.flags & ~kKnownWaitFlags) ||
+      ((wait.flags & kernel::kGuestSchedulerCaptureWaitFlagUserApcPending) &&
+       !(wait.flags & kernel::kGuestSchedulerCaptureWaitFlagAlertable))) {
+    return Fail(error, "scheduler capture wait state is malformed");
+  }
+  uint32_t epochs_before = 0;
+  uint32_t epochs_observed = 0;
+  for (size_t index = 0;
+       index < kernel::kGuestSchedulerCaptureMaximumWaitHandles; ++index) {
+    if (index < wait.handle_count) {
+      if (!wait.handles[index]) {
+        return Fail(error, "scheduler capture wait handle is invalid");
+      }
+    } else if (wait.handles[index] || wait.signal_epochs_before[index] ||
+               wait.signal_epochs_observed[index]) {
+      return Fail(error, "scheduler capture wait padding is nonzero");
+    }
+    epochs_before += wait.signal_epochs_before[index];
+    epochs_observed += wait.signal_epochs_observed[index];
+  }
+  if (epochs_before != wait.wait_epoch ||
+      epochs_observed != wait.observed_wait_epoch) {
+    return Fail(error, "scheduler capture wait epochs are inconsistent");
+  }
+
+  switch (event.value) {
+    case 1:
+      if (wait.handle_count != 1) {
+        return Fail(error, "scheduler single wait has no unique handle");
+      }
+      break;
+    case 2:
+    case 3:
+      if (!wait.handle_count) {
+        return Fail(error, "scheduler multi-wait has no handles");
+      }
+      break;
+    case 4:
+    case 5:
+    case 6:
+      if (wait.handle_count) {
+        return Fail(error, "scheduler handle-free wait names an object");
+      }
+      break;
+    default:
+      return Fail(error, "scheduler capture wait kind is invalid");
+  }
+
+  const bool gated = wait.flags & kernel::kGuestSchedulerCaptureWaitFlagGated;
+  if (event.kind == CaptureKind::kBlock) {
+    const uint8_t expected_wait_flags =
+        ((event.flags & kernel::kGuestSchedulerCaptureFlagGated)
+             ? kernel::kGuestSchedulerCaptureWaitFlagGated
+             : 0) |
+        ((event.flags & kernel::kGuestSchedulerCaptureFlagAlertable)
+             ? kernel::kGuestSchedulerCaptureWaitFlagAlertable
+             : 0) |
+        ((event.flags & kernel::kGuestSchedulerCaptureFlagInterruptible)
+             ? kernel::kGuestSchedulerCaptureWaitFlagInterruptible
+             : 0);
+    if ((wait.flags & ~kernel::kGuestSchedulerCaptureWaitFlagUserApcPending) !=
+            expected_wait_flags ||
+        bool(event.flags & kernel::kGuestSchedulerCaptureFlagHasDeadline) !=
+            bool(wait.deadline_ms)) {
+      return Fail(error, "scheduler block wait provenance is inconsistent");
+    }
+    return true;
+  }
+
+  switch (event.reason) {
+    case CaptureReason::kPolled:
+      if (gated) {
+        return Fail(error, "scheduler polled wake names a gated wait");
+      }
+      break;
+    case CaptureReason::kSignalEpoch:
+      if (!gated || wait.wait_epoch == wait.observed_wait_epoch) {
+        return Fail(error, "scheduler signal wake has no epoch transition");
+      }
+      break;
+    case CaptureReason::kDeadline:
+      if (!gated || !wait.deadline_ms ||
+          wait.observed_uptime_ms < wait.deadline_ms) {
+        return Fail(error, "scheduler deadline wake has no expired deadline");
+      }
+      break;
+    case CaptureReason::kUserApc:
+      if (!gated || !(wait.flags &
+                      kernel::kGuestSchedulerCaptureWaitFlagUserApcPending)) {
+        return Fail(error, "scheduler APC wake has no pending user APC");
+      }
+      break;
+    case CaptureReason::kBackstop:
+      if (!gated) {
+        return Fail(error, "scheduler backstop wake names an ungated wait");
+      }
+      break;
+    default:
+      return Fail(error, "scheduler wake reason is invalid");
+  }
+  return true;
+}
+
 bool ValidateSchedulerEvent(const CaptureEvent& event, std::string* error) {
   if (!event.sequence || !event.capture_instance_id || !event.guest_thread_id ||
       !IsSupportedKind(event.kind) || !IsKnownReason(event.reason) ||
@@ -226,6 +343,56 @@ bool ValidateSchedulerEvent(const CaptureEvent& event, std::string* error) {
       (event.flags & ~kKnownCaptureFlags) ||
       (event.flags & ~AllowedFlags(event.kind))) {
     return Fail(error, "scheduler capture event is unsupported or malformed");
+  }
+  const bool wait_event =
+      event.kind == CaptureKind::kBlock || event.kind == CaptureKind::kReready;
+  if ((!wait_event && !IsEmptyWaitState(event.wait)) ||
+      (event.kind != CaptureKind::kSafepoint && event.guest_pc) ||
+      (event.kind != CaptureKind::kSafepoint && event.count) ||
+      (event.kind != CaptureKind::kSafepoint &&
+       event.kind != CaptureKind::kBlock &&
+       event.kind != CaptureKind::kReready &&
+       event.kind != CaptureKind::kRequeuePriority && event.value)) {
+    return Fail(error, "scheduler capture event has unexpected provenance");
+  }
+  switch (event.kind) {
+    case CaptureKind::kEnqueueReady:
+      if ((event.cpu != -1 && !IsCpu(event.cpu)) || !IsCpu(event.target_cpu)) {
+        return Fail(error, "scheduler enqueue CPU is invalid");
+      }
+      break;
+    case CaptureKind::kReready:
+      if (!IsCpu(event.cpu) || !IsCpu(event.target_cpu)) {
+        return Fail(error, "scheduler reready CPU is invalid");
+      }
+      break;
+    case CaptureKind::kMigrate:
+      if (!IsCpu(event.cpu) || !IsCpu(event.target_cpu) ||
+          event.cpu == event.target_cpu) {
+        return Fail(error, "scheduler migration CPUs are invalid");
+      }
+      break;
+    default:
+      if (!IsCpu(event.cpu) || event.target_cpu != -1) {
+        return Fail(error, "scheduler capture CPU is invalid");
+      }
+      break;
+  }
+  if (event.kind == CaptureKind::kSafepoint) {
+    if (!event.guest_pc || (event.guest_pc & 3) ||
+        !(event.flags & (kernel::kGuestSchedulerCaptureFlagSchedulerRequested |
+                         kernel::kGuestSchedulerCaptureFlagCaptureRequested)) ||
+        ((event.reason == CaptureReason::kDeferredLock ||
+          event.reason == CaptureReason::kDeferredIrql) &&
+         event.count)) {
+      return Fail(error, "scheduler safepoint provenance is invalid");
+    }
+  }
+  if (event.kind == CaptureKind::kRequeuePriority && event.value > 31) {
+    return Fail(error, "scheduler previous priority is invalid");
+  }
+  if (wait_event && !ValidateWaitState(event, error)) {
+    return false;
   }
   return true;
 }
@@ -254,6 +421,19 @@ bool EncodeSchedulerPayload(const CaptureEvent& event,
   (*output)[44] = static_cast<uint8_t>(event.target_cpu);
   (*output)[45] = event.priority;
   (*output)[46] = event.value;
+  WriteU32(output, 48, event.guest_pc);
+  WriteU32(output, 52, event.wait.wait_epoch);
+  WriteU32(output, 56, event.wait.observed_wait_epoch);
+  (*output)[60] = event.wait.handle_count;
+  (*output)[61] = event.wait.flags;
+  WriteU64(output, 64, event.wait.deadline_ms);
+  WriteU64(output, 72, event.wait.observed_uptime_ms);
+  for (size_t index = 0;
+       index < kernel::kGuestSchedulerCaptureMaximumWaitHandles; ++index) {
+    WriteU32(output, 80 + index * 4, event.wait.handles[index]);
+    WriteU32(output, 112 + index * 4, event.wait.signal_epochs_before[index]);
+    WriteU32(output, 144 + index * 4, event.wait.signal_epochs_observed[index]);
+  }
   return true;
 }
 
@@ -573,7 +753,8 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::FinalizeBundle(
                 GuestExecutionSessionEventDisposition::kReplayCaptured ||
             canonical.payload_kind !=
                 GuestExecutionSessionPayloadKind::kGuestBytes ||
-            canonical.payload_size != kSchedulerPayloadSize) {
+            (canonical.payload_size != kSchedulerPayloadSize &&
+             canonical.payload_size != kSchedulerPayloadV1Size)) {
           return Fail(error,
                       "scheduler event bridge canonical payload is invalid");
         }
@@ -774,10 +955,25 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::
   if (error) {
     error->clear();
   }
-  if (!event || payload.size() != kSchedulerPayloadSize ||
+  if (!event || payload.size() < 12 ||
       !std::equal(kSchedulerPayloadMagic.cbegin(),
-                  kSchedulerPayloadMagic.cend(), payload.begin()) ||
-      ReadU32(payload, 8) != kSchedulerPayloadVersion || payload[47]) {
+                  kSchedulerPayloadMagic.cend(), payload.begin())) {
+    return Fail(error, "scheduler event payload envelope is invalid");
+  }
+  const uint32_t version = ReadU32(payload, 8);
+  if (version == 1) {
+    if (payload.size() != kSchedulerPayloadV1Size || payload[47]) {
+      return Fail(error, "scheduler event payload envelope is invalid");
+    }
+    return Fail(error,
+                "scheduler event payload version 1 is not deterministic-"
+                "replayable");
+  }
+  if (version != kSchedulerPayloadVersion ||
+      payload.size() != kSchedulerPayloadSize || payload[47] || payload[62] ||
+      payload[63] ||
+      std::any_of(payload.begin() + 176, payload.end(),
+                  [](uint8_t value) { return value != 0; })) {
     return Fail(error, "scheduler event payload envelope is invalid");
   }
   CaptureEvent decoded;
@@ -792,6 +988,21 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::
   decoded.target_cpu = static_cast<int8_t>(payload[44]);
   decoded.priority = payload[45];
   decoded.value = payload[46];
+  decoded.guest_pc = ReadU32(payload, 48);
+  decoded.wait.wait_epoch = ReadU32(payload, 52);
+  decoded.wait.observed_wait_epoch = ReadU32(payload, 56);
+  decoded.wait.handle_count = payload[60];
+  decoded.wait.flags = payload[61];
+  decoded.wait.deadline_ms = ReadU64(payload, 64);
+  decoded.wait.observed_uptime_ms = ReadU64(payload, 72);
+  for (size_t index = 0;
+       index < kernel::kGuestSchedulerCaptureMaximumWaitHandles; ++index) {
+    decoded.wait.handles[index] = ReadU32(payload, 80 + index * 4);
+    decoded.wait.signal_epochs_before[index] =
+        ReadU32(payload, 112 + index * 4);
+    decoded.wait.signal_epochs_observed[index] =
+        ReadU32(payload, 144 + index * 4);
+  }
   if (!ValidateSchedulerEvent(decoded, error)) {
     return false;
   }

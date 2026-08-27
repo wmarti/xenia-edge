@@ -152,6 +152,7 @@ GuestInvocationReplayConfig MakeBenchmarkConfig(
   SetValue(&config, "enable_early_precompilation", "false");
   SetValue(&config, "fold_readonly_guest_memory_loads", "false");
   SetValue(&config, "guest_scheduler", "false");
+  SetValue(&config, "guest_scheduler_quantum_us", "1000");
   SetValue(&config, "inline_mmio_access", "false");
   SetValue(&config, "log_safepoint_pc", "false");
   SetValue(&config, "serialize_guest_function_definitions", "true");
@@ -301,12 +302,17 @@ TEST_CASE("guest invocation replay config has a strict canonical encoding",
   REQUIRE(HashGuestInvocationReplayConfig(config, &second_hash, &error));
   REQUIRE(first_hash == second_hash);
   constexpr std::array<uint8_t, 32> kExpectedHash = {
-      0xDE, 0xDD, 0xD0, 0xA1, 0x76, 0x14, 0x74, 0x40, 0x07, 0x3F, 0xE8,
-      0x95, 0x2D, 0x73, 0x52, 0x2B, 0xE7, 0x8C, 0x61, 0xDC, 0x04, 0xC1,
-      0x9E, 0xFE, 0x68, 0xFF, 0xBF, 0x92, 0xB5, 0x81, 0x07, 0x82,
+      0x74, 0xE6, 0x28, 0xF7, 0x04, 0x4A, 0x03, 0x4C, 0xE5, 0x84, 0x6F,
+      0xEA, 0x57, 0xFF, 0x9F, 0x05, 0x04, 0xE5, 0x66, 0x55, 0x3C, 0x16,
+      0x78, 0x2B, 0xAA, 0xAD, 0x3D, 0x78, 0xA9, 0x5D, 0x41, 0x74,
   };
   REQUIRE(first_hash == kExpectedHash);
 
+  SetValue(&config, "guest_scheduler_quantum_us", "1000");
+  REQUIRE(HashGuestInvocationReplayConfig(config, &second_hash, &error));
+  REQUIRE(first_hash != second_hash);
+
+  config = MakeConfig("a64");
   SetValue(&config, "accurate_vmx_denormal_flush", "true");
   REQUIRE(HashGuestInvocationReplayConfig(config, &second_hash, &error));
   REQUIRE(first_hash != second_hash);
@@ -425,6 +431,12 @@ TEST_CASE("timed guest invocation replay requires Apple A64 and fixed controls",
   REQUIRE(
       HashGuestInvocationReplayConfig(config, &scheduler_enabled_hash, &error));
   REQUIRE(scheduler_enabled_hash != scheduler_disabled_hash);
+
+  SetValue(&config, "guest_scheduler_quantum_us", "2000");
+  std::array<uint8_t, 32> different_quantum_hash = {};
+  REQUIRE(
+      HashGuestInvocationReplayConfig(config, &different_quantum_hash, &error));
+  REQUIRE(different_quantum_hash != scheduler_enabled_hash);
 
   SetValue(&config, "guest_scheduler", "invalid");
   REQUIRE_FALSE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));

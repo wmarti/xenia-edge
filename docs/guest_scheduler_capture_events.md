@@ -61,11 +61,34 @@ latches a sticky rejection in the scheduler; nothing further, including
 exposes it as `GuestScheduler::capture_rejected()`, which the session owner
 must consult before accepting a tape that ends without `kShutdown`.
 
-No scheduler event carries a guest PC. `kSafepoint`, `kYield` and `kBlock`
-locate a transition only relative to the participant's other events; the
-instruction at which the participant left guest code comes from the combined
-safepoint lane's `kJitSafepointArrival` and `kInstructionCoverage` events. The
-scheduler tape is replayable only when merged with them.
+Every `kSafepoint` carries the exact aligned PPC address passed by the JIT
+safepoint. All other scheduler events require a zero `guest_pc`; `kYield` and
+`kBlock` still locate host-service transitions only relative to the
+participant's other events. This exact PC is independent of the boundary
+checkpoint route and lets the replay controller authenticate each scheduler
+safepoint rather than infer it from coverage.
+
+`kBlock` and `kReready` carry a pointer-free wait snapshot: up to eight guest
+handles, the per-object signal epochs sampled before the failed poll and at the
+scheduler decision, their aggregate epochs, deadline and observation uptime,
+and gated, alertable, interruptible and pending-user-APC bits. The bridge
+rejects a wait naming more than eight handles instead of replaying a truncated
+identity. For tracked multi-waits the per-object epochs identify which member
+moved. The diagnostic signal ring's signaler LR and host thread are not read
+under the scheduler lock because its inverse lock order would deadlock; they
+remain diagnostics rather than authenticated replay input.
+
+The canonical scheduler payload is version 2 and 192 bytes. Version 1's
+48-byte payload omitted exact PCs and wait causes, so the decoder recognizes it
+only to return the explicit `not deterministic-replayable` rejection. Capture
+emits version 2 only. The replay configuration schema separately authenticates
+`guest_scheduler_quantum_us`; changing the quantum therefore changes the
+configuration hash even though raw host slice-deadline ticks remain local.
+Version 2 also rejects lifecycle kinds `kExit`, `kTerminate`, `kForget` and
+`kShutdown`, and rejects `kBlock`/`kReready` with wait kind `kNone`. They lack
+enough durable lifecycle or wait-cause provenance for deterministic replay;
+observing one poisons the session instead of silently treating it as a control
+echo.
 
 `GuestSchedulerCaptureEventRecorder` is the reference nonblocking handoff. Its
 buffer is reserved at construction so a callback never allocates, it validates
@@ -102,9 +125,9 @@ Arming and disarming happen inside the recorder, not by attaching or detaching.
 | `kSwitchOut` | `SwitchTo` after control returns to the idle fiber | `cpu` |
 | `kYield` | `YieldCurrentThread` before re-queueing | `cpu`; `QuantumEnd`, `ToLower`, `Preempted` |
 | `kPreemptRequest` | every raise of `preempt_requested` by the scheduler; `kShutdown` once per fiber | `cpu`; reason `kPriority`, `kWake`, `kTimeslice`, `kShutdown` |
-| `kSafepoint` | the JIT safepoint handler: once per deferral episode, and every terminal outcome | `cpu`; reason `kDeferredLock`, `kDeferredIrql`, `kForcedIrql`, `kYielded`; `value` IRQL; `count` declined safepoints (terminal only); `SchedulerRequested`, `CaptureRequested` |
-| `kBlock` | `BlockCurrentThread` after parking | `cpu`; `Gated`, `Alertable`, `Interruptible`, `HasDeadline`; `value` wait kind |
-| `kReready` | `RereadyBlocked` per released waiter | `cpu` poller, `target_cpu` home; reason `kPolled`, `kSignalEpoch`, `kDeadline`, `kUserApc`, `kBackstop`; `AtHead`; `value` wait kind |
+| `kSafepoint` | the JIT safepoint handler: once per deferral episode, and every terminal outcome | `cpu`; exact `guest_pc`; reason `kDeferredLock`, `kDeferredIrql`, `kForcedIrql`, `kYielded`; `value` IRQL; `count` declined safepoints (terminal only); `SchedulerRequested`, `CaptureRequested` |
+| `kBlock` | `BlockCurrentThread` after parking | `cpu`; `Gated`, `Alertable`, `Interruptible`, `HasDeadline`; `value` wait kind; handles, pre-poll and observed signal epochs, deadline and APC provenance |
+| `kReready` | `RereadyBlocked` per released waiter | `cpu` poller, `target_cpu` home; reason `kPolled`, `kSignalEpoch`, `kDeadline`, `kUserApc`, `kBackstop`; `AtHead`; `value` wait kind; the same wait identity plus decision-time epochs, uptime and APC state |
 | `kParkSuspended` | `ParkSuspended` | `cpu` |
 | `kResume` | `ResumeThread` unparking a suspended thread | `cpu` |
 | `kRequeuePriority` | `RequeueForPriority` | `cpu`; `priority` new level, `value` old level |
@@ -190,7 +213,8 @@ refer to `src/xenia/kernel/guest_scheduler.cc` at the base commit.
   scheduler acts on them (`kMigrate`, `kReready` to another CPU).
 - The idle loop's decision to sleep, the `repoll_now` and `ready_event` pokes,
   slice deadlines in host ticks and the stats counters are host timing and are
-  intentionally not reported.
+  intentionally not reported. The configured quantum is authenticated in the
+  replay configuration instead.
 - The I/O worker's offloaded call itself is not an event; its park and release
   appear as `kBlock` and `kReready` with wait kind `kIoOffload`.
 - A guest thread on the host-thread model (`guest_scheduler=false` or an
@@ -211,6 +235,11 @@ teardown race, and exercises `GuestScheduler` attachment, detachment, shutdown
 release and the rejection latch (`capture_rejected()`) on a never-started
 scheduler. It lives in the CPU suite because `xenia-kernel-tests` links only
 `xenia-base`.
+
+`guest_execution_session_assembler_test.cc` additionally round-trips version 2
+block and signal-reready provenance through the canonical bundle, exercises all
+13 replay-modeled kinds, and proves exact-PC, wait-epoch, participant, sequence
+and legacy-version failures reject closed.
 
 Not exercised by unit tests, because they need a title, fibers and a
 `KernelState`: every emission site inside the live scheduler, the rejection of

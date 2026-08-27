@@ -67,6 +67,46 @@ static int ClampPriority(int32_t priority) {
   return priority < 0 ? 0 : (priority > 31 ? 31 : priority);
 }
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+static GuestSchedulerCaptureWaitState CaptureWaitState(XThread* thread,
+                                                       uint64_t now_ms) {
+  GuestSchedulerCaptureWaitState state;
+  auto& links = thread->scheduler_links();
+  state.deadline_ms = links.wait_deadline_ms;
+  state.observed_uptime_ms = now_ms;
+  state.wait_epoch = links.wait_epoch;
+  state.handle_count = links.wait_handle_count;
+  state.flags =
+      (links.wait_gated ? kGuestSchedulerCaptureWaitFlagGated : 0) |
+      (links.wait_alertable ? kGuestSchedulerCaptureWaitFlagAlertable : 0) |
+      (links.capture_wait_interruptible
+           ? kGuestSchedulerCaptureWaitFlagInterruptible
+           : 0) |
+      (links.wait_alertable && thread->HasPendingUserApc()
+           ? kGuestSchedulerCaptureWaitFlagUserApcPending
+           : 0);
+  const size_t handle_count = std::min<size_t>(
+      state.handle_count, kGuestSchedulerCaptureMaximumWaitHandles);
+  for (size_t i = 0; i < handle_count; ++i) {
+    state.handles[i] = links.wait_handles[i];
+  }
+  if (XObject* object = thread->cooperative_wait_object()) {
+    state.signal_epochs_before[0] = links.capture_wait_signal_epochs[0];
+    state.signal_epochs_observed[0] = object->cooperative_signal_epoch();
+    state.observed_wait_epoch = state.signal_epochs_observed[0];
+  } else {
+    for (uint8_t i = 0; i < links.wait_gate_count; ++i) {
+      state.signal_epochs_before[i] = links.capture_wait_signal_epochs[i];
+      state.signal_epochs_observed[i] =
+          links.wait_gate_objects[i]->cooperative_signal_epoch();
+      state.observed_wait_epoch += state.signal_epochs_observed[i];
+    }
+  }
+  return state;
+}
+#endif
+
 // Safepoints that may decline to preempt before one is forced through anyway.
 // A guest spinning at DISPATCH_LEVEL passes safepoints at roughly the loop
 // rate, so this is a short wait in wall-clock terms, and the alternative is an
@@ -150,7 +190,7 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
     // Once per episode; the count lands on the terminal outcome.
     if (!links.preempt_defers_lock) {
       self->kernel_state()->guest_scheduler()->NoteCaptureSafepoint(
-          self, CaptureReason::kDeferredLock, request_flags, 0);
+          self, CaptureReason::kDeferredLock, request_flags, 0, exact_guest_pc);
     }
 #endif
     if (++links.preempt_defers_lock == kLockPreemptDeferReport) {
@@ -179,7 +219,8 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
       if (links.preempt_defers_irql == 1) {
         self->kernel_state()->guest_scheduler()->NoteCaptureSafepoint(
-            self, CaptureReason::kDeferredIrql, request_flags, 0);
+            self, CaptureReason::kDeferredIrql, request_flags, 0,
+            exact_guest_pc);
       }
 #endif
       return;
@@ -208,7 +249,7 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
   self->kernel_state()->guest_scheduler()->NoteCaptureSafepoint(
       self,
       forced_at_irql ? CaptureReason::kForcedIrql : CaptureReason::kYielded,
-      request_flags, links.capture_declined_safepoints);
+      request_flags, links.capture_declined_safepoints, exact_guest_pc);
   links.capture_declined_safepoints = 0;
 #endif
   self->kernel_state()->guest_scheduler()->YieldCurrentThread(true,
@@ -2184,6 +2225,10 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
     links.wait_alertable = alertable;
     links.wait_epoch = wait_epoch;
     links.wait_deadline_ms = deadline_ms;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    links.capture_wait_interruptible = interruptible;
+#endif
     // A wait consumes the slice.
     links.quantum_deadline_tick = 0;
     Cpu& cpu = cpus_[cpu_index];
@@ -2209,13 +2254,15 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
     cpu.has_blocked.store(true);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    const GuestSchedulerCaptureWaitState capture_wait =
+        CaptureWaitState(self, Clock::QueryHostUptimeMillis());
     EmitCaptureLocked(
         CaptureKind::kBlock, self, cpu_index, -1, CaptureReason::kNone,
         (gated ? kGuestSchedulerCaptureFlagGated : 0) |
             (alertable ? kGuestSchedulerCaptureFlagAlertable : 0) |
             (interruptible ? kGuestSchedulerCaptureFlagInterruptible : 0) |
             (deadline_ms ? kGuestSchedulerCaptureFlagHasDeadline : 0),
-        links.wait_kind);
+        links.wait_kind, 0, 0, &capture_wait);
 #endif
   }
   self->guest_object<X_KTHREAD>()->thread_state = KTHREAD_STATE_WAITING;
@@ -2315,9 +2362,12 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
       links.preempted = false;
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-      EmitCaptureLocked(
-          CaptureKind::kReready, t, cpu_index, target, reready_reason,
-          at_head ? kGuestSchedulerCaptureFlagAtHead : 0, links.wait_kind);
+      const GuestSchedulerCaptureWaitState capture_wait =
+          CaptureWaitState(t, now_ms);
+      EmitCaptureLocked(CaptureKind::kReready, t, cpu_index, target,
+                        reready_reason,
+                        at_head ? kGuestSchedulerCaptureFlagAtHead : 0,
+                        links.wait_kind, 0, 0, &capture_wait);
 #endif
       LinkReadyLocked(cpus_[target], t, at_head);
       if (target != cpu_index) {
@@ -2777,7 +2827,8 @@ bool GuestScheduler::capture_rejected() const {
 void GuestScheduler::NoteCaptureSafepoint(XThread* thread,
                                           GuestSchedulerCaptureReason outcome,
                                           uint16_t request_flags,
-                                          uint32_t declined_count) {
+                                          uint32_t declined_count,
+                                          uint32_t guest_pc) {
   if (!thread) {
     return;
   }
@@ -2785,14 +2836,14 @@ void GuestScheduler::NoteCaptureSafepoint(XThread* thread,
   auto* kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
   EmitCapture(CaptureKind::kSafepoint, thread, t_current_cpu, -1, outcome,
               request_flags, static_cast<uint8_t>(kpcr->current_irql),
-              declined_count);
+              declined_count, guest_pc);
 }
 
-void GuestScheduler::EmitCaptureLocked(GuestSchedulerCaptureEventKind kind,
-                                       XThread* thread, int cpu, int target_cpu,
-                                       GuestSchedulerCaptureReason reason,
-                                       uint16_t flags, uint8_t value,
-                                       uint32_t count) {
+void GuestScheduler::EmitCaptureLocked(
+    GuestSchedulerCaptureEventKind kind, XThread* thread, int cpu,
+    int target_cpu, GuestSchedulerCaptureReason reason, uint16_t flags,
+    uint8_t value, uint32_t count, uint32_t guest_pc,
+    const GuestSchedulerCaptureWaitState* wait) {
   if (!capture_observer_ || capture_rejected_) {
     return;
   }
@@ -2813,6 +2864,10 @@ void GuestScheduler::EmitCaptureLocked(GuestSchedulerCaptureEventKind kind,
   event.target_cpu = static_cast<int8_t>(target_cpu);
   event.value = value;
   event.count = count;
+  event.guest_pc = guest_pc;
+  if (wait) {
+    event.wait = *wait;
+  }
   if (!capture_observer_->OnSchedulerEvent(event)) {
     capture_rejected_ = true;
     XELOGE(
@@ -2825,10 +2880,12 @@ void GuestScheduler::EmitCaptureLocked(GuestSchedulerCaptureEventKind kind,
 void GuestScheduler::EmitCapture(GuestSchedulerCaptureEventKind kind,
                                  XThread* thread, int cpu, int target_cpu,
                                  GuestSchedulerCaptureReason reason,
-                                 uint16_t flags, uint8_t value,
-                                 uint32_t count) {
+                                 uint16_t flags, uint8_t value, uint32_t count,
+                                 uint32_t guest_pc,
+                                 const GuestSchedulerCaptureWaitState* wait) {
   std::lock_guard<std::mutex> lock(lock_);
-  EmitCaptureLocked(kind, thread, cpu, target_cpu, reason, flags, value, count);
+  EmitCaptureLocked(kind, thread, cpu, target_cpu, reason, flags, value, count,
+                    guest_pc, wait);
 }
 
 void GuestScheduler::ReleaseCaptureObserverForShutdown() {

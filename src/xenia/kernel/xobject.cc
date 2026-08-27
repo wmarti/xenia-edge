@@ -258,8 +258,19 @@ X_STATUS CooperativeWait(GuestScheduler* scheduler, X_KTHREAD* kthread,
     uint32_t wait_epoch = 0;
     if (wait_object) {
       wait_epoch = wait_object->cooperative_signal_epoch();
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      if (auto* self = XThread::GetCurrentThread()) {
+        self->CaptureCooperativeWaitObjectEpoch(wait_epoch);
+      }
+#endif
     } else if (auto* self = XThread::GetCurrentThread()) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      wait_epoch = self->CaptureCooperativeWaitSetEpoch();
+#else
       wait_epoch = self->cooperative_wait_set_epoch();
+#endif
     }
     std::optional<X_STATUS> resolved = poll();
     if (resolved) {

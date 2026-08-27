@@ -69,6 +69,7 @@ constexpr const char* kCommonVariables[] = {
     "fold_readonly_guest_memory_loads",
     "full_optimization_even_with_debug",
     "guest_scheduler",
+    "guest_scheduler_quantum_us",
     "ignore_trap_instructions",
     "inline_loadclock",
     "inline_mmio_access",

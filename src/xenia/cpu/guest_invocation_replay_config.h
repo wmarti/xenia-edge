@@ -80,7 +80,7 @@ struct GuestInvocationReplayConfigEntry {
 // capability. Values use IConfigVar's locale-neutral effective serialization,
 // after command-line, per-title and global-config precedence has been applied.
 struct GuestInvocationReplayConfig {
-  static constexpr uint32_t kVersion = 2;
+  static constexpr uint32_t kVersion = 3;
   static constexpr uint32_t kGuestPageSize = 4096;
   static constexpr uint32_t kMaxHostProtectionPageSize = 65536;
   static constexpr uint32_t kMaxEntries = 128;
