@@ -58,6 +58,7 @@ enum class GuestExecutionCaptureThreadStateLifecycleDisposition : uint8_t {
 enum class GuestExecutionCaptureThreadStateRegistryRejection : uint8_t {
   kNone,
   kObserverRejectedRuntimeEvent,
+  kObserverRejectedJitSafepoint,
   kInvalidReadyTransition,
   kDuplicateRegistration,
   kMissingRegistration,
@@ -90,6 +91,22 @@ enum class GuestExecutionCaptureThreadStateVisitResult : uint8_t {
   kParticipantNotReady,
   kRegistryRejected,
   kObserverCallbackReentry,
+};
+
+enum class GuestExecutionCaptureJitSafepointDisposition : uint8_t {
+  kAccept,
+  kReject,
+};
+
+enum class GuestExecutionCaptureJitSafepointResult : uint8_t {
+  kDelivered,
+  kNotRequested,
+  kNoObserver,
+  kParticipantNotReady,
+  kRegistryRejected,
+  kObserverRejected,
+  kObserverCallbackReentry,
+  kInvalidContext,
 };
 
 struct GuestExecutionCaptureHostCallToken {
@@ -181,6 +198,14 @@ class GuestExecutionCaptureHostCallObserver {
   OnThreadStateLifecycle(
       GuestExecutionCaptureThreadStateLifecycleEvent) noexcept {
     return GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept;
+  }
+
+  // Runs on the guest thread at a block-head JIT safepoint. Implementations
+  // may park until a capture transition is released, but must not retain the
+  // ThreadState reference or call Processor or another capture-registry API.
+  virtual GuestExecutionCaptureJitSafepointDisposition OnJitSafepoint(
+      const ThreadState& thread_state, uint32_t guest_address) noexcept {
+    return GuestExecutionCaptureJitSafepointDisposition::kAccept;
   }
 
   virtual GuestExecutionCaptureHostCallToken OnHostGuestCallBegin(

@@ -28,7 +28,13 @@ class TestModule : public Module {
              std::function<bool(uint32_t)> contains_address,
              std::function<bool(hir::HIRBuilder&)> generate,
              bool skip_cf_simplification = false,
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+             uint32_t function_end_address = 0,
+             bool inject_preempt_checks = false);
+#else
              uint32_t function_end_address = 0);
+#endif
   ~TestModule() override;
 
   const std::string& name() const override { return name_; }

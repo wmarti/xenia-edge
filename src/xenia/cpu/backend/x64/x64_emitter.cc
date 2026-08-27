@@ -66,6 +66,10 @@ DEFINE_bool(instrument_call_times, false,
 #endif
 
 DECLARE_bool(log_safepoint_pc);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+DECLARE_bool(guest_scheduler);
+#endif
 
 namespace xe {
 namespace cpu {
@@ -1913,6 +1917,73 @@ Xbyak::Label& X64Emitter::NewCachedLabel() {
 }
 
 void X64Emitter::EmitPreemptCheck(uint32_t guest_address) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // The adjacent request bytes share one hot compare when the scheduler is on.
+  // The cold path preserves scheduler-first delivery and consumes capture
+  // independently. Scheduler-off code compares only the capture byte.
+  Xbyak::Label& after = NewCachedLabel();
+  const bool scheduler_enabled = cvars::guest_scheduler;
+  if (cvars::log_safepoint_pc && guest_address) {
+    mov(dword[GetContextReg() + offsetof(ppc::PPCContext, last_safepoint_pc)],
+        guest_address);
+  }
+
+  Xbyak::Label& do_rendezvous =
+      AddToTail([&after, scheduler_enabled, guest_address](X64Emitter& e,
+                                                           Xbyak::Label& tail) {
+        e.L(tail);
+        e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 0], e.rax);
+        e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 8], e.rcx);
+        e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 16], e.rdx);
+
+        if (scheduler_enabled) {
+          Xbyak::Label scheduler_done;
+          e.cmp(e.byte[e.GetContextReg() +
+                       offsetof(ppc::PPCContext, preempt_requested)],
+                0);
+          e.jz(scheduler_done, X64Emitter::T_NEAR);
+          e.mov(e.byte[e.GetContextReg() +
+                       offsetof(ppc::PPCContext, preempt_requested)],
+                0);
+          e.mov(e.rax, reinterpret_cast<uint64_t>(
+                           &xe::cpu::backend::preempt_yield_handler));
+          e.mov(e.rcx, e.qword[e.rax]);
+          e.test(e.rcx, e.rcx);
+          e.jz(scheduler_done, X64Emitter::T_NEAR);
+          e.call(e.backend()->guest_to_host_thunk());
+          e.L(scheduler_done);
+        }
+
+        Xbyak::Label capture_done;
+        e.cmp(e.byte[e.GetContextReg() +
+                     offsetof(ppc::PPCContext, capture_rendezvous_requested)],
+              0);
+        e.jz(capture_done, X64Emitter::T_NEAR);
+        e.mov(e.rcx, reinterpret_cast<uint64_t>(
+                         &xe::cpu::HandleGuestExecutionCaptureJitSafepoint));
+        e.mov(e.edx, guest_address);
+        e.call(e.backend()->guest_to_host_thunk());
+        e.L(capture_done);
+        e.mov(e.rax, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 0]);
+        e.mov(e.rcx, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 8]);
+        e.mov(e.rdx, e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 16]);
+        e.jmp(after, X64Emitter::T_NEAR);
+      });
+  if (scheduler_enabled) {
+    static_assert(offsetof(ppc::PPCContext, capture_rendezvous_requested) ==
+                  offsetof(ppc::PPCContext, preempt_requested) + 1);
+    static_assert(!(offsetof(ppc::PPCContext, preempt_requested) & 1));
+    cmp(word[GetContextReg() + offsetof(ppc::PPCContext, preempt_requested)],
+        0);
+  } else {
+    cmp(byte[GetContextReg() +
+             offsetof(ppc::PPCContext, capture_rendezvous_requested)],
+        0);
+  }
+  jnz(do_rendezvous, T_NEAR);
+  L(after);
+#else
   // Only safe at a block head, where the per-block register allocator leaves no
   // guest value live and ForgetMxcsrMode has already run, so the unannounced
   // guest->host call cannot lose a register or desync the mode tracking.
@@ -1956,6 +2027,7 @@ void X64Emitter::EmitPreemptCheck(uint32_t guest_address) {
       });
   jnz(do_yield, T_NEAR);
   L(after);
+#endif
 }
 
 static void LoadMxcsrDirectForMode(X64Emitter& e, MXCSRMode mode) {

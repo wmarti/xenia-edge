@@ -70,6 +70,11 @@ class ThreadState {
   // the thread. Destruction while still pending is valid for failed setup.
   GuestExecutionCaptureThreadStateLifecycleDisposition
   PublishGuestExecutionCaptureReady() noexcept;
+
+  // Safe to call from a locked capture ThreadState visitor. The byte is
+  // consumed by emitted JIT code before observer delivery.
+  void RequestGuestExecutionCaptureJitSafepoint() const noexcept;
+  bool IsGuestExecutionCaptureJitSafepointRequested() const noexcept;
 #endif
 
   static void Bind(ThreadState* thread_state);
@@ -94,6 +99,7 @@ class ThreadState {
       guest_execution_capture_lifecycle_state_ =
           GuestExecutionCaptureThreadStateLifecycleState::kPending;
   ThreadState* guest_execution_capture_next_ = nullptr;
+  uint64_t guest_execution_capture_jit_safepoint_callback_count_ = 0;
 #endif
 
   FunctionTraceState function_trace_state_;

@@ -38,6 +38,10 @@
 DECLARE_bool(a64_enable_host_guest_stack_synchronization);
 
 DECLARE_bool(log_safepoint_pc);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+DECLARE_bool(guest_scheduler);
+#endif
 
 namespace xe {
 namespace cpu {
@@ -1415,6 +1419,94 @@ uint32_t A64Emitter::MapReg(const hir::Value* v, const uint32_t* map, int count,
 }
 
 void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // The adjacent request bytes share one hot load when the scheduler is on.
+  // The cold path still handles scheduler preemption first, then capture, so a
+  // handler may re-set preempt_requested without consuming or delaying the
+  // independent capture request. Scheduler-off code tests only capture.
+  Label& after = NewCachedLabel();
+  static_assert(offsetof(ppc::PPCContext, preempt_requested) < 4096);
+  static_assert(offsetof(ppc::PPCContext, capture_rendezvous_requested) < 4096);
+  const uint32_t preempt_offset =
+      static_cast<uint32_t>(offsetof(ppc::PPCContext, preempt_requested));
+  const uint32_t capture_offset = static_cast<uint32_t>(
+      offsetof(ppc::PPCContext, capture_rendezvous_requested));
+  const bool has_vmx = function_has_vmx_;
+  const FPCRMode held_mode = fpcr_mode_;
+  const bool scheduler_enabled = cvars::guest_scheduler;
+
+  if (cvars::log_safepoint_pc && guest_address) {
+    static_assert(offsetof(ppc::PPCContext, last_safepoint_pc) < 16384);
+    mov(w9, guest_address);
+    str(w9, ptr(x20, static_cast<uint32_t>(
+                         offsetof(ppc::PPCContext, last_safepoint_pc))));
+  }
+
+  Label& do_rendezvous = AddToTail([&after, scheduler_enabled, preempt_offset,
+                                    capture_offset, has_vmx, held_mode,
+                                    guest_address](A64Emitter& e, Label&) {
+    // The hot loads and branches leave NZCV untouched. Save it before any cold
+    // callback so the block-head transition cannot perturb later sequences.
+    e.mrs(e.x10, 3, 3, 4, 2, 0);  // mrs x10, NZCV
+    e.str(e.x10, ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
+    if (has_vmx) {
+      e.ldr(e.w0, ptr(e.x19, static_cast<uint32_t>(
+                                 offsetof(A64BackendContext, fpcr_fpu))));
+      e.msr(3, 3, 4, 4, 0, e.x0);  // msr FPCR, x0
+    }
+
+    if (scheduler_enabled) {
+      Xbyak_aarch64::Label scheduler_done;
+      e.ldrb(e.w8, ptr(e.x20, preempt_offset));
+      e.cbz(e.w8, scheduler_done);
+      e.strb(e.wzr, ptr(e.x20, preempt_offset));
+      e.mov(e.x0, reinterpret_cast<uint64_t>(
+                      &xe::cpu::backend::preempt_yield_handler));
+      e.ldr(e.x0, ptr(e.x0));
+      e.cbz(e.x0, scheduler_done);
+      e.ldr(e.x9, ptr(e.GetBackendCtxReg(),
+                      static_cast<uint32_t>(offsetof(
+                          A64BackendContext, guest_to_host_thunk_address))));
+      e.blr(e.x9);
+      e.L(scheduler_done);
+    }
+
+    Xbyak_aarch64::Label capture_done;
+    e.ldrb(e.w8, ptr(e.x20, capture_offset));
+    e.cbz(e.w8, capture_done);
+    e.mov(e.x0, reinterpret_cast<uint64_t>(
+                    &xe::cpu::HandleGuestExecutionCaptureJitSafepoint));
+    e.mov(e.x1, static_cast<uint64_t>(guest_address));
+    e.ldr(e.x9, ptr(e.GetBackendCtxReg(),
+                    static_cast<uint32_t>(offsetof(
+                        A64BackendContext, guest_to_host_thunk_address))));
+    e.blr(e.x9);
+    e.L(capture_done);
+    if (held_mode != FPCRMode::Unknown && held_mode != FPCRMode::Fpu) {
+      e.fpcr_mode_ = FPCRMode::Unknown;
+      e.ChangeFpcrMode(held_mode);
+      e.fpcr_mode_ = held_mode;
+    }
+    e.ldr(e.x10, ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
+    e.msr(3, 3, 4, 2, 0, e.x10);  // msr NZCV, x10
+    e.b(after);
+  });
+  if (scheduler_enabled) {
+    static_assert(offsetof(ppc::PPCContext, capture_rendezvous_requested) ==
+                  offsetof(ppc::PPCContext, preempt_requested) + 1);
+    static_assert(!(offsetof(ppc::PPCContext, preempt_requested) & 1));
+    ldrh(w8, ptr(x20, preempt_offset));
+  } else {
+    ldrb(w8, ptr(x20, capture_offset));
+  }
+  if (near_tail_branches_safe_) {
+    cbnz_near(w8, do_rendezvous);
+  } else {
+    cbnz(w8, do_rendezvous);
+  }
+  L(after);
+#else
   // Only safe at a block head, where the per-block register allocator leaves no
   // guest value live and ForgetFpcrMode has already run, so the unannounced
   // guest->host call cannot lose a register or desync the mode tracking.
@@ -1490,6 +1582,7 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
     cbnz(w8, do_yield);
   }
   L(after);
+#endif
 }
 
 Label& A64Emitter::GetLabel(uint32_t label_id) {

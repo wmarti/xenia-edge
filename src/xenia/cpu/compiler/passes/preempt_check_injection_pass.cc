@@ -41,10 +41,20 @@ bool PreemptCheckInjectionPass::Run(HIRBuilder* builder) {
   // The bool return is pass success, not whether anything changed, and Compile
   // aborts the whole function on false.
   //
-  // Read the cvar here, not in the ctor, so a per-title override applies.
+  // Read the cvar here, not in the ctor, so a per-title override applies. A
+  // capture build always needs the same entry/back-edge coverage for its
+  // independent rendezvous request, including the secondary scheduler-off
+  // lane. Normal builds retain the original scheduler-only gate.
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (!builder->first_block()) {
+    return true;
+  }
+#else
   if (!cvars::guest_scheduler || !builder->first_block()) {
     return true;
   }
+#endif
   // Blocks are laid out in guest address order, so every intra-function cycle
   // branches to an already-seen block. Calls, recursion and indirect branches
   // (bcctr lowers to CallIndirect) re-enter at the entry block.

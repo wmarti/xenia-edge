@@ -616,6 +616,137 @@ class BlockingThreadStateVisitor final
   std::atomic<bool> context_valid_ = false;
 };
 
+class RequestJitSafepointVisitor final
+    : public GuestExecutionCaptureThreadStateVisitor {
+ public:
+  bool VisitThreadState(const ThreadState& thread_state) noexcept override {
+    thread_state.RequestGuestExecutionCaptureJitSafepoint();
+    ++request_count_;
+    return true;
+  }
+
+  size_t request_count() const { return request_count_; }
+
+ private:
+  size_t request_count_ = 0;
+};
+
+class JitSafepointObserver final
+    : public GuestExecutionCaptureHostCallObserver {
+ public:
+  explicit JitSafepointObserver(uint64_t blocked_instance_id = 0)
+      : blocked_instance_id_(blocked_instance_id) {}
+
+  GuestExecutionCaptureJitSafepointDisposition OnJitSafepoint(
+      const ThreadState& thread_state,
+      uint32_t guest_address) noexcept override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    guest_addresses_.push_back(guest_address);
+    requests_consumed_.push_back(
+        !thread_state.IsGuestExecutionCaptureJitSafepointRequested());
+    if (reenter_next_) {
+      reenter_next_ = false;
+      thread_state.RequestGuestExecutionCaptureJitSafepoint();
+      reentry_result_ = HandleGuestExecutionCaptureJitSafepoint(
+          thread_state.context(), guest_address + 4);
+      reentry_request_retained_ =
+          thread_state.IsGuestExecutionCaptureJitSafepointRequested();
+    }
+    condition_.notify_all();
+    if (blocked_instance_id_ &&
+        blocked_instance_id_ ==
+            thread_state.guest_execution_capture_instance_id()) {
+      blocked_instance_id_ = 0;
+      blocked_ = true;
+      condition_.notify_all();
+      condition_.wait(lock, [&] { return release_blocked_; });
+    }
+    if (reject_next_) {
+      reject_next_ = false;
+      return GuestExecutionCaptureJitSafepointDisposition::kReject;
+    }
+    return GuestExecutionCaptureJitSafepointDisposition::kAccept;
+  }
+
+  GuestExecutionCaptureHostCallToken OnHostGuestCallBegin(
+      const ThreadState& thread_state, const GuestFunction& function,
+      uint32_t return_address) noexcept override {
+    return {1};
+  }
+
+  bool OnHostGuestCallEnd(
+      GuestExecutionCaptureHostCallToken token, const ThreadState& thread_state,
+      const GuestFunction& function,
+      GuestExecutionCaptureHostCallOutcome outcome) noexcept override {
+    return token.value == 1;
+  }
+
+  bool CanDetach() const noexcept override { return true; }
+
+  void RejectNext() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    reject_next_ = true;
+  }
+
+  void ReenterNext() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    reenter_next_ = true;
+  }
+
+  bool WaitUntilBlocked() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return blocked_; });
+  }
+
+  bool WaitForCallbackCount(size_t count) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5), [&] {
+      return guest_addresses_.size() >= count;
+    });
+  }
+
+  void ReleaseBlocked() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_blocked_ = true;
+    condition_.notify_all();
+  }
+
+  std::vector<uint32_t> guest_addresses() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return guest_addresses_;
+  }
+
+  std::vector<bool> requests_consumed() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return requests_consumed_;
+  }
+
+  GuestExecutionCaptureJitSafepointResult reentry_result() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reentry_result_;
+  }
+
+  bool reentry_request_retained() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reentry_request_retained_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  std::vector<uint32_t> guest_addresses_;
+  std::vector<bool> requests_consumed_;
+  uint64_t blocked_instance_id_ = 0;
+  bool blocked_ = false;
+  bool release_blocked_ = false;
+  bool reject_next_ = false;
+  bool reenter_next_ = false;
+  GuestExecutionCaptureJitSafepointResult reentry_result_ =
+      GuestExecutionCaptureJitSafepointResult::kNotRequested;
+  bool reentry_request_retained_ = false;
+};
+
 }  // namespace
 
 TEST_CASE("Guest ThreadState registry rejects pending snapshots atomically",
@@ -1148,6 +1279,167 @@ TEST_CASE("Guest ThreadState locked visitor excludes destruction",
   REQUIRE(destroy_finished.load(std::memory_order_acquire));
   REQUIRE(environment.processor->QueryGuestExecutionCaptureParticipants()
               .participants.empty());
+}
+
+TEST_CASE("Guest JIT safepoint requests are independent and consumed once",
+          "[guest-execution-capture][jit-safepoint]") {
+  CaptureTestEnvironment environment;
+  auto thread_state = environment.MakeThread(0x707);
+  thread_state->context()->preempt_requested = 0x5A;
+  auto observer = std::make_shared<JitSafepointObserver>();
+  ScopedHostCallObserver attachment(*environment.processor, observer);
+
+  RequestJitSafepointVisitor visitor;
+  REQUIRE(
+      environment.processor->VisitGuestExecutionCaptureThreadStates(visitor) ==
+      GuestExecutionCaptureThreadStateVisitResult::kCompleted);
+  REQUIRE(visitor.request_count() == 1);
+  REQUIRE(thread_state->IsGuestExecutionCaptureJitSafepointRequested());
+  REQUIRE(thread_state->context()->preempt_requested == 0x5A);
+
+  REQUIRE(HandleGuestExecutionCaptureJitSafepoint(thread_state->context(),
+                                                  0x82000100) ==
+          GuestExecutionCaptureJitSafepointResult::kDelivered);
+  REQUIRE_FALSE(thread_state->IsGuestExecutionCaptureJitSafepointRequested());
+  REQUIRE(thread_state->context()->preempt_requested == 0x5A);
+  REQUIRE(HandleGuestExecutionCaptureJitSafepoint(thread_state->context(),
+                                                  0x82000104) ==
+          GuestExecutionCaptureJitSafepointResult::kNotRequested);
+  REQUIRE(observer->guest_addresses() == std::vector<uint32_t>{0x82000100});
+  REQUIRE(observer->requests_consumed() == std::vector<bool>{true});
+
+  REQUIRE(attachment.Detach());
+  thread_state.reset();
+}
+
+TEST_CASE("Guest JIT safepoint rejection is sticky and detachable",
+          "[guest-execution-capture][jit-safepoint]") {
+  CaptureTestEnvironment environment;
+  auto thread_state = environment.MakeThread(0x708);
+  auto observer = std::make_shared<JitSafepointObserver>();
+  observer->RejectNext();
+  ScopedHostCallObserver attachment(*environment.processor, observer);
+
+  thread_state->RequestGuestExecutionCaptureJitSafepoint();
+  REQUIRE(HandleGuestExecutionCaptureJitSafepoint(thread_state->context(),
+                                                  0x82000200) ==
+          GuestExecutionCaptureJitSafepointResult::kObserverRejected);
+  REQUIRE(environment.processor->QueryGuestExecutionCaptureParticipants()
+              .rejection == GuestExecutionCaptureThreadStateRegistryRejection::
+                                kObserverRejectedJitSafepoint);
+
+  thread_state->RequestGuestExecutionCaptureJitSafepoint();
+  REQUIRE(HandleGuestExecutionCaptureJitSafepoint(thread_state->context(),
+                                                  0x82000204) ==
+          GuestExecutionCaptureJitSafepointResult::kRegistryRejected);
+  REQUIRE_FALSE(thread_state->IsGuestExecutionCaptureJitSafepointRequested());
+  REQUIRE(observer->guest_addresses() == std::vector<uint32_t>{0x82000200});
+
+  REQUIRE(attachment.Detach());
+  REQUIRE(environment.processor->QueryGuestExecutionCaptureParticipants()
+              .rejection ==
+          GuestExecutionCaptureThreadStateRegistryRejection::kNone);
+  thread_state.reset();
+}
+
+TEST_CASE("Guest JIT safepoint callback reentry preserves the nested request",
+          "[guest-execution-capture][jit-safepoint]") {
+  CaptureTestEnvironment environment;
+  auto thread_state = environment.MakeThread(0x709);
+  auto observer = std::make_shared<JitSafepointObserver>();
+  observer->ReenterNext();
+  ScopedHostCallObserver attachment(*environment.processor, observer);
+
+  thread_state->RequestGuestExecutionCaptureJitSafepoint();
+  REQUIRE(HandleGuestExecutionCaptureJitSafepoint(thread_state->context(),
+                                                  0x82000300) ==
+          GuestExecutionCaptureJitSafepointResult::kDelivered);
+  REQUIRE(observer->reentry_result() ==
+          GuestExecutionCaptureJitSafepointResult::kObserverCallbackReentry);
+  REQUIRE(observer->reentry_request_retained());
+  REQUIRE(thread_state->IsGuestExecutionCaptureJitSafepointRequested());
+
+  REQUIRE(HandleGuestExecutionCaptureJitSafepoint(thread_state->context(),
+                                                  0x82000308) ==
+          GuestExecutionCaptureJitSafepointResult::kDelivered);
+  REQUIRE_FALSE(thread_state->IsGuestExecutionCaptureJitSafepointRequested());
+  REQUIRE(observer->guest_addresses() ==
+          std::vector<uint32_t>{0x82000300, 0x82000308});
+
+  REQUIRE(attachment.Detach());
+  thread_state.reset();
+}
+
+TEST_CASE("Guest JIT safepoint lease blocks only its ThreadState destruction",
+          "[guest-execution-capture][jit-safepoint]") {
+  CaptureTestEnvironment environment;
+  auto blocked_thread = environment.MakeThread(0x70A);
+  auto other_thread = environment.MakeThread(0x70B);
+  ppc::PPCContext* blocked_context = blocked_thread->context();
+  auto observer = std::make_shared<JitSafepointObserver>(
+      blocked_thread->guest_execution_capture_instance_id());
+  ScopedHostCallObserver attachment(*environment.processor, observer);
+
+  blocked_thread->RequestGuestExecutionCaptureJitSafepoint();
+  GuestExecutionCaptureJitSafepointResult blocked_result =
+      GuestExecutionCaptureJitSafepointResult::kInvalidContext;
+  std::thread callback_worker([&] {
+    blocked_result =
+        HandleGuestExecutionCaptureJitSafepoint(blocked_context, 0x82000400);
+  });
+  const bool callback_blocked = observer->WaitUntilBlocked();
+
+  std::atomic<bool> destroyer_reached_registry_gate = false;
+  std::atomic<bool> destroy_finished = false;
+  GuestExecutionCaptureRegistryTestAccess::SetThreadStateDestructionGateSignal(
+      *environment.processor, &destroyer_reached_registry_gate);
+  std::thread destroy_worker;
+  if (callback_blocked) {
+    destroy_worker = std::thread([&] {
+      blocked_thread.reset();
+      destroy_finished.store(true, std::memory_order_release);
+    });
+  }
+
+  const auto gate_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (callback_blocked &&
+         !destroyer_reached_registry_gate.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < gate_deadline) {
+    std::this_thread::yield();
+  }
+  const bool destroyer_reached_registry_gate_observed =
+      destroyer_reached_registry_gate.load(std::memory_order_acquire);
+  const bool destroy_finished_while_callback_blocked =
+      destroy_finished.load(std::memory_order_acquire);
+
+  other_thread->RequestGuestExecutionCaptureJitSafepoint();
+  const GuestExecutionCaptureJitSafepointResult other_result =
+      HandleGuestExecutionCaptureJitSafepoint(other_thread->context(),
+                                              0x82000404);
+  const bool both_callbacks_arrived = observer->WaitForCallbackCount(2);
+
+  observer->ReleaseBlocked();
+  callback_worker.join();
+  if (destroy_worker.joinable()) {
+    destroy_worker.join();
+  }
+  GuestExecutionCaptureRegistryTestAccess::SetThreadStateDestructionGateSignal(
+      *environment.processor, nullptr);
+
+  REQUIRE(callback_blocked);
+  REQUIRE(destroyer_reached_registry_gate_observed);
+  REQUIRE_FALSE(destroy_finished_while_callback_blocked);
+  REQUIRE(other_result == GuestExecutionCaptureJitSafepointResult::kDelivered);
+  REQUIRE(both_callbacks_arrived);
+  REQUIRE(blocked_result ==
+          GuestExecutionCaptureJitSafepointResult::kDelivered);
+  REQUIRE(destroy_finished.load(std::memory_order_acquire));
+  REQUIRE(observer->guest_addresses() ==
+          std::vector<uint32_t>{0x82000400, 0x82000404});
+
+  REQUIRE(attachment.Detach());
+  other_thread.reset();
 }
 
 TEST_CASE("Guest host-call roster records every terminal outcome",

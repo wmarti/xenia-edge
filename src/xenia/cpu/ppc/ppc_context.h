@@ -380,6 +380,14 @@ typedef struct alignas(64) PPCContext_s {
   // over.
   uint8_t preempt_requested;
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Independent of scheduler preemption. A capture coordinator raises this
+  // through a locked ThreadState visit, and the next JIT safepoint consumes it
+  // before entering the permanent capture observer.
+  uint8_t capture_rendezvous_requested;
+#endif
+
   // Most frequently used registers first.
 
   uint64_t r[32];  // 0x20 General purpose registers

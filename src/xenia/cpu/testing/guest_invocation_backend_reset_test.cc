@@ -185,6 +185,10 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
     backend_context->spin_wait_reset_tick = 0x7777777788888888ull;
 
     context->preempt_requested = 1;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    context->capture_rendezvous_requested = 1;
+#endif
     context->scratch = 0x99999999AAAAAAAAull;
     context->last_safepoint_pc = 0xBBBBBBBBu;
     context->fpscr.value = 0xA5A5A5A0u;
@@ -205,6 +209,10 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
     REQUIRE(std::memcmp(&context->vscr_vec, &captured_vscr,
                         sizeof(captured_vscr)) == 0);
     REQUIRE(context->preempt_requested == 0);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    REQUIRE(context->capture_rendezvous_requested == 0);
+#endif
     REQUIRE(context->scratch == 0);
     REQUIRE(context->last_safepoint_pc == 0);
 
@@ -284,6 +292,10 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
     backend_context->flags = 0xFFFFFFFFu;
 
     context->preempt_requested = 1;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    context->capture_rendezvous_requested = 1;
+#endif
     context->scratch = 0x99999999AAAAAAAAull;
     context->last_safepoint_pc = 0xBBBBBBBBu;
     context->fpscr.value = 0xA5A5A5A0u;
@@ -303,6 +315,10 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
     REQUIRE(std::memcmp(&context->vscr_vec, &captured_vscr,
                         sizeof(captured_vscr)) == 0);
     REQUIRE(context->preempt_requested == 0);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    REQUIRE(context->capture_rendezvous_requested == 0);
+#endif
     REQUIRE(context->scratch == 0);
     REQUIRE(context->last_safepoint_pc == 0);
 

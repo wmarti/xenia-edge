@@ -65,7 +65,7 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   compiler_->AddPass(std::make_unique<passes::ControlFlowAnalysisPass>());
   compiler_->AddPass(std::make_unique<passes::ControlFlowSimplificationPass>());
 
-  // Preemption safepoints for the guest scheduler. No-op when it is off.
+  // Scheduler preemption and capture-build rendezvous safepoints.
   compiler_->AddPass(std::make_unique<passes::PreemptCheckInjectionPass>());
 
   // Spin-wait tagging for guest wait loops with no db16cyc hint. No-op unless

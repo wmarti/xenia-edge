@@ -183,6 +183,17 @@ GuestExecutionCaptureThreadStateLifecycleDisposition
 ThreadState::PublishGuestExecutionCaptureReady() noexcept {
   return processor_->PublishGuestExecutionCaptureThreadStateReady(*this);
 }
+
+void ThreadState::RequestGuestExecutionCaptureJitSafepoint() const noexcept {
+  std::atomic_ref<uint8_t>(context_->capture_rendezvous_requested)
+      .store(1, std::memory_order_release);
+}
+
+bool ThreadState::IsGuestExecutionCaptureJitSafepointRequested()
+    const noexcept {
+  return std::atomic_ref<uint8_t>(context_->capture_rendezvous_requested)
+             .load(std::memory_order_acquire) != 0;
+}
 #endif
 
 void ThreadState::Bind(ThreadState* thread_state) {

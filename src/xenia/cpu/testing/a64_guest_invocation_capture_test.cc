@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -33,6 +34,7 @@
 #include "xenia/cpu/backend/a64/a64_code_cache.h"
 #include "xenia/cpu/backend/a64/a64_function.h"
 #include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
+#include "xenia/cpu/guest_execution_capture.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/guest_invocation_capture.h"
 #include "xenia/cpu/mmio_handler.h"
@@ -41,6 +43,7 @@
 #include "xenia/memory.h"
 
 DECLARE_bool(emit_mmio_aware_stores_for_recorded_exception_addresses);
+DECLARE_bool(guest_scheduler);
 
 namespace xe {
 namespace cpu {
@@ -601,6 +604,313 @@ SaverestCaptureResult RunInlineSaverestCapture(bool restore) {
   return {std::move(capture.events), guest_stack};
 }
 
+class BlockingSafepointEntryGate final {
+ public:
+  void Enter() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    entered_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, [&] { return released_; });
+  }
+
+  bool WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return entered_; });
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
+    condition_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
+void BlockBeforeSafepointLoop(ppc::PPCContext*, void* arg0, void*) {
+  reinterpret_cast<BlockingSafepointEntryGate*>(arg0)->Enter();
+}
+
+class RequestEmittedJitSafepointVisitor final
+    : public GuestExecutionCaptureThreadStateVisitor {
+ public:
+  bool VisitThreadState(const ThreadState& thread_state) noexcept override {
+    thread_state.RequestGuestExecutionCaptureJitSafepoint();
+    ++request_count_;
+    return true;
+  }
+
+  size_t request_count() const { return request_count_; }
+
+ private:
+  size_t request_count_ = 0;
+};
+
+struct SchedulerSafepointProbe {
+  std::atomic<uint32_t> delivery_count = 0;
+  bool rearm_first_delivery = false;
+};
+
+std::atomic<SchedulerSafepointProbe*> active_scheduler_safepoint_probe =
+    nullptr;
+
+void TestSchedulerSafepointHandler(void* raw_context) {
+  SchedulerSafepointProbe* probe =
+      active_scheduler_safepoint_probe.load(std::memory_order_acquire);
+  if (!probe) {
+    return;
+  }
+  auto* context = reinterpret_cast<ppc::PPCContext*>(raw_context);
+  const uint32_t delivery =
+      probe->delivery_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+  if (delivery == 1 && probe->rearm_first_delivery) {
+    context->preempt_requested = 1;
+  } else {
+    context->r[3] = 1;
+  }
+}
+
+class ScopedSchedulerSafepointConfiguration final {
+ public:
+  ScopedSchedulerSafepointConfiguration(bool scheduler_enabled,
+                                        SchedulerSafepointProbe& probe)
+      : old_guest_scheduler_(cvars::guest_scheduler),
+        old_handler_(backend::preempt_yield_handler) {
+    cvars::guest_scheduler = scheduler_enabled;
+    active_scheduler_safepoint_probe.store(&probe, std::memory_order_release);
+    backend::preempt_yield_handler = TestSchedulerSafepointHandler;
+  }
+
+  ~ScopedSchedulerSafepointConfiguration() {
+    backend::preempt_yield_handler = old_handler_;
+    active_scheduler_safepoint_probe.store(nullptr, std::memory_order_release);
+    cvars::guest_scheduler = old_guest_scheduler_;
+  }
+
+ private:
+  bool old_guest_scheduler_ = false;
+  void (*old_handler_)(void*) = nullptr;
+};
+
+class EmittedJitSafepointObserver final
+    : public GuestExecutionCaptureHostCallObserver {
+ public:
+  EmittedJitSafepointObserver(SchedulerSafepointProbe& scheduler_probe,
+                              bool exit_from_capture)
+      : scheduler_probe_(scheduler_probe),
+        exit_from_capture_(exit_from_capture) {}
+
+  GuestExecutionCaptureJitSafepointDisposition OnJitSafepoint(
+      const ThreadState& thread_state,
+      uint32_t guest_address) noexcept override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    ++delivery_count_;
+    guest_address_ = guest_address;
+    scheduler_deliveries_at_entry_ =
+        scheduler_probe_.delivery_count.load(std::memory_order_acquire);
+    request_consumed_at_entry_ =
+        !thread_state.IsGuestExecutionCaptureJitSafepointRequested();
+    preempt_requested_at_entry_ =
+        thread_state.context()->preempt_requested != 0;
+    if (exit_from_capture_) {
+      thread_state.context()->r[3] = 1;
+    }
+    entered_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, [&] { return released_; });
+    return GuestExecutionCaptureJitSafepointDisposition::kAccept;
+  }
+
+  GuestExecutionCaptureHostCallToken OnHostGuestCallBegin(
+      const ThreadState& thread_state, const GuestFunction& function,
+      uint32_t return_address) noexcept override {
+    return {1};
+  }
+
+  bool OnHostGuestCallEnd(
+      GuestExecutionCaptureHostCallToken token, const ThreadState& thread_state,
+      const GuestFunction& function,
+      GuestExecutionCaptureHostCallOutcome outcome) noexcept override {
+    return token.value == 1;
+  }
+
+  bool CanDetach() const noexcept override { return true; }
+
+  bool WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return entered_; });
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
+    condition_.notify_all();
+  }
+
+  uint32_t delivery_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return delivery_count_;
+  }
+
+  uint32_t guest_address() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return guest_address_;
+  }
+
+  uint32_t scheduler_deliveries_at_entry() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return scheduler_deliveries_at_entry_;
+  }
+
+  bool request_consumed_at_entry() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return request_consumed_at_entry_;
+  }
+
+  bool preempt_requested_at_entry() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return preempt_requested_at_entry_;
+  }
+
+ private:
+  SchedulerSafepointProbe& scheduler_probe_;
+  const bool exit_from_capture_;
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  uint32_t delivery_count_ = 0;
+  uint32_t guest_address_ = 0;
+  uint32_t scheduler_deliveries_at_entry_ = 0;
+  bool request_consumed_at_entry_ = false;
+  bool preempt_requested_at_entry_ = false;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
+struct EmittedJitSafepointResult {
+  bool entry_gate_entered = false;
+  bool capture_callback_entered = false;
+  bool visit_completed = false;
+  size_t requested_participant_count = 0;
+  bool call_succeeded = false;
+  uint32_t capture_delivery_count = 0;
+  uint32_t capture_guest_address = 0;
+  uint32_t scheduler_deliveries_at_capture = 0;
+  uint32_t scheduler_delivery_count = 0;
+  bool request_consumed_at_capture = false;
+  bool preempt_requested_at_capture = false;
+  bool request_pending_after_call = false;
+  bool preempt_requested_after_call = false;
+};
+
+EmittedJitSafepointResult RunEmittedJitSafepointDelivery(
+    bool scheduler_enabled) {
+  constexpr uint32_t kFunctionAddress = 0x83000000;
+  constexpr uint32_t kLoopAddress = kFunctionAddress + 4;
+  constexpr uint32_t kReturnAddress = 0xBCBCBCBC;
+  constexpr uint32_t kStackSize = 64 * 1024;
+
+  SchedulerSafepointProbe scheduler_probe;
+  scheduler_probe.rearm_first_delivery = scheduler_enabled;
+  ScopedSchedulerSafepointConfiguration scheduler_configuration(
+      scheduler_enabled, scheduler_probe);
+
+  auto memory = std::make_unique<Memory>();
+  REQUIRE(memory->Initialize());
+  auto processor = std::make_unique<Processor>(memory.get(), nullptr);
+  REQUIRE(processor->Setup(CreateBackend()));
+
+  BlockingSafepointEntryGate entry_gate;
+  Function* blocking_builtin =
+      processor->DefineBuiltin("BlockBeforeSafepointLoop",
+                               BlockBeforeSafepointLoop, &entry_gate, nullptr);
+  REQUIRE(blocking_builtin != nullptr);
+  auto module = std::make_unique<TestModule>(
+      processor.get(), "CaptureJitSafepointLoop",
+      [](uint32_t address) { return address == kFunctionAddress; },
+      [blocking_builtin](hir::HIRBuilder& builder) {
+        builder.SourceOffset(kFunctionAddress);
+        builder.CallExtern(blocking_builtin);
+        hir::Label* loop = builder.NewLabel();
+        builder.MarkLabel(loop);
+        builder.SourceOffset(kLoopAddress);
+        builder.BranchTrue(builder.CompareEQ(LoadGPR(builder, 3),
+                                             builder.LoadConstantUint64(0)),
+                           loop);
+        builder.Return();
+        return true;
+      },
+      /*skip_cf_simplification=*/true, kLoopAddress + 4,
+      /*inject_preempt_checks=*/true);
+  processor->AddModule(std::move(module));
+  processor->backend()->CommitExecutableRange(kFunctionAddress,
+                                              kFunctionAddress + 0x1000);
+  Function* function = processor->ResolveFunction(kFunctionAddress);
+  REQUIRE(function != nullptr);
+
+  const uint32_t stack_address = memory->SystemHeapAlloc(kStackSize);
+  REQUIRE(stack_address != 0);
+  auto thread_state = std::make_unique<ThreadState>(processor.get(), 0x800,
+                                                    stack_address + kStackSize);
+  REQUIRE(thread_state->PublishGuestExecutionCaptureReady() ==
+          GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept);
+  ppc::PPCContext* context = thread_state->context();
+  context->lr = kReturnAddress;
+  context->r[3] = 0;
+
+  auto observer = std::make_shared<EmittedJitSafepointObserver>(
+      scheduler_probe, !scheduler_enabled);
+  REQUIRE(processor->AttachGuestExecutionCaptureHostCallObserver(observer));
+
+  bool call_succeeded = false;
+  std::thread guest_worker([&] {
+    call_succeeded = function->Call(thread_state.get(), kReturnAddress);
+  });
+  EmittedJitSafepointResult result;
+  result.entry_gate_entered = entry_gate.WaitUntilEntered();
+  if (result.entry_gate_entered) {
+    context->preempt_requested = 1;
+    RequestEmittedJitSafepointVisitor visitor;
+    result.visit_completed =
+        processor->VisitGuestExecutionCaptureThreadStates(visitor) ==
+        GuestExecutionCaptureThreadStateVisitResult::kCompleted;
+    result.requested_participant_count = visitor.request_count();
+  }
+  entry_gate.Release();
+
+  result.capture_callback_entered = observer->WaitUntilEntered();
+  if (!result.capture_callback_entered) {
+    // Fail closed without leaving a runaway emitted loop behind the assertion.
+    context->r[3] = 1;
+  }
+  observer->Release();
+  guest_worker.join();
+
+  result.call_succeeded = call_succeeded;
+  result.capture_delivery_count = observer->delivery_count();
+  result.capture_guest_address = observer->guest_address();
+  result.scheduler_deliveries_at_capture =
+      observer->scheduler_deliveries_at_entry();
+  result.scheduler_delivery_count =
+      scheduler_probe.delivery_count.load(std::memory_order_acquire);
+  result.request_consumed_at_capture = observer->request_consumed_at_entry();
+  result.preempt_requested_at_capture = observer->preempt_requested_at_entry();
+  result.request_pending_after_call =
+      thread_state->IsGuestExecutionCaptureJitSafepointRequested();
+  result.preempt_requested_after_call = context->preempt_requested != 0;
+
+  thread_state.reset();
+  memory->SystemHeapFree(stack_address);
+  observer.reset();
+  processor.reset();
+  return result;
+}
+
 }  // namespace
 
 TEST_CASE("A64_DEFINITION_NOTIFICATION_PRECEDES_CALLABLE_PUBLICATION",
@@ -713,6 +1023,45 @@ TEST_CASE("A64_DEFINITION_NOTIFICATION_PRECEDES_CALLABLE_PUBLICATION",
   REQUIRE(*indirection_slot(kRejectedFunctionAddress) !=
           rejected_unresolved_slot);
   REQUIRE(processor->ResolveFunction(kRejectedFunctionAddress));
+}
+
+TEST_CASE("A64_CAPTURE_JIT_SAFEPOINT_DELIVERS_WITH_AND_WITHOUT_SCHEDULER",
+          "[backend][guest-invocation-capture][jit-safepoint]") {
+  SECTION("scheduler enabled preserves rearm and delivers capture second") {
+    const EmittedJitSafepointResult result =
+        RunEmittedJitSafepointDelivery(true);
+    REQUIRE(result.entry_gate_entered);
+    REQUIRE(result.visit_completed);
+    REQUIRE(result.requested_participant_count == 1);
+    REQUIRE(result.capture_callback_entered);
+    REQUIRE(result.call_succeeded);
+    REQUIRE(result.capture_delivery_count == 1);
+    REQUIRE(result.capture_guest_address == 0x83000004);
+    REQUIRE(result.scheduler_deliveries_at_capture == 1);
+    REQUIRE(result.scheduler_delivery_count == 2);
+    REQUIRE(result.request_consumed_at_capture);
+    REQUIRE(result.preempt_requested_at_capture);
+    REQUIRE_FALSE(result.request_pending_after_call);
+    REQUIRE_FALSE(result.preempt_requested_after_call);
+  }
+
+  SECTION("scheduler disabled delivers capture and leaves preempt untouched") {
+    const EmittedJitSafepointResult result =
+        RunEmittedJitSafepointDelivery(false);
+    REQUIRE(result.entry_gate_entered);
+    REQUIRE(result.visit_completed);
+    REQUIRE(result.requested_participant_count == 1);
+    REQUIRE(result.capture_callback_entered);
+    REQUIRE(result.call_succeeded);
+    REQUIRE(result.capture_delivery_count == 1);
+    REQUIRE(result.capture_guest_address == 0x83000004);
+    REQUIRE(result.scheduler_deliveries_at_capture == 0);
+    REQUIRE(result.scheduler_delivery_count == 0);
+    REQUIRE(result.request_consumed_at_capture);
+    REQUIRE(result.preempt_requested_at_capture);
+    REQUIRE_FALSE(result.request_pending_after_call);
+    REQUIRE(result.preempt_requested_after_call);
+  }
 }
 
 TEST_CASE("A64_CAPTURE_HELPERS_FORWARD_EXACT_CONTROL_EVENTS",

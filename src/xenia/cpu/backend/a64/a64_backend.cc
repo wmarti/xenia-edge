@@ -1627,6 +1627,10 @@ bool A64Backend::ResetGuestInvocationReplayState(void* ctx) {
   bctx->spin_wait_reset_tick = 0;
 
   ppc_context->preempt_requested = 0;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  ppc_context->capture_rendezvous_requested = 0;
+#endif
   ppc_context->scratch = 0;
   ppc_context->last_safepoint_pc = 0;
 

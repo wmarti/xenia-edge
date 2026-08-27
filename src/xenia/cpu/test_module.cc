@@ -32,7 +32,13 @@ TestModule::TestModule(Processor* processor, const std::string_view name,
                        std::function<bool(uint32_t)> contains_address,
                        std::function<bool(hir::HIRBuilder&)> generate,
                        bool skip_cf_simplification,
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+                       uint32_t function_end_address,
+                       bool inject_preempt_checks)
+#else
                        uint32_t function_end_address)
+#endif
     : Module(processor),
       name_(name),
       contains_address_(contains_address),
@@ -51,6 +57,12 @@ TestModule::TestModule(Processor* processor, const std::string_view name,
         std::make_unique<passes::ControlFlowSimplificationPass>());
   }
   compiler_->AddPass(std::make_unique<passes::ControlFlowAnalysisPass>());
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (inject_preempt_checks) {
+    compiler_->AddPass(std::make_unique<passes::PreemptCheckInjectionPass>());
+  }
+#endif
 
   // Passes are executed in the order they are added. Multiple of the same
   // pass type may be used.

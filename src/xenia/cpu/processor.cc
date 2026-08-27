@@ -391,8 +391,11 @@ bool Processor::DetachGuestExecutionCaptureHostCallObserver(
   if (can_detach) {
     guest_execution_capture_host_call_observer_ = nullptr;
     if (guest_execution_capture_thread_state_rejection_ ==
-        GuestExecutionCaptureThreadStateRegistryRejection::
-            kObserverRejectedRuntimeEvent) {
+            GuestExecutionCaptureThreadStateRegistryRejection::
+                kObserverRejectedRuntimeEvent ||
+        guest_execution_capture_thread_state_rejection_ ==
+            GuestExecutionCaptureThreadStateRegistryRejection::
+                kObserverRejectedJitSafepoint) {
       guest_execution_capture_thread_state_rejection_ =
           GuestExecutionCaptureThreadStateRegistryRejection::kNone;
     }
@@ -595,7 +598,7 @@ void Processor::BeginGuestExecutionCaptureThreadStateDestruction(
   }
   std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer;
   {
-    std::lock_guard<std::mutex> thread_state_lock(
+    std::unique_lock<std::mutex> thread_state_lock(
         guest_execution_capture_thread_state_mutex_);
     ThreadState** registered = &guest_execution_capture_thread_state_head_;
     while (*registered && *registered != &thread_state) {
@@ -618,6 +621,15 @@ void Processor::BeginGuestExecutionCaptureThreadStateDestruction(
     }
     thread_state.guest_execution_capture_lifecycle_state_ =
         GuestExecutionCaptureThreadStateLifecycleState::kDestroying;
+
+    // Reject new leases first, then let callbacks already parked in the
+    // observer finish without holding the registry gate. Other ThreadStates
+    // can still reach their safepoints while this lifetime is draining.
+    guest_execution_capture_thread_state_condition_.wait(
+        thread_state_lock, [&thread_state] {
+          return !thread_state
+                      .guest_execution_capture_jit_safepoint_callback_count_;
+        });
 
     observer = AcquireGuestExecutionCaptureObserverDispatch(false);
     if (observer) {
@@ -728,6 +740,89 @@ Processor::VisitGuestExecutionCaptureThreadStates(
     }
   }
   return GuestExecutionCaptureThreadStateVisitResult::kCompleted;
+}
+
+GuestExecutionCaptureJitSafepointResult
+Processor::DeliverGuestExecutionCaptureJitSafepoint(
+    ThreadState& thread_state, uint32_t guest_address) noexcept {
+  if (guest_execution_capture_callback_active) {
+    return GuestExecutionCaptureJitSafepointResult::kObserverCallbackReentry;
+  }
+
+  std::shared_ptr<GuestExecutionCaptureHostCallObserver> observer;
+  {
+    std::lock_guard<std::mutex> thread_state_lock(
+        guest_execution_capture_thread_state_mutex_);
+    ThreadState* registered = guest_execution_capture_thread_state_head_;
+    while (registered && registered != &thread_state) {
+      registered = registered->guest_execution_capture_next_;
+    }
+    if (!registered || thread_state.processor() != this ||
+        thread_state.guest_execution_capture_lifecycle_state_ !=
+            GuestExecutionCaptureThreadStateLifecycleState::kReady) {
+      return GuestExecutionCaptureJitSafepointResult::kParticipantNotReady;
+    }
+    if (guest_execution_capture_thread_state_rejection_ !=
+        GuestExecutionCaptureThreadStateRegistryRejection::kNone) {
+      return GuestExecutionCaptureJitSafepointResult::kRegistryRejected;
+    }
+    if (thread_state.guest_execution_capture_jit_safepoint_callback_count_ ==
+        std::numeric_limits<uint64_t>::max()) {
+      std::abort();
+    }
+    observer = AcquireGuestExecutionCaptureObserverDispatch(false);
+    if (!observer) {
+      return GuestExecutionCaptureJitSafepointResult::kNoObserver;
+    }
+    ++thread_state.guest_execution_capture_jit_safepoint_callback_count_;
+  }
+
+  GuestExecutionCaptureJitSafepointDisposition disposition;
+  {
+    GuestExecutionCaptureCallbackScope callback_scope;
+    disposition = observer->OnJitSafepoint(thread_state, guest_address);
+  }
+
+  {
+    std::lock_guard<std::mutex> thread_state_lock(
+        guest_execution_capture_thread_state_mutex_);
+    if (!thread_state.guest_execution_capture_jit_safepoint_callback_count_) {
+      std::abort();
+    }
+    --thread_state.guest_execution_capture_jit_safepoint_callback_count_;
+    if (disposition == GuestExecutionCaptureJitSafepointDisposition::kReject &&
+        guest_execution_capture_thread_state_rejection_ ==
+            GuestExecutionCaptureThreadStateRegistryRejection::kNone) {
+      guest_execution_capture_thread_state_rejection_ =
+          GuestExecutionCaptureThreadStateRegistryRejection::
+              kObserverRejectedJitSafepoint;
+    }
+  }
+  guest_execution_capture_thread_state_condition_.notify_all();
+  ReleaseGuestExecutionCaptureObserverDispatch();
+  observer.reset();
+  return disposition == GuestExecutionCaptureJitSafepointDisposition::kAccept
+             ? GuestExecutionCaptureJitSafepointResult::kDelivered
+             : GuestExecutionCaptureJitSafepointResult::kObserverRejected;
+}
+
+GuestExecutionCaptureJitSafepointResult HandleGuestExecutionCaptureJitSafepoint(
+    void* raw_context, uint64_t guest_address) noexcept {
+  if (guest_execution_capture_callback_active) {
+    return GuestExecutionCaptureJitSafepointResult::kObserverCallbackReentry;
+  }
+  auto* context = reinterpret_cast<ppc::PPCContext*>(raw_context);
+  if (!context || !context->processor || !context->thread_state ||
+      context->thread_state->context() != context ||
+      context->thread_state->processor() != context->processor) {
+    return GuestExecutionCaptureJitSafepointResult::kInvalidContext;
+  }
+  if (!std::atomic_ref<uint8_t>(context->capture_rendezvous_requested)
+           .exchange(0, std::memory_order_acq_rel)) {
+    return GuestExecutionCaptureJitSafepointResult::kNotRequested;
+  }
+  return context->processor->DeliverGuestExecutionCaptureJitSafepoint(
+      *context->thread_state, static_cast<uint32_t>(guest_address));
 }
 #endif
 

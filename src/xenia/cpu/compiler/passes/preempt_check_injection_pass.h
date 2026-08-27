@@ -17,8 +17,9 @@ namespace cpu {
 namespace compiler {
 namespace passes {
 
-// Prepends a preemption safepoint to the entry block and every back-edge
-// target when the guest scheduler is on. The x64 and a64 emitters lower it.
+// Prepends a safepoint to the entry block and every back-edge target. Normal
+// builds enable it with the guest scheduler; capture builds always enable it
+// for the independent capture rendezvous as well. Both backends lower it.
 class PreemptCheckInjectionPass : public CompilerPass {
  public:
   PreemptCheckInjectionPass();

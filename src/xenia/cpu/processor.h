@@ -11,6 +11,10 @@
 #define XENIA_CPU_PROCESSOR_H_
 
 #include <atomic>
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include <condition_variable>
+#endif
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -294,6 +298,9 @@ class Processor {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   friend class GuestExecutionCaptureRegistryTestAccess;
+  friend GuestExecutionCaptureJitSafepointResult
+  HandleGuestExecutionCaptureJitSafepoint(void* raw_context,
+                                          uint64_t guest_address) noexcept;
 
   void RegisterGuestExecutionCaptureThreadState(
       ThreadState& thread_state) noexcept;
@@ -307,6 +314,13 @@ class Processor {
   std::shared_ptr<GuestExecutionCaptureHostCallObserver>
   AcquireGuestExecutionCaptureObserverDispatch(bool host_call_begin);
   void ReleaseGuestExecutionCaptureObserverDispatch() noexcept;
+
+  // Delivers a consumed per-context request to the permanent observer. The
+  // callback may park; ThreadState destruction waits for only this lifetime's
+  // outstanding callbacks while other participants remain able to arrive.
+  GuestExecutionCaptureJitSafepointResult
+  DeliverGuestExecutionCaptureJitSafepoint(ThreadState& thread_state,
+                                           uint32_t guest_address) noexcept;
 #endif
 
   // Write the guestcoverage, guestcoveragethreads and guestsequences tables
@@ -406,6 +420,7 @@ class Processor {
   // ThreadState is registered. Always acquire this before the observer mutex
   // when both are needed. Lifecycle callbacks run while this is held.
   mutable std::mutex guest_execution_capture_thread_state_mutex_;
+  std::condition_variable guest_execution_capture_thread_state_condition_;
   ThreadState* guest_execution_capture_thread_state_head_ = nullptr;
   GuestExecutionCaptureThreadStateRegistryRejection
       guest_execution_capture_thread_state_rejection_ =
@@ -453,6 +468,14 @@ class Processor {
 
   Irql irql_;
 };
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+// Direct target of the backend guest-to-host thunk. It validates context
+// ownership, atomically consumes one request and forwards to Processor.
+GuestExecutionCaptureJitSafepointResult HandleGuestExecutionCaptureJitSafepoint(
+    void* raw_context, uint64_t guest_address) noexcept;
+#endif
 
 }  // namespace cpu
 }  // namespace xe
