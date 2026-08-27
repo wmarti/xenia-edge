@@ -224,7 +224,7 @@ class GuestExecutionSessionRunner {
 
   static std::unique_ptr<GuestExecutionSessionRunner> Create(
       const GuestExecutionSessionBundle& bundle,
-      std::unique_ptr<backend::Backend> backend, Options options = {},
+      std::unique_ptr<backend::Backend> backend, Options options,
       std::string* error = nullptr);
 
   ~GuestExecutionSessionRunner();

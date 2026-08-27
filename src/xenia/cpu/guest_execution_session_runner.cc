@@ -835,7 +835,7 @@ GuestExecutionSessionRunner::Create(const GuestExecutionSessionBundle& bundle,
   if (!runner->Initialize(std::move(backend), error)) {
     return nullptr;
   }
-  return runner;
+  return std::move(runner);
 }
 
 GuestExecutionSessionRunner::GuestExecutionSessionRunner(
