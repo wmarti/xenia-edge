@@ -75,6 +75,7 @@ struct GuestExecutionReelConfig {
       GuestExecutionReelCoverageMode::kInvocationSegments;
   uint64_t first_event_sequence = 0;
   uint64_t first_segment_ordinal = 0;
+  bool defer_duration_boundaries = false;
 };
 
 struct GuestExecutionReelEventRange {
@@ -187,7 +188,9 @@ class GuestExecutionReelCollector final {
       const GuestExecutionReelEventRange& event_range);
 
   GuestExecutionReelAction Poll(uint64_t now_tick);
+  GuestExecutionReelAction PollDeferredDurationStop(uint64_t now_tick);
   GuestExecutionReelAction RequestManualStop(uint64_t now_tick);
+  GuestExecutionReelAction RequestDeferredDurationStop(uint64_t now_tick);
 
   // Completes only after a policy requested stop and retained coverage matches
   // the configured mode.

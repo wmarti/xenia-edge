@@ -192,6 +192,12 @@ class Processor {
   GuestExecutionCaptureThreadStateVisitResult
   VisitGuestExecutionCaptureThreadStates(
       GuestExecutionCaptureThreadStateVisitor& visitor) const noexcept;
+  // Cleanup-only variant that visits ready participants and skips lifetimes
+  // already in destruction. Destruction synchronously disarms its own counter
+  // before the PPC context can be freed.
+  GuestExecutionCaptureThreadStateVisitResult
+  VisitReadyGuestExecutionCaptureThreadStates(
+      GuestExecutionCaptureThreadStateVisitor& visitor) const noexcept;
 #endif
 
   bool Setup(std::unique_ptr<backend::Backend> backend);

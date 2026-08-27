@@ -384,6 +384,7 @@ class GuestScheduler {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   friend class GuestSchedulerCheckpointRuntimeTestAccess;
   friend class GuestSchedulerCaptureWaitRuntimeTestAccess;
+  friend class GuestExecutionSessionCaptureRuntimeTestAccess;
 
   using CheckpointTestHook = void (*)(void* context);
   using RereadyDecisionTestHook =

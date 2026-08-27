@@ -108,12 +108,10 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     GuestExecutionCaptureParticipantIdentity participant;
     ppc::GuestInvocationRecorderIdentity invocation_identity;
     ppc::GuestPPCRegisterState registers;
-    ppc::PPCContext* context = nullptr;
   };
 
   struct InstructionCounter {
     GuestExecutionCaptureParticipantIdentity participant;
-    ppc::PPCContext* context = nullptr;
   };
 
   struct DataPageUse {
@@ -147,8 +145,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
             {{thread_state.guest_execution_capture_instance_id(),
               thread_state.thread_id()},
              {reinterpret_cast<uintptr_t>(context), context->thread_id},
-             ppc::CaptureGuestPPCRegisterState(*context),
-             context});
+             ppc::CaptureGuestPPCRegisterState(*context)});
         return true;
       } catch (...) {
         allocation_failed_ = true;
@@ -163,6 +160,171 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     std::vector<CapturedThreadState>* output_ = nullptr;
     bool invalid_ = false;
     bool allocation_failed_ = false;
+  };
+
+  class InstructionCounterArmVisitor final
+      : public GuestExecutionCaptureThreadStateVisitor {
+   public:
+    explicit InstructionCounterArmVisitor(
+        std::span<const InstructionCounter> counters,
+        std::span<ppc::PPCContext*> contexts)
+        : counters_(counters), contexts_(contexts) {
+      std::fill(contexts_.begin(), contexts_.end(), nullptr);
+    }
+
+    bool VisitThreadState(const ThreadState& thread_state) noexcept override {
+      ppc::PPCContext* context = thread_state.context();
+      const GuestExecutionCaptureParticipantIdentity participant = {
+          thread_state.guest_execution_capture_instance_id(),
+          thread_state.thread_id(),
+      };
+      const auto counter = std::lower_bound(
+          counters_.begin(), counters_.end(), participant.capture_instance_id,
+          [](const InstructionCounter& candidate, uint64_t instance_id) {
+            return candidate.participant.capture_instance_id < instance_id;
+          });
+      if (!context || counter == counters_.end() ||
+          counter->participant != participant ||
+          context->thread_id != participant.guest_thread_id) {
+        return false;
+      }
+      const size_t index = size_t(counter - counters_.begin());
+      if (contexts_[index]) {
+        return false;
+      }
+      contexts_[index] = context;
+      return true;
+    }
+
+    bool CompleteVisit() noexcept override {
+      for (ppc::PPCContext* context : contexts_) {
+        if (!context ||
+            std::atomic_ref<uint64_t*>(
+                context->guest_execution_session_instruction_counter)
+                .load(std::memory_order_acquire)) {
+          return false;
+        }
+      }
+      for (ppc::PPCContext* context : contexts_) {
+        std::atomic_ref<uint64_t>(
+            context->guest_execution_session_instruction_count)
+            .store(0, std::memory_order_relaxed);
+        std::atomic_ref<uint64_t*>(
+            context->guest_execution_session_instruction_counter)
+            .store(&context->guest_execution_session_instruction_count,
+                   std::memory_order_release);
+      }
+      std::fill(contexts_.begin(), contexts_.end(), nullptr);
+      return true;
+    }
+
+    void CancelVisit() noexcept override {
+      std::fill(contexts_.begin(), contexts_.end(), nullptr);
+    }
+
+   private:
+    std::span<const InstructionCounter> counters_;
+    std::span<ppc::PPCContext*> contexts_;
+  };
+
+  class InstructionCounterDrainVisitor final
+      : public GuestExecutionCaptureThreadStateVisitor {
+   public:
+    InstructionCounterDrainVisitor(
+        std::span<const InstructionCounter> counters,
+        std::span<ppc::PPCContext*> contexts,
+        std::vector<GuestExecutionSessionInstructionCoverageDelta>* output,
+        bool disarm, bool require_exact_roster, bool require_drained)
+        : counters_(counters),
+          contexts_(contexts),
+          output_(output),
+          disarm_(disarm),
+          require_exact_roster_(require_exact_roster),
+          require_drained_(require_drained) {
+      std::fill(contexts_.begin(), contexts_.end(), nullptr);
+    }
+
+    bool VisitThreadState(const ThreadState& thread_state) noexcept override {
+      ppc::PPCContext* context = thread_state.context();
+      const GuestExecutionCaptureParticipantIdentity participant = {
+          thread_state.guest_execution_capture_instance_id(),
+          thread_state.thread_id(),
+      };
+      const auto counter = std::lower_bound(
+          counters_.begin(), counters_.end(), participant.capture_instance_id,
+          [](const InstructionCounter& candidate, uint64_t instance_id) {
+            return candidate.participant.capture_instance_id < instance_id;
+          });
+      if (counter == counters_.end() || counter->participant != participant) {
+        return !require_exact_roster_;
+      }
+      const size_t index = size_t(counter - counters_.begin());
+      if (!context || context->thread_id != participant.guest_thread_id ||
+          contexts_[index]) {
+        return false;
+      }
+      contexts_[index] = context;
+      return true;
+    }
+
+    bool CompleteVisit() noexcept override {
+      bool valid = true;
+      for (ppc::PPCContext*& context : contexts_) {
+        if (!context) {
+          if (require_exact_roster_) {
+            std::fill(contexts_.begin(), contexts_.end(), nullptr);
+            return false;
+          }
+          continue;
+        }
+        uint64_t* expected =
+            &context->guest_execution_session_instruction_count;
+        if (std::atomic_ref<uint64_t*>(
+                context->guest_execution_session_instruction_counter)
+                .load(std::memory_order_acquire) != expected) {
+          if (require_exact_roster_) {
+            std::fill(contexts_.begin(), contexts_.end(), nullptr);
+            return false;
+          }
+          context = nullptr;
+          valid = false;
+        }
+      }
+      bool drained = true;
+      for (size_t index = 0; index < contexts_.size(); ++index) {
+        ppc::PPCContext* context = contexts_[index];
+        if (!context) {
+          continue;
+        }
+        if (disarm_) {
+          std::atomic_ref<uint64_t*>(
+              context->guest_execution_session_instruction_counter)
+              .store(nullptr, std::memory_order_release);
+        }
+        const uint64_t delta =
+            std::atomic_ref<uint64_t>(
+                context->guest_execution_session_instruction_count)
+                .exchange(0, std::memory_order_acq_rel);
+        drained = drained && (!require_drained_ || !delta);
+        if (output_ && delta) {
+          output_->push_back({counters_[index].participant, delta});
+        }
+      }
+      std::fill(contexts_.begin(), contexts_.end(), nullptr);
+      return valid && drained;
+    }
+
+    void CancelVisit() noexcept override {
+      std::fill(contexts_.begin(), contexts_.end(), nullptr);
+    }
+
+   private:
+    std::span<const InstructionCounter> counters_;
+    std::span<ppc::PPCContext*> contexts_;
+    std::vector<GuestExecutionSessionInstructionCoverageDelta>* output_;
+    bool disarm_ = false;
+    bool require_exact_roster_ = false;
+    bool require_drained_ = false;
   };
 
   Impl(Memory& memory_value, Processor& processor_value,
@@ -518,15 +680,11 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     std::vector<InstructionCounter> counters;
     counters.reserve(captured.size());
     for (const CapturedThreadState& thread : captured) {
-      if (!thread.context ||
-          !initial_states.contains(thread.participant.capture_instance_id) ||
-          std::atomic_ref<uint64_t*>(
-              thread.context->guest_execution_session_instruction_counter)
-              .load(std::memory_order_acquire)) {
+      if (!initial_states.contains(thread.participant.capture_instance_id)) {
         return RejectLocked(
             "capture provider cannot arm a participant instruction counter");
       }
-      counters.push_back({thread.participant, thread.context});
+      counters.push_back({thread.participant});
     }
     std::sort(counters.begin(), counters.end(),
               [](const auto& left, const auto& right) {
@@ -539,41 +697,48 @@ struct GuestExecutionSessionCaptureProvider::Impl {
         return RejectLocked(
             "capture provider instruction counter roster is not unique");
       }
-      ppc::PPCContext* context = counters[index].context;
-      std::atomic_ref<uint64_t>(
-          context->guest_execution_session_instruction_count)
-          .store(0, std::memory_order_relaxed);
-      std::atomic_ref<uint64_t*>(
-          context->guest_execution_session_instruction_counter)
-          .store(&context->guest_execution_session_instruction_count,
-                 std::memory_order_release);
+    }
+    std::vector<ppc::PPCContext*> context_scratch(counters.size(), nullptr);
+    InstructionCounterArmVisitor visitor(counters, context_scratch);
+    if (processor.VisitGuestExecutionCaptureThreadStates(visitor) !=
+        GuestExecutionCaptureThreadStateVisitResult::kCompleted) {
+      return RejectLocked(
+          "capture provider could not atomically arm the exact instruction "
+          "counter roster");
     }
     instruction_counters = std::move(counters);
+    instruction_counter_context_scratch = std::move(context_scratch);
     return true;
   }
 
   bool DisarmInstructionCountersLocked(bool require_drained) {
-    const char* rejection = nullptr;
-    for (const InstructionCounter& counter : instruction_counters) {
-      ppc::PPCContext* context = counter.context;
-      uint64_t* expected = &context->guest_execution_session_instruction_count;
-      auto pointer = std::atomic_ref<uint64_t*>(
-          context->guest_execution_session_instruction_counter);
-      if (pointer.load(std::memory_order_acquire) != expected) {
-        rejection =
-            "capture provider participant instruction counter was replaced";
-      }
-      pointer.store(nullptr, std::memory_order_release);
-      if (std::atomic_ref<uint64_t>(
-              context->guest_execution_session_instruction_count)
-              .exchange(0, std::memory_order_acq_rel) &&
-          require_drained) {
-        rejection =
-            "capture provider sealed before instruction coverage was drained";
-      }
+    if (instruction_counters.empty()) {
+      return true;
+    }
+    InstructionCounterDrainVisitor visitor(
+        instruction_counters, instruction_counter_context_scratch, nullptr,
+        true, require_drained, require_drained);
+    const GuestExecutionCaptureThreadStateVisitResult result =
+        require_drained
+            ? processor.VisitGuestExecutionCaptureThreadStates(visitor)
+            : processor.VisitReadyGuestExecutionCaptureThreadStates(visitor);
+    if (require_drained &&
+        result != GuestExecutionCaptureThreadStateVisitResult::kCompleted) {
+      InstructionCounterDrainVisitor cleanup_visitor(
+          instruction_counters, instruction_counter_context_scratch, nullptr,
+          true, false, false);
+      processor.VisitReadyGuestExecutionCaptureThreadStates(cleanup_visitor);
     }
     instruction_counters.clear();
-    return rejection ? RejectLocked(rejection) : true;
+    instruction_counter_context_scratch.clear();
+    if (result != GuestExecutionCaptureThreadStateVisitResult::kCompleted) {
+      return RejectLocked(require_drained
+                              ? "capture provider sealed before the exact "
+                                "instruction counter roster was drained"
+                              : "capture provider could not safely disarm all "
+                                "live instruction counters");
+    }
+    return true;
   }
 
   bool BuildCheckpointStatesLocked(
@@ -1052,6 +1217,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
   std::map<uint64_t, std::vector<uint8_t>> initial_states;
   std::map<uint64_t, std::vector<uint8_t>> final_states;
   std::vector<InstructionCounter> instruction_counters;
+  std::vector<ppc::PPCContext*> instruction_counter_context_scratch;
   std::map<uint32_t, uint32_t> closure_seeds;
 
   std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> initial_data_pages;
@@ -1240,24 +1406,15 @@ bool GuestExecutionSessionCaptureProvider::CollectInstructionCoverageDeltas(
       return impl_->SetErrorFromRejection(error);
     }
     output->reserve(impl_->instruction_counters.size());
-    for (const Impl::InstructionCounter& counter :
-         impl_->instruction_counters) {
-      ppc::PPCContext* context = counter.context;
-      uint64_t* expected = &context->guest_execution_session_instruction_count;
-      if (std::atomic_ref<uint64_t*>(
-              context->guest_execution_session_instruction_counter)
-              .load(std::memory_order_acquire) != expected) {
-        impl_->RejectLocked(
-            "capture provider participant instruction counter is not armed");
-        return impl_->SetErrorFromRejection(error);
-      }
-      const uint64_t delta =
-          std::atomic_ref<uint64_t>(
-              context->guest_execution_session_instruction_count)
-              .exchange(0, std::memory_order_acq_rel);
-      if (delta) {
-        output->push_back({counter.participant, delta});
-      }
+    Impl::InstructionCounterDrainVisitor visitor(
+        impl_->instruction_counters, impl_->instruction_counter_context_scratch,
+        output, false, true, false);
+    if (impl_->processor.VisitGuestExecutionCaptureThreadStates(visitor) !=
+        GuestExecutionCaptureThreadStateVisitResult::kCompleted) {
+      impl_->RejectLocked(
+          "capture provider could not atomically drain the exact instruction "
+          "counter roster");
+      return impl_->SetErrorFromRejection(error);
     }
     return true;
   } catch (...) {
@@ -1291,10 +1448,6 @@ bool GuestExecutionSessionCaptureProvider::SealCapture(
         "capture provider could not detach and drain execution hooks");
     return impl_->SetErrorFromRejection(error);
   }
-  if (auto hook =
-          impl_->seal_detached_test_hook.load(std::memory_order_acquire)) {
-    hook(impl_->seal_detached_test_context.load(std::memory_order_acquire));
-  }
   std::vector<Impl::CapturedThreadState> captured;
   if (!impl_->CaptureThreadStates(impl_->initial_states.size(), &captured,
                                   error)) {
@@ -1303,6 +1456,10 @@ bool GuestExecutionSessionCaptureProvider::SealCapture(
                               : "capture provider could not snapshot the "
                                 "final live thread states");
     return false;
+  }
+  if (auto hook =
+          impl_->seal_detached_test_hook.load(std::memory_order_acquire)) {
+    hook(impl_->seal_detached_test_context.load(std::memory_order_acquire));
   }
   try {
     std::lock_guard<std::mutex> lock(impl_->mutex);

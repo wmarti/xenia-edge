@@ -143,13 +143,15 @@ class GuestExecutionCaptureCallbackScope final {
 
 GuestExecutionCaptureThreadStateLifecycleEvent MakeThreadStateLifecycleEvent(
     const ThreadState& thread_state,
-    GuestExecutionCaptureThreadStateLifecycleState state) {
+    GuestExecutionCaptureThreadStateLifecycleState state,
+    uint64_t guest_instruction_delta = 0) {
   return {
       {
           thread_state.guest_execution_capture_instance_id(),
           thread_state.thread_id(),
       },
       state,
+      guest_instruction_delta,
   };
 }
 
@@ -905,6 +907,28 @@ void Processor::BeginGuestExecutionCaptureThreadStateDestruction(
                       .guest_execution_capture_jit_safepoint_callback_count_;
         });
 
+    uint64_t guest_instruction_delta = 0;
+    if (ppc::PPCContext* context = thread_state.context()) {
+      uint64_t* expected = &context->guest_execution_session_instruction_count;
+      uint64_t* installed =
+          std::atomic_ref<uint64_t*>(
+              context->guest_execution_session_instruction_counter)
+              .exchange(nullptr, std::memory_order_acq_rel);
+      if (installed) {
+        if (installed != expected &&
+            guest_execution_capture_thread_state_rejection_ ==
+                GuestExecutionCaptureThreadStateRegistryRejection::kNone) {
+          guest_execution_capture_thread_state_rejection_ =
+              GuestExecutionCaptureThreadStateRegistryRejection::
+                  kInvalidInstructionCounter;
+        }
+        guest_instruction_delta =
+            std::atomic_ref<uint64_t>(
+                context->guest_execution_session_instruction_count)
+                .exchange(0, std::memory_order_acq_rel);
+      }
+    }
+
     observer = AcquireGuestExecutionCaptureObserverDispatch(false);
     if (observer) {
       GuestExecutionCaptureThreadStateLifecycleDisposition disposition;
@@ -913,7 +937,8 @@ void Processor::BeginGuestExecutionCaptureThreadStateDestruction(
         disposition =
             observer->OnThreadStateLifecycle(MakeThreadStateLifecycleEvent(
                 thread_state,
-                GuestExecutionCaptureThreadStateLifecycleState::kDestroying));
+                GuestExecutionCaptureThreadStateLifecycleState::kDestroying,
+                guest_instruction_delta));
       }
       if (disposition !=
               GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept &&
@@ -1032,10 +1057,68 @@ Processor::VisitGuestExecutionCaptureThreadStates(
       continue_visiting = visitor.VisitThreadState(*thread_state);
     }
     if (!continue_visiting) {
+      GuestExecutionCaptureCallbackScope callback_scope;
+      visitor.CancelVisit();
       return GuestExecutionCaptureThreadStateVisitResult::kStoppedByVisitor;
     }
   }
-  return GuestExecutionCaptureThreadStateVisitResult::kCompleted;
+  bool visit_completed = false;
+  {
+    GuestExecutionCaptureCallbackScope callback_scope;
+    visit_completed = visitor.CompleteVisit();
+    if (!visit_completed) {
+      visitor.CancelVisit();
+    }
+  }
+  return visit_completed
+             ? GuestExecutionCaptureThreadStateVisitResult::kCompleted
+             : GuestExecutionCaptureThreadStateVisitResult::kStoppedByVisitor;
+}
+
+GuestExecutionCaptureThreadStateVisitResult
+Processor::VisitReadyGuestExecutionCaptureThreadStates(
+    GuestExecutionCaptureThreadStateVisitor& visitor) const noexcept {
+  if (guest_execution_capture_callback_active) {
+    return GuestExecutionCaptureThreadStateVisitResult::
+        kObserverCallbackReentry;
+  }
+  std::lock_guard<std::mutex> lock(guest_execution_capture_thread_state_mutex_);
+  const bool registry_rejected =
+      guest_execution_capture_thread_state_rejection_ !=
+      GuestExecutionCaptureThreadStateRegistryRejection::kNone;
+  for (const ThreadState* thread_state =
+           guest_execution_capture_thread_state_head_;
+       thread_state;
+       thread_state = thread_state->guest_execution_capture_next_) {
+    if (thread_state->guest_execution_capture_lifecycle_state_ !=
+        GuestExecutionCaptureThreadStateLifecycleState::kReady) {
+      continue;
+    }
+    bool continue_visiting = false;
+    {
+      GuestExecutionCaptureCallbackScope callback_scope;
+      continue_visiting = visitor.VisitThreadState(*thread_state);
+    }
+    if (!continue_visiting) {
+      GuestExecutionCaptureCallbackScope callback_scope;
+      visitor.CancelVisit();
+      return GuestExecutionCaptureThreadStateVisitResult::kStoppedByVisitor;
+    }
+  }
+  bool visit_completed = false;
+  {
+    GuestExecutionCaptureCallbackScope callback_scope;
+    visit_completed = visitor.CompleteVisit();
+    if (!visit_completed) {
+      visitor.CancelVisit();
+    }
+  }
+  if (!visit_completed) {
+    return GuestExecutionCaptureThreadStateVisitResult::kStoppedByVisitor;
+  }
+  return registry_rejected
+             ? GuestExecutionCaptureThreadStateVisitResult::kRegistryRejected
+             : GuestExecutionCaptureThreadStateVisitResult::kCompleted;
 }
 
 GuestExecutionCaptureJitSafepointResult

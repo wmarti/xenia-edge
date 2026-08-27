@@ -999,6 +999,40 @@ TEST_CASE("Guest ThreadState lifecycle exposes exact state transitions",
   REQUIRE(attachment.Detach());
 }
 
+TEST_CASE("Guest ThreadState destruction cuts instruction coverage",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  auto thread_state = environment.MakeThread(0x404);
+  const GuestExecutionCaptureParticipantIdentity identity = {
+      thread_state->guest_execution_capture_instance_id(),
+      thread_state->thread_id(),
+  };
+  auto observer = std::make_shared<RecordingLifecycleObserver>();
+  ScopedHostCallObserver attachment(*environment.processor, observer);
+  auto* context = thread_state->context();
+  std::atomic_ref<uint64_t>(context->guest_execution_session_instruction_count)
+      .store(41, std::memory_order_relaxed);
+  std::atomic_ref<uint64_t*>(
+      context->guest_execution_session_instruction_counter)
+      .store(&context->guest_execution_session_instruction_count,
+             std::memory_order_release);
+
+  thread_state.reset();
+
+  const auto events = observer->events();
+  REQUIRE(events.size() == 2);
+  REQUIRE((events.front() ==
+           GuestExecutionCaptureThreadStateLifecycleEvent{
+               identity, GuestExecutionCaptureThreadStateLifecycleState::kReady,
+               0}));
+  REQUIRE(
+      (events.back() ==
+       GuestExecutionCaptureThreadStateLifecycleEvent{
+           identity,
+           GuestExecutionCaptureThreadStateLifecycleState::kDestroying, 41}));
+  REQUIRE(attachment.Detach());
+}
+
 TEST_CASE("Guest ThreadState remains registered throughout destruction",
           "[guest-execution-capture]") {
   CaptureTestEnvironment environment;

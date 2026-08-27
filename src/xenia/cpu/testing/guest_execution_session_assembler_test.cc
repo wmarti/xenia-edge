@@ -2591,10 +2591,12 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
                                   &harness.error) == Action::kContinue);
   kernel::GuestSchedulerCaptureEvent yield = BridgeSchedulerEvent(
       41, kernel::GuestSchedulerCaptureEventKind::kYield, kB);
+  yield.guest_instruction_delta = 5;
   REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, yield, &harness.error) ==
           Action::kContinue);
   kernel::GuestSchedulerCaptureEvent block = BridgeSchedulerEvent(
       42, kernel::GuestSchedulerCaptureEventKind::kBlock, kB);
+  block.guest_instruction_delta = 6;
   REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, block, &harness.error) ==
           Action::kContinue);
   kernel::GuestSchedulerCaptureEvent reready = BridgeSchedulerEvent(
@@ -2619,6 +2621,7 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
   REQUIRE(harness.publisher.bundles.size() == 1);
 
   GuestExecutionSessionBundle bundle = harness.publisher.bundles.front();
+  REQUIRE(bundle.manifest.stop_request_guest_instruction_count == 32);
   const bool finalized = bridge.FinalizeBundle(&bundle, 4, &harness.error);
   INFO(harness.error);
   REQUIRE(finalized);
@@ -2845,6 +2848,16 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
     REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, safepoint,
                                     &harness.error) == Action::kReject);
     REQUIRE(harness.error.find("safepoint provenance") != std::string::npos);
+  }
+
+  SECTION("nonterminal instruction coverage fails closed") {
+    kernel::GuestSchedulerCaptureEvent dispatch = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kDispatch);
+    dispatch.guest_instruction_delta = 1;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, dispatch,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("unsupported or malformed") !=
+            std::string::npos);
   }
 
   SECTION("capture-only safepoint provenance fails closed") {

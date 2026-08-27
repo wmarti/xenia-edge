@@ -50,6 +50,18 @@ using CaptureKind = GuestSchedulerCaptureEventKind;
 using CaptureReason = GuestSchedulerCaptureReason;
 using CaptureWaitKind = GuestSchedulerCaptureWaitKind;
 
+bool IsGuestInstructionDrainBoundary(CaptureKind kind) {
+  switch (kind) {
+    case CaptureKind::kSwitchOut:
+    case CaptureKind::kYield:
+    case CaptureKind::kSafepoint:
+    case CaptureKind::kBlock:
+      return true;
+    default:
+      return false;
+  }
+}
+
 static_assert(static_cast<uint8_t>(XThread::CooperativeWaitKind::kNone) ==
               static_cast<uint8_t>(CaptureWaitKind::kNone));
 static_assert(static_cast<uint8_t>(XThread::CooperativeWaitKind::kSingle) ==
@@ -1792,6 +1804,8 @@ void GuestScheduler::SwitchTo(XThread* next) {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     auto& checkpoint_held = checkpoint_held_[t_current_cpu];
     uint64_t checkpoint_generation = 0;
+    EmitCaptureLocked(CaptureKind::kSwitchOut, next, t_current_cpu, -1,
+                      CaptureReason::kNone, 0, 0);
     if (checkpoint_held.thread == next) {
       checkpoint_generation = checkpoint_held.state.generation();
       if (checkpoint_barrier_.active() &&
@@ -1809,8 +1823,6 @@ void GuestScheduler::SwitchTo(XThread* next) {
         checkpoint_generation = 0;
       }
     }
-    EmitCaptureLocked(CaptureKind::kSwitchOut, next, t_current_cpu, -1,
-                      CaptureReason::kNone, 0, 0);
     if (checkpoint_generation) {
       RequeueReleasedCheckpointFiberLocked(t_current_cpu,
                                            checkpoint_generation);
@@ -3001,6 +3013,25 @@ void GuestScheduler::EmitCaptureLocked(
     if (auto* thread_state = thread->thread_state()) {
       event.capture_instance_id =
           thread_state->guest_execution_capture_instance_id();
+      if (IsGuestInstructionDrainBoundary(kind)) {
+        auto* context = thread_state->context();
+        uint64_t* counter =
+            std::atomic_ref<uint64_t*>(
+                context->guest_execution_session_instruction_counter)
+                .load(std::memory_order_acquire);
+        if (counter) {
+          if (counter != &context->guest_execution_session_instruction_count) {
+            capture_rejected_ = true;
+            XELOGE(
+                "GuestScheduler: participant instruction counter ownership "
+                "is invalid; scheduler capture delivery has stopped");
+            return;
+          }
+          event.guest_instruction_delta =
+              std::atomic_ref<uint64_t>(*counter).exchange(
+                  0, std::memory_order_acq_rel);
+        }
+      }
     }
     event.guest_thread_id = thread->thread_id();
     event.priority = static_cast<uint8_t>(ClampPriority(thread->priority()));

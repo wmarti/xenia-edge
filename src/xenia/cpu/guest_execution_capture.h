@@ -45,6 +45,9 @@ struct GuestExecutionCaptureThreadStateLifecycleEvent {
   GuestExecutionCaptureParticipantIdentity participant;
   GuestExecutionCaptureThreadStateLifecycleState state =
       GuestExecutionCaptureThreadStateLifecycleState::kPending;
+  // Transport-only coverage cut made synchronously before a destroying PPC
+  // context can be freed. Consumers serialize it as a separate coverage event.
+  uint64_t guest_instruction_delta = 0;
 
   bool operator==(const GuestExecutionCaptureThreadStateLifecycleEvent&) const =
       default;
@@ -63,6 +66,7 @@ enum class GuestExecutionCaptureThreadStateRegistryRejection : uint8_t {
   kDuplicateRegistration,
   kMissingRegistration,
   kInvalidDestroyTransition,
+  kInvalidInstructionCounter,
   kObserverCallbackReentry,
 };
 
@@ -158,11 +162,15 @@ struct GuestExecutionCaptureHostCallRosterSnapshot {
 // Provides scoped access to ready ThreadState objects while Processor holds
 // the capture-only lifetime registry lock. Implementations must not retain the
 // reference or call back into Processor. Returning false stops the visit.
+// CompleteVisit runs under the same lock after the exact roster has been
+// visited, allowing an implementation to commit a validated transaction.
 class GuestExecutionCaptureThreadStateVisitor {
  public:
   virtual ~GuestExecutionCaptureThreadStateVisitor() = default;
 
   virtual bool VisitThreadState(const ThreadState& thread_state) noexcept = 0;
+  virtual bool CompleteVisit() noexcept { return true; }
+  virtual void CancelVisit() noexcept {}
 };
 
 // Capture-build-only observer for generic host-to-guest dispatches. Install one

@@ -157,6 +157,11 @@ bool HasParticipantActor(CaptureKind kind) {
          kind == CaptureKind::kBlock;
 }
 
+bool IsInstructionDrainBoundary(CaptureKind kind) {
+  return kind == CaptureKind::kSwitchOut || kind == CaptureKind::kYield ||
+         kind == CaptureKind::kSafepoint || kind == CaptureKind::kBlock;
+}
+
 GuestExecutionSessionEventKind CanonicalKind(CaptureKind kind) {
   switch (kind) {
     case CaptureKind::kSafepoint:
@@ -416,7 +421,9 @@ bool ValidateSchedulerEvent(const CaptureEvent& event, std::string* error) {
       !IsSupportedKind(event.kind) || !IsKnownReason(event.reason) ||
       !IsReasonAllowed(event.kind, event.reason) || event.priority > 31 ||
       (event.flags & ~kKnownCaptureFlags) ||
-      (event.flags & ~AllowedFlags(event.kind))) {
+      (event.flags & ~AllowedFlags(event.kind)) ||
+      (event.guest_instruction_delta &&
+       !IsInstructionDrainBoundary(event.kind))) {
     return Fail(error, "scheduler capture event is unsupported or malformed");
   }
   const bool wait_event =
@@ -690,6 +697,18 @@ GuestExecutionSessionCaptureSchedulerEventBridge::OnSchedulerEvent(
        event.sequence != last_scheduler_sequence_ + 1)) {
     rejected_ = true;
     Fail(error, "scheduler event bridge source sequence has a gap");
+    return AssemblerAction::kReject;
+  }
+  if (event.guest_instruction_delta &&
+      assembler.OnInstructionCoverage(participant->identity,
+                                      event.guest_instruction_delta) !=
+          AssemblerAction::kContinue) {
+    rejected_ = true;
+    const std::string message = assembler.status().message;
+    Fail(error, message.empty()
+                    ? "scheduler event bridge instruction coverage was "
+                      "rejected"
+                    : message);
     return AssemblerAction::kReject;
   }
   try {

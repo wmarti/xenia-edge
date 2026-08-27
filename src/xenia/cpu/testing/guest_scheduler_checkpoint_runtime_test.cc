@@ -24,12 +24,14 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <utility>
 
 #include "third_party/catch/include/catch.hpp"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/mutex.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/guest_execution_capture.h"
 #include "xenia/cpu/processor.h"
@@ -527,6 +529,145 @@ struct WaitInventoryControl {
   std::condition_variable condition;
 };
 
+struct InstructionCoverageControl {
+  bool WaitForCompletion(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return condition.wait_for(lock, timeout, [this]() { return completed; });
+  }
+
+  void Complete() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      completed = true;
+    }
+    condition.notify_all();
+  }
+
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool completed = false;
+};
+
+class SwitchOutGateObserver final : public GuestSchedulerCaptureObserver {
+ public:
+  bool OnSchedulerEvent(
+      const GuestSchedulerCaptureEvent& event) noexcept override {
+    const uint32_t target_thread_id =
+        target_thread_id_.load(std::memory_order_acquire);
+    if (event.kind != Kind::kSwitchOut || !target_thread_id ||
+        event.guest_thread_id != target_thread_id || entered_.exchange(true)) {
+      return true;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      entered_visible_ = true;
+    }
+    condition_.notify_all();
+    std::unique_lock<std::mutex> lock(mutex_);
+    condition_.wait(lock, [this]() { return released_; });
+    return true;
+  }
+
+  bool CanDetach() const noexcept override { return false; }
+
+  void SetTargetThread(uint32_t thread_id) {
+    target_thread_id_.store(thread_id, std::memory_order_release);
+  }
+
+  bool WaitUntilEntered(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, timeout,
+                               [this]() { return entered_visible_; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    condition_.notify_all();
+  }
+
+ private:
+  std::atomic<uint32_t> target_thread_id_{0};
+  std::atomic<bool> entered_{false};
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool entered_visible_ = false;
+  bool released_ = false;
+};
+
+class InstructionCoverageRuntimeThread final : public XThread {
+ public:
+  InstructionCoverageRuntimeThread(KernelState* kernel_state,
+                                   InstructionCoverageControl* control)
+      : XThread(kernel_state, 64 * 1024, 0, kSafepointPc, 0, kCpu0CreationFlags,
+                true, false, kernel_state->GetSystemProcess()),
+        control_(control) {}
+
+  void Execute() override {
+    auto* context = thread_state()->context();
+    std::atomic_ref<uint64_t*>(
+        context->guest_execution_session_instruction_counter)
+        .store(&context->guest_execution_session_instruction_count,
+               std::memory_order_release);
+    std::atomic_ref<uint64_t>(
+        context->guest_execution_session_instruction_count)
+        .store(7, std::memory_order_relaxed);
+    kernel_state()->guest_scheduler()->YieldCurrentThread(false);
+    std::atomic_ref<uint64_t>(
+        context->guest_execution_session_instruction_count)
+        .store(11, std::memory_order_relaxed);
+    kernel_state()->guest_scheduler()->YieldCurrentThread(false);
+    std::atomic_ref<uint64_t>(
+        context->guest_execution_session_instruction_count)
+        .store(13, std::memory_order_relaxed);
+    control_->Complete();
+    Exit(0);
+  }
+
+ private:
+  InstructionCoverageControl* control_;
+};
+
+class DeferredInstructionCoverageRuntimeThread final : public XThread {
+ public:
+  DeferredInstructionCoverageRuntimeThread(KernelState* kernel_state,
+                                           InstructionCoverageControl* control)
+      : XThread(kernel_state, 64 * 1024, 0, kSafepointPc, 0, kCpu0CreationFlags,
+                true, false, kernel_state->GetSystemProcess()),
+        control_(control) {}
+
+  void Execute() override {
+    auto* context = thread_state()->context();
+    std::atomic_ref<uint64_t*>(
+        context->guest_execution_session_instruction_counter)
+        .store(&context->guest_execution_session_instruction_count,
+               std::memory_order_release);
+    std::atomic_ref<uint64_t>(
+        context->guest_execution_session_instruction_count)
+        .store(5, std::memory_order_relaxed);
+    scheduler_links().scheduler_safepoint_requested.store(
+        true, std::memory_order_release);
+    {
+      auto global_lock = xe::global_critical_region::AcquireDirect();
+      cpu::backend::preempt_yield_handler(context, kSafepointPc);
+    }
+
+    std::atomic_ref<uint64_t>(
+        context->guest_execution_session_instruction_count)
+        .fetch_add(7, std::memory_order_relaxed);
+    std::atomic_ref<uint8_t>(context->preempt_requested)
+        .store(0, std::memory_order_release);
+    cpu::backend::preempt_yield_handler(context, kSafepointPc);
+    control_->Complete();
+    Exit(0);
+  }
+
+ private:
+  InstructionCoverageControl* control_;
+};
+
 class WaitInventoryRuntimeThread final : public XThread {
  public:
   WaitInventoryRuntimeThread(KernelState* kernel_state,
@@ -974,6 +1115,173 @@ bool ContainsRestorableJitSafepoint(
                                   ResumeKind::kJitSafepoint &&
                               participant.restorable;
                      });
+}
+
+TEST_CASE("Guest scheduler drains instruction coverage at actor boundaries",
+          "[guest_scheduler_capture_observer][runtime]") {
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(128);
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  InstructionCoverageControl control;
+  auto thread = object_ref<InstructionCoverageRuntimeThread>(
+      new InstructionCoverageRuntimeThread(
+          environment.emulator()->kernel_state(), &control));
+  thread->set_name("Scheduler instruction coverage test");
+  REQUIRE(thread->Create() == X_STATUS_SUCCESS);
+  REQUIRE(control.WaitForCompletion(2s));
+  scheduler.Shutdown();
+
+  const auto snapshot = recorder->snapshot();
+  REQUIRE(snapshot.rejection == GuestSchedulerCaptureRecorderRejection::kNone);
+  std::vector<uint64_t> yield_deltas;
+  std::vector<uint64_t> switch_out_deltas;
+  for (const GuestSchedulerCaptureEvent& event : snapshot.events) {
+    if (event.guest_thread_id != thread->thread_id()) {
+      continue;
+    }
+    if (event.kind == GuestSchedulerCaptureEventKind::kYield) {
+      yield_deltas.push_back(event.guest_instruction_delta);
+    } else if (event.kind == GuestSchedulerCaptureEventKind::kSwitchOut) {
+      switch_out_deltas.push_back(event.guest_instruction_delta);
+    } else {
+      REQUIRE(event.guest_instruction_delta == 0);
+    }
+  }
+  REQUIRE(yield_deltas == std::vector<uint64_t>{7, 11});
+  REQUIRE(std::count(switch_out_deltas.begin(), switch_out_deltas.end(), 13) ==
+          1);
+  REQUIRE(std::accumulate(switch_out_deltas.begin(), switch_out_deltas.end(),
+                          uint64_t{0}) == 13);
+
+  std::atomic_ref<uint64_t*>(thread->thread_state()
+                                 ->context()
+                                 ->guest_execution_session_instruction_counter)
+      .store(nullptr, std::memory_order_release);
+  thread->ReclaimExited();
+  thread->ReleaseHandle();
+  thread.reset();
+}
+
+TEST_CASE("Guest scheduler partitions coverage across a deferred safepoint",
+          "[guest_scheduler_capture_observer][runtime]") {
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(128);
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+  REQUIRE(cpu::backend::preempt_yield_handler);
+
+  InstructionCoverageControl control;
+  auto thread = object_ref<DeferredInstructionCoverageRuntimeThread>(
+      new DeferredInstructionCoverageRuntimeThread(
+          environment.emulator()->kernel_state(), &control));
+  thread->set_name("Scheduler deferred coverage test");
+  REQUIRE(thread->Create() == X_STATUS_SUCCESS);
+  REQUIRE(control.WaitForCompletion(2s));
+  scheduler.Shutdown();
+
+  const auto snapshot = recorder->snapshot();
+  REQUIRE(snapshot.rejection == GuestSchedulerCaptureRecorderRejection::kNone);
+  std::vector<GuestSchedulerCaptureEvent> safepoints;
+  uint64_t other_instruction_delta = 0;
+  for (const GuestSchedulerCaptureEvent& event : snapshot.events) {
+    if (event.guest_thread_id != thread->thread_id()) {
+      continue;
+    }
+    if (event.kind == GuestSchedulerCaptureEventKind::kSafepoint) {
+      safepoints.push_back(event);
+    } else {
+      other_instruction_delta += event.guest_instruction_delta;
+    }
+  }
+  REQUIRE(safepoints.size() == 2);
+  REQUIRE(safepoints[0].reason == GuestSchedulerCaptureReason::kDeferredLock);
+  REQUIRE(safepoints[0].guest_instruction_delta == 5);
+  REQUIRE(safepoints[0].value == 0);
+  REQUIRE(safepoints[0].count == 0);
+  REQUIRE(safepoints[1].reason == GuestSchedulerCaptureReason::kYielded);
+  REQUIRE(safepoints[1].guest_instruction_delta == 7);
+  REQUIRE(safepoints[1].value == 0);
+  REQUIRE(safepoints[1].count == 1);
+  REQUIRE(other_instruction_delta == 0);
+
+  std::atomic_ref<uint64_t*>(thread->thread_state()
+                                 ->context()
+                                 ->guest_execution_session_instruction_counter)
+      .store(nullptr, std::memory_order_release);
+  thread->ReclaimExited();
+  thread->ReleaseHandle();
+  thread.reset();
+}
+
+TEST_CASE("Guest scheduler rejects foreign instruction counters",
+          "[guest_scheduler_capture_observer][runtime]") {
+  FiberControl control;
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  auto recorder = std::make_shared<GuestSchedulerCaptureEventRecorder>(128);
+  REQUIRE(scheduler.AttachCaptureObserver(recorder));
+  REQUIRE(recorder->Arm());
+
+  CreatedThread created =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(created.status));
+  REQUIRE(control.WaitForStart(2s));
+  uint64_t foreign_counter = 73;
+  auto* context = created.thread->thread_state()->context();
+  std::atomic_ref<uint64_t*>(
+      context->guest_execution_session_instruction_counter)
+      .store(&foreign_counter, std::memory_order_release);
+  GuestSchedulerCheckpointRuntimeTestAccess::RequestSchedulerSafepoint(
+      scheduler, created.thread.get(), true);
+  REQUIRE(control.WaitForSafepointReturn(2s));
+
+  REQUIRE(scheduler.capture_rejected());
+  REQUIRE(foreign_counter == 73);
+  std::atomic_ref<uint64_t*>(
+      context->guest_execution_session_instruction_counter)
+      .store(nullptr, std::memory_order_release);
+  REQUIRE(StopRuntimeThread(created, control));
+}
+
+TEST_CASE("Guest scheduler publishes switch-out before checkpoint quiescence",
+          "[guest_scheduler_checkpoint][guest_scheduler_capture][runtime]") {
+  FiberControl control;
+  auto observer = std::make_shared<SwitchOutGateObserver>();
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  REQUIRE(scheduler.AttachCaptureObserver(observer));
+
+  CreatedThread created =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(created.status));
+  observer->SetTargetThread(created.thread->thread_id());
+  REQUIRE(control.WaitForStart(2s));
+
+  auto pause_future = std::async(std::launch::async,
+                                 [&scheduler] { return Pause(scheduler, 2s); });
+  const bool observer_entered = observer->WaitUntilEntered(2s);
+  const bool pause_blocked =
+      observer_entered &&
+      pause_future.wait_for(20ms) == std::future_status::timeout;
+  observer->Release();
+  const bool pause_ready =
+      pause_future.wait_for(3s) == std::future_status::ready;
+  CHECK(observer_entered);
+  CHECK(pause_blocked);
+  REQUIRE(pause_ready);
+  PauseResult pause = pause_future.get();
+  REQUIRE(pause.rejection == Rejection::kNone);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              pause.snapshot.generation, nullptr) == Rejection::kNone);
+  REQUIRE(StopRuntimeThread(created, control));
 }
 
 TEST_CASE("Guest scheduler capture inventories every cooperative block source",

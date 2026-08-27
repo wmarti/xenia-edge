@@ -236,15 +236,19 @@ GuestExecutionReelAction GuestExecutionReelCollector::ObserveTickLocked(
   }
   status_.last_observed_tick = now_tick;
   const uint64_t elapsed = now_tick - status_.capture_start_tick;
-  if (config_.boundary.kind ==
-          GuestExecutionReelBoundaryKind::kCaptureDurationTicks &&
-      elapsed >= config_.boundary.value) {
-    RequestStopLocked(GuestExecutionReelStopReason::kCaptureDuration, now_tick);
-    return GuestExecutionReelAction::kStop;
-  }
-  if (elapsed >= config_.limits.maximum_duration_ticks) {
-    RequestStopLocked(GuestExecutionReelStopReason::kMaximumDuration, now_tick);
-    return GuestExecutionReelAction::kStop;
+  if (!config_.defer_duration_boundaries) {
+    if (config_.boundary.kind ==
+            GuestExecutionReelBoundaryKind::kCaptureDurationTicks &&
+        elapsed >= config_.boundary.value) {
+      RequestStopLocked(GuestExecutionReelStopReason::kCaptureDuration,
+                        now_tick);
+      return GuestExecutionReelAction::kStop;
+    }
+    if (elapsed >= config_.limits.maximum_duration_ticks) {
+      RequestStopLocked(GuestExecutionReelStopReason::kMaximumDuration,
+                        now_tick);
+      return GuestExecutionReelAction::kStop;
+    }
   }
   return GuestExecutionReelAction::kContinue;
 }
@@ -535,6 +539,26 @@ GuestExecutionReelAction GuestExecutionReelCollector::Poll(uint64_t now_tick) {
   return ObserveTickLocked(now_tick);
 }
 
+GuestExecutionReelAction GuestExecutionReelCollector::PollDeferredDurationStop(
+    uint64_t now_tick) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!config_.defer_duration_boundaries) {
+    return RejectLocked(GuestExecutionReelRejection::kInvalidCall,
+                        "capture reel duration stop is not deferred", now_tick);
+  }
+  GuestExecutionReelAction action = ObserveTickLocked(now_tick);
+  if (action != GuestExecutionReelAction::kContinue) {
+    return action;
+  }
+  const uint64_t elapsed = now_tick - status_.capture_start_tick;
+  return (config_.boundary.kind ==
+              GuestExecutionReelBoundaryKind::kCaptureDurationTicks &&
+          elapsed >= config_.boundary.value) ||
+                 elapsed >= config_.limits.maximum_duration_ticks
+             ? GuestExecutionReelAction::kStop
+             : GuestExecutionReelAction::kContinue;
+}
+
 GuestExecutionReelAction GuestExecutionReelCollector::RequestManualStop(
     uint64_t now_tick) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -549,6 +573,33 @@ GuestExecutionReelAction GuestExecutionReelCollector::RequestManualStop(
   }
   RequestStopLocked(GuestExecutionReelStopReason::kManual, now_tick);
   return GuestExecutionReelAction::kStop;
+}
+
+GuestExecutionReelAction
+GuestExecutionReelCollector::RequestDeferredDurationStop(uint64_t now_tick) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!config_.defer_duration_boundaries) {
+    return RejectLocked(GuestExecutionReelRejection::kInvalidCall,
+                        "capture reel duration stop is not deferred", now_tick);
+  }
+  GuestExecutionReelAction action = ObserveTickLocked(now_tick);
+  if (action != GuestExecutionReelAction::kContinue) {
+    return action;
+  }
+  const uint64_t elapsed = now_tick - status_.capture_start_tick;
+  if (config_.boundary.kind ==
+          GuestExecutionReelBoundaryKind::kCaptureDurationTicks &&
+      elapsed >= config_.boundary.value) {
+    RequestStopLocked(GuestExecutionReelStopReason::kCaptureDuration, now_tick);
+    return GuestExecutionReelAction::kStop;
+  }
+  if (elapsed >= config_.limits.maximum_duration_ticks) {
+    RequestStopLocked(GuestExecutionReelStopReason::kMaximumDuration, now_tick);
+    return GuestExecutionReelAction::kStop;
+  }
+  return RejectLocked(GuestExecutionReelRejection::kInvalidCall,
+                      "capture reel deferred duration stop is not due",
+                      now_tick);
 }
 
 bool GuestExecutionReelCollector::Complete(uint64_t now_tick,

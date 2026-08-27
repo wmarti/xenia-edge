@@ -88,6 +88,9 @@ struct GuestExecutionSessionAssemblerConfig {
   uint64_t maximum_start_rendezvous_ticks = 0;
   uint64_t capture_tick_frequency = 0;
   uint32_t maximum_events_per_chunk = 0;
+  // A runtime with a real quiescence controller defers time-based requests
+  // until it has stopped every participant and drained the causal event queue.
+  bool defer_duration_boundaries = false;
   // Optional external sink that owns PM4 swap markers; once held it may not
   // emit them.
   uint32_t pm4_marker_sink_ordinal = UINT32_MAX;
@@ -314,6 +317,7 @@ class GuestExecutionSessionAssembler final {
   bool Arm(std::string* error = nullptr);
   bool RequestStart(std::string* error = nullptr);
   GuestExecutionSessionAssemblerAction RequestStop();
+  GuestExecutionSessionAssemblerAction RequestDeferredDurationStop();
   GuestExecutionSessionAssemblerAction Poll();
 
   GuestExecutionSessionAssemblerAction OnExternalSinkHeld(

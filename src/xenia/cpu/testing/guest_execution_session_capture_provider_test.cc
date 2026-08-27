@@ -321,6 +321,10 @@ bool WaitForLifecycleWaiter(GuestExecutionSessionCaptureProvider& provider,
   return provider.lifecycle_waiter_count_for_test() != 0;
 }
 
+void DestroyThreadState(void* context) {
+  static_cast<std::unique_ptr<ThreadState>*>(context)->reset();
+}
+
 }  // namespace
 
 TEST_CASE(
@@ -438,6 +442,101 @@ TEST_CASE("guest execution session provider owns instruction counters",
                                         harness.HostCalls(), &error));
   REQUIRE(context->guest_execution_session_instruction_counter == nullptr);
   harness.provider->EndCapture(true);
+}
+
+TEST_CASE(
+    "guest execution session provider keeps participant counters "
+    "isolated",
+    "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  std::string error;
+  REQUIRE(harness.provider->BeginCapture(harness.TwoThreadCheckpoint(),
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  ppc::PPCContext* first_context = harness.thread->context();
+  ppc::PPCContext* second_context = harness.second_thread->context();
+  std::atomic_ref<uint64_t>(
+      first_context->guest_execution_session_instruction_count)
+      .fetch_add(17, std::memory_order_relaxed);
+  std::atomic_ref<uint64_t>(
+      second_context->guest_execution_session_instruction_count)
+      .fetch_add(29, std::memory_order_relaxed);
+
+  std::vector<GuestExecutionSessionInstructionCoverageDelta> deltas;
+  REQUIRE(harness.provider->CollectInstructionCoverageDeltas(&deltas, &error));
+  REQUIRE(deltas.size() == 2);
+  REQUIRE(deltas[0].participant == harness.participant);
+  REQUIRE(deltas[0].guest_instruction_delta == 17);
+  REQUIRE(deltas[1].participant == harness.second_participant);
+  REQUIRE(deltas[1].guest_instruction_delta == 29);
+  REQUIRE(harness.provider->CollectInstructionCoverageDeltas(&deltas, &error));
+  REQUIRE(deltas.empty());
+
+  REQUIRE(harness.provider->SealCapture(harness.TwoThreadCheckpoint(),
+                                        harness.TwoThreadHostCalls(), &error));
+  REQUIRE(first_context->guest_execution_session_instruction_counter ==
+          nullptr);
+  REQUIRE(second_context->guest_execution_session_instruction_counter ==
+          nullptr);
+  harness.provider->EndCapture(true);
+}
+
+TEST_CASE("guest execution session provider disarms around participant death",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  std::string error;
+  REQUIRE(harness.provider->BeginCapture(harness.TwoThreadCheckpoint(),
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  ppc::PPCContext* first_context = harness.thread->context();
+  ppc::PPCContext* second_context = harness.second_thread->context();
+  REQUIRE(first_context->guest_execution_session_instruction_counter ==
+          &first_context->guest_execution_session_instruction_count);
+  REQUIRE(second_context->guest_execution_session_instruction_counter ==
+          &second_context->guest_execution_session_instruction_count);
+  std::atomic_ref<uint64_t>(
+      first_context->guest_execution_session_instruction_count)
+      .store(17, std::memory_order_relaxed);
+  std::atomic_ref<uint64_t>(
+      second_context->guest_execution_session_instruction_count)
+      .store(29, std::memory_order_relaxed);
+
+  harness.thread.reset();
+  harness.provider->EndCapture(false);
+
+  REQUIRE(second_context->guest_execution_session_instruction_counter ==
+          nullptr);
+  REQUIRE(second_context->guest_execution_session_instruction_count == 0);
+  REQUIRE(harness.provider->status().state ==
+          GuestExecutionSessionCaptureProviderState::kStopped);
+}
+
+TEST_CASE("guest execution session provider cleans up a failed exact disarm",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  std::string error;
+  REQUIRE(harness.provider->BeginCapture(harness.TwoThreadCheckpoint(),
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  ppc::PPCContext* second_context = harness.second_thread->context();
+  std::atomic_ref<uint64_t>(
+      second_context->guest_execution_session_instruction_count)
+      .store(31, std::memory_order_relaxed);
+  harness.provider->SetSealDetachedTestHook(&DestroyThreadState,
+                                            &harness.thread);
+
+  REQUIRE_FALSE(harness.provider->SealCapture(
+      harness.TwoThreadCheckpoint(), harness.TwoThreadHostCalls(), &error));
+
+  REQUIRE(second_context->guest_execution_session_instruction_counter ==
+          nullptr);
+  REQUIRE(second_context->guest_execution_session_instruction_count == 0);
+  REQUIRE(harness.provider->status().state ==
+          GuestExecutionSessionCaptureProviderState::kRejected);
+  harness.provider->SetSealDetachedTestHook(nullptr, nullptr);
 }
 
 TEST_CASE("guest execution session provider authenticates nested returns",

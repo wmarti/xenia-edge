@@ -320,6 +320,7 @@ enum class RuntimeEventKind : uint8_t {
 struct RuntimeEvent {
   RuntimeEventKind kind = RuntimeEventKind::kStart;
   GuestExecutionCaptureParticipantIdentity participant;
+  uint64_t guest_instruction_delta = 0;
   GuestExecutionCaptureThreadStateLifecycleEvent lifecycle;
   GuestExecutionCaptureHostCallToken host_call_token;
   GuestExecutionCaptureHostCallOutcome host_call_outcome =
@@ -407,6 +408,7 @@ enum class AsyncFailure : uint8_t {
   kQueueOverflow,
   kSchedulerSequence,
   kHostCallRoster,
+  kInstructionCounter,
   kUnexpectedJitSafepoint,
   kSourceAfterSeal,
 };
@@ -418,6 +420,7 @@ RuntimeRejection MapAsyncFailure(AsyncFailure failure) {
     case AsyncFailure::kSchedulerSequence:
       return RuntimeRejection::kSchedulerSequence;
     case AsyncFailure::kHostCallRoster:
+    case AsyncFailure::kInstructionCounter:
     case AsyncFailure::kUnexpectedJitSafepoint:
     case AsyncFailure::kSourceAfterSeal:
       return RuntimeRejection::kSourceRejected;
@@ -435,6 +438,9 @@ const char* AsyncFailureMessage(AsyncFailure failure) {
       return "capture runtime scheduler event sequence is discontinuous";
     case AsyncFailure::kHostCallRoster:
       return "capture runtime host-call roster rejected an observation";
+    case AsyncFailure::kInstructionCounter:
+      return "capture runtime participant instruction counter ownership is "
+             "invalid";
     case AsyncFailure::kUnexpectedJitSafepoint:
       return "capture runtime received an unsupported Processor JIT safepoint";
     case AsyncFailure::kSourceAfterSeal:
@@ -474,8 +480,10 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     assembler_dependencies.state_provider = dependencies.provider;
     assembler_dependencies.content_provider = dependencies.provider;
     assembler_dependencies.publisher = &deferred_publisher;
+    GuestExecutionSessionAssemblerConfig assembler_config = config.assembler;
+    assembler_config.defer_duration_boundaries = true;
     assembler = GuestExecutionSessionAssembler::Create(
-        config.assembler, assembler_dependencies, error);
+        assembler_config, assembler_dependencies, error);
     return assembler != nullptr;
   }
 
@@ -910,12 +918,30 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
                                      std::string* error) {
     switch (event.kind) {
       case RuntimeEventKind::kLifecycle:
+        if (event.guest_instruction_delta &&
+            assembler->OnInstructionCoverage(event.lifecycle.participant,
+                                             event.guest_instruction_delta) !=
+                AssemblerAction::kContinue) {
+          if (error && error->empty()) {
+            *error = assembler->status().message;
+          }
+          return AssemblerAction::kReject;
+        }
         return assembler->OnParticipantLifecycle(event.lifecycle);
       case RuntimeEventKind::kHostCallBegin:
         return assembler->OnOuterHostCallBegin(
             event.participant, event.function_address,
             event.function_end_address, event.return_address);
       case RuntimeEventKind::kHostCallEnd:
+        if (event.guest_instruction_delta &&
+            assembler->OnInstructionCoverage(event.participant,
+                                             event.guest_instruction_delta) !=
+                AssemblerAction::kContinue) {
+          if (error && error->empty()) {
+            *error = assembler->status().message;
+          }
+          return AssemblerAction::kReject;
+        }
         return assembler->OnOuterHostCallEnd(event.participant,
                                              event.host_call_outcome);
       case RuntimeEventKind::kScheduler: {
@@ -935,7 +961,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     return AssemblerAction::kContinue;
   }
 
-  bool FlushInstructionCoverage() {
+  bool FlushQuiescedInstructionCoverage() {
     std::string error;
     instruction_coverage_deltas.clear();
     if (!dependencies.provider->CollectInstructionCoverageDeltas(
@@ -946,17 +972,11 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
                  : std::move(error));
       return false;
     }
-    for (const auto& delta : instruction_coverage_deltas) {
-      if (!delta.guest_instruction_delta ||
-          assembler->OnInstructionCoverage(delta.participant,
-                                           delta.guest_instruction_delta) ==
-              AssemblerAction::kReject) {
-        Reject(RuntimeRejection::kAssemblerFailure,
-               assembler->status().message.empty()
-                   ? "capture runtime rejected instruction coverage"
-                   : assembler->status().message);
-        return false;
-      }
+    if (!instruction_coverage_deltas.empty()) {
+      Reject(RuntimeRejection::kSourceRejected,
+             "capture runtime checkpoint found unordered residual instruction "
+             "coverage");
+      return false;
     }
     return true;
   }
@@ -979,7 +999,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     return true;
   }
 
-  void HandleStop(bool manual_request) {
+  void HandleStop(bool manual_request, bool deferred_duration_request = false) {
     if (state_atomic.load(std::memory_order_acquire) !=
         RuntimeState::kRecording) {
       return;
@@ -1005,6 +1025,11 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     WaitForCallbacks();
 
     std::string error;
+    if (scheduler.capture_rejected()) {
+      Reject(RuntimeRejection::kEventBridgeFailure,
+             "capture runtime scheduler source rejected delivery");
+      return;
+    }
     if (RejectAsyncFailureIfAny()) {
       return;
     }
@@ -1012,7 +1037,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       Reject(RuntimeRejection::kAssemblerFailure, std::move(error));
       return;
     }
-    if (!FlushInstructionCoverage()) {
+    if (!FlushQuiescedInstructionCoverage()) {
       return;
     }
     // A manual stop becomes an assembler boundary only after the checkpoint
@@ -1022,8 +1047,12 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     // its end as unbalanced. A drained event may itself have triggered an
     // automatic reel boundary, in which case that earlier boundary wins.
     AssemblerState assembler_state = assembler->status().state;
-    if (manual_request && assembler_state == AssemblerState::kRecording) {
-      if (assembler->RequestStop() == AssemblerAction::kReject) {
+    if ((manual_request || deferred_duration_request) &&
+        assembler_state == AssemblerState::kRecording) {
+      const AssemblerAction request_action =
+          deferred_duration_request ? assembler->RequestDeferredDurationStop()
+                                    : assembler->RequestStop();
+      if (request_action == AssemblerAction::kReject) {
         Reject(RuntimeRejection::kAssemblerFailure,
                assembler->status().message);
         return;
@@ -1182,9 +1211,6 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     if (current != RuntimeState::kRecording) {
       return;
     }
-    if (!FlushInstructionCoverage()) {
-      return;
-    }
     std::string error;
     if (ProcessSourceEvent(event, &error) == AssemblerAction::kReject) {
       Reject(event.kind == RuntimeEventKind::kScheduler
@@ -1208,9 +1234,6 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
         RuntimeState::kRecording) {
       return;
     }
-    if (!FlushInstructionCoverage()) {
-      return;
-    }
     const AssemblerState coverage_state = assembler->status().state;
     if (coverage_state == AssemblerState::kStopRequested ||
         coverage_state == AssemblerState::kStopRendezvous ||
@@ -1224,6 +1247,11 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       return;
     }
     const AssemblerState assembler_state = assembler->status().state;
+    if (action == AssemblerAction::kHold &&
+        assembler_state == AssemblerState::kRecording) {
+      HandleStop(false, true);
+      return;
+    }
     if (assembler_state == AssemblerState::kStopRequested ||
         assembler_state == AssemblerState::kStopRendezvous ||
         assembler_state == AssemblerState::kPublishing) {
@@ -1250,6 +1278,10 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
           ProcessEvent(event);
           if (shutdown_requested.load(std::memory_order_acquire) ||
               IsTerminal(state_atomic.load(std::memory_order_acquire))) {
+            break;
+          }
+          PollAssembler();
+          if (IsTerminal(state_atomic.load(std::memory_order_acquire))) {
             break;
           }
         }
@@ -1378,6 +1410,12 @@ GuestExecutionSessionCaptureRuntime::CreateAndAttach(
       GuestExecutionReelCoverageMode::kContinuousInstructions) {
     Fail(error,
          "capture runtime requires continuous instruction coverage mode");
+    return nullptr;
+  }
+  if (config.assembler.boundary.kind ==
+      GuestExecutionSessionBoundaryKind::kGuestInstructionCount) {
+    Fail(error,
+         "capture runtime does not support exact instruction-count boundaries");
     return nullptr;
   }
   if (config.event_queue_capacity < 2 ||
@@ -1584,6 +1622,7 @@ GuestExecutionSessionCaptureRuntime::OnThreadStateSeed(
   }
   for (const auto& event : events) {
     if (event.state != GuestExecutionCaptureThreadStateLifecycleState::kReady ||
+        event.guest_instruction_delta ||
         !event.participant.capture_instance_id ||
         !event.participant.guest_thread_id) {
       return GuestExecutionCaptureThreadStateLifecycleDisposition::kReject;
@@ -1595,8 +1634,15 @@ GuestExecutionSessionCaptureRuntime::OnThreadStateSeed(
 GuestExecutionCaptureThreadStateLifecycleDisposition
 GuestExecutionSessionCaptureRuntime::OnThreadStateLifecycle(
     GuestExecutionCaptureThreadStateLifecycleEvent event) noexcept {
+  if (event.guest_instruction_delta &&
+      event.state !=
+          GuestExecutionCaptureThreadStateLifecycleState::kDestroying) {
+    return GuestExecutionCaptureThreadStateLifecycleDisposition::kReject;
+  }
   RuntimeEvent runtime_event;
   runtime_event.kind = RuntimeEventKind::kLifecycle;
+  runtime_event.guest_instruction_delta = event.guest_instruction_delta;
+  event.guest_instruction_delta = 0;
   runtime_event.lifecycle = event;
   return impl_->ForwardIfActive(runtime_event)
              ? GuestExecutionCaptureThreadStateLifecycleDisposition::kAccept
@@ -1664,6 +1710,23 @@ bool GuestExecutionSessionCaptureRuntime::OnHostGuestCallEnd(
     impl_->LatchAsyncFailure(AsyncFailure::kHostCallRoster);
     impl_->callback_count.fetch_sub(1, std::memory_order_acq_rel);
     return false;
+  }
+  if (active && accepting) {
+    ppc::PPCContext* context = thread_state.context();
+    uint64_t* counter =
+        std::atomic_ref<uint64_t*>(
+            context->guest_execution_session_instruction_counter)
+            .load(std::memory_order_acquire);
+    if (counter) {
+      if (counter != &context->guest_execution_session_instruction_count) {
+        impl_->LatchAsyncFailure(AsyncFailure::kInstructionCounter);
+        impl_->callback_count.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+      }
+      event.guest_instruction_delta =
+          std::atomic_ref<uint64_t>(*counter).exchange(
+              0, std::memory_order_acq_rel);
+    }
   }
   const bool forwarded = impl_->ForwardInsideCallback(event, active, accepting);
   impl_->callback_count.fetch_sub(1, std::memory_order_acq_rel);

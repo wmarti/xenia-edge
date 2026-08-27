@@ -153,6 +153,12 @@ struct GuestSchedulerCaptureWaitState {
 struct GuestSchedulerCaptureEvent {
   uint64_t sequence = 0;
   uint64_t capture_instance_id = 0;
+  // Capture-transport-only executed-basic-block instruction weight accumulated
+  // by this participant since its previous actor-owned scheduler cut. The
+  // session bridge emits
+  // this as a separate instruction-coverage event immediately before the
+  // scheduler event; it is not duplicated in the durable scheduler payload.
+  uint64_t guest_instruction_delta = 0;
   uint32_t guest_thread_id = 0;
   // kSafepoint kForcedIrql and kYielded: safepoints declined since the
   // participant's previous terminal outcome, both lock and IRQL episodes.

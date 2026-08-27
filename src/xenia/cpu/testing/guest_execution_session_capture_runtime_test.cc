@@ -39,6 +39,18 @@
 #include "xenia/memory.h"
 
 namespace xe {
+namespace kernel {
+
+class GuestExecutionSessionCaptureRuntimeTestAccess final {
+ public:
+  static void SetCaptureRejected(GuestScheduler& scheduler) {
+    std::lock_guard<std::mutex> lock(scheduler.lock_);
+    scheduler.capture_rejected_ = true;
+  }
+};
+
+}  // namespace kernel
+
 namespace cpu {
 
 class GuestExecutionSessionCaptureRuntimeTestAccess final {
@@ -241,6 +253,10 @@ class FakeClock final : public ppc::GuestInvocationRecorderClock {
     return now.fetch_add(1, std::memory_order_relaxed);
   }
 
+  void Advance(uint64_t delta) {
+    now.fetch_add(delta, std::memory_order_relaxed);
+  }
+
  private:
   mutable std::atomic<uint64_t> now{1000};
 };
@@ -436,8 +452,11 @@ class CanonicalEventBridge final
                          "outer call begin", error)) {
       return Action::kReject;
     }
-    if (!RequireContinue(assembler.OnInstructionCoverage(participant, 10),
-                         "instruction coverage", error)) {
+    const uint64_t instruction_delta =
+        event.guest_instruction_delta ? event.guest_instruction_delta : 10;
+    if (!RequireContinue(
+            assembler.OnInstructionCoverage(participant, instruction_delta),
+            "instruction coverage", error)) {
       return Action::kReject;
     }
     if (!coverage_only &&
@@ -629,8 +648,12 @@ class CountingPublisher final : public GuestExecutionSessionAssemblerPublisher {
  public:
   bool Publish(const GuestExecutionSessionBundle& bundle,
                std::string*) noexcept override {
+    stop_reason.store(bundle.manifest.stop_reason, std::memory_order_release);
     stop_request_guest_instruction_count.store(
         bundle.manifest.stop_request_guest_instruction_count,
+        std::memory_order_release);
+    stop_request_matching_guest_marker_count.store(
+        bundle.manifest.stop_request_matching_guest_marker_count,
         std::memory_order_release);
     std::unique_lock<std::mutex> lock(mutex);
     entered = true;
@@ -669,7 +692,10 @@ class CountingPublisher final : public GuestExecutionSessionAssemblerPublisher {
 
   std::atomic<uint32_t> calls{0};
   std::atomic<bool> reentered{false};
+  std::atomic<GuestExecutionSessionStopReason> stop_reason{
+      GuestExecutionSessionStopReason::kManualRequest};
   std::atomic<uint64_t> stop_request_guest_instruction_count{0};
+  std::atomic<uint64_t> stop_request_matching_guest_marker_count{0};
 
  private:
   std::mutex mutex;
@@ -818,7 +844,7 @@ struct RuntimeHarness {
                      GuestExecutionReelCoverageMode::kContinuousInstructions,
                  GuestExecutionSessionBoundaryKind boundary_kind =
                      GuestExecutionSessionBoundaryKind::kManual,
-                 uint64_t marker_count = 0)
+                 uint64_t boundary_value = 0)
       : checkpoint(thread), config(MakeConfig(queue_capacity)) {
     config.assembler.coverage_mode = coverage_mode;
     config.assembler.boundary.kind = boundary_kind;
@@ -826,7 +852,14 @@ struct RuntimeHarness {
       config.assembler.boundary.marker_source =
           GuestExecutionSessionMarkerSource::kPm4Swap;
       config.assembler.boundary.marker_identity = gpu::kPm4SwapMarkerOpcode;
-      config.assembler.boundary.value = marker_count;
+      config.assembler.boundary.value = boundary_value;
+    } else if (boundary_kind ==
+               GuestExecutionSessionBoundaryKind::kCaptureDurationNanoseconds) {
+      config.assembler.boundary.value = boundary_value;
+      config.assembler.limits.maximum_duration_ticks = boundary_value * 2;
+    } else if (boundary_kind ==
+               GuestExecutionSessionBoundaryKind::kGuestInstructionCount) {
+      config.assembler.boundary.value = boundary_value;
     }
     dependencies.clock = &clock;
     dependencies.provider = &provider;
@@ -983,7 +1016,101 @@ TEST_CASE("session capture runtime rejects invocation-segment mode",
   thread.reset();
 }
 
-TEST_CASE("session capture runtime drains provider instruction coverage",
+TEST_CASE("session capture runtime rejects exact instruction boundaries",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 16,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kGuestInstructionCount, 10);
+  REQUIRE_FALSE(harness.runtime);
+  REQUIRE(harness.error ==
+          "capture runtime does not support exact instruction-count "
+          "boundaries");
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime admits coverage before duration stop",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  constexpr uint64_t kDuration = 100000;
+  RuntimeHarness harness(
+      environment, *thread, 16,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kCaptureDurationNanoseconds,
+      kDuration);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  harness.checkpoint.block_pause_number = 2;
+  harness.clock.Advance(kDuration);
+  const bool pause_entered = harness.checkpoint.WaitForPause();
+  bool event_accepted = false;
+  if (pause_entered) {
+    auto event = SchedulerEvent(
+        harness.runtime->status().last_scheduler_sequence + 1, *thread);
+    event.guest_instruction_delta = 23;
+    event_accepted = harness.runtime->OnSchedulerEvent(event);
+  }
+  harness.checkpoint.ReleasePause();
+  CHECK(pause_entered);
+  REQUIRE(event_accepted);
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kComplete);
+  REQUIRE(status.canonical_output_published);
+  REQUIRE(harness.publisher.stop_request_guest_instruction_count.load(
+              std::memory_order_acquire) == 23);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE(
+    "session capture runtime preserves an event boundary found while "
+    "quiescing for duration",
+    "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 16,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kGuestMarkerCount, 1);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  harness.checkpoint.block_pause_number = 2;
+  harness.clock.Advance(harness.config.assembler.limits.maximum_duration_ticks);
+  const bool pause_entered = harness.checkpoint.WaitForPause();
+  bool marker_accepted = false;
+  if (pause_entered) {
+    marker_accepted = harness.runtime->OnGuestMarker(
+        GuestExecutionSessionMarkerSource::kPm4Swap, gpu::kPm4SwapMarkerOpcode);
+  }
+  harness.checkpoint.ReleasePause();
+  CHECK(pause_entered);
+  REQUIRE(marker_accepted);
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kComplete);
+  REQUIRE(status.canonical_output_published);
+  REQUIRE(harness.publisher.stop_reason.load(std::memory_order_acquire) ==
+          GuestExecutionSessionStopReason::kRequestedBoundary);
+  REQUIRE(harness.publisher.stop_request_matching_guest_marker_count.load(
+              std::memory_order_acquire) == 1);
+  REQUIRE(harness.publisher.stop_request_guest_instruction_count.load(
+              std::memory_order_acquire) == 10);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime preserves scheduler-ordered coverage",
           "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;
   auto thread = environment.MakeThread(1);
@@ -992,16 +1119,131 @@ TEST_CASE("session capture runtime drains provider instruction coverage",
 
   REQUIRE(harness.runtime->RequestStart());
   REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  auto event = SchedulerEvent(
+      harness.runtime->status().last_scheduler_sequence + 1, *thread);
+  event.guest_instruction_delta = 7;
+  REQUIRE(harness.runtime->OnSchedulerEvent(event));
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  REQUIRE(harness.runtime->status().state == RuntimeState::kComplete);
+  REQUIRE(harness.publisher.stop_request_guest_instruction_count.load(
+              std::memory_order_acquire) == 7);
+  REQUIRE(harness.provider.coverage_collection_count.load(
+              std::memory_order_acquire) != 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rejects unordered checkpoint residuals",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 16);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
   harness.provider.QueueInstructionCoverage(
       {thread->guest_execution_capture_instance_id(), thread->thread_id()}, 7);
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kSourceRejected);
+  REQUIRE_FALSE(status.canonical_output_published);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rejects a stopped scheduler source",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 16);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  kernel::GuestExecutionSessionCaptureRuntimeTestAccess::SetCaptureRejected(
+      *environment.scheduler);
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kEventBridgeFailure);
+  REQUIRE_FALSE(status.canonical_output_published);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime orders coverage before host return",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 16);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  ImmediateGuestFunction function(0x82002000, 0x82002100);
+  const GuestExecutionCaptureHostCallToken token =
+      harness.runtime->OnHostGuestCallBegin(*thread, function, 0x82003000);
+  REQUIRE(token);
+  auto* context = thread->context();
+  std::atomic_ref<uint64_t>(context->guest_execution_session_instruction_count)
+      .store(9, std::memory_order_relaxed);
+  std::atomic_ref<uint64_t*>(
+      context->guest_execution_session_instruction_counter)
+      .store(&context->guest_execution_session_instruction_count,
+             std::memory_order_release);
+  REQUIRE(harness.runtime->OnHostGuestCallEnd(
+      token, *thread, function,
+      GuestExecutionCaptureHostCallOutcome::kReturnedToHost));
+  std::atomic_ref<uint64_t*>(
+      context->guest_execution_session_instruction_counter)
+      .store(nullptr, std::memory_order_release);
   REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
   REQUIRE(harness.runtime->RequestStop());
   REQUIRE(harness.runtime->WaitForTerminal(2s));
   REQUIRE(harness.runtime->status().state == RuntimeState::kComplete);
   REQUIRE(harness.publisher.stop_request_guest_instruction_count.load(
-              std::memory_order_acquire) == 17);
-  REQUIRE(harness.provider.coverage_collection_count.load(
-              std::memory_order_acquire) != 0);
+              std::memory_order_acquire) == 19);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rejects foreign instruction counters",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 16);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  ImmediateGuestFunction function(0x82002000, 0x82002100);
+  const GuestExecutionCaptureHostCallToken token =
+      harness.runtime->OnHostGuestCallBegin(*thread, function, 0x82003000);
+  REQUIRE(token);
+  uint64_t foreign_counter = 83;
+  auto* context = thread->context();
+  std::atomic_ref<uint64_t*>(
+      context->guest_execution_session_instruction_counter)
+      .store(&foreign_counter, std::memory_order_release);
+  REQUIRE_FALSE(harness.runtime->OnHostGuestCallEnd(
+      token, *thread, function,
+      GuestExecutionCaptureHostCallOutcome::kReturnedToHost));
+  std::atomic_ref<uint64_t*>(
+      context->guest_execution_session_instruction_counter)
+      .store(nullptr, std::memory_order_release);
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  REQUIRE(harness.runtime->status().state == RuntimeState::kRejected);
+  REQUIRE(foreign_counter == 83);
 
   harness.runtime->Shutdown();
   thread.reset();

@@ -241,6 +241,7 @@ bool BuildReelConfig(const GuestExecutionSessionAssemblerConfig& config,
   reel_config.boundary.marker_identity = config.boundary.marker_identity;
   reel_config.boundary.value = config.boundary.value;
   reel_config.coverage_mode = config.coverage_mode;
+  reel_config.defer_duration_boundaries = config.defer_duration_boundaries;
   if (config.boundary.kind ==
       GuestExecutionSessionBoundaryKind::kCaptureDurationNanoseconds) {
     if (!config.boundary.value ||
@@ -1219,7 +1220,8 @@ bool GuestExecutionSessionAssembler::SeedParticipants(
         seeds[i].participant;
     if (seeds[i].state !=
             GuestExecutionCaptureThreadStateLifecycleState::kReady ||
-        !identity.capture_instance_id || !identity.guest_thread_id) {
+        seeds[i].guest_instruction_delta || !identity.capture_instance_id ||
+        !identity.guest_thread_id) {
       return false;
     }
     for (size_t j = 0; j < i; ++j) {
@@ -1263,6 +1265,11 @@ Action GuestExecutionSessionAssembler::OnParticipantLifecycle(
   uint64_t now = 0;
   if (!impl_->BeginCallLocked(scope, &now)) {
     return impl_->TerminalAction();
+  }
+  if (event.guest_instruction_delta) {
+    return impl_->RejectLocked(
+        Rejection::kInvalidCall,
+        "capture session lifecycle event contains transport coverage");
   }
   if (impl_->state != State::kIdle) {
     return impl_->RejectLocked(
@@ -1461,6 +1468,31 @@ Action GuestExecutionSessionAssembler::RequestStop() {
   }
 }
 
+Action GuestExecutionSessionAssembler::RequestDeferredDurationStop() {
+  Impl::Scope scope(*impl_);
+  uint64_t now = 0;
+  if (!impl_->BeginCallLocked(scope, &now)) {
+    return impl_->TerminalAction();
+  }
+  if (impl_->state != State::kRecording ||
+      !impl_->reel_config.defer_duration_boundaries) {
+    return impl_->RejectLocked(
+        Rejection::kInvalidCall,
+        "capture session deferred duration stop is invalid");
+  }
+  const GuestExecutionReelAction action =
+      impl_->reel->RequestDeferredDurationStop(now);
+  if (action == GuestExecutionReelAction::kReject) {
+    return impl_->RejectFromReelLocked();
+  }
+  if (action != GuestExecutionReelAction::kStop ||
+      !impl_->HandleReelStopLocked()) {
+    return Action::kReject;
+  }
+  impl_->TryCompleteStopLocked(now);
+  return impl_->RendezvousActionLocked();
+}
+
 Action GuestExecutionSessionAssembler::Poll() {
   Impl::Scope scope(*impl_);
   uint64_t now = 0;
@@ -1477,11 +1509,17 @@ Action GuestExecutionSessionAssembler::Poll() {
       }
       return Action::kHold;
     case State::kRecording: {
-      const GuestExecutionReelAction action = impl_->reel->Poll(now);
+      const GuestExecutionReelAction action =
+          impl_->reel_config.defer_duration_boundaries
+              ? impl_->reel->PollDeferredDurationStop(now)
+              : impl_->reel->Poll(now);
       if (action == GuestExecutionReelAction::kReject) {
         return impl_->RejectFromReelLocked();
       }
       if (action == GuestExecutionReelAction::kStop) {
+        if (impl_->reel_config.defer_duration_boundaries) {
+          return Action::kHold;
+        }
         if (!impl_->HandleReelStopLocked()) {
           return Action::kReject;
         }
