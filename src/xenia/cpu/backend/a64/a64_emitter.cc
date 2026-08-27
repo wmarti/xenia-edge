@@ -1112,6 +1112,11 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
     mov(x1, static_cast<uint64_t>(current_guest_function_));
     CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationTailCall));
     mov(target_w, w0);
+    if (hoist_ret_slots) {
+      // The native call consumes both ABI return registers. Restore the guest
+      // and host return boundaries that the tail transition passes onward.
+      ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
+    }
   }
 #endif
 
