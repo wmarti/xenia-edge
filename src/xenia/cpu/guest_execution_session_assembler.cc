@@ -2131,6 +2131,9 @@ Action GuestExecutionSessionAssembler::OnExternalEvent(
   }
   const bool interrupt =
       input.kind == GuestExecutionSessionEventKind::kInterrupt;
+  const bool scheduler_control =
+      input.kind == GuestExecutionSessionEventKind::kThreadDispatch ||
+      input.kind == GuestExecutionSessionEventKind::kSynchronization;
   const bool addressed =
       input.kind == GuestExecutionSessionEventKind::kMmio ||
       input.kind == GuestExecutionSessionEventKind::kAtomicOrReservation;
@@ -2149,7 +2152,7 @@ Action GuestExecutionSessionAssembler::OnExternalEvent(
       GuestExecutionSessionEventDisposition::kValidateDeterministic;
   if (!IsExternalEventKind(input.kind) ||
       !IsKnownDisposition(input.disposition) ||
-      (!interrupt && !identity.has_value()) ||
+      (!interrupt && !scheduler_control && !identity.has_value()) ||
       (!identity.has_value() && deterministic) ||
       (payload_none != input.payload.empty()) ||
       (!payload_none && !scalar_payload &&

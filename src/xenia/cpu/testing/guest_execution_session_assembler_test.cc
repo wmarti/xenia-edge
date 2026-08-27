@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -24,6 +25,8 @@
 
 #include "third_party/catch/include/catch.hpp"
 #include "xenia/cpu/execution_jit_corpus.h"
+#include "xenia/cpu/guest_execution_continuous_event.h"
+#include "xenia/cpu/guest_execution_session_capture_event_bridge.h"
 
 namespace xe {
 namespace cpu {
@@ -115,6 +118,25 @@ class FakeStateProvider final
     if (reenter_target) {
       reenter_target->Poll();
     }
+    if (encode_thread_checkpoint) {
+      const auto participant_it =
+          std::find(checkpoint_participants.cbegin(),
+                    checkpoint_participants.cend(), participant);
+      if (participant_it == checkpoint_participants.cend()) {
+        *error = "thread checkpoint participant differs";
+        return false;
+      }
+      ppc::GuestPPCThreadCheckpoint checkpoint;
+      checkpoint.participant_ordinal = static_cast<uint32_t>(
+          participant_it - checkpoint_participants.cbegin());
+      checkpoint.guest_thread_id = participant.guest_thread_id;
+      checkpoint.resume_pc = 0x82000040;
+      checkpoint.owning_function_address = 0x82000000;
+      checkpoint.owning_function_end_address = 0x820000FC;
+      checkpoint.outer_guest_return_address = 0x82001000;
+      return ppc::GuestPPCThreadCheckpointCodec::Encode(checkpoint, output,
+                                                        error);
+    }
     output->assign(
         state_size,
         static_cast<uint8_t>(participant.capture_instance_id + generation));
@@ -124,6 +146,8 @@ class FakeStateProvider final
   size_t state_size = 64;
   uint8_t generation = 0;
   bool fail = false;
+  bool encode_thread_checkpoint = false;
+  std::vector<GuestExecutionCaptureParticipantIdentity> checkpoint_participants;
   uint32_t calls = 0;
   GuestExecutionSessionAssembler* reenter_target = nullptr;
 };
@@ -444,6 +468,68 @@ void RequireCreateFails(GuestExecutionSessionAssemblerConfig config,
   Harness harness(config);
   REQUIRE_FALSE(harness.Create());
   REQUIRE(harness.error.find(diagnostic) != std::string::npos);
+}
+
+kernel::GuestSchedulerCheckpointBarrierSnapshot BridgeCheckpoint(
+    uint64_t generation,
+    std::initializer_list<GuestExecutionCaptureParticipantIdentity> identities =
+        {kA}) {
+  kernel::GuestSchedulerCheckpointBarrierSnapshot checkpoint;
+  checkpoint.generation = generation;
+  checkpoint.active = true;
+  checkpoint.quiesced = true;
+  checkpoint.dispatch_cpu_mask = 1;
+  checkpoint.quiesced_cpu_mask = 1;
+  checkpoint.roster_scope =
+      kernel::GuestSchedulerCheckpointRosterScope::kSchedulerOwned;
+  checkpoint.release_policy = kernel::GuestSchedulerCheckpointReleasePolicy::
+      kRunningSafepointsRequeueAtHead;
+  for (const GuestExecutionCaptureParticipantIdentity& identity : identities) {
+    kernel::GuestSchedulerCheckpointParticipant participant;
+    participant.thread_id = identity.guest_thread_id;
+    participant.guest_pc = 0x82000040;
+    participant.cpu = 0;
+    participant.state =
+        kernel::GuestSchedulerCheckpointParticipantState::kReady;
+    participant.resume_kind =
+        kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint;
+    participant.restorable = true;
+    checkpoint.participants.push_back(participant);
+  }
+  return checkpoint;
+}
+
+kernel::GuestSchedulerCaptureEvent BridgeSchedulerEvent(
+    uint64_t sequence, kernel::GuestSchedulerCaptureEventKind kind,
+    GuestExecutionCaptureParticipantIdentity identity = kA) {
+  kernel::GuestSchedulerCaptureEvent event;
+  event.sequence = sequence;
+  event.capture_instance_id = identity.capture_instance_id;
+  event.guest_thread_id = identity.guest_thread_id;
+  event.kind = kind;
+  event.cpu = 0;
+  event.priority = 8;
+  if (kind == kernel::GuestSchedulerCaptureEventKind::kYield) {
+    event.flags = kernel::kGuestSchedulerCaptureFlagQuantumEnd;
+  }
+  return event;
+}
+
+std::vector<GuestExecutionContinuousEvent> DecodeBridgeOverlay(
+    const GuestExecutionSessionBundle& bundle) {
+  std::vector<GuestExecutionContinuousEvent> result;
+  for (size_t index = 0; index < bundle.manifest.chunks.size(); ++index) {
+    if (bundle.manifest.chunks[index].kind !=
+        GuestExecutionSessionChunkKind::kContinuousEvents) {
+      continue;
+    }
+    std::vector<GuestExecutionContinuousEvent> chunk;
+    std::string error;
+    REQUIRE(GuestExecutionContinuousEventCodec::Decode(bundle.chunks[index],
+                                                       &chunk, &error));
+    result.insert(result.end(), chunk.begin(), chunk.end());
+  }
+  return result;
 }
 
 }  // namespace
@@ -2381,6 +2467,242 @@ TEST_CASE("session assembler publishes through the directory publisher",
     REQUIRE_FALSE(std::filesystem::exists(output, filesystem_error));
     REQUIRE_FALSE(std::filesystem::exists(directory.path() / "session.part",
                                           filesystem_error));
+  }
+}
+
+TEST_CASE("scheduler event bridge closes the canonical continuous tape",
+          "[guest-execution-session-capture-event-bridge]") {
+  Harness harness(MakeContinuousConfig());
+  REQUIRE(harness.Create());
+  harness.states.encode_thread_checkpoint = true;
+  harness.states.checkpoint_participants = {kA, kB};
+  std::vector<GuestExecutionCaptureThreadStateLifecycleEvent> seeds;
+  GuestExecutionCaptureHostCallRosterSnapshot roster;
+  MakeSeeds({{kB, 1}, {kA, 1}}, &seeds, &roster);
+  REQUIRE(harness.assembler->SeedParticipants(seeds, roster));
+
+  GuestExecutionSessionCaptureSchedulerEventBridge bridge;
+  REQUIRE(bridge.BeginSession(*harness.assembler, BridgeCheckpoint(1, {kA, kB}),
+                              seeds, &harness.error));
+  REQUIRE(harness.assembler->Arm(&harness.error));
+  REQUIRE(harness.assembler->RequestStart(&harness.error));
+  REQUIRE(harness.state() == State::kStartRendezvous);
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kHold);
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kB) == Action::kContinue);
+  REQUIRE(harness.state() == State::kRecording);
+  REQUIRE(harness.assembler->OnInstructionCoverage(kA, 10) ==
+          Action::kContinue);
+  REQUIRE(harness.assembler->OnInstructionCoverage(kB, 11) ==
+          Action::kContinue);
+
+  kernel::GuestSchedulerCaptureEvent dispatch = BridgeSchedulerEvent(
+      40, kernel::GuestSchedulerCaptureEventKind::kDispatch);
+  dispatch.flags = kernel::kGuestSchedulerCaptureFlagFreshQuantum;
+  REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, dispatch,
+                                  &harness.error) == Action::kContinue);
+  kernel::GuestSchedulerCaptureEvent yield = BridgeSchedulerEvent(
+      41, kernel::GuestSchedulerCaptureEventKind::kYield, kB);
+  REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, yield, &harness.error) ==
+          Action::kContinue);
+  REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+  REQUIRE(harness.state() == State::kStopRequested);
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kHold);
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kB) == Action::kHold);
+  REQUIRE(harness.state() == State::kPublishing);
+  REQUIRE(bridge.SealSession(*harness.assembler, BridgeCheckpoint(2, {kA, kB}),
+                             &harness.error));
+  const bool published = harness.assembler->Publish(&harness.error);
+  INFO(harness.error);
+  REQUIRE(published);
+  REQUIRE(harness.publisher.bundles.size() == 1);
+
+  GuestExecutionSessionBundle bundle = harness.publisher.bundles.front();
+  const bool finalized = bridge.FinalizeBundle(&bundle, 2, &harness.error);
+  INFO(harness.error);
+  REQUIRE(finalized);
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &harness.error));
+  const std::vector<GuestExecutionContinuousEvent> overlay =
+      DecodeBridgeOverlay(bundle);
+  REQUIRE(overlay.size() == bundle.manifest.accepted_event_count);
+  std::vector<GuestExecutionContinuousEvent> scheduler_overlay;
+  for (const GuestExecutionContinuousEvent& event : overlay) {
+    if (event.kind == GuestExecutionSessionEventKind::kThreadDispatch ||
+        event.kind == GuestExecutionSessionEventKind::kSynchronization) {
+      scheduler_overlay.push_back(event);
+    }
+  }
+  REQUIRE(scheduler_overlay.size() == 2);
+  REQUIRE(scheduler_overlay[0].actor ==
+          GuestExecutionContinuousEventIdentity{});
+  REQUIRE(scheduler_overlay[0].subject ==
+          GuestExecutionContinuousEventIdentity{0, kA.guest_thread_id});
+  REQUIRE(scheduler_overlay[1].actor ==
+          GuestExecutionContinuousEventIdentity{1, kB.guest_thread_id});
+  REQUIRE(scheduler_overlay[1].subject ==
+          GuestExecutionContinuousEventIdentity{1, kB.guest_thread_id});
+
+  std::vector<GuestExecutionContinuousEvent> checkpoint_overlay;
+  for (const GuestExecutionContinuousEvent& event : overlay) {
+    if (event.checkpoint.kind ==
+        GuestExecutionContinuousCheckpointReferenceKind::kThreadState) {
+      checkpoint_overlay.push_back(event);
+    }
+  }
+  REQUIRE(checkpoint_overlay.size() == 2);
+  for (uint32_t ordinal = 0; ordinal < checkpoint_overlay.size(); ++ordinal) {
+    const GuestExecutionContinuousEvent& checkpoint =
+        checkpoint_overlay[ordinal];
+    const GuestExecutionSessionParticipant& participant =
+        bundle.manifest.participants[ordinal];
+    REQUIRE(checkpoint.kind ==
+            GuestExecutionSessionEventKind::kJitSafepointArrival);
+    REQUIRE(checkpoint.subject == GuestExecutionContinuousEventIdentity{
+                                      ordinal, participant.guest_thread_id});
+    REQUIRE(checkpoint.checkpoint.checkpoint_global_sequence ==
+            bundle.manifest.last_event_sequence);
+    REQUIRE(checkpoint.checkpoint.checkpoint_global_sequence >
+            checkpoint.global_sequence);
+    REQUIRE(checkpoint.checkpoint.binding.participant_ordinal == ordinal);
+    REQUIRE(checkpoint.checkpoint.binding.guest_thread_id ==
+            participant.guest_thread_id);
+  }
+  REQUIRE(overlay.back().kind == GuestExecutionSessionEventKind::kBoundaryHeld);
+  REQUIRE(overlay.back().checkpoint.kind ==
+          GuestExecutionContinuousCheckpointReferenceKind::kNone);
+
+  std::vector<uint64_t> decoded_scheduler_sequences;
+  for (size_t chunk_index = 0; chunk_index < bundle.manifest.chunks.size();
+       ++chunk_index) {
+    if (bundle.manifest.chunks[chunk_index].kind !=
+        GuestExecutionSessionChunkKind::kEvents) {
+      continue;
+    }
+    GuestExecutionSessionEventChunk chunk;
+    REQUIRE(GuestExecutionSessionCodec::DecodeEventChunk(
+        bundle.chunks[chunk_index], &chunk, &harness.error));
+    for (const GuestExecutionSessionEvent& event : chunk.events) {
+      if (event.kind != GuestExecutionSessionEventKind::kThreadDispatch &&
+          event.kind != GuestExecutionSessionEventKind::kSynchronization) {
+        continue;
+      }
+      const auto blob = std::find_if(
+          bundle.content_blobs.cbegin(), bundle.content_blobs.cend(),
+          [&event](const GuestExecutionSessionContentBlob& candidate) {
+            return candidate.sha256 == event.payload_sha256;
+          });
+      REQUIRE(blob != bundle.content_blobs.cend());
+      kernel::GuestSchedulerCaptureEvent decoded;
+      REQUIRE(GuestExecutionSessionCaptureSchedulerEventBridge::
+                  DecodeSchedulerEventPayload(blob->bytes, &decoded,
+                                              &harness.error));
+      decoded_scheduler_sequences.push_back(decoded.sequence);
+    }
+  }
+  REQUIRE(decoded_scheduler_sequences == std::vector<uint64_t>{40, 41});
+}
+
+TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
+          "[guest-execution-session-capture-event-bridge]") {
+  Harness harness(MakeContinuousConfig());
+  REQUIRE(harness.Create());
+  std::vector<GuestExecutionCaptureThreadStateLifecycleEvent> seeds;
+  GuestExecutionCaptureHostCallRosterSnapshot roster;
+  MakeSeeds({{kA, 1}}, &seeds, &roster);
+  REQUIRE(harness.assembler->SeedParticipants(seeds, roster));
+  GuestExecutionSessionCaptureSchedulerEventBridge bridge;
+  REQUIRE(bridge.BeginSession(*harness.assembler, BridgeCheckpoint(1), seeds,
+                              &harness.error));
+  REQUIRE(harness.assembler->Arm(&harness.error));
+  REQUIRE(harness.assembler->RequestStart(&harness.error));
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kContinue);
+
+  SECTION("every modeled scheduler transition is accepted") {
+    const std::vector<kernel::GuestSchedulerCaptureEventKind> kinds = {
+        kernel::GuestSchedulerCaptureEventKind::kEnqueueReady,
+        kernel::GuestSchedulerCaptureEventKind::kDequeueReady,
+        kernel::GuestSchedulerCaptureEventKind::kDispatch,
+        kernel::GuestSchedulerCaptureEventKind::kSwitchOut,
+        kernel::GuestSchedulerCaptureEventKind::kYield,
+        kernel::GuestSchedulerCaptureEventKind::kPreemptRequest,
+        kernel::GuestSchedulerCaptureEventKind::kSafepoint,
+        kernel::GuestSchedulerCaptureEventKind::kBlock,
+        kernel::GuestSchedulerCaptureEventKind::kReready,
+        kernel::GuestSchedulerCaptureEventKind::kParkSuspended,
+        kernel::GuestSchedulerCaptureEventKind::kResume,
+        kernel::GuestSchedulerCaptureEventKind::kRequeuePriority,
+        kernel::GuestSchedulerCaptureEventKind::kMigrate,
+    };
+    uint64_t sequence = 100;
+    for (kernel::GuestSchedulerCaptureEventKind kind : kinds) {
+      kernel::GuestSchedulerCaptureEvent event =
+          BridgeSchedulerEvent(sequence++, kind);
+      switch (kind) {
+        case kernel::GuestSchedulerCaptureEventKind::kPreemptRequest:
+          event.reason = kernel::GuestSchedulerCaptureReason::kPriority;
+          break;
+        case kernel::GuestSchedulerCaptureEventKind::kSafepoint:
+          event.reason = kernel::GuestSchedulerCaptureReason::kForcedIrql;
+          event.flags = kernel::kGuestSchedulerCaptureFlagSchedulerRequested;
+          break;
+        case kernel::GuestSchedulerCaptureEventKind::kBlock:
+          event.flags = kernel::kGuestSchedulerCaptureFlagGated;
+          break;
+        case kernel::GuestSchedulerCaptureEventKind::kReready:
+          event.reason = kernel::GuestSchedulerCaptureReason::kPolled;
+          break;
+        default:
+          break;
+      }
+      REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, event,
+                                      &harness.error) == Action::kContinue);
+    }
+  }
+
+  SECTION("an unsupported participant transition rejects permanently") {
+    REQUIRE(bridge.OnSchedulerEvent(
+                *harness.assembler,
+                BridgeSchedulerEvent(
+                    9, kernel::GuestSchedulerCaptureEventKind::kExit),
+                &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("unsupported or malformed") !=
+            std::string::npos);
+    REQUIRE(bridge.OnSchedulerEvent(
+                *harness.assembler,
+                BridgeSchedulerEvent(
+                    10, kernel::GuestSchedulerCaptureEventKind::kDispatch),
+                &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("not recording") != std::string::npos);
+  }
+
+  SECTION("the global shutdown transition rejects without a participant") {
+    kernel::GuestSchedulerCaptureEvent shutdown;
+    shutdown.sequence = 9;
+    shutdown.kind = kernel::GuestSchedulerCaptureEventKind::kShutdown;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, shutdown,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("unsupported or malformed") !=
+            std::string::npos);
+  }
+
+  SECTION("a source sequence gap rejects permanently") {
+    REQUIRE(bridge.OnSchedulerEvent(
+                *harness.assembler,
+                BridgeSchedulerEvent(
+                    10, kernel::GuestSchedulerCaptureEventKind::kDispatch),
+                &harness.error) == Action::kContinue);
+    REQUIRE(bridge.OnSchedulerEvent(
+                *harness.assembler,
+                BridgeSchedulerEvent(
+                    12, kernel::GuestSchedulerCaptureEventKind::kDispatch),
+                &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("source sequence has a gap") !=
+            std::string::npos);
+    REQUIRE(bridge.OnSchedulerEvent(
+                *harness.assembler,
+                BridgeSchedulerEvent(
+                    11, kernel::GuestSchedulerCaptureEventKind::kDispatch),
+                &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("not recording") != std::string::npos);
   }
 }
 

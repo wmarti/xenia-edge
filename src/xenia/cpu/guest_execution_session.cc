@@ -1030,8 +1030,12 @@ bool ValidateEvent(const GuestExecutionSessionEvent& event,
     } else if (event.guest_address || event.byte_count) {
       return Fail(error, "non-addressed event contains a guest range");
     }
+    const bool scheduler_control =
+        event.kind == GuestExecutionSessionEventKind::kThreadDispatch ||
+        event.kind == GuestExecutionSessionEventKind::kSynchronization;
     if (event.kind != GuestExecutionSessionEventKind::kInterrupt &&
         event.kind != GuestExecutionSessionEventKind::kUnsupported &&
+        !scheduler_control &&
         event.thread_ordinal == kGuestExecutionSessionNoThread) {
       return Fail(error, "synchronous event has no participant");
     }
