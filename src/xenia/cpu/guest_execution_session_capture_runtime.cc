@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "xenia/cpu/function.h"
+#include "xenia/cpu/guest_execution_continuous_event.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/guest_scheduler.h"
@@ -48,11 +49,119 @@ bool Fail(std::string* error, std::string message) {
   return false;
 }
 
-bool IsPowerOfTwo(size_t value) { return value >= 2 && !(value & (value - 1)); }
+bool IsPowerOfTwo(size_t value) { return value && !(value & (value - 1)); }
 
 bool IsTerminal(RuntimeState state) {
   return state == RuntimeState::kComplete || state == RuntimeState::kRejected ||
          state == RuntimeState::kShutdown;
+}
+
+bool ValidateRuntimePublicationBundle(
+    const GuestExecutionSessionBundle& bundle,
+    const GuestExecutionSessionBundleLimits& limits, std::string* error) {
+  if (!bundle.manifest.segments.empty()) {
+    return Fail(error,
+                "capture runtime publication is not a continuous session");
+  }
+  if (bundle.manifest.chunks.size() < 5 ||
+      bundle.manifest.chunks.size() != bundle.chunks.size() ||
+      bundle.manifest.chunks.front().kind !=
+          GuestExecutionSessionChunkKind::kCheckpoint ||
+      bundle.manifest.chunks[1].kind !=
+          GuestExecutionSessionChunkKind::kCodeCorpus ||
+      bundle.manifest.chunks.back().kind !=
+          GuestExecutionSessionChunkKind::kCheckpoint) {
+    return Fail(error,
+                "capture runtime publication lacks the continuous checkpoint "
+                "and code-corpus envelope");
+  }
+  bool saw_canonical_events = false;
+  bool saw_continuous_events = false;
+  for (size_t index = 2; index + 1 < bundle.manifest.chunks.size(); ++index) {
+    const GuestExecutionSessionChunkKind kind =
+        bundle.manifest.chunks[index].kind;
+    if (kind == GuestExecutionSessionChunkKind::kEvents &&
+        !saw_continuous_events) {
+      saw_canonical_events = true;
+    } else if (kind == GuestExecutionSessionChunkKind::kContinuousEvents &&
+               saw_canonical_events) {
+      saw_continuous_events = true;
+    } else {
+      return Fail(error,
+                  "capture runtime publication chunk order is not initial "
+                  "checkpoint, corpus, canonical events, overlay, final "
+                  "checkpoint");
+    }
+  }
+  if (!saw_canonical_events || !saw_continuous_events ||
+      !ValidateGuestExecutionSessionBundle(bundle, error, limits)) {
+    if (error && error->empty()) {
+      *error =
+          "capture runtime publication lacks an authenticated event "
+          "overlay";
+    }
+    return false;
+  }
+
+  GuestExecutionSessionCheckpointChunk final_checkpoint;
+  if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
+          bundle.chunks.back(), &final_checkpoint, error, limits.session) ||
+      final_checkpoint.checkpoint.global_sequence !=
+          bundle.manifest.last_event_sequence ||
+      final_checkpoint.checkpoint.thread_states.size() !=
+          bundle.manifest.participants.size()) {
+    return Fail(error,
+                "capture runtime final checkpoint does not cover its roster");
+  }
+  std::vector<bool> participant_binding_seen(
+      bundle.manifest.participants.size(), false);
+  GuestExecutionContinuousEventLimits continuous_limits;
+  continuous_limits.maximum_encoded_bytes = limits.session.maximum_chunk_bytes;
+  continuous_limits.maximum_records = limits.session.maximum_events_per_chunk;
+  for (size_t index = 2; index + 1 < bundle.manifest.chunks.size(); ++index) {
+    if (bundle.manifest.chunks[index].kind !=
+        GuestExecutionSessionChunkKind::kContinuousEvents) {
+      continue;
+    }
+    std::vector<GuestExecutionContinuousEvent> events;
+    if (!GuestExecutionContinuousEventCodec::Decode(
+            bundle.chunks[index], &events, error, continuous_limits)) {
+      return false;
+    }
+    for (const GuestExecutionContinuousEvent& event : events) {
+      if (event.checkpoint.kind !=
+              GuestExecutionContinuousCheckpointReferenceKind::kThreadState ||
+          event.checkpoint.checkpoint_global_sequence !=
+              bundle.manifest.last_event_sequence) {
+        continue;
+      }
+      const uint32_t ordinal = event.subject.participant_ordinal;
+      if (ordinal >= bundle.manifest.participants.size()) {
+        return Fail(error,
+                    "capture runtime overlay checkpoint subject is invalid");
+      }
+      const GuestExecutionSessionParticipant& participant =
+          bundle.manifest.participants[ordinal];
+      const GuestExecutionSessionThreadStateReference& state =
+          final_checkpoint.checkpoint.thread_states[ordinal];
+      if (event.subject.guest_thread_id != participant.guest_thread_id ||
+          event.checkpoint.state_size != state.byte_size ||
+          event.checkpoint.state_sha256 != state.sha256) {
+        return Fail(error,
+                    "capture runtime overlay checkpoint differs from the "
+                    "final participant state");
+      }
+      participant_binding_seen[ordinal] = true;
+    }
+  }
+  if (std::find(participant_binding_seen.begin(),
+                participant_binding_seen.end(),
+                false) != participant_binding_seen.end()) {
+    return Fail(error,
+                "capture runtime publication lacks an exact-PC final state "
+                "binding for every participant");
+  }
+  return true;
 }
 
 const CheckpointParticipant* FindCheckpointParticipant(
@@ -287,14 +396,24 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
 
   void StartWorker() {
     worker = std::thread([this]() { WorkerMain(); });
+    worker_id = worker.get_id();
   }
 
   void RequestShutdownFence() noexcept {
-    // Publication and shutdown are totally ordered. A publisher that acquired
-    // this gate first is allowed to finish before Shutdown establishes its
-    // fence; once the fence is established, no publisher can enter.
-    std::lock_guard<std::mutex> lock(publication_mutex);
+    std::lock_guard<std::mutex> lock(control_mutex);
     shutdown_requested.store(true, std::memory_order_release);
+  }
+
+  bool AdmitPublication() noexcept {
+    // Admission and shutdown are totally ordered, but the external publisher
+    // is never called while this internal gate is held. A publication admitted
+    // first completes on the worker before an external Shutdown join returns.
+    std::lock_guard<std::mutex> lock(control_mutex);
+    return !shutdown_requested.load(std::memory_order_acquire);
+  }
+
+  bool IsWorkerThread() const noexcept {
+    return std::this_thread::get_id() == worker_id;
   }
 
   void StopWorker() noexcept {
@@ -898,31 +1017,28 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     if (shutdown_requested.load(std::memory_order_acquire)) {
       return;
     }
-    if (!ValidateGuestExecutionSessionBundle(*staged, &error,
-                                             config.assembler.bundle_limits)) {
+    if (!ValidateRuntimePublicationBundle(
+            *staged, config.assembler.bundle_limits, &error)) {
       Reject(RuntimeRejection::kBundleValidation,
              error.empty() ? "capture runtime staged bundle is invalid"
                            : std::move(error));
       return;
     }
-    {
-      std::lock_guard<std::mutex> publication_lock(publication_mutex);
-      if (shutdown_requested.load(std::memory_order_acquire)) {
-        return;
-      }
-      if (!dependencies.publisher->Publish(*staged, &error)) {
-        Reject(RuntimeRejection::kPublicationFailure,
-               error.empty() ? "capture runtime canonical publication failed"
-                             : std::move(error));
-        return;
-      }
-      {
-        std::lock_guard<std::mutex> lock(status_mutex);
-        canonical_output_published = true;
-        status_message.clear();
-      }
-      SetState(RuntimeState::kComplete);
+    if (!AdmitPublication()) {
+      return;
     }
+    if (!dependencies.publisher->Publish(*staged, &error)) {
+      Reject(RuntimeRejection::kPublicationFailure,
+             error.empty() ? "capture runtime canonical publication failed"
+                           : std::move(error));
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(status_mutex);
+      canonical_output_published = true;
+      status_message.clear();
+    }
+    SetState(RuntimeState::kComplete);
   }
 
   void ProcessEvent(const RuntimeEvent& event) {
@@ -1060,9 +1176,11 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   std::unique_ptr<GuestExecutionSessionAssembler> assembler;
 
   std::thread worker;
+  std::thread::id worker_id;
   mutable std::mutex wake_mutex;
   std::condition_variable wake_condition;
-  std::mutex publication_mutex;
+  std::mutex control_mutex;
+  std::mutex shutdown_operation_mutex;
   std::atomic<bool> shutdown_requested{false};
   std::atomic<bool> shutdown_pending{false};
   std::atomic<bool> session_active{false};
@@ -1073,8 +1191,8 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   std::atomic<uint64_t> queued_event_count{0};
   std::atomic<uint64_t> processed_event_count{0};
   std::atomic<RuntimeState> state_atomic{RuntimeState::kIdle};
-  std::atomic<bool> start_requested{false};
-  std::atomic<bool> stop_requested{false};
+  bool start_requested = false;
+  bool stop_requested = false;
 
   mutable std::mutex status_mutex;
   mutable std::condition_variable status_condition;
@@ -1086,6 +1204,8 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   bool processor_attached = false;
   bool scheduler_attached = false;
   std::atomic<bool> provider_armed{false};
+  std::atomic<void (*)(void*)> request_start_prequeue_test_hook{nullptr};
+  std::atomic<void*> request_start_prequeue_test_context{nullptr};
   bool canonical_output_published = false;
   bool worker_running = false;
   std::weak_ptr<GuestExecutionSessionCaptureRuntime> owner;
@@ -1105,12 +1225,24 @@ GuestExecutionSessionCaptureRuntime::CreateAndAttach(
     Fail(error, "capture runtime dependencies are missing");
     return nullptr;
   }
-  if (!IsPowerOfTwo(config.event_queue_capacity) ||
-      config.checkpoint_timeout.count() <= 0 ||
+  if (config.assembler.coverage_mode !=
+      GuestExecutionReelCoverageMode::kContinuousInstructions) {
+    Fail(error,
+         "capture runtime requires continuous instruction coverage mode");
+    return nullptr;
+  }
+  if (config.event_queue_capacity < 2 ||
+      !IsPowerOfTwo(config.event_queue_capacity)) {
+    Fail(error,
+         "capture runtime event queue capacity must be a power of two and at "
+         "least two");
+    return nullptr;
+  }
+  if (config.checkpoint_timeout.count() <= 0 ||
       config.control_poll_interval.count() <= 0 ||
       !config.checkpoint_release_attempts ||
       config.checkpoint_release_attempts > 64) {
-    Fail(error, "capture runtime queue or timing configuration is invalid");
+    Fail(error, "capture runtime timing configuration is invalid");
     return nullptr;
   }
 
@@ -1140,7 +1272,7 @@ GuestExecutionSessionCaptureRuntime::GuestExecutionSessionCaptureRuntime(
     : impl_(std::move(impl)) {}
 
 GuestExecutionSessionCaptureRuntime::~GuestExecutionSessionCaptureRuntime() {
-  impl_->StopWorker();
+  Shutdown();
 }
 
 bool GuestExecutionSessionCaptureRuntime::Attach(std::string* error) {
@@ -1164,34 +1296,39 @@ bool GuestExecutionSessionCaptureRuntime::Attach(std::string* error) {
 }
 
 bool GuestExecutionSessionCaptureRuntime::RequestStart() noexcept {
-  if (impl_->shutdown_requested.load(std::memory_order_acquire) ||
+  std::lock_guard<std::mutex> lock(impl_->control_mutex);
+  if (impl_->start_requested ||
+      impl_->shutdown_requested.load(std::memory_order_acquire) ||
       IsTerminal(impl_->state_atomic.load(std::memory_order_acquire))) {
     return false;
   }
-  bool expected = false;
-  if (!impl_->start_requested.compare_exchange_strong(
-          expected, true, std::memory_order_acq_rel,
-          std::memory_order_relaxed)) {
-    return false;
+  if (auto hook = impl_->request_start_prequeue_test_hook.load(
+          std::memory_order_acquire)) {
+    hook(impl_->request_start_prequeue_test_context.load(
+        std::memory_order_acquire));
   }
   RuntimeEvent event;
   event.kind = RuntimeEventKind::kStart;
   if (!impl_->Push(event)) {
     return false;
   }
+  impl_->start_requested = true;
   return true;
 }
 
+void GuestExecutionSessionCaptureRuntime::SetRequestStartPrequeueTestHook(
+    void (*hook)(void*), void* context) noexcept {
+  impl_->request_start_prequeue_test_context.store(context,
+                                                   std::memory_order_release);
+  impl_->request_start_prequeue_test_hook.store(hook,
+                                                std::memory_order_release);
+}
+
 bool GuestExecutionSessionCaptureRuntime::RequestStop() noexcept {
-  if (!impl_->start_requested.load(std::memory_order_acquire) ||
+  std::lock_guard<std::mutex> lock(impl_->control_mutex);
+  if (!impl_->start_requested || impl_->stop_requested ||
       impl_->shutdown_requested.load(std::memory_order_acquire) ||
       IsTerminal(impl_->state_atomic.load(std::memory_order_acquire))) {
-    return false;
-  }
-  bool expected = false;
-  if (!impl_->stop_requested.compare_exchange_strong(
-          expected, true, std::memory_order_acq_rel,
-          std::memory_order_relaxed)) {
     return false;
   }
   RuntimeEvent event;
@@ -1199,10 +1336,21 @@ bool GuestExecutionSessionCaptureRuntime::RequestStop() noexcept {
   if (!impl_->Push(event)) {
     return false;
   }
+  impl_->stop_requested = true;
   return true;
 }
 
 void GuestExecutionSessionCaptureRuntime::Shutdown() noexcept {
+  if (impl_->IsWorkerThread()) {
+    // External callbacks may reenter Shutdown from the control worker. The
+    // worker can establish the no-new-publication fence, but a non-worker call
+    // owns joining and detaching the two permanent observers.
+    impl_->shutdown_pending.store(true, std::memory_order_release);
+    impl_->RequestShutdownFence();
+    impl_->wake_condition.notify_all();
+    return;
+  }
+  std::lock_guard<std::mutex> shutdown_lock(impl_->shutdown_operation_mutex);
   impl_->StopWorker();
   const auto owner = impl_->owner.lock();
   if (!owner) {

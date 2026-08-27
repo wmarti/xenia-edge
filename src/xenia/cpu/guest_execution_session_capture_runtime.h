@@ -206,6 +206,9 @@ class GuestExecutionSessionCaptureRuntime final
   // Establishes a linearizable publication fence and joins the worker. A
   // canonical Publish call that entered first completes before this returns;
   // after this returns, no publication can still start or complete.
+  // A Publisher reentering this method on the worker establishes the fence but
+  // cannot join itself; its already-admitted Publish may finish, and a later
+  // non-worker call performs the join and observer detachment.
   void Shutdown() noexcept;
   bool WaitForTerminal(std::chrono::milliseconds timeout) const;
   GuestExecutionSessionCaptureRuntimeStatus status() const;
@@ -230,10 +233,14 @@ class GuestExecutionSessionCaptureRuntime final
   bool CanDetach() const noexcept override;
 
  private:
+  friend class GuestExecutionSessionCaptureRuntimeTestAccess;
+
   struct Impl;
 
   explicit GuestExecutionSessionCaptureRuntime(std::unique_ptr<Impl> impl);
   bool Attach(std::string* error);
+  void SetRequestStartPrequeueTestHook(void (*hook)(void*),
+                                       void* context) noexcept;
 
   std::unique_ptr<Impl> impl_;
 };

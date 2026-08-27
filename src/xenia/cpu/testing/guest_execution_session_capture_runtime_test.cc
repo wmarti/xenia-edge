@@ -12,6 +12,7 @@
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -25,8 +26,11 @@
 
 #include "third_party/catch/include/catch.hpp"
 #include "xenia/cpu/backend/backend.h"
+#include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/function.h"
+#include "xenia/cpu/guest_execution_continuous_event.h"
 #include "xenia/cpu/guest_execution_session_capture_runtime.h"
+#include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/guest_scheduler.h"
@@ -35,6 +39,16 @@
 
 namespace xe {
 namespace cpu {
+
+class GuestExecutionSessionCaptureRuntimeTestAccess final {
+ public:
+  static void SetRequestStartPrequeueHook(
+      GuestExecutionSessionCaptureRuntime& runtime, void (*hook)(void*),
+      void* context) {
+    runtime.SetRequestStartPrequeueTestHook(hook, context);
+  }
+};
+
 namespace testing {
 namespace {
 
@@ -45,6 +59,17 @@ using RuntimeState = GuestExecutionSessionCaptureRuntimeState;
 using CheckpointParticipant = kernel::GuestSchedulerCheckpointParticipant;
 using CheckpointRejection = kernel::GuestSchedulerCheckpointBarrierRejection;
 using CheckpointSnapshot = kernel::GuestSchedulerCheckpointBarrierSnapshot;
+
+constexpr uint32_t kCodePageAddress = 0x82000000;
+constexpr uint32_t kFunctionEndAddress = 0x820000FC;
+constexpr uint32_t kResumePc = 0x82000040;
+
+bool Fail(std::string* error, std::string message) {
+  if (error) {
+    *error = std::move(message);
+  }
+  return false;
+}
 
 class StubBackend final : public backend::Backend {
  public:
@@ -115,6 +140,37 @@ class BlockingGuestFunction final : public GuestFunction {
   bool released_ = false;
 };
 
+class BlockingHook final {
+ public:
+  static void Hook(void* context) {
+    static_cast<BlockingHook*>(context)->Enter();
+  }
+
+  bool WaitForEntry() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, 2s, [this]() { return entered_; });
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
+    condition_.notify_all();
+  }
+
+ private:
+  void Enter() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    entered_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, [this]() { return released_; });
+  }
+
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
 class RuntimeEnvironment final {
  public:
   RuntimeEnvironment() {
@@ -157,6 +213,8 @@ GuestExecutionSessionCaptureRuntimeConfig MakeConfig(size_t queue_capacity) {
   config.checkpoint_timeout = 100ms;
   config.control_poll_interval = 1ms;
   config.assembler.session_epoch = 1;
+  config.assembler.coverage_mode =
+      GuestExecutionReelCoverageMode::kContinuousInstructions;
   config.assembler.boundary.kind = GuestExecutionSessionBoundaryKind::kManual;
   config.assembler.limits.maximum_segment_count = 8;
   config.assembler.limits.maximum_event_count = 64;
@@ -188,6 +246,20 @@ class FakeClock final : public ppc::GuestInvocationRecorderClock {
 
 class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
  public:
+  FakeProvider() : code_page_(JitCorpus::kPageSize, 0x5A) {
+    ExecutionJitCorpusBuilder builder(JitCorpus::kConfigGuestScheduler);
+    const ExecutionJitCorpus::FunctionRecord function = {
+        kCodePageAddress, kFunctionEndAddress, 64, 0};
+    std::string error;
+    if (!builder.AddCodePage(kCodePageAddress, code_page_.data(),
+                             code_page_.size(), &error) ||
+        !builder.AddFunction(function, &error) ||
+        !builder.Encode(&code_corpus_, &error)) {
+      throw std::runtime_error("runtime test corpus construction failed: " +
+                               error);
+    }
+  }
+
   bool SupportsCheckpointParticipant(const CheckpointParticipant& participant,
                                      std::string*) noexcept override {
     return participant.restorable;
@@ -218,27 +290,46 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
 
   bool EncodeParticipantState(
       const GuestExecutionCaptureParticipantIdentity& participant,
-      std::vector<uint8_t>* output, std::string*) noexcept override {
+      std::vector<uint8_t>* output, std::string* error) noexcept override {
     {
       std::unique_lock<std::mutex> lock(state_mutex);
       state_encode_entered = true;
       state_condition.notify_all();
       state_condition.wait(lock, [this]() { return !block_state_encode; });
     }
-    output->assign(64, static_cast<uint8_t>(participant.capture_instance_id));
-    return true;
+    if (emit_invalid_state) {
+      output->assign(64, static_cast<uint8_t>(participant.capture_instance_id));
+      return true;
+    }
+    ppc::GuestPPCThreadCheckpoint checkpoint;
+    checkpoint.participant_ordinal = 0;
+    checkpoint.guest_thread_id = participant.guest_thread_id;
+    checkpoint.resume_kind = ppc::GuestPPCThreadResumeKind::kGuestBlockHead;
+    checkpoint.resume_pc = kResumePc;
+    checkpoint.owning_function_address = kCodePageAddress;
+    checkpoint.owning_function_end_address = kFunctionEndAddress;
+    checkpoint.outer_guest_return_address = kCodePageAddress + 0x100;
+    checkpoint.registers.gpr.front() =
+        state_generation.fetch_add(1, std::memory_order_relaxed);
+    return ppc::GuestPPCThreadCheckpointCodec::Encode(checkpoint, output,
+                                                      error);
   }
 
   bool CollectCheckpointContent(
-      bool, std::vector<GuestExecutionSessionAssemblerContent>* output,
+      bool initial_checkpoint,
+      std::vector<GuestExecutionSessionAssemblerContent>* output,
       std::string*) noexcept override {
     output->clear();
+    if (initial_checkpoint) {
+      output->push_back({GuestExecutionSessionContentKind::kGuestCode,
+                         kCodePageAddress, code_page_});
+    }
     return true;
   }
 
   bool CollectSessionCodeCorpus(std::vector<uint8_t>* output,
                                 std::string*) noexcept override {
-    output->assign(64, 0x5A);
+    *output = code_corpus_;
     return true;
   }
 
@@ -281,6 +372,7 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
   std::atomic<uint32_t> seal_count{0};
   std::atomic<uint32_t> end_count{0};
   std::atomic<bool> ended_accepted{false};
+  bool emit_invalid_state = false;
 
  private:
   std::mutex state_mutex;
@@ -291,6 +383,9 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
   std::condition_variable seal_condition;
   bool block_seal = false;
   bool seal_entered = false;
+  std::atomic<uint64_t> state_generation{1};
+  std::vector<uint8_t> code_page_;
+  std::vector<uint8_t> code_corpus_;
 };
 
 class CanonicalEventBridge final
@@ -310,38 +405,19 @@ class CanonicalEventBridge final
     using Action = GuestExecutionSessionAssemblerAction;
     const GuestExecutionCaptureParticipantIdentity participant = {
         event.capture_instance_id, event.guest_thread_id};
-    const bool segment_only =
+    const bool coverage_only =
         record_next_event_as_segment_only_.exchange(false);
-    if (!segment_only &&
+    if (!coverage_only &&
         !RequireContinue(assembler.OnOuterHostCallBegin(participant, 0x82000000,
                                                         0x820000FC, 0x82001000),
                          "outer call begin", error)) {
       return Action::kReject;
     }
-    if (!RequireContinue(
-            assembler.OnSegmentBegin(participant, 0x82000000, 0x820000FC),
-            "segment begin", error) ||
-        !RequireContinue(assembler.OnInstructionCoverage(participant, 10),
+    if (!RequireContinue(assembler.OnInstructionCoverage(participant, 10),
                          "instruction coverage", error)) {
       return Action::kReject;
     }
-    const uint64_t capture_start_tick = assembler.status().capture_start_tick;
-    GuestExecutionSessionAssemblerSegmentEnd segment_end;
-    segment_end.status.state = GuestInvocationCaptureState::kPublished;
-    segment_end.status.recorder_state =
-        ppc::GuestInvocationRecorderState::kComplete;
-    segment_end.status.segment_ordinal =
-        assembler.status().next_segment_ordinal;
-    segment_end.status.accepted_segment_count = 1;
-    segment_end.status.capture_start_tick = capture_start_tick;
-    segment_end.status.capture_end_tick = capture_start_tick;
-    segment_end.segment.assign(96, 0x11);
-    if (!RequireContinue(
-            assembler.OnSegmentEnd(participant, std::move(segment_end)),
-            "segment end", error)) {
-      return Action::kReject;
-    }
-    if (!segment_only &&
+    if (!coverage_only &&
         !RequireContinue(
             assembler.OnOuterHostCallEnd(
                 participant,
@@ -349,6 +425,7 @@ class CanonicalEventBridge final
             "outer call end", error)) {
       return Action::kReject;
     }
+    observed_scheduler_event_count_.fetch_add(1, std::memory_order_relaxed);
     return Action::kContinue;
   }
 
@@ -357,16 +434,160 @@ class CanonicalEventBridge final
     return true;
   }
 
-  bool FinalizeBundle(GuestExecutionSessionBundle*, uint64_t,
-                      std::string*) noexcept override {
-    return true;
+  bool FinalizeBundle(GuestExecutionSessionBundle* bundle,
+                      uint64_t scheduler_event_count,
+                      std::string* error) noexcept override {
+    if (omit_overlay) {
+      return true;
+    }
+    try {
+      if (!bundle ||
+          scheduler_event_count !=
+              observed_scheduler_event_count_.load(std::memory_order_relaxed) ||
+          bundle->manifest.participants.size() != 1 ||
+          bundle->chunks.size() < 4) {
+        return Fail(error, "test bridge cannot close the scheduler tape");
+      }
+      const size_t final_index = bundle->chunks.size() - 1;
+      GuestExecutionSessionCheckpointChunk final_checkpoint;
+      if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
+              bundle->chunks[final_index], &final_checkpoint, error) ||
+          final_checkpoint.checkpoint.thread_states.size() != 1) {
+        return false;
+      }
+      const GuestExecutionSessionThreadStateReference& final_state =
+          final_checkpoint.checkpoint.thread_states.front();
+      const auto state_blob = std::find_if(
+          bundle->content_blobs.cbegin(), bundle->content_blobs.cend(),
+          [&final_state](const GuestExecutionSessionContentBlob& blob) {
+            return blob.sha256 == final_state.sha256;
+          });
+      if (state_blob == bundle->content_blobs.cend()) {
+        return Fail(error, "test bridge final state blob is missing");
+      }
+      ppc::GuestPPCThreadCheckpoint checkpoint;
+      if (!ppc::GuestPPCThreadCheckpointCodec::Decode(state_blob->bytes,
+                                                      &checkpoint, error)) {
+        return false;
+      }
+
+      std::vector<GuestExecutionSessionEvent> canonical_events;
+      for (size_t index = 0; index < final_index; ++index) {
+        if (bundle->manifest.chunks[index].kind !=
+            GuestExecutionSessionChunkKind::kEvents) {
+          continue;
+        }
+        GuestExecutionSessionEventChunk chunk;
+        if (!GuestExecutionSessionCodec::DecodeEventChunk(bundle->chunks[index],
+                                                          &chunk, error)) {
+          return false;
+        }
+        canonical_events.insert(canonical_events.end(), chunk.events.begin(),
+                                chunk.events.end());
+      }
+      if (canonical_events.empty()) {
+        return Fail(error, "test bridge canonical tape is empty");
+      }
+      std::vector<GuestExecutionContinuousEvent> continuous_events;
+      continuous_events.reserve(canonical_events.size());
+      for (const GuestExecutionSessionEvent& canonical : canonical_events) {
+        GuestExecutionContinuousEvent continuous;
+        continuous.global_sequence = canonical.global_sequence;
+        continuous.kind = canonical.kind;
+        if (canonical.thread_ordinal != kGuestExecutionSessionNoThread) {
+          continuous.actor = {
+              canonical.thread_ordinal,
+              bundle->manifest.participants[canonical.thread_ordinal]
+                  .guest_thread_id};
+        }
+        continuous_events.push_back(continuous);
+      }
+      GuestExecutionContinuousEvent& boundary = continuous_events.back();
+      const GuestExecutionSessionParticipant& participant =
+          bundle->manifest.participants.front();
+      boundary.subject = {participant.ordinal, participant.guest_thread_id};
+      boundary.checkpoint.kind =
+          GuestExecutionContinuousCheckpointReferenceKind::kThreadState;
+      boundary.checkpoint.checkpoint_global_sequence =
+          final_checkpoint.checkpoint.global_sequence;
+      boundary.checkpoint.state_size = final_state.byte_size;
+      boundary.checkpoint.state_sha256 = final_state.sha256;
+      boundary.checkpoint.binding = BindingFor(checkpoint);
+
+      std::vector<uint8_t> overlay_bytes;
+      if (!GuestExecutionContinuousEventCodec::Encode(continuous_events,
+                                                      &overlay_bytes, error)) {
+        return false;
+      }
+      const uint32_t overlay_ordinal = static_cast<uint32_t>(final_index);
+      final_checkpoint.ordinal = overlay_ordinal + 1;
+      std::vector<uint8_t> final_bytes;
+      if (!GuestExecutionSessionCodec::EncodeCheckpointChunk(
+              final_checkpoint, &final_bytes, error)) {
+        return false;
+      }
+      bundle->chunks.insert(bundle->chunks.begin() + final_index,
+                            std::move(overlay_bytes));
+      bundle->chunks.back() = std::move(final_bytes);
+      bundle->manifest.chunks.insert(
+          bundle->manifest.chunks.begin() + final_index,
+          ReferenceFor(GuestExecutionSessionChunkKind::kContinuousEvents,
+                       overlay_ordinal,
+                       continuous_events.front().global_sequence,
+                       continuous_events.back().global_sequence,
+                       static_cast<uint32_t>(continuous_events.size()),
+                       bundle->chunks[final_index]));
+      bundle->manifest.chunks.back() = ReferenceFor(
+          GuestExecutionSessionChunkKind::kCheckpoint, final_checkpoint.ordinal,
+          final_checkpoint.checkpoint.global_sequence,
+          final_checkpoint.checkpoint.global_sequence, 1,
+          bundle->chunks.back());
+      return true;
+    } catch (...) {
+      return Fail(error, "test bridge could not allocate the event overlay");
+    }
   }
 
   void RecordNextEventAsSegmentOnly() {
     record_next_event_as_segment_only_.store(true);
   }
 
+  bool omit_overlay = false;
+
  private:
+  static GuestExecutionSessionChunkReference ReferenceFor(
+      GuestExecutionSessionChunkKind kind, uint32_t ordinal,
+      uint64_t first_sequence, uint64_t last_sequence, uint32_t record_count,
+      const std::vector<uint8_t>& encoded) {
+    GuestExecutionSessionChunkReference reference;
+    reference.kind = kind;
+    reference.ordinal = ordinal;
+    reference.first_event_sequence = first_sequence;
+    reference.last_event_sequence = last_sequence;
+    reference.record_count = record_count;
+    reference.encoded_size = encoded.size();
+    reference.encoded_sha256 = GuestExecutionSessionCodec::HashBytes(encoded);
+    return reference;
+  }
+
+  static ppc::GuestPPCThreadCheckpointBinding BindingFor(
+      const ppc::GuestPPCThreadCheckpoint& checkpoint) {
+    ppc::GuestPPCThreadCheckpointBinding binding;
+    binding.participant_ordinal = checkpoint.participant_ordinal;
+    binding.guest_thread_id = checkpoint.guest_thread_id;
+    binding.resume_kind = checkpoint.resume_kind;
+    binding.resume_pc = checkpoint.resume_pc;
+    binding.owning_function_address = checkpoint.owning_function_address;
+    binding.owning_function_end_address =
+        checkpoint.owning_function_end_address;
+    binding.outer_guest_return_address = checkpoint.outer_guest_return_address;
+    binding.pending_external_event_sequence =
+        checkpoint.pending_external_event_sequence;
+    binding.pending_export_guest_address =
+        checkpoint.pending_export_guest_address;
+    return binding;
+  }
+
   static bool RequireContinue(GuestExecutionSessionAssemblerAction action,
                               const char* operation,
                               std::string* error) noexcept {
@@ -378,6 +599,7 @@ class CanonicalEventBridge final
   }
 
   std::atomic<bool> record_next_event_as_segment_only_{false};
+  std::atomic<uint64_t> observed_scheduler_event_count_{0};
 };
 
 class CountingPublisher final : public GuestExecutionSessionAssemblerPublisher {
@@ -387,6 +609,12 @@ class CountingPublisher final : public GuestExecutionSessionAssemblerPublisher {
     std::unique_lock<std::mutex> lock(mutex);
     entered = true;
     condition.notify_all();
+    GuestExecutionSessionCaptureRuntime* runtime = reentrant_runtime;
+    if (runtime && !reentered.exchange(true, std::memory_order_acq_rel)) {
+      lock.unlock();
+      runtime->Shutdown();
+      lock.lock();
+    }
     condition.wait(lock, [this]() { return !blocked; });
     ++calls;
     return true;
@@ -409,13 +637,19 @@ class CountingPublisher final : public GuestExecutionSessionAssemblerPublisher {
     condition.notify_all();
   }
 
+  void ReenterShutdownOnPublish(GuestExecutionSessionCaptureRuntime* runtime) {
+    reentrant_runtime = runtime;
+  }
+
   std::atomic<uint32_t> calls{0};
+  std::atomic<bool> reentered{false};
 
  private:
   std::mutex mutex;
   std::condition_variable condition;
   bool blocked = false;
   bool entered = false;
+  GuestExecutionSessionCaptureRuntime* reentrant_runtime = nullptr;
 };
 
 class FakeCheckpointController final
@@ -546,8 +780,11 @@ class FakeCheckpointController final
 
 struct RuntimeHarness {
   RuntimeHarness(RuntimeEnvironment& environment, ThreadState& thread,
-                 size_t queue_capacity)
+                 size_t queue_capacity,
+                 GuestExecutionReelCoverageMode coverage_mode =
+                     GuestExecutionReelCoverageMode::kContinuousInstructions)
       : checkpoint(thread), config(MakeConfig(queue_capacity)) {
+    config.assembler.coverage_mode = coverage_mode;
     dependencies.clock = &clock;
     dependencies.provider = &provider;
     dependencies.event_bridge = &event_bridge;
@@ -677,6 +914,97 @@ TEST_CASE("session capture runtime pre-arm path only observes sources",
   thread.reset();
 }
 
+TEST_CASE("session capture runtime rejects a one-cell event queue",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 1);
+  REQUIRE_FALSE(harness.runtime);
+  REQUIRE(harness.error ==
+          "capture runtime event queue capacity must be a power of two and at "
+          "least two");
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rejects invocation-segment mode",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8,
+                         GuestExecutionReelCoverageMode::kInvocationSegments);
+  REQUIRE_FALSE(harness.runtime);
+  REQUIRE(harness.error ==
+          "capture runtime requires continuous instruction coverage mode");
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime linearizes concurrent start and stop",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  BlockingHook prequeue_gate;
+  GuestExecutionSessionCaptureRuntimeTestAccess::SetRequestStartPrequeueHook(
+      *harness.runtime, &BlockingHook::Hook, &prequeue_gate);
+
+  bool start_result = false;
+  bool stop_result = false;
+  std::mutex stop_mutex;
+  std::condition_variable stop_condition;
+  bool stop_attempting = false;
+  bool stop_returned = false;
+  std::thread start([&]() { start_result = harness.runtime->RequestStart(); });
+  const bool start_hook_entered = prequeue_gate.WaitForEntry();
+  std::thread stop;
+  if (start_hook_entered) {
+    stop = std::thread([&]() {
+      {
+        std::lock_guard<std::mutex> lock(stop_mutex);
+        stop_attempting = true;
+      }
+      stop_condition.notify_all();
+      stop_result = harness.runtime->RequestStop();
+      {
+        std::lock_guard<std::mutex> lock(stop_mutex);
+        stop_returned = true;
+      }
+      stop_condition.notify_all();
+    });
+  }
+  bool stop_attempt_seen = false;
+  bool stop_returned_before_start_enqueued = false;
+  if (stop.joinable()) {
+    std::unique_lock<std::mutex> lock(stop_mutex);
+    stop_attempt_seen =
+        stop_condition.wait_for(lock, 2s, [&]() { return stop_attempting; });
+    if (stop_attempt_seen) {
+      stop_returned_before_start_enqueued =
+          stop_condition.wait_for(lock, 100ms, [&]() { return stop_returned; });
+    }
+  }
+  prequeue_gate.Release();
+  start.join();
+  if (stop.joinable()) {
+    stop.join();
+  }
+  GuestExecutionSessionCaptureRuntimeTestAccess::SetRequestStartPrequeueHook(
+      *harness.runtime, nullptr, nullptr);
+
+  REQUIRE(start_hook_entered);
+  REQUIRE(stop_attempt_seen);
+  REQUIRE_FALSE(stop_returned_before_start_enqueued);
+  REQUIRE(start_result);
+  REQUIRE(stop_result);
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  REQUIRE(harness.runtime->status().state == RuntimeState::kRejected);
+  REQUIRE(harness.runtime->status().queued_event_count == 2);
+  REQUIRE(harness.runtime->status().processed_event_count == 2);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
 TEST_CASE("session capture runtime retries a retained checkpoint generation",
           "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;
@@ -773,6 +1101,87 @@ TEST_CASE("session capture runtime queue overflow fails closed",
   thread.reset();
 }
 
+TEST_CASE("session capture runtime preserves exact-full wrap control order",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 2);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.block_finalize = true;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(harness.checkpoint.WaitForFinalize());
+  bool source_result = false;
+  bool stop_result = false;
+  std::thread source([&]() {
+    source_result =
+        harness.runtime->OnSchedulerEvent(SchedulerEvent(1, *thread));
+  });
+  source.join();
+  std::thread control([&]() { stop_result = harness.runtime->RequestStop(); });
+  control.join();
+  harness.checkpoint.ReleaseFinalize();
+
+  REQUIRE(source_result);
+  REQUIRE(stop_result);
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kComplete);
+  REQUIRE(status.queued_event_count == 3);
+  REQUIRE(status.processed_event_count == 3);
+  REQUIRE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 1);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rejects a no-op overlay finalizer",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  harness.event_bridge.omit_overlay = true;
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kBundleValidation);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rejects a non-checkpoint state blob",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  harness.provider.emit_invalid_state = true;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kEventBridgeFailure);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
 TEST_CASE("session capture runtime shutdown fences a blocked start release",
           "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;
@@ -800,6 +1209,40 @@ TEST_CASE("session capture runtime shutdown fences a blocked start release",
   REQUIRE(harness.publisher.calls.load() == 0);
   REQUIRE(harness.provider.end_count.load() == 1);
   REQUIRE_FALSE(harness.provider.ended_accepted.load());
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime serializes concurrent shutdown callers",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.block_pause_number = 1;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(harness.checkpoint.WaitForPause());
+  std::atomic<uint32_t> returned{0};
+  std::thread first([&]() {
+    harness.runtime->Shutdown();
+    returned.fetch_add(1, std::memory_order_release);
+  });
+  std::thread second([&]() {
+    harness.runtime->Shutdown();
+    returned.fetch_add(1, std::memory_order_release);
+  });
+  REQUIRE(WaitForShutdownPending(*harness.runtime));
+  REQUIRE(returned.load(std::memory_order_acquire) == 0);
+  harness.checkpoint.ReleasePause();
+  first.join();
+  second.join();
+
+  const auto status = harness.runtime->status();
+  REQUIRE(returned.load(std::memory_order_acquire) == 2);
+  REQUIRE(status.state == RuntimeState::kShutdown);
+  REQUIRE_FALSE(status.worker_running);
+  REQUIRE_FALSE(status.processor_attached);
+  REQUIRE_FALSE(status.scheduler_attached);
   thread.reset();
 }
 
@@ -901,6 +1344,32 @@ TEST_CASE("session capture runtime shutdown serializes a blocked publisher",
   thread.reset();
 }
 
+TEST_CASE("session capture runtime publisher may reenter shutdown",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  harness.publisher.ReenterShutdownOnPublish(harness.runtime.get());
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  REQUIRE(harness.publisher.reentered.load(std::memory_order_acquire));
+  REQUIRE(harness.publisher.calls.load() == 1);
+  REQUIRE(harness.runtime->status().state == RuntimeState::kComplete);
+  REQUIRE(harness.runtime->status().canonical_output_published);
+
+  harness.runtime->Shutdown();
+  const auto status = harness.runtime->status();
+  REQUIRE_FALSE(status.worker_running);
+  REQUIRE_FALSE(status.processor_attached);
+  REQUIRE_FALSE(status.scheduler_attached);
+  thread.reset();
+}
+
 TEST_CASE("session capture runtime rejects lifecycle mutation before cutoff",
           "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;
@@ -972,8 +1441,9 @@ TEST_CASE("session capture runtime includes host call before cutoff",
   thread.reset();
 }
 
-TEST_CASE("session capture runtime rejects incomplete host call before cutoff",
-          "[guest-execution-session-capture-runtime]") {
+TEST_CASE(
+    "session capture runtime includes zero-segment host call before cutoff",
+    "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;
   auto thread = environment.MakeThread(1);
   RuntimeHarness harness(environment, *thread, 8);
@@ -991,9 +1461,9 @@ TEST_CASE("session capture runtime rejects incomplete host call before cutoff",
 
   REQUIRE(harness.runtime->WaitForTerminal(2s));
   const auto status = harness.runtime->status();
-  REQUIRE(status.state == RuntimeState::kRejected);
-  REQUIRE_FALSE(status.canonical_output_published);
-  REQUIRE(harness.publisher.calls.load() == 0);
+  REQUIRE(status.state == RuntimeState::kComplete);
+  REQUIRE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 1);
 
   harness.runtime->Shutdown();
   thread.reset();
