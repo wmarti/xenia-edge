@@ -414,10 +414,21 @@ TEST_CASE("timed guest invocation replay requires Apple A64 and fixed controls",
   GuestInvocationReplayConfig config = MakeBenchmarkConfig("a64");
   REQUIRE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));
   REQUIRE(error.empty());
+  std::array<uint8_t, 32> scheduler_disabled_hash = {};
+  REQUIRE(HashGuestInvocationReplayConfig(config, &scheduler_disabled_hash,
+                                          &error));
 
   SetValue(&config, "guest_scheduler", "true");
+  REQUIRE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));
+  REQUIRE(error.empty());
+  std::array<uint8_t, 32> scheduler_enabled_hash = {};
+  REQUIRE(
+      HashGuestInvocationReplayConfig(config, &scheduler_enabled_hash, &error));
+  REQUIRE(scheduler_enabled_hash != scheduler_disabled_hash);
+
+  SetValue(&config, "guest_scheduler", "invalid");
   REQUIRE_FALSE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));
-  REQUIRE(error.find("guest_scheduler=false") != std::string::npos);
+  REQUIRE(error.find("guest_scheduler=true or false") != std::string::npos);
 
   config = MakeBenchmarkConfig("a64");
   SetValue(&config, "log_safepoint_pc", "true");

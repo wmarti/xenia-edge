@@ -189,11 +189,13 @@ struct GuestInvocationCaptureRuntime::Impl {
   Impl(Memory& memory, Processor& processor,
        std::filesystem::path output_directory,
        ppc::GuestInvocationRecorderSelection selection,
+       uint32_t jit_corpus_config_flags,
        GuestInvocationReplayConfig replay_config,
        GuestInvocationReplaySha256 capture_build_sha256)
       : processor(processor),
         output_directory(std::move(output_directory)),
         selection(std::move(selection)),
+        jit_corpus_config_flags(jit_corpus_config_flags),
         replay_config(std::move(replay_config)),
         capture_build_sha256(capture_build_sha256),
         page_reader(memory) {}
@@ -219,7 +221,7 @@ struct GuestInvocationCaptureRuntime::Impl {
       return Fail(error, "capture result has an empty translation closure");
     }
 
-    ExecutionJitCorpusBuilder corpus_builder(0);
+    ExecutionJitCorpusBuilder corpus_builder(jit_corpus_config_flags);
     std::unordered_set<uint32_t> copied_code_pages;
     for (const ppc::GuestInvocationPage& code_page : result.code_pages) {
       if (!copied_code_pages.insert(code_page.guest_address).second) {
@@ -331,6 +333,7 @@ struct GuestInvocationCaptureRuntime::Impl {
   Processor& processor;
   std::filesystem::path output_directory;
   ppc::GuestInvocationRecorderSelection selection;
+  const uint32_t jit_corpus_config_flags;
   GuestInvocationReplayConfig replay_config;
   GuestInvocationReplaySha256 capture_build_sha256 = {};
   GuestInvocationCapturePageReader page_reader;
@@ -368,10 +371,6 @@ GuestInvocationCaptureRuntime::Create(Memory& memory, Processor& processor,
                                          &selection, &limits, error)) {
     return nullptr;
   }
-  if (guest_scheduler_enabled) {
-    Fail(error, "capture requires explicit --guest_scheduler=false");
-    return nullptr;
-  }
   if (!config.ValidateOutputDirectory(error)) {
     return nullptr;
   }
@@ -388,9 +387,11 @@ GuestInvocationCaptureRuntime::Create(Memory& memory, Processor& processor,
     return nullptr;
   }
 
-  auto impl = std::make_unique<Impl>(memory, processor, config.output_directory,
-                                     selection, std::move(replay_config),
-                                     capture_build_sha256);
+  const uint32_t jit_corpus_config_flags =
+      guest_scheduler_enabled ? JitCorpus::kConfigGuestScheduler : 0;
+  auto impl = std::make_unique<Impl>(
+      memory, processor, config.output_directory, selection,
+      jit_corpus_config_flags, std::move(replay_config), capture_build_sha256);
   Impl* impl_pointer = impl.get();
   impl->coordinator = GuestInvocationCaptureCoordinator::Create(
       0, impl->selection, limits, impl->page_reader, impl->clock,

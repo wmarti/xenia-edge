@@ -125,9 +125,8 @@ bool HashGuestInvocationReplayConfig(const GuestInvocationReplayConfig& config,
                                      std::array<uint8_t, 32>* output,
                                      std::string* error = nullptr);
 
-// Enforces the noise- and scheduler-free subset required for a timed replay.
-// Capture may still serialize a non-benchmark configuration for diagnostics,
-// but the runner must pass this check before warming or executing guest code.
+// Enforces the fixed controls required for a timed replay. guest_scheduler may
+// be enabled or disabled because its exact value is included in provenance.
 bool ValidateGuestInvocationReplayBenchmarkConfig(
     const GuestInvocationReplayConfig& config, std::string* error = nullptr);
 

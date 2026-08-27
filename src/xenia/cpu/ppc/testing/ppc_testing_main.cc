@@ -1026,10 +1026,12 @@ bool WriteSyntheticFixture(const std::filesystem::path& executable_path) {
     return Reject("synthetic fixture host page size",
                   "native host page size does not fit the fixture format");
   }
+  const uint32_t corpus_config_flags =
+      cvars::guest_scheduler ? JitCorpus::kConfigGuestScheduler : 0;
   SyntheticGuestInvocationFixture bootstrap_fixture;
   if (!BuildSyntheticGuestInvocationFixture(
-          static_cast<uint32_t>(native_page_size), 1, &bootstrap_fixture,
-          &error)) {
+          static_cast<uint32_t>(native_page_size), 1, corpus_config_flags,
+          &bootstrap_fixture, &error)) {
     return Reject("synthetic fixture construction", error);
   }
 
@@ -1065,7 +1067,7 @@ bool WriteSyntheticFixture(const std::filesystem::path& executable_path) {
   SyntheticGuestInvocationFixture final_fixture;
   if (!BuildSyntheticGuestInvocationFixture(
           static_cast<uint32_t>(native_page_size), captured_host_code_size,
-          &final_fixture, &error)) {
+          corpus_config_flags, &final_fixture, &error)) {
     return Reject("synthetic fixture final construction", error);
   }
   if (!WriteSyntheticGuestInvocationFixture(
@@ -1128,6 +1130,13 @@ bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
   if (corpus_file.sha256 != artifact.code_corpus_sha256) {
     return Reject("corpus provenance",
                   "corpus SHA-256 does not match the invocation artifact");
+  }
+  const bool corpus_guest_scheduler =
+      (corpus.config_flags() & JitCorpus::kConfigGuestScheduler) != 0;
+  if (corpus_guest_scheduler != cvars::guest_scheduler) {
+    return Reject(
+        "corpus configuration provenance",
+        "runtime guest_scheduler does not match the invocation corpus");
   }
 
   GuestInvocationReplaySha256 candidate_build_sha256 = {};

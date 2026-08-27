@@ -132,7 +132,8 @@ TEST_CASE("capture bundle publishes fixed round-tripped payloads",
   ScopedTestDirectory temporary_directory;
   SyntheticGuestInvocationFixture fixture;
   std::string error;
-  REQUIRE(BuildSyntheticGuestInvocationFixture(16384, 321, &fixture, &error));
+  REQUIRE(
+      BuildSyntheticGuestInvocationFixture(16384, 321, 0, &fixture, &error));
   GuestInvocationReplayConfig config = MakeBenchmarkConfig(16384);
   GuestInvocationReplaySha256 capture_build_sha256 = {};
   capture_build_sha256.fill(0xA5);
@@ -214,7 +215,7 @@ TEST_CASE("capture bundle preserves existing output and staging",
   ScopedTestDirectory temporary_directory;
   SyntheticGuestInvocationFixture fixture;
   std::string error;
-  REQUIRE(BuildSyntheticGuestInvocationFixture(4096, 123, &fixture, &error));
+  REQUIRE(BuildSyntheticGuestInvocationFixture(4096, 123, 0, &fixture, &error));
   const GuestInvocationReplayConfig config = MakeBenchmarkConfig(4096);
   GuestInvocationReplaySha256 capture_build_sha256 = {};
   capture_build_sha256.fill(0x5A);
@@ -251,7 +252,8 @@ TEST_CASE("capture bundle rejects tampered inputs before staging",
   ScopedTestDirectory temporary_directory;
   SyntheticGuestInvocationFixture fixture;
   std::string error;
-  REQUIRE(BuildSyntheticGuestInvocationFixture(16384, 123, &fixture, &error));
+  REQUIRE(
+      BuildSyntheticGuestInvocationFixture(16384, 123, 0, &fixture, &error));
   const GuestInvocationReplayConfig config = MakeBenchmarkConfig(16384);
   GuestInvocationReplaySha256 capture_build_sha256 = {};
   capture_build_sha256.fill(0xC3);
@@ -293,7 +295,7 @@ TEST_CASE("capture bundle publication cannot replace a racing output",
   ScopedTestDirectory temporary_directory;
   SyntheticGuestInvocationFixture fixture;
   std::string error;
-  REQUIRE(BuildSyntheticGuestInvocationFixture(4096, 123, &fixture, &error));
+  REQUIRE(BuildSyntheticGuestInvocationFixture(4096, 123, 0, &fixture, &error));
   // Keep the writer busy after staging becomes observable so the competing
   // directory is deterministically installed after the initial existence
   // check and before publication.

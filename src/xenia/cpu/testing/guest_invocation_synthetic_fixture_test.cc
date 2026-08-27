@@ -28,8 +28,8 @@ TEST_CASE("synthetic invocation fixture closes each supported host granule",
     INFO("host page size " << host_page_size);
     SyntheticGuestInvocationFixture fixture;
     std::string error;
-    REQUIRE(BuildSyntheticGuestInvocationFixture(host_page_size, 123, &fixture,
-                                                 &error));
+    REQUIRE(BuildSyntheticGuestInvocationFixture(host_page_size, 123, 0,
+                                                 &fixture, &error));
     REQUIRE(error.empty());
     REQUIRE(fixture.host_page_size == host_page_size);
     REQUIRE(fixture.captured_host_code_size == 123);
@@ -103,6 +103,13 @@ TEST_CASE("synthetic invocation fixture closes each supported host granule",
         encoded_artifact, &decoded_artifact, &error));
     REQUIRE(decoded_artifact == artifact);
   }
+
+  SyntheticGuestInvocationFixture scheduler_fixture;
+  std::string error;
+  REQUIRE(BuildSyntheticGuestInvocationFixture(
+      4096, 123, JitCorpus::kConfigGuestScheduler, &scheduler_fixture, &error));
+  REQUIRE(scheduler_fixture.corpus.config_flags() ==
+          JitCorpus::kConfigGuestScheduler);
 }
 
 TEST_CASE("synthetic invocation fixture rejects unsupported host granules",
@@ -111,16 +118,22 @@ TEST_CASE("synthetic invocation fixture rejects unsupported host granules",
   fixture.host_page_size = 123;
   std::string error;
   REQUIRE_FALSE(
-      BuildSyntheticGuestInvocationFixture(8193, 1, &fixture, &error));
+      BuildSyntheticGuestInvocationFixture(8193, 1, 0, &fixture, &error));
   REQUIRE(error == "synthetic fixture host page size is unsupported");
   REQUIRE(fixture.host_page_size == 0);
 
-  REQUIRE_FALSE(BuildSyntheticGuestInvocationFixture(4096, 1, nullptr, &error));
+  REQUIRE_FALSE(
+      BuildSyntheticGuestInvocationFixture(4096, 1, 0, nullptr, &error));
   REQUIRE(error == "synthetic fixture output is null");
 
   REQUIRE_FALSE(
-      BuildSyntheticGuestInvocationFixture(4096, 0, &fixture, &error));
+      BuildSyntheticGuestInvocationFixture(4096, 0, 0, &fixture, &error));
   REQUIRE(error == "synthetic fixture is missing the captured host code size");
+  REQUIRE(fixture.host_page_size == 0);
+
+  REQUIRE_FALSE(BuildSyntheticGuestInvocationFixture(4096, 1, 1u << 31,
+                                                     &fixture, &error));
+  REQUIRE(error == "corpus configuration contains unsupported flags");
   REQUIRE(fixture.host_page_size == 0);
 }
 

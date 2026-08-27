@@ -56,10 +56,12 @@ struct SyntheticGuestInvocationFixture {
 // Builds strict in-memory inputs using exactly one host-protection-granule of
 // code and, for the valid invocation, exactly one granule of data. The host
 // code size must be nonzero because execution replay rejects compile-only
-// corpus records that lack this capture provenance.
+// corpus records that lack this capture provenance. corpus_config_flags records
+// the codegen configuration used to obtain that host code size.
 bool BuildSyntheticGuestInvocationFixture(
     uint32_t host_page_size, uint32_t captured_host_code_size,
-    SyntheticGuestInvocationFixture* output, std::string* error = nullptr);
+    uint32_t corpus_config_flags, SyntheticGuestInvocationFixture* output,
+    std::string* error = nullptr);
 
 // Writes a complete bundle through the production corpus and artifact codecs.
 // The output directory and its sibling .part directory must not exist. All

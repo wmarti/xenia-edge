@@ -545,7 +545,7 @@ bool ValidateGuestInvocationReplayBenchmarkConfig(
     return false;
   }
 
-  constexpr std::array<std::pair<std::string_view, std::string_view>, 13>
+  constexpr std::array<std::pair<std::string_view, std::string_view>, 12>
       kRequiredValues = {
           {{"break_on_instruction", "0"},
            {"count_call_paths", "false"},
@@ -555,7 +555,6 @@ bool ValidateGuestInvocationReplayBenchmarkConfig(
            {"emit_mmio_aware_stores_for_recorded_exception_addresses", "false"},
            {"enable_early_precompilation", "false"},
            {"fold_readonly_guest_memory_loads", "false"},
-           {"guest_scheduler", "false"},
            {"inline_mmio_access", "false"},
            {"log_safepoint_pc", "false"},
            {"serialize_guest_function_definitions", "true"},
@@ -564,6 +563,15 @@ bool ValidateGuestInvocationReplayBenchmarkConfig(
     if (!RequireValue(config, name, expected, error)) {
       return false;
     }
+  }
+  const GuestInvocationReplayConfigEntry* guest_scheduler =
+      FindEntry(config, "guest_scheduler");
+  if (!guest_scheduler ||
+      (guest_scheduler->value != "false" && guest_scheduler->value != "true")) {
+    if (error) {
+      error->assign("timed replay requires guest_scheduler=true or false");
+    }
+    return false;
   }
   if (config.backend_name == "x64" &&
       config.host_platform == GuestInvocationReplayHostPlatform::kWindows &&

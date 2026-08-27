@@ -41,7 +41,6 @@ class GuestInvocationCaptureRuntime final {
 
   // Creates and attaches the capture sink. guest_scheduler_enabled is passed
   // explicitly to keep the CPU runtime independent of kernel configuration.
-  // Capture fails closed unless it is false.
   static std::unique_ptr<GuestInvocationCaptureRuntime> Create(
       Memory& memory, Processor& processor, bool guest_scheduler_enabled,
       std::string* error = nullptr);

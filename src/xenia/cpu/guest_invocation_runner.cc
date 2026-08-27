@@ -500,11 +500,6 @@ bool BuildGuestInvocationReplayPlan(
     return FailPlan(output, error,
                     "host page size is unsupported for invocation replay");
   }
-  if (corpus.config_flags()) {
-    return FailPlan(
-        output, error,
-        "invocation replay v1 requires zero corpus configuration flags");
-  }
   CorpusWorkload workload;
   if (!ValidateCorpusShape(corpus, &workload, error)) {
     return false;

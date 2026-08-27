@@ -320,7 +320,8 @@ bool WriteAndVerifyArtifact(
 
 bool BuildSyntheticGuestInvocationFixture(
     uint32_t host_page_size, uint32_t captured_host_code_size,
-    SyntheticGuestInvocationFixture* output, std::string* error) {
+    uint32_t corpus_config_flags, SyntheticGuestInvocationFixture* output,
+    std::string* error) {
   if (error) {
     error->clear();
   }
@@ -343,7 +344,7 @@ bool BuildSyntheticGuestInvocationFixture(
   fixture.captured_host_code_size = captured_host_code_size;
   const uint32_t closure_page_count = host_page_size / kGuestPageSize;
 
-  ExecutionJitCorpusBuilder corpus_builder(0);
+  ExecutionJitCorpusBuilder corpus_builder(corpus_config_flags);
   for (uint32_t i = 0; i < closure_page_count; ++i) {
     std::array<uint8_t, kGuestPageSize> page = {};
     if (!i) {

@@ -350,7 +350,7 @@ TEST_CASE("guest invocation planner derives closed reset and access sets",
           {kDataAddress, 16 * 1024, true}, {kCodeAddress, 16 * 1024, false}});
 }
 
-TEST_CASE("guest invocation planner rejects corpus configuration drift",
+TEST_CASE("guest invocation planner accepts known corpus configuration",
           "[guest-invocation-runner]") {
   ppc::GuestFunctionInvocation invocation = MakeInvocation(4);
   GuestInvocationReplayPlan plan;
@@ -358,20 +358,18 @@ TEST_CASE("guest invocation planner rejects corpus configuration drift",
 
   ExecutionJitCorpus corpus = MakeCorpus(4, JitCorpus::kConfigGuestScheduler);
   REQUIRE(corpus.config_flags() == JitCorpus::kConfigGuestScheduler);
-  REQUIRE_FALSE(BuildGuestInvocationReplayPlan(invocation, corpus, 16 * 1024,
-                                               &plan, &error));
-  REQUIRE(error ==
-          "invocation replay v1 requires zero corpus configuration flags");
-  REQUIRE(plan.supplied_page_addresses.empty());
-  REQUIRE(plan.reset_page_addresses.empty());
-  REQUIRE(plan.protection_granules.empty());
+  REQUIRE(BuildGuestInvocationReplayPlan(invocation, corpus, 16 * 1024, &plan,
+                                         &error));
+  REQUIRE(error.empty());
+  REQUIRE(plan.supplied_page_addresses.size() == 8);
+  REQUIRE(plan.reset_page_addresses.size() == 4);
+  REQUIRE(plan.protection_granules.size() == 2);
 
 #if XE_PLATFORM_MAC && XE_ARCH_ARM64
   std::unique_ptr<GuestInvocationRunner> runner = GuestInvocationRunner::Create(
       invocation, corpus, testing::CreateBackend(), &error);
-  REQUIRE_FALSE(runner);
-  REQUIRE(error ==
-          "invocation replay v1 requires zero corpus configuration flags");
+  REQUIRE(runner);
+  REQUIRE(error.empty());
 #endif  // XE_PLATFORM_MAC && XE_ARCH_ARM64
 }
 
