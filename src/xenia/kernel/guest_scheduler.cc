@@ -289,96 +289,120 @@ GuestScheduler::PauseForCheckpointBarrier(
 
   uint8_t dispatch_cpu_mask = 0;
   uint64_t checkpoint_generation = 0;
-  {
-    std::lock_guard<std::mutex> lock(lock_);
-    if (!started_.load(std::memory_order_acquire) ||
-        !checkpoint_dispatch_ready_.load(std::memory_order_acquire) ||
-        shutting_down_.load(std::memory_order_acquire)) {
-      return GuestSchedulerCheckpointBarrierRejection::kNotStarted;
-    }
-    if (checkpoint_barrier_.active()) {
-      return GuestSchedulerCheckpointBarrierRejection::kAlreadyActive;
-    }
-    for (const auto& held : checkpoint_held_) {
-      if (held.thread || !held.state.empty()) {
-        return GuestSchedulerCheckpointBarrierRejection::kReleasePending;
+  try {
+    {
+      std::lock_guard<std::mutex> lock(lock_);
+      if (!started_.load(std::memory_order_acquire) ||
+          !checkpoint_dispatch_ready_.load(std::memory_order_acquire) ||
+          shutting_down_.load(std::memory_order_acquire)) {
+        return GuestSchedulerCheckpointBarrierRejection::kNotStarted;
       }
-    }
-    std::vector<GuestSchedulerCheckpointParticipant> participants;
-    for (int cpu_index = 0; cpu_index < kMaxCpus; ++cpu_index) {
-      Cpu& cpu = cpus_[cpu_index];
-      if (cpu.host_thread) {
-        dispatch_cpu_mask |= uint8_t{1} << cpu_index;
+      if (checkpoint_barrier_.active()) {
+        return GuestSchedulerCheckpointBarrierRejection::kAlreadyActive;
       }
-      if (cpu.current_thread) {
-        GuestSchedulerCheckpointParticipant participant;
-        participant.thread_id = cpu.current_thread->thread_id();
-        participant.cpu = static_cast<int8_t>(cpu_index);
-        participant.state = GuestSchedulerCheckpointParticipantState::kRunning;
-        participant.resume_kind =
-            GuestSchedulerCheckpointResumeKind::kNativeContinuation;
-        participants.push_back(participant);
+      for (const auto& held : checkpoint_held_) {
+        if (held.thread || !held.state.empty()) {
+          return GuestSchedulerCheckpointBarrierRejection::kReleasePending;
+        }
       }
-      for (int priority = 31; priority >= 0; --priority) {
+      std::vector<GuestSchedulerCheckpointParticipant> participants;
+      for (int cpu_index = 0; cpu_index < kMaxCpus; ++cpu_index) {
+        Cpu& cpu = cpus_[cpu_index];
+        if (cpu.host_thread) {
+          dispatch_cpu_mask |= uint8_t{1} << cpu_index;
+        }
+        if (cpu.current_thread) {
+          GuestSchedulerCheckpointParticipant participant;
+          participant.thread_id = cpu.current_thread->thread_id();
+          participant.cpu = static_cast<int8_t>(cpu_index);
+          participant.state =
+              GuestSchedulerCheckpointParticipantState::kRunning;
+          participant.resume_kind =
+              GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+          participants.push_back(participant);
+        }
+        for (int priority = 31; priority >= 0; --priority) {
+          AppendCheckpointListLocked(
+              participants, cpu.ready_head[priority],
+              GuestSchedulerCheckpointParticipantState::kReady);
+        }
         AppendCheckpointListLocked(
-            participants, cpu.ready_head[priority],
-            GuestSchedulerCheckpointParticipantState::kReady);
+            participants, cpu.blocked_head,
+            GuestSchedulerCheckpointParticipantState::kBlocked);
+        AppendCheckpointListLocked(
+            participants, cpu.suspended_head,
+            GuestSchedulerCheckpointParticipantState::kSuspended);
       }
-      AppendCheckpointListLocked(
-          participants, cpu.blocked_head,
-          GuestSchedulerCheckpointParticipantState::kBlocked);
-      AppendCheckpointListLocked(
-          participants, cpu.suspended_head,
-          GuestSchedulerCheckpointParticipantState::kSuspended);
+      if (!dispatch_cpu_mask ||
+          !checkpoint_barrier_.Begin(dispatch_cpu_mask, participants,
+                                     &checkpoint_generation)) {
+        auto snapshot = checkpoint_barrier_.snapshot();
+        return snapshot.rejection ==
+                       GuestSchedulerCheckpointBarrierRejection::kNone
+                   ? GuestSchedulerCheckpointBarrierRejection::kInvalidTopology
+                   : snapshot.rejection;
+      }
+      for (Cpu& cpu : cpus_) {
+        if (cpu.current_thread) {
+          cpu.current_thread->thread_state()->context()->preempt_requested = 1;
+        }
+      }
     }
-    if (!dispatch_cpu_mask ||
-        !checkpoint_barrier_.Begin(dispatch_cpu_mask, participants)) {
-      auto snapshot = checkpoint_barrier_.snapshot();
-      return snapshot.rejection ==
-                     GuestSchedulerCheckpointBarrierRejection::kNone
-                 ? GuestSchedulerCheckpointBarrierRejection::kInvalidTopology
-                 : snapshot.rejection;
-    }
-    checkpoint_generation = checkpoint_barrier_.snapshot().generation;
+
     for (Cpu& cpu : cpus_) {
-      if (cpu.current_thread) {
-        cpu.current_thread->thread_state()->context()->preempt_requested = 1;
+      if (cpu.ready_event) {
+        cpu.ready_event->Set();
       }
     }
-  }
 
-  for (Cpu& cpu : cpus_) {
-    if (cpu.ready_event) {
-      cpu.ready_event->Set();
+    if (!checkpoint_barrier_.WaitUntilQuiesced(timeout)) {
+      GuestSchedulerCheckpointBarrierSnapshot final_snapshot;
+      const auto rejection = FinalizeAndResumeCheckpointBarrier(
+          checkpoint_generation, &final_snapshot);
+      if (out_snapshot) {
+        *out_snapshot = std::move(final_snapshot);
+      }
+      return rejection;
     }
-  }
 
-  if (!checkpoint_barrier_.WaitUntilQuiesced(timeout)) {
-    GuestSchedulerCheckpointBarrierSnapshot final_snapshot;
-    const auto rejection = FinalizeAndResumeCheckpointBarrier(
-        checkpoint_generation, &final_snapshot);
+    if (auto hook =
+            checkpoint_snapshot_test_hook_.load(std::memory_order_acquire)) {
+      hook(checkpoint_snapshot_test_context_.load(std::memory_order_acquire));
+    }
+    const auto snapshot = checkpoint_barrier_.snapshot();
+    if (snapshot.generation != checkpoint_generation ||
+        snapshot.rejection != GuestSchedulerCheckpointBarrierRejection::kNone ||
+        !snapshot.active || !snapshot.quiesced) {
+      GuestSchedulerCheckpointBarrierSnapshot final_snapshot;
+      const auto rejection = FinalizeAndResumeCheckpointBarrier(
+          checkpoint_generation, &final_snapshot);
+      if (out_snapshot) {
+        *out_snapshot = std::move(final_snapshot);
+      }
+      return rejection;
+    }
     if (out_snapshot) {
-      *out_snapshot = std::move(final_snapshot);
+      *out_snapshot = snapshot;
     }
-    return rejection;
-  }
-
-  const auto snapshot = checkpoint_barrier_.snapshot();
-  if (snapshot.generation != checkpoint_generation ||
-      snapshot.rejection != GuestSchedulerCheckpointBarrierRejection::kNone ||
-      !snapshot.active || !snapshot.quiesced) {
-    GuestSchedulerCheckpointBarrierSnapshot final_snapshot;
-    const auto rejection = FinalizeAndResumeCheckpointBarrier(
-        checkpoint_generation, &final_snapshot);
+    return GuestSchedulerCheckpointBarrierRejection::kNone;
+  } catch (...) {
+    if (!checkpoint_generation) {
+      return GuestSchedulerCheckpointBarrierRejection::kInvalidTopology;
+    }
+    checkpoint_barrier_.Reject(
+        GuestSchedulerCheckpointBarrierRejection::kInvalidTopology);
+    const auto rejection =
+        FinalizeAndResumeCheckpointBarrier(checkpoint_generation, nullptr);
     if (out_snapshot) {
-      *out_snapshot = std::move(final_snapshot);
+      *out_snapshot = {};
+      out_snapshot->generation = checkpoint_generation;
+      out_snapshot->rejection =
+          GuestSchedulerCheckpointBarrierRejection::kInvalidTopology;
     }
-    return rejection;
+    return rejection == GuestSchedulerCheckpointBarrierRejection::kNone
+               ? GuestSchedulerCheckpointBarrierRejection::kInvalidTopology
+               : rejection;
   }
-  if (out_snapshot) {
-    *out_snapshot = snapshot;
-  }
-  return GuestSchedulerCheckpointBarrierRejection::kNone;
 }
 
 GuestSchedulerCheckpointBarrierRejection

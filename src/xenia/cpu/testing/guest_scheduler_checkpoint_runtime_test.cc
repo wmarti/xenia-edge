@@ -20,6 +20,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <utility>
@@ -68,6 +69,15 @@ class GuestSchedulerCheckpointRuntimeTestAccess final {
                                                      std::memory_order_release);
     scheduler.checkpoint_startup_test_hook_.store(hook,
                                                   std::memory_order_release);
+  }
+
+  static void SetSnapshotHook(GuestScheduler& scheduler,
+                              GuestScheduler::CheckpointTestHook hook,
+                              void* context) {
+    scheduler.checkpoint_snapshot_test_context_.store(
+        context, std::memory_order_release);
+    scheduler.checkpoint_snapshot_test_hook_.store(hook,
+                                                   std::memory_order_release);
   }
 
   static GuestSchedulerCheckpointBarrierSnapshot Snapshot(
@@ -433,6 +443,8 @@ bool ContainsRestorableJitSafepoint(
                      });
 }
 
+void ThrowBeforeCheckpointSnapshot(void*) { throw std::bad_alloc(); }
+
 struct ReleaseRaceResult {
   bool setup = false;
   bool observer_attached = false;
@@ -677,6 +689,35 @@ TEST_CASE("Guest scheduler checkpoint rejects a partially started dispatch set",
   REQUIRE(snapshot.participants.empty());
   REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
               snapshot.generation, nullptr) == Rejection::kNone);
+}
+
+TEST_CASE(
+    "Guest scheduler releases a barrier when snapshot construction throws",
+    "[guest_scheduler_checkpoint][runtime]") {
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  scheduler.EnsureStarted();
+  REQUIRE(GuestSchedulerCheckpointRuntimeTestAccess::DispatchReady(scheduler));
+
+  GuestSchedulerCheckpointRuntimeTestAccess::SetSnapshotHook(
+      scheduler, &ThrowBeforeCheckpointSnapshot, nullptr);
+  GuestSchedulerCheckpointBarrierSnapshot failed_snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &failed_snapshot) ==
+          Rejection::kInvalidTopology);
+  REQUIRE(failed_snapshot.generation != 0);
+  REQUIRE(failed_snapshot.rejection == Rejection::kInvalidTopology);
+  REQUIRE_FALSE(
+      GuestSchedulerCheckpointRuntimeTestAccess::Snapshot(scheduler).active);
+
+  GuestSchedulerCheckpointRuntimeTestAccess::SetSnapshotHook(scheduler, nullptr,
+                                                             nullptr);
+  GuestSchedulerCheckpointBarrierSnapshot retry_snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &retry_snapshot) ==
+          Rejection::kNone);
+  REQUIRE(retry_snapshot.generation > failed_snapshot.generation);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              retry_snapshot.generation, nullptr) == Rejection::kNone);
 }
 
 TEST_CASE("Guest scheduler checkpoint timeout waits for fiber switch-out",

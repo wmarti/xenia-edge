@@ -392,6 +392,8 @@ class GuestScheduler {
   std::atomic<void*> checkpoint_arrival_test_context_{nullptr};
   std::atomic<CheckpointTestHook> checkpoint_startup_test_hook_{nullptr};
   std::atomic<void*> checkpoint_startup_test_context_{nullptr};
+  std::atomic<CheckpointTestHook> checkpoint_snapshot_test_hook_{nullptr};
+  std::atomic<void*> checkpoint_snapshot_test_context_{nullptr};
 #endif
 
   KernelState* kernel_state_;

@@ -118,7 +118,8 @@ class GuestSchedulerCheckpointBarrier {
       const GuestSchedulerCheckpointBarrier&) = delete;
 
   bool Begin(uint8_t dispatch_cpu_mask,
-             std::span<const GuestSchedulerCheckpointParticipant> participants);
+             std::span<const GuestSchedulerCheckpointParticipant> participants,
+             uint64_t* out_generation = nullptr);
   bool ArriveAtSafepoint(uint32_t thread_id, int cpu, uint32_t guest_pc);
   bool ConfirmSwitchOut(uint32_t thread_id, int cpu);
   bool AcknowledgeDispatchQuiesced(int cpu);

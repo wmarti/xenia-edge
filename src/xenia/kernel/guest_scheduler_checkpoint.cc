@@ -20,7 +20,11 @@ namespace kernel {
 
 bool GuestSchedulerCheckpointBarrier::Begin(
     uint8_t dispatch_cpu_mask,
-    std::span<const GuestSchedulerCheckpointParticipant> participants) {
+    std::span<const GuestSchedulerCheckpointParticipant> participants,
+    uint64_t* out_generation) {
+  if (out_generation) {
+    *out_generation = 0;
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   if (active_.load(std::memory_order_relaxed)) {
     return false;
@@ -72,6 +76,9 @@ bool GuestSchedulerCheckpointBarrier::Begin(
   quiesced_cpu_mask_ = 0;
   participants_.assign(participants.begin(), participants.end());
   arrivals_.assign(participants_.size(), ArrivalState{});
+  if (out_generation) {
+    *out_generation = generation_;
+  }
   active_.store(true, std::memory_order_release);
   return true;
 }
