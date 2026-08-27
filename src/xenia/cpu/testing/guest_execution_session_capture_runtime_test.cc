@@ -33,6 +33,7 @@
 #include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
+#include "xenia/gpu/pm4_marker_sink.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/guest_scheduler_capture_observer.h"
 #include "xenia/memory.h"
@@ -790,9 +791,19 @@ struct RuntimeHarness {
   RuntimeHarness(RuntimeEnvironment& environment, ThreadState& thread,
                  size_t queue_capacity,
                  GuestExecutionReelCoverageMode coverage_mode =
-                     GuestExecutionReelCoverageMode::kContinuousInstructions)
+                     GuestExecutionReelCoverageMode::kContinuousInstructions,
+                 GuestExecutionSessionBoundaryKind boundary_kind =
+                     GuestExecutionSessionBoundaryKind::kManual,
+                 uint64_t marker_count = 0)
       : checkpoint(thread), config(MakeConfig(queue_capacity)) {
     config.assembler.coverage_mode = coverage_mode;
+    config.assembler.boundary.kind = boundary_kind;
+    if (boundary_kind == GuestExecutionSessionBoundaryKind::kGuestMarkerCount) {
+      config.assembler.boundary.marker_source =
+          GuestExecutionSessionMarkerSource::kPm4Swap;
+      config.assembler.boundary.marker_identity = gpu::kPm4SwapMarkerOpcode;
+      config.assembler.boundary.value = marker_count;
+    }
     dependencies.clock = &clock;
     dependencies.provider = &provider;
     dependencies.event_bridge = &event_bridge;
@@ -1139,6 +1150,46 @@ TEST_CASE("session capture runtime preserves exact-full wrap control order",
   REQUIRE(status.state == RuntimeState::kComplete);
   REQUIRE(status.queued_event_count == 3);
   REQUIRE(status.processed_event_count == 3);
+  REQUIRE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 1);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime lets the assembler own the PM4 stop",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 8,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kGuestMarkerCount, 2);
+  REQUIRE(harness.runtime);
+
+  const auto before = harness.runtime->status();
+  REQUIRE(harness.runtime->OnGuestMarker(
+      GuestExecutionSessionMarkerSource::kPm4Swap, gpu::kPm4SwapMarkerOpcode));
+  REQUIRE(harness.runtime->status().queued_event_count ==
+          before.queued_event_count);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->OnGuestMarker(
+      GuestExecutionSessionMarkerSource::kPm4Swap, gpu::kPm4SwapMarkerOpcode));
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(harness.runtime->OnGuestMarker(
+      GuestExecutionSessionMarkerSource::kPm4Swap, gpu::kPm4SwapMarkerOpcode));
+
+  const bool reached_terminal = harness.runtime->WaitForTerminal(2s);
+  const auto status = harness.runtime->status();
+  INFO("state=" << static_cast<uint32_t>(status.state)
+                << " queued=" << status.queued_event_count
+                << " processed=" << status.processed_event_count
+                << " message=" << status.message);
+  REQUIRE(reached_terminal);
+  REQUIRE(status.state == RuntimeState::kComplete);
   REQUIRE(status.canonical_output_published);
   REQUIRE(harness.publisher.calls.load() == 1);
 

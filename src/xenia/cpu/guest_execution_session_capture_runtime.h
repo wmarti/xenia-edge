@@ -207,6 +207,11 @@ class GuestExecutionSessionCaptureRuntime final
 
   bool RequestStart() noexcept;
   bool RequestStop() noexcept;
+  // Fixed-size source ingress for PM4 and other no-thread guest markers. The
+  // control worker is the only caller of the assembler; markers before the
+  // session becomes active are intentionally ignored.
+  bool OnGuestMarker(GuestExecutionSessionMarkerSource source,
+                     uint64_t marker_identity) noexcept;
   // Establishes a linearizable publication fence and joins the worker. A
   // canonical Publish call that entered first completes before this returns;
   // after this returns, no publication can still start or complete.

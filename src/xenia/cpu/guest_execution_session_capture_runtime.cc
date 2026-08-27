@@ -314,6 +314,7 @@ enum class RuntimeEventKind : uint8_t {
   kHostCallBegin,
   kHostCallEnd,
   kScheduler,
+  kGuestMarker,
 };
 
 struct RuntimeEvent {
@@ -327,6 +328,9 @@ struct RuntimeEvent {
   uint32_t function_end_address = 0;
   uint32_t return_address = 0;
   kernel::GuestSchedulerCaptureEvent scheduler;
+  GuestExecutionSessionMarkerSource marker_source =
+      GuestExecutionSessionMarkerSource::kNone;
+  uint64_t marker_identity = 0;
 };
 
 // Dmitry Vyukov's bounded sequence-cell queue. There is one consumer and any
@@ -913,6 +917,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
         scheduler_event_count.fetch_add(1, std::memory_order_relaxed);
         return action;
       }
+      case RuntimeEventKind::kGuestMarker:
+        return assembler->OnGuestMarker(std::nullopt, event.marker_source,
+                                        event.marker_identity);
       case RuntimeEventKind::kStart:
       case RuntimeEventKind::kStop:
         break;
@@ -1149,7 +1156,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     const AssemblerState assembler_state = assembler->status().state;
     if (assembler_state == AssemblerState::kRejected) {
       Reject(RuntimeRejection::kAssemblerFailure, assembler->status().message);
-    } else if (assembler_state == AssemblerState::kStopRequested) {
+    } else if (assembler_state == AssemblerState::kStopRequested ||
+               assembler_state == AssemblerState::kStopRendezvous ||
+               assembler_state == AssemblerState::kPublishing) {
       HandleStop(false);
     }
   }
@@ -1164,7 +1173,10 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       Reject(RuntimeRejection::kAssemblerFailure, assembler->status().message);
       return;
     }
-    if (assembler->status().state == AssemblerState::kStopRequested) {
+    const AssemblerState assembler_state = assembler->status().state;
+    if (assembler_state == AssemblerState::kStopRequested ||
+        assembler_state == AssemblerState::kStopRendezvous ||
+        assembler_state == AssemblerState::kPublishing) {
       HandleStop(false);
     }
   }
@@ -1423,6 +1435,16 @@ bool GuestExecutionSessionCaptureRuntime::RequestStop() noexcept {
   }
   impl_->stop_requested = true;
   return true;
+}
+
+bool GuestExecutionSessionCaptureRuntime::OnGuestMarker(
+    GuestExecutionSessionMarkerSource source,
+    uint64_t marker_identity) noexcept {
+  RuntimeEvent event;
+  event.kind = RuntimeEventKind::kGuestMarker;
+  event.marker_source = source;
+  event.marker_identity = marker_identity;
+  return impl_->ForwardIfActive(event);
 }
 
 void GuestExecutionSessionCaptureRuntime::Shutdown() noexcept {
