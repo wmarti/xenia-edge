@@ -518,6 +518,14 @@ void Processor::ReleaseGuestExecutionCaptureObserverDispatch() noexcept {
 
 void Processor::RegisterGuestExecutionCaptureThreadState(
     ThreadState& thread_state) noexcept {
+  if (guest_execution_capture_thread_state_registration_gate_test_signal_) {
+    guest_execution_capture_thread_state_registration_gate_test_signal_->store(
+        true, std::memory_order_release);
+    while (!guest_execution_capture_thread_state_registration_gate_test_release_
+                ->load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  }
   if (guest_execution_capture_callback_active) {
     std::abort();
   }
@@ -535,6 +543,11 @@ void Processor::RegisterGuestExecutionCaptureThreadState(
       }
       insertion = &(*insertion)->guest_execution_capture_next_;
     }
+    std::atomic_ref<uint8_t>(
+        thread_state.context()->guest_invocation_capture_event_mask)
+        .store(guest_invocation_capture_initial_event_mask_.load(
+                   std::memory_order_acquire),
+               std::memory_order_release);
     thread_state.guest_execution_capture_next_ = nullptr;
     *insertion = &thread_state;
 

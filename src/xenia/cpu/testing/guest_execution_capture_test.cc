@@ -44,6 +44,22 @@ class GuestExecutionCaptureRegistryTestAccess final {
         .guest_execution_capture_thread_state_destruction_gate_test_signal_ =
         signal;
   }
+
+  static void SetThreadStateRegistrationGate(Processor& processor,
+                                             std::atomic<bool>* signal,
+                                             std::atomic<bool>* release) {
+    processor
+        .guest_execution_capture_thread_state_registration_gate_test_signal_ =
+        signal;
+    processor
+        .guest_execution_capture_thread_state_registration_gate_test_release_ =
+        release;
+  }
+
+  static void SetInitialEventMask(Processor& processor, uint8_t event_mask) {
+    processor.guest_invocation_capture_initial_event_mask_.store(
+        event_mask, std::memory_order_release);
+  }
 };
 
 namespace testing {
@@ -1279,6 +1295,43 @@ TEST_CASE("Guest ThreadState locked visitor excludes destruction",
   REQUIRE(destroy_finished.load(std::memory_order_acquire));
   REQUIRE(environment.processor->QueryGuestExecutionCaptureParticipants()
               .participants.empty());
+}
+
+TEST_CASE("Guest ThreadState registration publishes current capture event mask",
+          "[guest-execution-capture]") {
+  CaptureTestEnvironment environment;
+  std::atomic<bool> registration_reached = false;
+  std::atomic<bool> registration_release = false;
+  GuestExecutionCaptureRegistryTestAccess::SetThreadStateRegistrationGate(
+      *environment.processor, &registration_reached, &registration_release);
+
+  std::unique_ptr<ThreadState> thread_state;
+  std::thread constructor([&] {
+    thread_state =
+        std::make_unique<ThreadState>(environment.processor.get(), 0x607);
+  });
+  const auto gate_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!registration_reached.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < gate_deadline) {
+    std::this_thread::yield();
+  }
+  const bool registration_reached_observed =
+      registration_reached.load(std::memory_order_acquire);
+  constexpr uint8_t kPublishedEventMask = 0x05;
+  GuestExecutionCaptureRegistryTestAccess::SetInitialEventMask(
+      *environment.processor, kPublishedEventMask);
+  registration_release.store(true, std::memory_order_release);
+  constructor.join();
+  GuestExecutionCaptureRegistryTestAccess::SetThreadStateRegistrationGate(
+      *environment.processor, nullptr, nullptr);
+
+  REQUIRE(registration_reached_observed);
+  REQUIRE(thread_state);
+  REQUIRE(std::atomic_ref<uint8_t>(
+              thread_state->context()->guest_invocation_capture_event_mask)
+              .load(std::memory_order_acquire) == kPublishedEventMask);
+  thread_state.reset();
 }
 
 TEST_CASE("Guest JIT safepoint requests are independent and consumed once",

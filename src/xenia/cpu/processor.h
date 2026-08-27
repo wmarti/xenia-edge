@@ -437,6 +437,14 @@ class Processor {
   std::atomic<bool>*
       guest_execution_capture_thread_state_destruction_gate_test_signal_ =
           nullptr;
+  // Non-owning deterministic test rendezvous immediately before a newly
+  // initialized ThreadState enters the registry gate.
+  std::atomic<bool>*
+      guest_execution_capture_thread_state_registration_gate_test_signal_ =
+          nullptr;
+  std::atomic<bool>*
+      guest_execution_capture_thread_state_registration_gate_test_release_ =
+          nullptr;
 
   // Protects observer registration and short callback acquisition leases. It
   // is never held while invoking the observer, which may later rendezvous and
