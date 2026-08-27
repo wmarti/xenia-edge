@@ -27,6 +27,7 @@
 #include "xenia/cpu/guest_invocation_runner.h"
 #include "xenia/cpu/guest_invocation_synthetic_fixture.h"
 #include "xenia/cpu/jit_corpus.h"
+#include "xenia/cpu/ppc/testing/ppc_test_selection.h"
 
 DECLARE_bool(guest_scheduler);
 #include "xenia/cpu/ppc/ppc_context.h"
@@ -844,10 +845,6 @@ bool RunTests(const std::vector<std::string>& test_names) {
     }
     test_suites.push_back(std::move(test_suite));
   }
-  if (load_failed) {
-    XELOGE("One or more test suites failed to load.");
-  }
-
   XELOGI("{} tests loaded.", test_suites.size());
 
   // Collect all test cases across all suites, filtering out skipped tests
@@ -867,6 +864,22 @@ bool RunTests(const std::vector<std::string>& test_names) {
     fprintf(stderr, "Filtered out %d test cases based on skip list.\n",
             skipped_count);
   }
+
+  switch (EvaluatePpcTestSelection(load_failed, test_suites.size(),
+                                   all_tests.size())) {
+    case PpcTestSelectionVerdict::kSuiteLoadFailed:
+      XELOGE("Refusing to run a partial corpus after a suite load failure.");
+      return false;
+    case PpcTestSelectionVerdict::kNoLoadedSuites:
+      XELOGE("No selected test suites loaded.");
+      return false;
+    case PpcTestSelectionVerdict::kNoRunnableCases:
+      XELOGE("No runnable test cases selected.");
+      return false;
+    case PpcTestSelectionVerdict::kRunnable:
+      break;
+  }
+
   if (cvars::test_benchmark_warmed &&
       (test_suites.size() != 1 || all_tests.size() != 1)) {
     fprintf(stderr,
