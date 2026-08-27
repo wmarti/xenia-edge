@@ -332,6 +332,8 @@ class X64Emitter : public Xbyak::CodeGenerator {
   // guest_address is stamped into the context for wedge diagnosis when
   // log_safepoint_pc is on. 0 means unknown.
   void EmitPreemptCheck(uint32_t guest_address = 0);
+  void EmitGuestExecutionSessionInstructionCoverage(
+      uint32_t guest_instruction_count);
 
   void PushStackpoint();
   void PopStackpoint();

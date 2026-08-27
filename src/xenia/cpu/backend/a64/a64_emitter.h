@@ -267,6 +267,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // guest_address is stamped into the context for wedge diagnosis when
   // log_safepoint_pc is on; 0 means unknown.
   void EmitPreemptCheck(uint32_t guest_address = 0);
+  void EmitGuestExecutionSessionInstructionCoverage(
+      uint32_t guest_instruction_count);
 
   // ARM64 conditional branches (cbz/cbnz: ±1 MiB, tbz/tbnz: ±32 KiB,
   // b.cond: ±1 MiB) can fall short of their target in large guest functions.

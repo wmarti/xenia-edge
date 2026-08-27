@@ -933,6 +933,46 @@ EmittedJitSafepointResult RunEmittedJitSafepointDelivery(
 
 }  // namespace
 
+TEST_CASE("A64_SESSION_INSTRUCTION_COVERAGE_COUNTS_EXECUTED_BLOCKS",
+          "[backend][guest-execution-session-capture]") {
+  constexpr uint32_t kAddress = 0x80000000;
+  TestFunction function(
+      [](hir::HIRBuilder& builder) {
+        builder.SourceOffset(kAddress);
+        StoreGPR(builder, 3, builder.LoadConstantUint64(3));
+        hir::Label* loop = builder.NewLabel();
+        builder.MarkLabel(loop);
+        builder.SourceOffset(kAddress + 4);
+        StoreGPR(
+            builder, 3,
+            builder.Sub(LoadGPR(builder, 3), builder.LoadConstantUint64(1)));
+        builder.SourceOffset(kAddress + 8);
+        builder.BranchTrue(builder.CompareNE(LoadGPR(builder, 3),
+                                             builder.LoadConstantUint64(0)),
+                           loop);
+        builder.SourceOffset(kAddress + 12);
+        builder.Return();
+      },
+      kAddress + 12);
+
+  function.Run(
+      [](ppc::PPCContext* context) {
+        context->guest_execution_session_instruction_counter =
+            &context->guest_execution_session_instruction_count;
+      },
+      [](ppc::PPCContext* context) {
+        REQUIRE(context->guest_execution_session_instruction_count == 8);
+      });
+  function.Run(
+      [](ppc::PPCContext* context) {
+        context->guest_execution_session_instruction_count = 71;
+        context->guest_execution_session_instruction_counter = nullptr;
+      },
+      [](ppc::PPCContext* context) {
+        REQUIRE(context->guest_execution_session_instruction_count == 71);
+      });
+}
+
 TEST_CASE("A64_DEFINITION_NOTIFICATION_PRECEDES_CALLABLE_PUBLICATION",
           "[backend][guest-invocation-capture][frontend]") {
   constexpr uint32_t kFunctionAddress = 0x82000000u;

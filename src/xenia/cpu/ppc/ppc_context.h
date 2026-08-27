@@ -457,6 +457,9 @@ typedef struct alignas(64) PPCContext_s {
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  alignas(8) uint64_t guest_execution_session_instruction_count;
+  uint64_t* guest_execution_session_instruction_counter;
+
   // One atomic publication unit for the selected root, inline event mask and
   // sink generation. Emitted hooks retain this value across the host call so
   // a callback from an older generation cannot bind to or rearm a new sink.
