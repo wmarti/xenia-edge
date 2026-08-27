@@ -104,6 +104,10 @@ class GuestInvocationRecorderPageReader {
   virtual ~GuestInvocationRecorderPageReader() = default;
   virtual bool ReadPage(uint32_t page_address,
                         std::array<uint8_t, 4096>* output) = 0;
+  // Queried only immediately after ReadPage returns false on the recorder's
+  // serialized callback stream. A retryable failure must not have modified
+  // the output and may be retried by Poll without rejecting the capture.
+  virtual bool last_read_was_retryable() const { return false; }
 };
 
 class GuestInvocationRecorderClock {

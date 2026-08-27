@@ -178,6 +178,9 @@ TEST_CASE("guest invocation capture page reader never waits for global region",
   REQUIRE(read_started.load(std::memory_order_acquire));
   REQUIRE(read_finished_while_contended);
   REQUIRE_FALSE(read_result);
+  REQUIRE(reader.last_read_was_retryable());
+  REQUIRE(reader.ReadPage(kReadablePage, &output));
+  REQUIRE_FALSE(reader.last_read_was_retryable());
 }
 
 }  // namespace test

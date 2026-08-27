@@ -118,6 +118,7 @@ GuestInvocationCaptureRuntimeConfig CurrentConfig() {
 
 bool GuestInvocationCapturePageReader::ReadPage(
     uint32_t page_address, std::array<uint8_t, 4096>* output) {
+  last_read_was_retryable_ = false;
   static_assert(JitCorpus::kPageSize == 4096);
   if (!output || (page_address & (JitCorpus::kPageSize - 1)) ||
       page_address >
@@ -133,6 +134,7 @@ bool GuestInvocationCapturePageReader::ReadPage(
   // A contended snapshot fails closed and rejects only the capture.
   auto global_lock = xe::global_critical_region::TryAcquire();
   if (!global_lock.owns_lock()) {
+    last_read_was_retryable_ = true;
     return false;
   }
 

@@ -54,11 +54,17 @@ class FakePageReader final : public GuestInvocationRecorderPageReader {
  public:
   bool ReadPage(uint32_t page_address,
                 std::array<uint8_t, 4096>* output) override {
+    last_read_retryable = false;
     ++read_count;
     read_addresses.push_back(page_address);
     if (reenter_on_read) {
       reenter_on_read = false;
       reentrant_result = reentrant_recorder->OnAsyncReentry(kOwner);
+    }
+    if (retryable_read_count) {
+      --retryable_read_count;
+      last_read_retryable = true;
+      return false;
     }
     if (failed_pages.contains(page_address)) {
       return false;
@@ -80,6 +86,8 @@ class FakePageReader final : public GuestInvocationRecorderPageReader {
     return true;
   }
 
+  bool last_read_was_retryable() const override { return last_read_retryable; }
+
   void AddPage(uint32_t page_address, uint8_t seed) {
     std::array<uint8_t, 4096>& page = pages[page_address];
     for (size_t i = 0; i < page.size(); ++i) {
@@ -92,9 +100,11 @@ class FakePageReader final : public GuestInvocationRecorderPageReader {
   std::set<uint32_t> unstable_pages;
   std::vector<uint32_t> read_addresses;
   uint32_t read_count = 0;
+  uint32_t retryable_read_count = 0;
   GuestInvocationRecorder* reentrant_recorder = nullptr;
   bool reenter_on_read = false;
   bool reentrant_result = true;
+  bool last_read_retryable = false;
 };
 
 GuestInvocationRecorderSelection MakeSelection(
@@ -370,6 +380,54 @@ TEST_CASE("guest invocation recorder converges and builds a complete result",
   REQUIRE(GuestInvocationArtifactCodec::Encode(artifact, &encoded, &error));
   REQUIRE(error.empty());
   REQUIRE_FALSE(encoded.empty());
+}
+
+TEST_CASE("guest invocation recorder retries contended definition snapshots",
+          "[guest-invocation-recorder]") {
+  FakePageReader reader;
+  reader.AddPage(kRootAddress, 0x30);
+  reader.retryable_read_count = 1;
+  FakeClock clock;
+  std::unique_ptr<GuestInvocationRecorder> recorder =
+      MakeRecorder(reader, clock);
+
+  REQUIRE(recorder->state() ==
+          GuestInvocationRecorderState::kWaitingForOccurrence);
+  REQUIRE(recorder->rejection() == GuestInvocationRecorderRejection::kNone);
+  REQUIRE(reader.read_count == 1);
+  REQUIRE(recorder->Poll());
+  REQUIRE(reader.read_count == 3);
+
+  DiscoveryAttempt(*recorder, {});
+  DiscoveryAttempt(*recorder, {});
+  REQUIRE(recorder->state() ==
+          GuestInvocationRecorderState::kWaitingForFinalAttempt);
+  EnterRoot(*recorder, MakeState(30));
+  ExitRoot(*recorder, MakeState(31));
+
+  REQUIRE(recorder->state() == GuestInvocationRecorderState::kComplete);
+  REQUIRE(recorder->rejection() == GuestInvocationRecorderRejection::kNone);
+  REQUIRE(recorder->result());
+  REQUIRE(recorder->result()->code_pages.size() == 1);
+  REQUIRE(recorder->result()->code_pages[0].guest_address == kRootAddress);
+  REQUIRE(recorder->result()->code_pages[0].data == reader.pages[kRootAddress]);
+}
+
+TEST_CASE("guest invocation recorder rejects writes before deferred snapshot",
+          "[guest-invocation-recorder]") {
+  FakePageReader reader;
+  reader.AddPage(kRootAddress, 0x30);
+  reader.retryable_read_count = 1;
+  FakeClock clock;
+  std::unique_ptr<GuestInvocationRecorder> recorder =
+      MakeRecorder(reader, clock);
+
+  REQUIRE(recorder->OnMemoryAccess(
+      kOther, kRootAddress, 4, GuestInvocationRecorderMemoryAccess::kWrite));
+  REQUIRE_FALSE(recorder->Poll());
+  RequireRejected(*recorder,
+                  GuestInvocationRecorderRejection::kSelfModifyingCode,
+                  kGuestInvocationDependencySelfModifyingCode);
 }
 
 TEST_CASE("guest invocation recorder claims owner and validates registry order",

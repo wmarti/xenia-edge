@@ -31,9 +31,13 @@ class GuestInvocationCapturePageReader final
 
   bool ReadPage(uint32_t page_address,
                 std::array<uint8_t, 4096>* output) override;
+  bool last_read_was_retryable() const override {
+    return last_read_was_retryable_;
+  }
 
  private:
   Memory& memory_;
+  bool last_read_was_retryable_ = false;
 };
 
 }  // namespace cpu

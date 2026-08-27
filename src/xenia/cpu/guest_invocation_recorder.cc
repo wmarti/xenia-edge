@@ -72,6 +72,7 @@ struct GuestInvocationRecorder::Impl {
     uint32_t end_address = 0;
     uint32_t definition_order = 0;
     bool defined = false;
+    bool code_pages_snapshotted = false;
     std::set<uint32_t> dependencies;
     std::vector<uint32_t> code_page_addresses;
   };
@@ -79,6 +80,12 @@ struct GuestInvocationRecorder::Impl {
   struct CodePageSnapshot {
     std::array<uint8_t, kGuestPageSize> data = {};
     uint64_t write_generation = 0;
+  };
+
+  enum class CodePageReadResult {
+    kSuccess,
+    kRetry,
+    kFailure,
   };
 
   struct CallFrame {
@@ -264,29 +271,103 @@ struct GuestInvocationRecorder::Impl {
     return true;
   }
 
-  bool ReadStableCodePage(uint32_t page_address,
-                          std::array<uint8_t, kGuestPageSize>* stable_page) {
+  CodePageReadResult ReadStableCodePage(
+      uint32_t page_address, std::array<uint8_t, kGuestPageSize>* stable_page) {
     std::array<uint8_t, kGuestPageSize> verification = {};
     const bool first_read = page_reader.ReadPage(page_address, stable_page);
     if (state == GuestInvocationRecorderState::kRejected) {
-      return false;
+      return CodePageReadResult::kFailure;
+    }
+    if (!first_read && page_reader.last_read_was_retryable()) {
+      return CodePageReadResult::kRetry;
     }
     const bool second_read =
         first_read && page_reader.ReadPage(page_address, &verification);
     if (state == GuestInvocationRecorderState::kRejected) {
-      return false;
+      return CodePageReadResult::kFailure;
+    }
+    if (!second_read && page_reader.last_read_was_retryable()) {
+      return CodePageReadResult::kRetry;
     }
     if (!first_read || !second_read) {
-      return Reject(GuestInvocationRecorderRejection::kPageReadFailure,
-                    "unable to read a guest code page",
-                    kGuestInvocationDependencyUnsupportedMappingOrProtection);
+      Reject(GuestInvocationRecorderRejection::kPageReadFailure,
+             "unable to read a guest code page",
+             kGuestInvocationDependencyUnsupportedMappingOrProtection);
+      return CodePageReadResult::kFailure;
     }
     if (*stable_page != verification) {
-      return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
-                    "guest code changed while it was sampled",
-                    kGuestInvocationDependencySelfModifyingCode);
+      Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+             "guest code changed while it was sampled",
+             kGuestInvocationDependencySelfModifyingCode);
+      return CodePageReadResult::kFailure;
     }
-    return true;
+    return CodePageReadResult::kSuccess;
+  }
+
+  bool RequireStableCodePage(uint32_t page_address,
+                             std::array<uint8_t, kGuestPageSize>* stable_page) {
+    const CodePageReadResult read =
+        ReadStableCodePage(page_address, stable_page);
+    if (read == CodePageReadResult::kSuccess) {
+      return true;
+    }
+    if (read == CodePageReadResult::kRetry) {
+      return Reject(
+          GuestInvocationRecorderRejection::kPageReadFailure,
+          "global memory snapshot remained contended at capture boundary",
+          kGuestInvocationDependencyUnsupportedMappingOrProtection);
+    }
+    return false;
+  }
+
+  CodePageReadResult SnapshotDefinition(DefinitionRecord& definition) {
+    std::map<uint32_t, CodePageSnapshot> code_pages;
+    for (uint32_t page_address : definition.code_page_addresses) {
+      const auto generation =
+          definition_page_write_generations.find(page_address);
+      if (generation == definition_page_write_generations.cend() ||
+          generation->second) {
+        Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+               "guest code was written before its definition snapshot",
+               kGuestInvocationDependencySelfModifyingCode);
+        return CodePageReadResult::kFailure;
+      }
+      CodePageSnapshot snapshot;
+      const CodePageReadResult read =
+          ReadStableCodePage(page_address, &snapshot.data);
+      if (read != CodePageReadResult::kSuccess) {
+        return read;
+      }
+      snapshot.write_generation = generation->second;
+      const auto existing = definition_code_pages.find(page_address);
+      if (existing != definition_code_pages.cend() &&
+          (existing->second.write_generation != snapshot.write_generation ||
+           existing->second.data != snapshot.data)) {
+        Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+               "shared code page changed between successful definitions",
+               kGuestInvocationDependencySelfModifyingCode);
+        return CodePageReadResult::kFailure;
+      }
+      code_pages.emplace(page_address, std::move(snapshot));
+    }
+    for (auto& [page_address, snapshot] : code_pages) {
+      definition_code_pages.emplace(page_address, std::move(snapshot));
+    }
+    definition.code_pages_snapshotted = true;
+    return CodePageReadResult::kSuccess;
+  }
+
+  CodePageReadResult SnapshotPendingDefinitions() {
+    for (auto pending = pending_definition_snapshots.begin();
+         pending != pending_definition_snapshots.end();) {
+      DefinitionRecord& definition = definitions.at(*pending);
+      const CodePageReadResult snapshot = SnapshotDefinition(definition);
+      if (snapshot != CodePageReadResult::kSuccess) {
+        return snapshot;
+      }
+      pending = pending_definition_snapshots.erase(pending);
+    }
+    return CodePageReadResult::kSuccess;
   }
 
   bool RegisterDefinition(uint32_t address, uint32_t end_address) {
@@ -325,47 +406,33 @@ struct GuestInvocationRecorder::Impl {
                     kGuestInvocationDependencyPageDiscoveryOverflow);
     }
 
-    std::map<uint32_t, CodePageSnapshot> code_pages;
     for (uint64_t page = first_page; page <= last_page;
          page += kGuestPageSize) {
       const uint32_t page_address = static_cast<uint32_t>(page);
-      CodePageSnapshot snapshot;
-      if (!ReadStableCodePage(page_address, &snapshot.data)) {
-        return false;
-      }
-      const auto generation =
-          definition_page_write_generations.find(page_address);
-      snapshot.write_generation =
-          generation == definition_page_write_generations.cend()
-              ? 0
-              : generation->second;
-      const auto existing = definition_code_pages.find(page_address);
-      if (existing != definition_code_pages.cend() &&
-          (existing->second.write_generation != snapshot.write_generation ||
-           existing->second.data != snapshot.data)) {
-        return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
-                      "shared code page changed between successful definitions",
-                      kGuestInvocationDependencySelfModifyingCode);
-      }
-      code_pages.emplace(page_address, std::move(snapshot));
+      definition->code_page_addresses.push_back(page_address);
     }
     for (uint32_t page_address : new_page_addresses) {
       definition_page_write_generations.emplace(page_address, 0);
-    }
-    definition->code_page_addresses.reserve(code_pages.size());
-    for (auto& [page_address, snapshot] : code_pages) {
-      definition->code_page_addresses.push_back(page_address);
-      definition_code_pages.emplace(page_address, std::move(snapshot));
     }
     definition->defined = true;
     definition->end_address = end_address;
     definition->definition_order =
         static_cast<uint32_t>(definition_order.size());
     definition_order.push_back(address);
-    return true;
+    const CodePageReadResult snapshot = SnapshotDefinition(*definition);
+    if (snapshot == CodePageReadResult::kRetry) {
+      pending_definition_snapshots.insert(address);
+      return true;
+    }
+    return snapshot == CodePageReadResult::kSuccess;
   }
 
   bool MergeDefinitionCodePages(const DefinitionRecord& definition) {
+    if (!definition.code_pages_snapshotted) {
+      return Reject(
+          GuestInvocationRecorderRejection::kIncompleteTranslationClosure,
+          "successful definition still has a pending code-page snapshot");
+    }
     for (uint32_t page_address : definition.code_page_addresses) {
       const auto immutable_page = definition_code_pages.find(page_address);
       if (immutable_page == definition_code_pages.cend()) {
@@ -406,7 +473,7 @@ struct GuestInvocationRecorder::Impl {
                       kGuestInvocationDependencySelfModifyingCode);
       }
       std::array<uint8_t, kGuestPageSize> current = {};
-      if (!ReadStableCodePage(page_address, &current)) {
+      if (!RequireStableCodePage(page_address, &current)) {
         return false;
       }
       if (current != snapshot.data) {
@@ -420,6 +487,16 @@ struct GuestInvocationRecorder::Impl {
 
   bool AddTranslationClosureSeed(uint32_t address,
                                  uint32_t expected_end_address) {
+    const CodePageReadResult pending_snapshot = SnapshotPendingDefinitions();
+    if (pending_snapshot == CodePageReadResult::kRetry) {
+      return Reject(
+          GuestInvocationRecorderRejection::kPageReadFailure,
+          "definition snapshot contention persisted until function entry",
+          kGuestInvocationDependencyUnsupportedMappingOrProtection);
+    }
+    if (pending_snapshot == CodePageReadResult::kFailure) {
+      return false;
+    }
     const auto seed = definitions.find(address);
     if (seed == definitions.cend() || !seed->second.defined) {
       return Reject(
@@ -891,6 +968,7 @@ struct GuestInvocationRecorder::Impl {
   std::map<uint32_t, DefinitionRecord> definitions;
   std::vector<uint32_t> definition_order;
   std::map<uint32_t, uint64_t> definition_page_write_generations;
+  std::set<uint32_t> pending_definition_snapshots;
   std::map<uint32_t, CodePageSnapshot> definition_code_pages;
   std::map<uint32_t, CodePageSnapshot> closure_code_pages;
   std::map<uint32_t, uint32_t> closure_functions;
@@ -960,7 +1038,11 @@ GuestInvocationRecorder::~GuestInvocationRecorder() = default;
 
 bool GuestInvocationRecorder::Poll() {
   Impl::CallbackScope callback(*impl_);
-  return callback && impl_->CheckDeadline();
+  if (!callback || !impl_->CheckDeadline()) {
+    return false;
+  }
+  return impl_->SnapshotPendingDefinitions() !=
+         Impl::CodePageReadResult::kFailure;
 }
 
 bool GuestInvocationRecorder::OnFunctionDependency(
