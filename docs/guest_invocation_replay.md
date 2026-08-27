@@ -21,6 +21,47 @@ The existing JIT corpus cannot provide this proof by itself. It contains guest
 code pages and function extents for compilation, but no PPC registers, writable
 memory or chronological execution state.
 
+## Campaign status and TODO (2026-08-27)
+
+The replay consumer is implemented as isolated commits: strict artifact and
+execution-corpus codecs, exact replay module, architectural reset, Apple/A64
+warmed runner, canonical configuration fingerprint, bounded workload planning,
+single-invocation CLI, current-thread CPU timing, paired fail-closed driver and
+copyright-free synthetic fixtures. This is not yet a real-title replay result;
+the linked end-to-end gate and recorder producer remain open.
+
+- [ ] Finish adversarial hardening and the serialized Release validation matrix:
+      `./xb format --all`, Python driver tests, full CPU tests, exactly 169,048
+      PPC corpus cases, one valid linked replay, and actual omitted-page and
+      `0x7F` child failures with no accepted marker.
+- [x] Add a deterministic exact-corpus builder that retains the complete
+      translation/declaration closure required by executed functions, including
+      static callees and helper/save-restore metadata that translation looks up
+      even when that function is not entered during the selected invocation.
+- [ ] Add the bounded platform-neutral recorder state machine: explicit root and
+      occurrence selection, convergence across attempts, pointer-free entry/exit
+      state, page/granule closure, call-stack checks, dependency flags and strict
+      count/size/deadline rejection.
+- [ ] Add build-only A64 boundary, translation-dependency and pre-memory-access
+      hooks. Reject extern/kernel, MMIO, clock, atomic/reservation, recursion,
+      tail/longjmp imbalance, async reentry, self-modifying code and cross-thread
+      writes instead of truncating or approximating the capture.
+- [x] Add a reusable writer for one accepted invocation and exact corpus. It
+      validates and round-trips the payloads, records the capture-build and
+      canonical-config hashes, never replaces output or staging, and publishes
+      through one same-parent directory rename.
+- [ ] Wire the bounded recorder to hash its running executable and call the
+      bundle writer. Captured title bytes remain local benchmark inputs and must
+      never be committed.
+- [ ] Pass the recorder's synthetic positive and negative matrix before enabling
+      a bounded GTA capture. For each accepted title invocation, require exact
+      baseline offline output parity and stable code shape before collecting CPU
+      timing.
+- [ ] Rank optimization candidates from paired per-invocation CPU deltas weighted
+      only by matching live execution counts. Implement one candidate per commit
+      and require focused tests, full PPC semantics, paired offline replay and a
+      bounded title-level regression guard before adoption.
+
 ## Artifact split
 
 Code and execution inputs remain separate:
@@ -332,7 +373,8 @@ An optimization comparison is accepted only when all of these hold:
 - the procedural same-build-tree/compiler/SDK/flags attestation is present and
   backed by a retained configure/build log;
 - A/A and B/B controls are stable enough to resolve the proposed effect;
-- A/B and B/A ordering agree in sign beyond that measured floor; and
+- every A/B and B/A pair clears that measured floor in the same canonical sign;
+  and
 - no crash, timeout, zero-work run, missing marker or rejected sample is
   included in the statistics.
 
