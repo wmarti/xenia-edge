@@ -1,0 +1,228 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2026 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#ifndef XENIA_CPU_GUEST_EXECUTION_EXTERNAL_EVENT_H_
+#define XENIA_CPU_GUEST_EXECUTION_EXTERNAL_EVENT_H_
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <vector>
+
+#include "xenia/cpu/guest_execution_capture.h"
+#include "xenia/cpu/guest_execution_session.h"
+
+namespace xe {
+namespace cpu {
+
+// The session codec enumerations are reused directly so every recorded value
+// is the durable one and no parallel numbering can drift.
+//
+// Kind: only kKernelExport and kExternOrBuiltin are accepted. Both are
+// synchronous host work invoked by the active guest thread on its own call
+// stack. Asynchronous classes (scheduler, MMIO, clocks, interrupts, atomics,
+// GPU/DMA/host and other-thread writes) are out of scope here and belong to
+// sibling adapters.
+using GuestExecutionCaptureExternalEventKind = GuestExecutionSessionEventKind;
+
+// Disposition: explicit for every event so no nondeterministic result is
+// silently trusted or ignored. A kRejectSession event is still recorded as
+// durable diagnostic metadata, and the snapshot's sticky reject-session
+// indicator marks the whole log non-replayable.
+using GuestExecutionCaptureExternalEventDisposition =
+    GuestExecutionSessionEventDisposition;
+
+// Mutation source: only kNone and kActiveGuestThread are accepted. A
+// synchronous export runs on behalf of the calling guest thread, so its
+// guest-memory writes belong to that thread; GPU, DMA, host and
+// other-guest-thread sources are rejected so an active-guest store can never be
+// mislabeled as an asynchronous one.
+using GuestExecutionCaptureExternalEventMutationSource =
+    GuestExecutionSessionMutationSource;
+
+// Runtime-local pairing metadata for one begin/end span. Never a durable
+// session sequence.
+struct GuestExecutionCaptureExternalEventToken {
+  uint64_t value = 0;
+
+  explicit operator bool() const { return value != 0; }
+  bool operator==(const GuestExecutionCaptureExternalEventToken&) const =
+      default;
+};
+
+// Bounds on buffering and per-event payload. Every limit rejects the log
+// instead of silently truncating.
+struct GuestExecutionCaptureExternalEventLimits {
+  uint64_t max_active_calls = 256;
+  uint64_t max_recorded_events = 1u << 20;
+  uint32_t max_effect_bytes = 64u * 1024u;
+  uint64_t max_total_payload_bytes = 64ull * 1024ull * 1024ull;
+};
+
+// Opens one external event. The declared guest-memory effect range is the
+// contiguous region the export is expected to write; its exact preimage bytes
+// are supplied separately and snapshotted before the export body runs. An
+// empty preimage means the event declares no guest-memory effect.
+struct GuestExecutionCaptureExternalEventBegin {
+  GuestExecutionCaptureParticipantIdentity participant;
+  GuestExecutionCaptureExternalEventKind kind =
+      GuestExecutionCaptureExternalEventKind::kKernelExport;
+  // Stable export identity within its module; zero when none applies.
+  uint32_t export_ordinal = 0;
+  // Guest return address at the dispatch boundary, for provenance only.
+  uint32_t call_site_address = 0;
+  // Base of the declared guest-memory effect range; meaningful only when the
+  // preimage span is non-empty.
+  uint32_t effect_address = 0;
+};
+
+// Closes one external event with its observed result and postimage. The
+// postimage span must be empty when the begin declared no effect, and
+// otherwise exactly as long as the preimage. mutation_source must be
+// kActiveGuestThread exactly when an effect is present.
+struct GuestExecutionCaptureExternalEventEnd {
+  GuestExecutionCaptureExternalEventDisposition disposition =
+      GuestExecutionCaptureExternalEventDisposition::kReplayCaptured;
+  GuestExecutionCaptureExternalEventMutationSource mutation_source =
+      GuestExecutionCaptureExternalEventMutationSource::kNone;
+  bool has_returned_value = false;
+  // Raw return register value; canonicalized to little-endian in the record.
+  uint64_t returned_value = 0;
+};
+
+// One finished external event. Payload bytes are canonical: the return value
+// is little-endian, and the guest-memory pre/postimages are the exact guest
+// bytes for the recorded address and range.
+struct GuestExecutionCaptureExternalEventRecord {
+  uint64_t sequence = 0;
+  GuestExecutionCaptureParticipantIdentity participant;
+  GuestExecutionCaptureExternalEventKind kind =
+      GuestExecutionCaptureExternalEventKind::kKernelExport;
+  GuestExecutionCaptureExternalEventDisposition disposition =
+      GuestExecutionCaptureExternalEventDisposition::kReplayCaptured;
+  GuestExecutionCaptureExternalEventMutationSource mutation_source =
+      GuestExecutionCaptureExternalEventMutationSource::kNone;
+  uint32_t export_ordinal = 0;
+  uint32_t call_site_address = 0;
+  bool has_returned_value = false;
+  std::array<uint8_t, 8> returned_value_le = {};
+  uint32_t effect_address = 0;
+  uint32_t effect_byte_count = 0;
+  std::vector<uint8_t> preimage;
+  std::vector<uint8_t> postimage;
+
+  bool operator==(const GuestExecutionCaptureExternalEventRecord&) const =
+      default;
+};
+
+enum class GuestExecutionCaptureExternalEventRejection : uint8_t {
+  kNone,
+  kInvalidBegin,
+  kInvalidEnd,
+  kAllocationFailure,
+  kTokenOverflow,
+  kSequenceOverflow,
+  kActiveCallLimit,
+  kEventLimit,
+  kPayloadLimit,
+};
+
+// One still-open external event.
+struct GuestExecutionCaptureExternalEventActiveCall {
+  GuestExecutionCaptureExternalEventToken token;
+  GuestExecutionCaptureParticipantIdentity participant;
+  GuestExecutionCaptureExternalEventKind kind =
+      GuestExecutionCaptureExternalEventKind::kKernelExport;
+  uint32_t export_ordinal = 0;
+  uint32_t call_site_address = 0;
+  uint32_t effect_address = 0;
+  uint32_t effect_byte_count = 0;
+  uint32_t participant_depth = 0;
+
+  bool is_outermost() const { return participant_depth == 1; }
+  bool operator==(const GuestExecutionCaptureExternalEventActiveCall&) const =
+      default;
+};
+
+struct GuestExecutionCaptureExternalEventSnapshot {
+  uint64_t recorded_event_count = 0;
+  uint64_t total_payload_bytes = 0;
+  GuestExecutionCaptureExternalEventRejection rejection =
+      GuestExecutionCaptureExternalEventRejection::kNone;
+  // Sticky: a recorded kRejectSession event never clears these, so a consumer
+  // that only checks rejection cannot mistake this log for a replayable one.
+  uint64_t reject_session_count = 0;
+  uint64_t first_reject_session_sequence = 0;
+  std::vector<GuestExecutionCaptureExternalEventActiveCall> active_calls;
+  std::vector<GuestExecutionCaptureExternalEventRecord> events;
+
+  bool replayable() const {
+    return rejection == GuestExecutionCaptureExternalEventRejection::kNone &&
+           reject_session_count == 0;
+  }
+};
+
+// Thread-safe, observational external-event state machine for the synchronous
+// kernel-export / extern-dispatch class. It carries no capture start, stop,
+// checkpoint, event-sequence or publication policy: a future bounded
+// execution-capture runtime owns those and calls this at the semantically
+// correct dispatch boundary. Every method is fail-closed. Once any rejection
+// latches, later begins return an empty token and later ends return false, so
+// an incomplete log can never be mistaken for a complete one. A latched log
+// also reports CanDetach() true so its owner can always release it.
+//
+// Pairing is last-in-first-out per participant so a nested export that reenters
+// guest code and dispatches another export closes in the correct order; an
+// out-of-order end latches kInvalidEnd rather than silently reordering.
+//
+// A kRejectSession end is accepted and recorded, but the snapshot's sticky
+// reject-session indicator makes replayable() false from then on.
+class GuestExecutionCaptureExternalEventLog final {
+ public:
+  explicit GuestExecutionCaptureExternalEventLog(
+      const GuestExecutionCaptureExternalEventLimits& limits = {});
+  ~GuestExecutionCaptureExternalEventLog();
+  GuestExecutionCaptureExternalEventLog(
+      const GuestExecutionCaptureExternalEventLog&) = delete;
+  GuestExecutionCaptureExternalEventLog& operator=(
+      const GuestExecutionCaptureExternalEventLog&) = delete;
+
+  // Opens an event, snapshotting the declared effect preimage. Returns an empty
+  // token on rejection.
+  GuestExecutionCaptureExternalEventToken OnExternalEventBegin(
+      const GuestExecutionCaptureExternalEventBegin& begin,
+      std::span<const uint8_t> effect_preimage) noexcept;
+
+  // Closes the event named by token, recording the return value and effect
+  // postimage. Returns false on any rejection.
+  bool OnExternalEventEnd(GuestExecutionCaptureExternalEventToken token,
+                          const GuestExecutionCaptureExternalEventEnd& end,
+                          std::span<const uint8_t> effect_postimage) noexcept;
+
+  // True when no event is still open, or once any rejection has latched so a
+  // failed log never pins its owner.
+  bool CanDetach() const noexcept;
+
+  GuestExecutionCaptureExternalEventSnapshot snapshot() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace cpu
+}  // namespace xe
+
+#endif
+
+#endif  // XENIA_CPU_GUEST_EXECUTION_EXTERNAL_EVENT_H_
