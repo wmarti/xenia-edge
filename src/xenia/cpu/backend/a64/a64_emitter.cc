@@ -523,7 +523,7 @@ void* A64Emitter::Emplace(const EmitFunctionInfo& func_info,
     code_cache_->PlaceGuestCode(
         function->address(),
         const_cast<void*>(static_cast<const void*>(getCode())), func_info,
-        function, new_execute_address, new_write_address);
+        function, new_execute_address, new_write_address, false);
   } else {
     code_cache_->PlaceHostCode(
         0, const_cast<void*>(static_cast<const void*>(getCode())), func_info,

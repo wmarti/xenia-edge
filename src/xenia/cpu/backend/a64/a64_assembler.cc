@@ -91,11 +91,6 @@ bool A64Assembler::Assemble(GuestFunction* function, HIRBuilder* builder,
   static_cast<A64Function*>(function)->Setup(
       reinterpret_cast<uint8_t*>(machine_code), code_size);
 
-  // Install into indirection table (supports code cache at any 64-bit VA).
-  reinterpret_cast<A64CodeCache*>(backend_->code_cache())
-      ->AddIndirection64(function->address(),
-                         reinterpret_cast<uint64_t>(machine_code));
-
   return true;
 }
 

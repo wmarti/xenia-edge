@@ -483,7 +483,8 @@ class CodeCacheBase : public CodeCache {
                       const EmitFunctionInfo& func_info,
                       GuestFunction* function_info,
                       void*& code_execute_address_out,
-                      void*& code_write_address_out) {
+                      void*& code_write_address_out,
+                      bool publish_indirection = true) {
     using namespace xe::literals;
     uint8_t* code_execute_address;
     {
@@ -565,11 +566,11 @@ class CodeCacheBase : public CodeCache {
                          func_info.code_size.total);
 
     // Fix up indirection table.
-    if (guest_address && indirection_table_base_) {
+    if (publish_indirection && guest_address && indirection_table_base_) {
       UpdateIndirection(guest_address, code_execute_address);
     }
 
-    // Publish only after the placement and its indirection update are
+    // Publish only after placement and any requested indirection update are
     // complete. Relaxed execution would be sufficient for the count itself,
     // but release pairs with the benchmark's acquire snapshot and makes the
     // completed-placement meaning explicit.

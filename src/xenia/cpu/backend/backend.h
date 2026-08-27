@@ -87,6 +87,10 @@ class Backend {
   virtual std::unique_ptr<GuestFunction> CreateGuestFunction(
       Module* module, uint32_t address) = 0;
 
+  // Makes machine code staged by the assembler callable. Backends that publish
+  // during assembly need no extra work.
+  virtual bool PublishGuestFunction(GuestFunction*) { return true; }
+
   // Calculates the next host instruction based on the current thread state and
   // current PC. This will look for branches and other control flow
   // instructions.

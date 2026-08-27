@@ -198,11 +198,12 @@ TEST_CASE("GUEST_INVOCATION_CAPTURE_FRONTEND_DEFINITION_CLOSURE",
   REQUIRE(capture.dependencies.size() == 1);
   REQUIRE(capture.definitions.size() == 2);
 
-  // Capture rejection is sink-owned and must not change title translation.
+  // A rejected definition must not become available to title execution.
   capture.accept_callbacks = false;
-  REQUIRE(processor->ResolveFunction(kAfterCaptureAddress));
+  REQUIRE_FALSE(processor->ResolveFunction(kAfterCaptureAddress));
   REQUIRE((capture.definitions.back() ==
            FunctionExtent{kAfterCaptureAddress, kAfterCaptureAddress}));
+  REQUIRE_FALSE(processor->ResolveFunction(kAfterCaptureAddress));
 
   processor->set_guest_invocation_capture_sink(nullptr);
   REQUIRE(processor->guest_invocation_capture_sink() == nullptr);

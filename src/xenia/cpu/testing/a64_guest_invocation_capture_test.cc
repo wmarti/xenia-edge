@@ -14,21 +14,29 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "third_party/catch/include/catch.hpp"
 #include "xenia/base/cvar.h"
+#include "xenia/cpu/backend/a64/a64_backend.h"
+#include "xenia/cpu/backend/a64/a64_code_cache.h"
+#include "xenia/cpu/backend/a64/a64_function.h"
 #include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/guest_invocation_capture.h"
 #include "xenia/cpu/mmio_handler.h"
+#include "xenia/cpu/module.h"
 #include "xenia/cpu/testing/util.h"
 #include "xenia/memory.h"
 
@@ -91,7 +99,8 @@ class RecordingCaptureSink final : public GuestInvocationCaptureEventSink {
     event.address = address;
     event.second_address = end_address;
     events.push_back(std::move(event));
-    return true;
+    return definition_observer ? definition_observer(address, end_address)
+                               : true;
   }
 
   bool OnFunctionEntry(const ppc::GuestInvocationRecorderIdentity& identity,
@@ -194,8 +203,48 @@ class RecordingCaptureSink final : public GuestInvocationCaptureEventSink {
   }
 
   std::vector<CaptureEvent> events;
+  std::function<bool(uint32_t, uint32_t)> definition_observer;
   std::function<void(const CaptureEvent&)> memory_observer;
   std::function<void(const CaptureEvent&)> unsupported_observer;
+};
+
+class DefinitionPublicationTestModule final : public Module {
+ public:
+  DefinitionPublicationTestModule(Processor* processor, uint32_t low_address,
+                                  uint32_t high_address)
+      : Module(processor),
+        low_address_(low_address),
+        high_address_(high_address) {}
+
+  const std::string& name() const override {
+    static const std::string kName = "DefinitionPublicationTest";
+    return kName;
+  }
+
+  bool is_executable() const override { return true; }
+
+  bool ContainsAddress(uint32_t address) override {
+    return address >= low_address_ && address < high_address_;
+  }
+
+  Symbol::Status DeclareFunction(uint32_t address,
+                                 Function** out_function) override {
+    const Symbol::Status status =
+        Module::DeclareFunction(address, out_function);
+    if (status == Symbol::Status::kNew) {
+      (*out_function)->set_end_address(address);
+    }
+    return status;
+  }
+
+ protected:
+  std::unique_ptr<Function> CreateFunction(uint32_t address) override {
+    return processor_->backend()->CreateGuestFunction(this, address);
+  }
+
+ private:
+  uint32_t low_address_;
+  uint32_t high_address_;
 };
 
 class SyntheticCaptureClock final : public ppc::GuestInvocationRecorderClock {
@@ -553,6 +602,118 @@ SaverestCaptureResult RunInlineSaverestCapture(bool restore) {
 }
 
 }  // namespace
+
+TEST_CASE("A64_DEFINITION_NOTIFICATION_PRECEDES_CALLABLE_PUBLICATION",
+          "[backend][guest-invocation-capture][frontend]") {
+  constexpr uint32_t kFunctionAddress = 0x82000000u;
+  constexpr uint32_t kRejectedFunctionAddress = 0x82001000u;
+  constexpr uint32_t kModuleEnd = kRejectedFunctionAddress + 4;
+  constexpr uint32_t kBranchToLinkRegister = 0x4E800020u;
+  constexpr uintptr_t kIndirectionGuestBase = 0x80000000u;
+
+  auto memory = std::make_unique<Memory>();
+  REQUIRE(memory->Initialize());
+  store_and_swap<uint32_t>(memory->TranslateVirtual(kFunctionAddress),
+                           kBranchToLinkRegister);
+  store_and_swap<uint32_t>(memory->TranslateVirtual(kRejectedFunctionAddress),
+                           kBranchToLinkRegister);
+
+  auto backend = CreateBackend();
+  REQUIRE(backend);
+  auto processor = std::make_unique<Processor>(memory.get(), nullptr);
+  REQUIRE(processor->Setup(std::move(backend)));
+  REQUIRE(
+      processor->AddModule(std::make_unique<DefinitionPublicationTestModule>(
+          processor.get(), kFunctionAddress, kModuleEnd)));
+  processor->backend()->CommitExecutableRange(kFunctionAddress, kModuleEnd);
+
+  auto* a64_backend =
+      static_cast<backend::a64::A64Backend*>(processor->backend());
+  backend::a64::A64CodeCache* code_cache = a64_backend->code_cache();
+  REQUIRE(code_cache);
+  auto indirection_slot = [&](uint32_t address) {
+    return reinterpret_cast<uint32_t*>(
+        code_cache->indirection_table_base_address() +
+        (address - kIndirectionGuestBase));
+  };
+
+  auto* declared_function =
+      static_cast<GuestFunction*>(processor->LookupFunction(kFunctionAddress));
+  REQUIRE(declared_function);
+  REQUIRE(declared_function->status() == Symbol::Status::kDeclared);
+  const uint32_t unresolved_slot = *indirection_slot(kFunctionAddress);
+
+  RecordingCaptureSink capture;
+  std::mutex notification_mutex;
+  std::condition_variable notification_condition;
+  bool notification_entered = false;
+  bool release_notification = false;
+  capture.definition_observer = [&](uint32_t address, uint32_t end_address) {
+    std::unique_lock<std::mutex> lock(notification_mutex);
+    notification_entered =
+        address == kFunctionAddress && end_address == kFunctionAddress;
+    notification_condition.notify_all();
+    notification_condition.wait(lock, [&] { return release_notification; });
+    return true;
+  };
+  ScopedCaptureSink scoped_capture(*processor, capture);
+
+  Function* resolved_function = nullptr;
+  std::thread resolver([&] {
+    resolved_function = processor->ResolveFunction(kFunctionAddress);
+  });
+
+  bool observed_notification = false;
+  {
+    std::unique_lock<std::mutex> lock(notification_mutex);
+    observed_notification = notification_condition.wait_for(
+        lock, std::chrono::seconds(5), [&] { return notification_entered; });
+  }
+  const uint8_t* machine_code_during_notification =
+      declared_function->machine_code();
+  const size_t machine_code_length_during_notification =
+      declared_function->machine_code_length();
+  const uint32_t slot_during_notification = *indirection_slot(kFunctionAddress);
+  {
+    std::lock_guard<std::mutex> lock(notification_mutex);
+    release_notification = true;
+  }
+  notification_condition.notify_all();
+  resolver.join();
+
+  REQUIRE(observed_notification);
+  REQUIRE(machine_code_during_notification == nullptr);
+  REQUIRE(machine_code_length_during_notification == 0);
+  REQUIRE(slot_during_notification == unresolved_slot);
+  REQUIRE(resolved_function == declared_function);
+  REQUIRE(declared_function->machine_code());
+  REQUIRE(declared_function->machine_code_length() != 0);
+
+  const uint32_t published_slot = *indirection_slot(kFunctionAddress);
+  REQUIRE(published_slot != unresolved_slot);
+  uintptr_t published_target = published_slot;
+  if (code_cache->encoded_indirection()) {
+    REQUIRE((published_slot &
+             backend::a64::A64CodeCache::kIndirectionExternalTag) == 0);
+    published_target += code_cache->execute_base_address();
+  }
+  REQUIRE(published_target ==
+          reinterpret_cast<uintptr_t>(declared_function->machine_code()));
+
+  capture.definition_observer = [](uint32_t, uint32_t) { return false; };
+  auto* rejected_function = static_cast<GuestFunction*>(
+      processor->LookupFunction(kRejectedFunctionAddress));
+  REQUIRE(rejected_function);
+  const uint32_t rejected_unresolved_slot =
+      *indirection_slot(kRejectedFunctionAddress);
+  REQUIRE_FALSE(processor->ResolveFunction(kRejectedFunctionAddress));
+  REQUIRE(rejected_function->status() == Symbol::Status::kFailed);
+  REQUIRE(rejected_function->machine_code() == nullptr);
+  REQUIRE(rejected_function->machine_code_length() == 0);
+  REQUIRE(*indirection_slot(kRejectedFunctionAddress) ==
+          rejected_unresolved_slot);
+  REQUIRE_FALSE(processor->ResolveFunction(kRejectedFunctionAddress));
+}
 
 TEST_CASE("A64_CAPTURE_HELPERS_FORWARD_EXACT_CONTROL_EVENTS",
           "[backend][guest-invocation-capture]") {

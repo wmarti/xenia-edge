@@ -16,6 +16,7 @@
 #include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
 #endif
 #include "xenia/cpu/backend/a64/a64_backend.h"
+#include "xenia/cpu/backend/a64/a64_code_cache.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
 
@@ -60,8 +61,21 @@ A64Function::~A64Function() {
 }
 
 void A64Function::Setup(uint8_t* machine_code, size_t machine_code_length) {
-  machine_code_length_.store(machine_code_length, std::memory_order_relaxed);
-  machine_code_.store(machine_code, std::memory_order_release);
+  pending_machine_code_ = machine_code;
+  pending_machine_code_length_ = machine_code_length;
+}
+
+bool A64Function::Publish(A64CodeCache* code_cache) {
+  if (!code_cache || !pending_machine_code_ || !pending_machine_code_length_ ||
+      machine_code_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  code_cache->AddIndirection64(
+      address(), reinterpret_cast<uint64_t>(pending_machine_code_));
+  machine_code_length_.store(pending_machine_code_length_,
+                             std::memory_order_relaxed);
+  machine_code_.store(pending_machine_code_, std::memory_order_release);
+  return true;
 }
 
 bool A64Function::CallImpl(ThreadState* thread_state, uint32_t return_address) {

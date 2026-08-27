@@ -867,16 +867,24 @@ bool Processor::DemandFunction(Function* function) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     if (guest_invocation_capture_sink_) {
-      guest_invocation_capture_sink_->OnFunctionDefined(
-          function->address(), function->end_address());
+      if (!guest_invocation_capture_sink_->OnFunctionDefined(
+              function->address(), function->end_address())) {
+        function->set_status(Symbol::Status::kFailed);
+        return false;
+      }
     }
 #endif
+
+    auto* guest_function = static_cast<GuestFunction*>(function);
+    if (!backend_->PublishGuestFunction(guest_function)) {
+      function->set_status(Symbol::Status::kFailed);
+      return false;
+    }
 
     // Before we give the symbol back to the rest, let the debugger know.
     OnFunctionDefined(function);
 
     if (jit_corpus_writer_) {
-      auto* guest_function = static_cast<GuestFunction*>(function);
       // Externs carry no emitted code, so they have nothing to replay.
       if (guest_function->machine_code()) {
         jit_corpus_writer_->RecordFunction(

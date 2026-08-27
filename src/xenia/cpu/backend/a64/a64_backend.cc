@@ -1239,6 +1239,10 @@ std::unique_ptr<GuestFunction> A64Backend::CreateGuestFunction(
   return std::make_unique<A64Function>(module, address);
 }
 
+bool A64Backend::PublishGuestFunction(GuestFunction* function) {
+  return function && static_cast<A64Function*>(function)->Publish(code_cache());
+}
+
 namespace {
 
 // Reads Xn from a captured host context. Encoding 31 is XZR here, not SP:

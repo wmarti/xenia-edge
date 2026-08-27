@@ -20,6 +20,8 @@ namespace cpu {
 namespace backend {
 namespace a64 {
 
+class A64CodeCache;
+
 class A64Function : public GuestFunction {
  public:
   A64Function(Module* module, uint32_t address);
@@ -33,6 +35,7 @@ class A64Function : public GuestFunction {
   }
 
   void Setup(uint8_t* machine_code, size_t machine_code_length);
+  bool Publish(A64CodeCache* code_cache);
 
  protected:
   bool CallImpl(ThreadState* thread_state, uint32_t return_address) override;
@@ -40,6 +43,8 @@ class A64Function : public GuestFunction {
  private:
   std::atomic<uint8_t*> machine_code_{nullptr};
   std::atomic<size_t> machine_code_length_{0};
+  uint8_t* pending_machine_code_ = nullptr;
+  size_t pending_machine_code_length_ = 0;
 };
 
 }  // namespace a64

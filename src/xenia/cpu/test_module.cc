@@ -112,23 +112,35 @@ Symbol::Status TestModule::DeclareFunction(uint32_t address,
     // Run optimization passes.
     compiler_->Compile(builder_.get());
 
-    // Assemble the function.
-    assembler_->Assemble(function, builder_.get(), 0, nullptr);
+    // Assemble the function, leaving publication to the same post-capture gate
+    // as the production frontend path.
+    if (!assembler_->Assemble(function, builder_.get(), 0, nullptr)) {
+      builder_->RemoveCurrent();
+      function->set_status(Symbol::Status::kFailed);
+      return Symbol::Status::kFailed;
+    }
 
     // Remove the HIRBuilder as current for this thread
     builder_->RemoveCurrent();
 
-    status = Symbol::Status::kDefined;
-    function->set_status(status);
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     // TestModule assembles directly in DeclareFunction, bypassing the normal
-    // Processor::DemandFunction definition callback. Report the same
-    // successful-definition event only after assembly and status publication.
+    // Processor::DemandFunction definition callback. Preserve its ordering.
     if (auto* capture = processor_->guest_invocation_capture_sink()) {
-      capture->OnFunctionDefined(function->address(), function->end_address());
+      if (!capture->OnFunctionDefined(function->address(),
+                                      function->end_address())) {
+        function->set_status(Symbol::Status::kFailed);
+        return Symbol::Status::kFailed;
+      }
     }
 #endif
+    if (!processor_->backend()->PublishGuestFunction(function)) {
+      function->set_status(Symbol::Status::kFailed);
+      return Symbol::Status::kFailed;
+    }
+    status = Symbol::Status::kDefined;
+    function->set_status(status);
   }
   return status;
 }
