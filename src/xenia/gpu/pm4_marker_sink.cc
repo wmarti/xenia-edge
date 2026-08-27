@@ -101,6 +101,13 @@ bool Pm4MarkerDispatcher::HoldSink(const std::shared_ptr<Pm4MarkerSink>& sink,
     if (dispatching_ && dispatch_thread_ == std::this_thread::get_id()) {
       return false;
     }
+    if (boundary_fenced_) {
+      if (held_sink_ != sink || sink_failed_ || source_advanced_while_held_) {
+        return false;
+      }
+      *token = hold_token_;
+      return true;
+    }
   }
   const uint64_t ticket =
       next_admission_ticket_.fetch_add(1, std::memory_order_acq_rel);
@@ -140,9 +147,25 @@ bool Pm4MarkerDispatcher::ResumeSink(const std::shared_ptr<Pm4MarkerSink>& sink,
     return false;
   }
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (dispatching_ && dispatch_thread_ == std::this_thread::get_id()) {
       return false;
+    }
+    if (boundary_fenced_) {
+      if (held_sink_ != sink || sink_ || token != hold_token_ || shut_down_ ||
+          sink_failed_ || source_advanced_while_held_ ||
+          marker_count_.load(std::memory_order_relaxed) != token.last_ordinal ||
+          sink_generation_ == std::numeric_limits<uint64_t>::max()) {
+        return false;
+      }
+      ++sink_generation_;
+      sink_ = std::move(held_sink_);
+      hold_token_ = {};
+      boundary_fenced_ = false;
+      admission_open_.store(true, std::memory_order_release);
+      lock.unlock();
+      dispatch_condition_.notify_all();
+      return true;
     }
   }
   const uint64_t ticket =
@@ -177,9 +200,22 @@ bool Pm4MarkerDispatcher::SealAndDetachHeldSink(
     return false;
   }
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (dispatching_ && dispatch_thread_ == std::this_thread::get_id()) {
       return false;
+    }
+    if (boundary_fenced_) {
+      if (sink_ || held_sink_ != sink || token != hold_token_ || shut_down_ ||
+          sink_failed_ || source_advanced_while_held_ ||
+          marker_count_.load(std::memory_order_relaxed) != token.last_ordinal) {
+        return false;
+      }
+      held_sink_.reset();
+      hold_token_ = {};
+      boundary_fenced_ = false;
+      lock.unlock();
+      dispatch_condition_.notify_all();
+      return true;
     }
   }
   const uint64_t ticket =
@@ -208,9 +244,21 @@ bool Pm4MarkerDispatcher::DetachSink(
     return false;
   }
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (dispatching_ && dispatch_thread_ == std::this_thread::get_id()) {
       return false;
+    }
+    if (boundary_fenced_) {
+      if (held_sink_ != sink) {
+        return false;
+      }
+      admission_open_.store(false, std::memory_order_release);
+      held_sink_.reset();
+      hold_token_ = {};
+      boundary_fenced_ = false;
+      lock.unlock();
+      dispatch_condition_.notify_all();
+      return true;
     }
   }
   const uint64_t ticket =
@@ -246,6 +294,7 @@ Pm4MarkerDispatcherStatus Pm4MarkerDispatcher::status() const {
   result.hold_epoch = hold_epoch_.load(std::memory_order_relaxed);
   result.sink_attached = static_cast<bool>(sink_);
   result.sink_held = static_cast<bool>(held_sink_);
+  result.boundary_fenced = boundary_fenced_;
   result.sink_failed = sink_failed_;
   result.source_advanced_while_held = source_advanced_while_held_;
   result.shut_down = shut_down_;
@@ -281,6 +330,7 @@ Pm4MarkerDispatchLease Pm4MarkerDispatcher::BeginPm4Swap() noexcept {
     std::unique_lock<std::mutex> lock(mutex_);
     dispatch_condition_.wait(
         lock, [this, ticket]() { return serving_admission_ticket_ == ticket; });
+    dispatch_condition_.wait(lock, [this]() { return !boundary_fenced_; });
     const uint64_t last = marker_count_.load(std::memory_order_relaxed);
     if (last == std::numeric_limits<uint64_t>::max()) {
       sink_failed_ = true;
@@ -342,12 +392,28 @@ void Pm4MarkerDispatcher::CompleteLease(Pm4MarkerDispatchLease* lease,
   Pm4MarkerDispatcher* previous_dispatcher = active_marker_dispatcher;
   active_marker_dispatcher = this;
   const bool accepted = deliver && lease->sink_->OnPm4Marker(lease->event_);
+  const bool boundary_fence_requested =
+      accepted && lease->sink_->ShouldFenceAfterPm4Marker(lease->event_);
   active_marker_dispatcher = previous_dispatcher;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     dispatching_ = false;
     dispatch_thread_ = {};
-    if (!accepted) {
+    if (boundary_fence_requested) {
+      const uint64_t hold_epoch = hold_epoch_.load(std::memory_order_relaxed);
+      if (sink_ != lease->sink_ || held_sink_ || shut_down_ ||
+          hold_epoch == std::numeric_limits<uint64_t>::max()) {
+        sink_failed_ = true;
+      } else {
+        admission_open_.store(false, std::memory_order_release);
+        hold_epoch_.store(hold_epoch + 1, std::memory_order_release);
+        hold_token_.sink_generation = sink_generation_;
+        hold_token_.hold_epoch = hold_epoch + 1;
+        hold_token_.last_ordinal = lease->event_.ordinal;
+        held_sink_ = std::move(sink_);
+        boundary_fenced_ = true;
+      }
+    } else if (!accepted) {
       sink_failed_ = true;
     }
     ++serving_admission_ticket_;
@@ -366,12 +432,46 @@ void Pm4MarkerDispatcher::NotifyPm4Swap(uint64_t host_tick) noexcept {
 }
 
 void Pm4MarkerDispatcher::Shutdown() noexcept {
+  std::shared_ptr<Pm4MarkerSink> boundary_sink;
+  bool boundary_shutdown = false;
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (dispatching_ && dispatch_thread_ == std::this_thread::get_id()) {
       sink_failed_ = true;
       return;
     }
+    if (boundary_fenced_) {
+      if (shut_down_) {
+        dispatch_condition_.wait(lock, [this]() { return !boundary_fenced_; });
+        return;
+      }
+      if (!shut_down_) {
+        shut_down_ = true;
+        admission_open_.store(false, std::memory_order_release);
+        boundary_sink = std::move(held_sink_);
+        hold_token_ = {};
+        dispatching_ = static_cast<bool>(boundary_sink);
+        dispatch_thread_ =
+            boundary_sink ? std::this_thread::get_id() : std::thread::id{};
+      }
+      boundary_shutdown = true;
+    }
+  }
+  if (boundary_shutdown) {
+    if (boundary_sink) {
+      Pm4MarkerDispatcher* previous_dispatcher = active_marker_dispatcher;
+      active_marker_dispatcher = this;
+      boundary_sink->OnPm4MarkerSourceShutdown();
+      active_marker_dispatcher = previous_dispatcher;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      dispatching_ = false;
+      dispatch_thread_ = {};
+      boundary_fenced_ = false;
+    }
+    dispatch_condition_.notify_all();
+    return;
   }
   const uint64_t ticket =
       next_admission_ticket_.fetch_add(1, std::memory_order_acq_rel);

@@ -660,7 +660,7 @@ TEST_CASE("PM4 hold drains a pre-hold ordinal before a new generation",
 TEST_CASE("PM4 production while held permanently prevents resume",
           "[pm4-marker-source][concurrency]") {
   RealControllerHarness harness(100);
-  harness.Arm();
+  harness.HoldAcknowledgeAndResume();
   Pm4MarkerHoldToken token;
   REQUIRE(harness.dispatcher.HoldSink(harness.controller, &token));
   Pm4MarkerHoldToken repeated;
@@ -675,13 +675,107 @@ TEST_CASE("PM4 production while held permanently prevents resume",
   REQUIRE(failed.source_advanced_while_held);
   REQUIRE(harness.boundary_sink.armed_marker_count() == 0);
   REQUIRE_FALSE(harness.dispatcher.HoldSink(harness.controller, &repeated));
-  REQUIRE(harness.controller->AcknowledgeBoundary(1));
   REQUIRE_FALSE(harness.dispatcher.ResumeSink(harness.controller, token));
 
   harness.dispatcher.NotifyPm4Swap(130);
   REQUIRE(harness.dispatcher.marker_count() == 4);
   REQUIRE(harness.dispatcher.status().sink_held);
   REQUIRE(harness.boundary_sink.armed_marker_count() == 0);
+}
+
+TEST_CASE("PM4 arm boundary fences queued swaps until delayed start resumes",
+          "[pm4-marker-source][concurrency]") {
+  RealControllerHarness harness(100);
+  harness.Arm();
+  const Pm4MarkerDispatcherStatus armed = harness.dispatcher.status();
+  REQUIRE(armed.boundary_fenced);
+  REQUIRE(armed.sink_held);
+  REQUIRE(armed.marker_count == 2);
+
+  TicketAssignmentBlocker observer(100);
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(
+      harness.dispatcher, &TicketAssignmentBlocker::Hook, &observer);
+  std::thread first([&harness]() { harness.dispatcher.NotifyPm4Swap(120); });
+  std::thread second([&harness]() { harness.dispatcher.NotifyPm4Swap(130); });
+  const bool both_queued = observer.WaitUntilSeen(4, 2s);
+
+  Pm4MarkerHoldToken token;
+  const bool held = harness.dispatcher.HoldSink(harness.controller, &token);
+  const Pm4MarkerDispatcherStatus delayed = harness.dispatcher.status();
+  const bool acknowledged = held && harness.controller->AcknowledgeBoundary(1);
+  const bool resumed =
+      acknowledged && harness.dispatcher.ResumeSink(harness.controller, token);
+  if (!resumed) {
+    harness.dispatcher.DetachSink(harness.controller);
+  }
+  first.join();
+  second.join();
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(harness.dispatcher,
+                                                             nullptr, nullptr);
+
+  REQUIRE(both_queued);
+  REQUIRE(held);
+  const Pm4MarkerHoldToken expected_start_token{1, 1, 2};
+  REQUIRE(token == expected_start_token);
+  REQUIRE(delayed.boundary_fenced);
+  REQUIRE(delayed.marker_count == 2);
+  REQUIRE_FALSE(delayed.sink_failed);
+  REQUIRE(acknowledged);
+  REQUIRE(resumed);
+  REQUIRE(harness.dispatcher.marker_count() == 4);
+  REQUIRE(harness.boundary_sink.armed_marker_count() == 2);
+  REQUIRE(harness.boundary_sink.armed_marker(0).ordinal == 3);
+  REQUIRE(harness.boundary_sink.armed_marker(1).ordinal == 4);
+}
+
+TEST_CASE("PM4 stop boundary seals before queued later swaps advance",
+          "[pm4-marker-source][concurrency]") {
+  RealControllerHarness harness(1);
+  harness.HoldAcknowledgeAndResume();
+  harness.clock.now.store(12);
+  harness.dispatcher.NotifyPm4Swap(120);
+  const Pm4MarkerDispatcherStatus stopped = harness.dispatcher.status();
+  REQUIRE(stopped.boundary_fenced);
+  REQUIRE(stopped.sink_held);
+  REQUIRE(stopped.marker_count == 3);
+
+  TicketAssignmentBlocker observer(100);
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(
+      harness.dispatcher, &TicketAssignmentBlocker::Hook, &observer);
+  std::thread first([&harness]() { harness.dispatcher.NotifyPm4Swap(130); });
+  std::thread second([&harness]() { harness.dispatcher.NotifyPm4Swap(140); });
+  const bool both_queued = observer.WaitUntilSeen(5, 2s);
+
+  Pm4MarkerHoldToken token;
+  const bool held = harness.dispatcher.HoldSink(harness.controller, &token);
+  const Pm4MarkerDispatcherStatus delayed = harness.dispatcher.status();
+  const bool sealed = held && harness.dispatcher.SealAndDetachHeldSink(
+                                  harness.controller, token);
+  if (!sealed) {
+    harness.dispatcher.DetachSink(harness.controller);
+  }
+  first.join();
+  second.join();
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(harness.dispatcher,
+                                                             nullptr, nullptr);
+
+  REQUIRE(both_queued);
+  REQUIRE(held);
+  const Pm4MarkerHoldToken expected_stop_token{2, 2, 3};
+  REQUIRE(token == expected_stop_token);
+  REQUIRE(delayed.boundary_fenced);
+  REQUIRE(delayed.marker_count == 3);
+  REQUIRE_FALSE(delayed.sink_failed);
+  REQUIRE(sealed);
+  REQUIRE(harness.controller->AcknowledgeBoundary(2));
+  REQUIRE(harness.controller->status().stop_marker_ordinal == 3);
+  REQUIRE(harness.boundary_sink.armed_marker_count() == 1);
+  REQUIRE(harness.dispatcher.marker_count() == 5);
+  const Pm4MarkerDispatcherStatus final = harness.dispatcher.status();
+  REQUIRE_FALSE(final.sink_attached);
+  REQUIRE_FALSE(final.sink_held);
+  REQUIRE_FALSE(final.boundary_fenced);
+  REQUIRE_FALSE(final.sink_failed);
 }
 
 TEST_CASE("PM4 terminal seal orders the next swap outside the session",
@@ -916,6 +1010,36 @@ TEST_CASE("PM4 shutdown rejects an attached armed controller",
           cpu::GuestExecutionMarkerControllerRejection::kMarkerSourceLost);
   REQUIRE(harness.dispatcher.status().shut_down);
   REQUIRE_FALSE(harness.dispatcher.status().sink_attached);
+}
+
+TEST_CASE("PM4 shutdown drains an automatic boundary fence",
+          "[pm4-marker-source][concurrency]") {
+  RealControllerHarness harness(100);
+  harness.Arm();
+
+  TicketAssignmentBlocker observer(100);
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(
+      harness.dispatcher, &TicketAssignmentBlocker::Hook, &observer);
+  std::thread producer([&harness]() { harness.dispatcher.NotifyPm4Swap(120); });
+  const bool marker_queued = observer.WaitUntilSeen(3, 2s);
+  harness.dispatcher.Shutdown();
+  producer.join();
+  Pm4MarkerDispatcherTestAccess::SetPostTicketAssignmentHook(harness.dispatcher,
+                                                             nullptr, nullptr);
+
+  REQUIRE(marker_queued);
+  const auto controller_status = harness.controller->status();
+  REQUIRE(controller_status.state ==
+          cpu::GuestExecutionMarkerControllerState::kFailed);
+  REQUIRE(controller_status.rejection ==
+          cpu::GuestExecutionMarkerControllerRejection::kMarkerSourceLost);
+  const Pm4MarkerDispatcherStatus source = harness.dispatcher.status();
+  REQUIRE(source.shut_down);
+  REQUIRE_FALSE(source.sink_attached);
+  REQUIRE_FALSE(source.sink_held);
+  REQUIRE_FALSE(source.boundary_fenced);
+  REQUIRE_FALSE(source.sink_failed);
+  REQUIRE(source.marker_count == 3);
 }
 
 }  // namespace testing

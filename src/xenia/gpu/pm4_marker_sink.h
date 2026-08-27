@@ -68,6 +68,7 @@ struct Pm4MarkerDispatcherStatus {
   uint64_t hold_epoch = 0;
   bool sink_attached = false;
   bool sink_held = false;
+  bool boundary_fenced = false;
   bool sink_failed = false;
   bool source_advanced_while_held = false;
   bool shut_down = false;
@@ -106,6 +107,15 @@ class Pm4MarkerSink {
   // Runs on the command processor thread and must not block, allocate, or call
   // back into the command processor. False fails delivery closed.
   virtual bool OnPm4Marker(const Pm4MarkerEvent& event) noexcept = 0;
+
+  // Called immediately after an accepted marker callback, before any later
+  // source ticket may be serviced. Returning true converts this occurrence
+  // into a command-processor-owned admission fence. The owner retrieves the
+  // resulting hold token with HoldSink and must resume or terminally detach
+  // the sink before later PM4 swaps can pass the fence.
+  virtual bool ShouldFenceAfterPm4Marker(const Pm4MarkerEvent& event) noexcept {
+    return false;
+  }
 
   // Delivered at most once after marker production has stopped, if the sink is
   // still attached when the source shuts down.
@@ -171,6 +181,7 @@ class Pm4MarkerDispatcher {
   bool dispatching_ = false;
   bool sink_failed_ = false;
   bool source_advanced_while_held_ = false;
+  bool boundary_fenced_ = false;
   bool shut_down_ = false;
   void (*post_ordinal_assignment_hook_)(void*) = nullptr;
   void* post_ordinal_assignment_context_ = nullptr;

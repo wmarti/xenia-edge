@@ -284,6 +284,13 @@ bool GuestExecutionMarkerController::OnPm4Marker(
   }
 }
 
+bool GuestExecutionMarkerController::ShouldFenceAfterPm4Marker(
+    const gpu::Pm4MarkerEvent& event) noexcept {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  return event.ordinal && (event.ordinal == status_.arm_marker_ordinal ||
+                           event.ordinal == status_.stop_marker_ordinal);
+}
+
 void GuestExecutionMarkerController::OnPm4MarkerSourceShutdown() noexcept {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   if (!EnterLocked()) {

@@ -169,6 +169,8 @@ class GuestExecutionMarkerController final : public gpu::Pm4MarkerSink {
   bool AcknowledgeBoundary(uint64_t sequence);
 
   bool OnPm4Marker(const gpu::Pm4MarkerEvent& event) noexcept override;
+  bool ShouldFenceAfterPm4Marker(
+      const gpu::Pm4MarkerEvent& event) noexcept override;
   void OnPm4MarkerSourceShutdown() noexcept override;
 
   GuestExecutionMarkerControllerStatus status() const;
