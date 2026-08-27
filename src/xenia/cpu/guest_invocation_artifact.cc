@@ -27,7 +27,13 @@ namespace {
 
 constexpr std::array<uint8_t, 8> kMagic = {'X', 'E', 'P', 'P',
                                            'C', 'I', 'R', 0};
+constexpr std::array<uint8_t, 8> kRegisterStateMagic = {'X', 'E', 'P', 'P',
+                                                        'C', 'S', 'T', 0};
 constexpr uint32_t kArtifactKnownFlags = 0;
+constexpr uint32_t kRegisterStateKnownFlags = 0;
+constexpr uint32_t kRegisterStatePayloadSize =
+    32 * sizeof(uint64_t) + 32 * sizeof(uint64_t) + 128 * 16 + 8 * 4 +
+    3 * sizeof(uint64_t) + sizeof(uint32_t) + 16 + sizeof(uint32_t) + 4;
 constexpr uint64_t kMinimumInvocationSize =
     GuestInvocationArtifactCodec::kInvocationHeaderSize +
     2ull * GuestInvocationArtifactCodec::kArchitecturalStateSize;
@@ -38,6 +44,9 @@ static_assert(offsetof(PPCContext_s, cr7) + sizeof(PPCContext_s::cr7) -
               8 * 4);
 static_assert(sizeof(PPCContext_s::v[0]) == 16);
 static_assert(sizeof(PPCContext_s::vscr_vec) == 16);
+static_assert(kRegisterStatePayloadSize ==
+              GuestPPCRegisterStateCodec::kPayloadSize);
+static_assert(8 + 4 + 4 + 8 + 4 + 4 == GuestPPCRegisterStateCodec::kHeaderSize);
 
 bool Fail(std::string* error, std::string_view message) {
   if (error) {
@@ -291,7 +300,8 @@ class Reader {
   size_t offset_ = 0;
 };
 
-void WriteRegisterState(Writer* writer, const GuestPPCRegisterState& state) {
+void WriteRegisterStatePayload(Writer* writer,
+                               const GuestPPCRegisterState& state) {
   for (uint64_t value : state.gpr) {
     writer->WriteU64(value);
   }
@@ -316,7 +326,7 @@ void WriteRegisterState(Writer* writer, const GuestPPCRegisterState& state) {
   writer->WriteU8(state.vscr_sat);
 }
 
-bool ReadRegisterState(Reader* reader, GuestPPCRegisterState* state) {
+bool ReadRegisterStatePayload(Reader* reader, GuestPPCRegisterState* state) {
   for (uint64_t& value : state->gpr) {
     if (!reader->ReadU64(&value)) {
       return false;
@@ -427,6 +437,96 @@ void RestoreGuestPPCRegisterState(const GuestPPCRegisterState& state,
   context->vscr_sat = state.vscr_sat;
 }
 
+bool GuestPPCRegisterStateCodec::Encode(const GuestPPCRegisterState& state,
+                                        std::vector<uint8_t>* output,
+                                        std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!output) {
+    return Fail(error, "output vector is null");
+  }
+  output->clear();
+
+  Writer writer(kEncodedSize);
+  writer.WriteBytes(kRegisterStateMagic.data(), kRegisterStateMagic.size());
+  writer.WriteU32(kVersion);
+  writer.WriteU32(kHeaderSize);
+  writer.WriteU64(kEncodedSize);
+  writer.WriteU32(kRegisterStateKnownFlags);
+  writer.WriteU32(0);
+  WriteRegisterStatePayload(&writer, state);
+
+  *output = writer.TakeData();
+  if (output->size() != kEncodedSize) {
+    output->clear();
+    return Fail(error, "internal encoded-size mismatch");
+  }
+  return true;
+}
+
+bool GuestPPCRegisterStateCodec::Decode(const uint8_t* data, size_t data_size,
+                                        GuestPPCRegisterState* output,
+                                        std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!output) {
+    return Fail(error, "output register state is null");
+  }
+  *output = {};
+  if (!data && data_size) {
+    return Fail(error, "input data is null");
+  }
+
+  Reader reader(data, data_size);
+  std::array<uint8_t, kRegisterStateMagic.size()> magic = {};
+  uint32_t version = 0;
+  uint32_t header_size = 0;
+  uint64_t encoded_size = 0;
+  uint32_t flags = 0;
+  uint32_t reserved = 0;
+  if (!reader.ReadBytes(magic.data(), magic.size()) ||
+      !reader.ReadU32(&version) || !reader.ReadU32(&header_size) ||
+      !reader.ReadU64(&encoded_size) || !reader.ReadU32(&flags) ||
+      !reader.ReadU32(&reserved)) {
+    return Fail(error, "register-state header is truncated");
+  }
+  if (magic != kRegisterStateMagic) {
+    return Fail(error, "register-state magic is invalid");
+  }
+  if (version != kVersion) {
+    return Fail(error, "register-state version is unsupported");
+  }
+  if (header_size != kHeaderSize) {
+    return Fail(error, "register-state header size is unsupported");
+  }
+  if (encoded_size != kEncodedSize) {
+    return Fail(error, "register-state encoded size is noncanonical");
+  }
+  if (flags & ~kRegisterStateKnownFlags) {
+    return Fail(error, "register-state contains unknown flags");
+  }
+  if (reserved) {
+    return Fail(error, "register-state reserved field is nonzero");
+  }
+  if (data_size != kEncodedSize) {
+    return Fail(error, data_size < kEncodedSize
+                           ? "register-state blob is truncated"
+                           : "register-state blob has trailing data");
+  }
+
+  GuestPPCRegisterState state;
+  if (!ReadRegisterStatePayload(&reader, &state)) {
+    return Fail(error, "register-state payload is truncated");
+  }
+  if (reader.remaining()) {
+    return Fail(error, "register-state blob has trailing data");
+  }
+  *output = std::move(state);
+  return true;
+}
+
 bool GuestInvocationArtifactCodec::Encode(
     const GuestInvocationArtifact& artifact, std::vector<uint8_t>* output,
     std::string* error) {
@@ -474,8 +574,8 @@ bool GuestInvocationArtifactCodec::Encode(
     writer.WriteU32(
         static_cast<uint32_t>(invocation.expected_dirty_pages.size()));
     writer.WriteU32(0);
-    WriteRegisterState(&writer, invocation.input);
-    WriteRegisterState(&writer, invocation.expected_output);
+    WriteRegisterStatePayload(&writer, invocation.input);
+    WriteRegisterStatePayload(&writer, invocation.expected_output);
     for (const GuestInvocationPage& page : invocation.input_data_pages) {
       WritePage(&writer, page);
     }
@@ -608,8 +708,8 @@ bool GuestInvocationArtifactCodec::Decode(const uint8_t* data, size_t data_size,
     if (invocation_size - kInvocationHeaderSize > reader.remaining()) {
       return Fail(error, "invocation is truncated");
     }
-    if (!ReadRegisterState(&reader, &invocation.input) ||
-        !ReadRegisterState(&reader, &invocation.expected_output)) {
+    if (!ReadRegisterStatePayload(&reader, &invocation.input) ||
+        !ReadRegisterStatePayload(&reader, &invocation.expected_output)) {
       return Fail(error, "invocation register state is truncated");
     }
     invocation.input_data_pages.resize(input_page_count);

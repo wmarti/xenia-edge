@@ -93,6 +93,41 @@ GuestPPCRegisterState CaptureGuestPPCRegisterState(const PPCContext_s& context);
 void RestoreGuestPPCRegisterState(const GuestPPCRegisterState& state,
                                   PPCContext_s* context);
 
+// Canonical standalone encoding for one pointer-free architectural register
+// state. The fixed little-endian header makes the content-addressed blob
+// self-describing; decoders accept exactly one complete blob and reject every
+// truncated or trailing byte sequence.
+//
+// The payload is the exact field-by-field register-state representation
+// embedded by version 1 GuestInvocationArtifactCodec. The artifact keeps its
+// existing bytes by embedding only that payload, while standalone state blobs
+// add this codec's header. A payload layout change therefore requires a new
+// version here and in every enclosing format that embeds it.
+class GuestPPCRegisterStateCodec {
+ public:
+  static constexpr uint32_t kVersion = 1;
+  static constexpr uint32_t kHeaderSize = 32;
+  static constexpr uint32_t kPayloadSize = 2644;
+  static constexpr uint32_t kEncodedSize = kHeaderSize + kPayloadSize;
+
+  // On failure, output is cleared and error (when non-null) describes the
+  // first rejected invariant.
+  static bool Encode(const GuestPPCRegisterState& state,
+                     std::vector<uint8_t>* output,
+                     std::string* error = nullptr);
+
+  // On failure, output is reset. The magic, version, size, flags and reserved
+  // fields are all validated before the architectural payload is accepted.
+  static bool Decode(const uint8_t* data, size_t data_size,
+                     GuestPPCRegisterState* output,
+                     std::string* error = nullptr);
+  static bool Decode(const std::vector<uint8_t>& data,
+                     GuestPPCRegisterState* output,
+                     std::string* error = nullptr) {
+    return Decode(data.data(), data.size(), output, error);
+  }
+};
+
 struct GuestInvocationPage {
   uint32_t guest_address = 0;
   std::array<uint8_t, 4096> data = {};
@@ -178,7 +213,8 @@ class GuestInvocationArtifactCodec {
   // Public for format tests and independent readers.
   static constexpr uint32_t kHeaderSize = 136;
   static constexpr uint32_t kInvocationHeaderSize = 40;
-  static constexpr uint32_t kArchitecturalStateSize = 2644;
+  static constexpr uint32_t kArchitecturalStateSize =
+      GuestPPCRegisterStateCodec::kPayloadSize;
   static constexpr uint32_t kPageRecordSize = 4 + kPageSize;
 
   // On failure, output is cleared and error (when non-null) describes the

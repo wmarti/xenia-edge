@@ -120,6 +120,15 @@ std::vector<uint8_t> EncodeValidArtifact() {
   return encoded;
 }
 
+std::vector<uint8_t> EncodeValidRegisterState() {
+  std::vector<uint8_t> encoded;
+  std::string error;
+  REQUIRE(GuestPPCRegisterStateCodec::Encode(
+      MakeRegisterState(0x5A, 0x90005000), &encoded, &error));
+  REQUIRE(error.empty());
+  return encoded;
+}
+
 void WriteU32(std::vector<uint8_t>* data, size_t offset, uint32_t value) {
   REQUIRE(offset + 4 <= data->size());
   for (size_t i = 0; i < 4; ++i) {
@@ -151,7 +160,135 @@ void RequireDecodeFailure(const std::vector<uint8_t>& data) {
   REQUIRE(output.invocations.empty());
 }
 
+void RequireRegisterStateDecodeFailure(const std::vector<uint8_t>& data) {
+  GuestPPCRegisterState output = MakeRegisterState(0xA5, 0x9000A000);
+  std::string error;
+  REQUIRE_FALSE(GuestPPCRegisterStateCodec::Decode(data, &output, &error));
+  REQUIRE_FALSE(error.empty());
+  REQUIRE(output == GuestPPCRegisterState{});
+}
+
 }  // namespace
+
+TEST_CASE("PPC register-state codec round-trips its canonical blob exactly",
+          "[guest-invocation-artifact]") {
+  const GuestPPCRegisterState expected = MakeRegisterState(0x5A, 0x90005000);
+  std::vector<uint8_t> encoded;
+  std::string error;
+  REQUIRE(GuestPPCRegisterStateCodec::Encode(expected, &encoded, &error));
+  REQUIRE(error.empty());
+  REQUIRE(encoded.size() == GuestPPCRegisterStateCodec::kEncodedSize);
+  constexpr std::array<uint8_t, 8> kExpectedMagic = {'X', 'E', 'P', 'P',
+                                                     'C', 'S', 'T', 0};
+  REQUIRE(std::equal(encoded.cbegin(), encoded.cbegin() + kExpectedMagic.size(),
+                     kExpectedMagic.cbegin()));
+  REQUIRE(encoded[8] == GuestPPCRegisterStateCodec::kVersion);
+  REQUIRE(ReadU64(encoded, 16) == GuestPPCRegisterStateCodec::kEncodedSize);
+
+  GuestPPCRegisterState decoded;
+  REQUIRE(GuestPPCRegisterStateCodec::Decode(encoded, &decoded, &error));
+  REQUIRE(error.empty());
+  REQUIRE(decoded == expected);
+
+  GuestInvocationArtifact artifact = MakeArtifact();
+  artifact.invocations[0].input = expected;
+  artifact.invocations[0].expected_return_address =
+      static_cast<uint32_t>(expected.link_register);
+  std::vector<uint8_t> artifact_bytes;
+  REQUIRE(GuestInvocationArtifactCodec::Encode(artifact, &artifact_bytes));
+  const size_t artifact_state_offset =
+      GuestInvocationArtifactCodec::kHeaderSize +
+      GuestInvocationArtifactCodec::kInvocationHeaderSize;
+  REQUIRE(std::equal(encoded.cbegin() + GuestPPCRegisterStateCodec::kHeaderSize,
+                     encoded.cend(),
+                     artifact_bytes.cbegin() + artifact_state_offset));
+}
+
+TEST_CASE("PPC register-state codec rejects truncation and trailing data",
+          "[guest-invocation-artifact]") {
+  const std::vector<uint8_t> encoded = EncodeValidRegisterState();
+  for (size_t size = 0; size < encoded.size(); ++size) {
+    INFO("truncated size " << size);
+    RequireRegisterStateDecodeFailure(
+        std::vector<uint8_t>(encoded.cbegin(), encoded.cbegin() + size));
+  }
+
+  std::vector<uint8_t> trailing = encoded;
+  trailing.push_back(0);
+  RequireRegisterStateDecodeFailure(trailing);
+
+  GuestPPCRegisterState output = MakeRegisterState(0xA5, 0x9000A000);
+  std::string error;
+  REQUIRE_FALSE(GuestPPCRegisterStateCodec::Decode(
+      nullptr, GuestPPCRegisterStateCodec::kEncodedSize, &output, &error));
+  REQUIRE(output == GuestPPCRegisterState{});
+  REQUIRE_FALSE(error.empty());
+  REQUIRE_FALSE(GuestPPCRegisterStateCodec::Decode(encoded, nullptr, &error));
+  REQUIRE_FALSE(GuestPPCRegisterStateCodec::Encode(output, nullptr, &error));
+}
+
+TEST_CASE("PPC register-state codec rejects noncanonical header fields",
+          "[guest-invocation-artifact]") {
+  std::vector<uint8_t> malformed = EncodeValidRegisterState();
+  malformed[0] ^= 1;
+  RequireRegisterStateDecodeFailure(malformed);
+
+  malformed = EncodeValidRegisterState();
+  WriteU32(&malformed, 8, GuestPPCRegisterStateCodec::kVersion + 1);
+  RequireRegisterStateDecodeFailure(malformed);
+
+  malformed = EncodeValidRegisterState();
+  WriteU32(&malformed, 12, GuestPPCRegisterStateCodec::kHeaderSize + 4);
+  RequireRegisterStateDecodeFailure(malformed);
+
+  malformed = EncodeValidRegisterState();
+  WriteU64(&malformed, 16, GuestPPCRegisterStateCodec::kEncodedSize - 1);
+  RequireRegisterStateDecodeFailure(malformed);
+
+  malformed = EncodeValidRegisterState();
+  WriteU32(&malformed, 24, 1);
+  RequireRegisterStateDecodeFailure(malformed);
+
+  malformed = EncodeValidRegisterState();
+  WriteU32(&malformed, 28, 1);
+  RequireRegisterStateDecodeFailure(malformed);
+}
+
+TEST_CASE("PPC register-state codec preserves architectural edge bits",
+          "[guest-invocation-artifact]") {
+  GuestPPCRegisterState expected;
+  for (size_t i = 0; i < expected.gpr.size(); ++i) {
+    expected.gpr[i] = i & 1 ? UINT64_MAX : 0;
+    expected.fpr_bits[i] =
+        i & 1 ? 0xFFF0000000000001ull : 0x8000000000000000ull;
+  }
+  for (size_t i = 0; i < expected.vector_registers.size(); ++i) {
+    expected.vector_registers[i].fill(i & 1 ? UINT8_MAX : 0);
+  }
+  for (size_t i = 0; i < expected.condition_register_fields.size(); ++i) {
+    expected.condition_register_fields[i].fill(i & 1 ? UINT8_MAX : 0);
+  }
+  expected.link_register = UINT64_MAX;
+  expected.count_register = UINT64_MAX - 1;
+  expected.machine_state_register = UINT64_MAX - 2;
+  expected.fpscr = UINT32_MAX;
+  expected.vscr_vector.fill(UINT8_MAX);
+  expected.vrsave = UINT32_MAX;
+  expected.xer_ca = UINT8_MAX;
+  expected.xer_ov = UINT8_MAX - 1;
+  expected.xer_so = 1;
+  expected.vscr_sat = UINT8_MAX;
+
+  std::vector<uint8_t> first;
+  std::vector<uint8_t> second;
+  REQUIRE(GuestPPCRegisterStateCodec::Encode(expected, &first));
+  REQUIRE(GuestPPCRegisterStateCodec::Encode(expected, &second));
+  REQUIRE(first == second);
+
+  GuestPPCRegisterState decoded;
+  REQUIRE(GuestPPCRegisterStateCodec::Decode(first, &decoded));
+  REQUIRE(decoded == expected);
+}
 
 TEST_CASE("guest invocation artifact round-trips multiple captures exactly",
           "[guest-invocation-artifact]") {
