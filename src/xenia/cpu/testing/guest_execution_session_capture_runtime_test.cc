@@ -1136,6 +1136,7 @@ TEST_CASE("session capture runtime rejects a partial final preemption episode",
 
   REQUIRE(harness.runtime->RequestStart());
   REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
   harness.checkpoint.provisional.participants.front().preempt_defers_irql = 1;
   REQUIRE(harness.runtime->RequestStop());
   REQUIRE(harness.runtime->WaitForTerminal(2s));
