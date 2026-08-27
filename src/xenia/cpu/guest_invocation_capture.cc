@@ -41,7 +41,7 @@ GuestInvocationCaptureCoordinator::Create(
     }
     return nullptr;
   }
-  const uint64_t segment_start_tick = clock.NowTicks();
+  const uint64_t capture_start_tick = clock.NowTicks();
   std::unique_ptr<ppc::GuestInvocationRecorder> recorder =
       ppc::GuestInvocationRecorder::Create(selection, limits, page_reader,
                                            clock, error);
@@ -49,18 +49,18 @@ GuestInvocationCaptureCoordinator::Create(
     return nullptr;
   }
   return std::unique_ptr<GuestInvocationCaptureCoordinator>(
-      new GuestInvocationCaptureCoordinator(segment_ordinal, segment_start_tick,
+      new GuestInvocationCaptureCoordinator(segment_ordinal, capture_start_tick,
                                             std::move(recorder), clock,
                                             std::move(segment_handler)));
 }
 
 GuestInvocationCaptureCoordinator::GuestInvocationCaptureCoordinator(
-    uint64_t segment_ordinal, uint64_t segment_start_tick,
+    uint64_t segment_ordinal, uint64_t capture_start_tick,
     std::unique_ptr<ppc::GuestInvocationRecorder> recorder,
     const ppc::GuestInvocationRecorderClock& clock,
     SegmentHandler segment_handler)
     : segment_ordinal_(segment_ordinal),
-      segment_start_tick_(segment_start_tick),
+      capture_start_tick_(capture_start_tick),
       recorder_(std::move(recorder)),
       clock_(clock),
       segment_handler_(std::move(segment_handler)) {}
@@ -80,7 +80,7 @@ bool GuestInvocationCaptureCoordinator::FinishCallbackLocked(
   }
   if (recorder_->state() == ppc::GuestInvocationRecorderState::kRejected) {
     state_ = GuestInvocationCaptureState::kRejected;
-    segment_end_tick_ = clock_.NowTicks();
+    capture_end_tick_ = clock_.NowTicks();
     message_ = recorder_->rejection_message();
     if (message_.empty()) {
       message_ = "capture recorder rejected without a diagnostic";
@@ -95,13 +95,19 @@ bool GuestInvocationCaptureCoordinator::FinishCallbackLocked(
   const ppc::GuestInvocationRecorderResult* result = recorder_->result();
   if (!result) {
     state_ = GuestInvocationCaptureState::kPublicationFailed;
+    capture_end_tick_ = clock_.NowTicks();
     message_ = "completed capture has no recorder result";
+    segment_handler_ = {};
     return false;
   }
-  segment_end_tick_ = clock_.NowTicks();
+  capture_end_tick_ = clock_.NowTicks();
+  // Publication may reenter the emulator and therefore this coordinator. Mark
+  // it terminal before invoking the handler so a recursive callback cannot
+  // observe kRecording and publish the same completed result again.
+  state_ = GuestInvocationCaptureState::kPublishing;
   std::string publication_error;
-  if (!segment_handler_(segment_ordinal_, segment_start_tick_,
-                        segment_end_tick_, *result, &publication_error)) {
+  if (!segment_handler_(segment_ordinal_, capture_start_tick_,
+                        capture_end_tick_, *result, &publication_error)) {
     state_ = GuestInvocationCaptureState::kPublicationFailed;
     message_ = publication_error.empty()
                    ? std::string(kMissingPublicationDiagnostic)
@@ -223,7 +229,7 @@ void GuestInvocationCaptureCoordinator::Stop() {
   }
   state_ = GuestInvocationCaptureState::kStopped;
   message_.assign(kStoppedDiagnostic);
-  segment_end_tick_ = clock_.NowTicks();
+  capture_end_tick_ = clock_.NowTicks();
   segment_handler_ = {};
 }
 
@@ -243,8 +249,8 @@ GuestInvocationCaptureStatus GuestInvocationCaptureCoordinator::status() const {
               state_ == GuestInvocationCaptureState::kStopped
           ? 1
           : 0;
-  status.segment_start_tick = segment_start_tick_;
-  status.segment_end_tick = segment_end_tick_;
+  status.capture_start_tick = capture_start_tick_;
+  status.capture_end_tick = capture_end_tick_;
   status.message = message_;
   return status;
 }

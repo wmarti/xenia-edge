@@ -158,8 +158,8 @@ TEST_CASE("guest invocation capture publishes one ordered segment",
   REQUIRE(status.segment_ordinal == 7);
   REQUIRE(status.accepted_segment_count == 1);
   REQUIRE(status.rejected_segment_count == 0);
-  REQUIRE(status.segment_start_tick == 100);
-  REQUIRE(status.segment_end_tick == 200);
+  REQUIRE(status.capture_start_tick == 100);
+  REQUIRE(status.capture_end_tick == 200);
   REQUIRE(status.message.empty());
 
   REQUIRE(coordinator->Poll());
@@ -226,7 +226,7 @@ TEST_CASE("guest invocation capture surfaces rejection and incomplete stop",
     const GuestInvocationCaptureStatus status = coordinator->status();
     REQUIRE(status.state == GuestInvocationCaptureState::kStopped);
     REQUIRE(status.rejected_segment_count == 1);
-    REQUIRE(status.segment_end_tick == 250);
+    REQUIRE(status.capture_end_tick == 250);
     REQUIRE(status.message.find("before") != std::string::npos);
     REQUIRE_FALSE(coordinator->Poll());
   }
@@ -240,6 +240,36 @@ TEST_CASE("guest invocation capture requires a segment handler",
   REQUIRE_FALSE(GuestInvocationCaptureCoordinator::Create(
       0, MakeSelection(), MakeLimits(), reader, clock, {}, &error));
   REQUIRE(error == "capture segment handler is missing");
+}
+
+TEST_CASE("guest invocation capture publication is reentrancy-safe",
+          "[guest-invocation-capture]") {
+  FakePageReader reader;
+  reader.pages[kDataPage] = {};
+  FakeClock clock;
+  GuestInvocationCaptureCoordinator* coordinator_pointer = nullptr;
+  uint32_t handler_count = 0;
+  std::unique_ptr<GuestInvocationCaptureCoordinator> coordinator =
+      MakeCoordinator(
+          reader, clock,
+          [&](uint64_t, uint64_t, uint64_t,
+              const ppc::GuestInvocationRecorderResult&, std::string*) {
+            ++handler_count;
+            REQUIRE(coordinator_pointer);
+            REQUIRE(coordinator_pointer->status().state ==
+                    GuestInvocationCaptureState::kPublishing);
+            REQUIRE_FALSE(coordinator_pointer->Poll());
+            return true;
+          });
+  coordinator_pointer = coordinator.get();
+
+  CompleteCapture(*coordinator, reader);
+
+  REQUIRE(handler_count == 1);
+  REQUIRE(coordinator->status().state ==
+          GuestInvocationCaptureState::kPublished);
+  REQUIRE(coordinator->Poll());
+  REQUIRE(handler_count == 1);
 }
 
 }  // namespace test

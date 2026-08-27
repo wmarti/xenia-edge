@@ -23,6 +23,7 @@ namespace cpu {
 
 enum class GuestInvocationCaptureState : uint8_t {
   kRecording,
+  kPublishing,
   kPublished,
   kRejected,
   kPublicationFailed,
@@ -39,8 +40,10 @@ struct GuestInvocationCaptureStatus {
   uint64_t segment_ordinal = 0;
   uint64_t accepted_segment_count = 0;
   uint64_t rejected_segment_count = 0;
-  uint64_t segment_start_tick = 0;
-  uint64_t segment_end_tick = 0;
+  // Bounds the full recorder lifetime, including discovery attempts. These
+  // are not the start and end of the accepted final invocation.
+  uint64_t capture_start_tick = 0;
+  uint64_t capture_end_tick = 0;
   std::string message;
 };
 
@@ -93,8 +96,8 @@ class GuestInvocationCaptureCoordinator final
     : public GuestInvocationCaptureEventSink {
  public:
   using SegmentHandler = std::function<bool(
-      uint64_t segment_ordinal, uint64_t segment_start_tick,
-      uint64_t segment_end_tick,
+      uint64_t segment_ordinal, uint64_t capture_start_tick,
+      uint64_t capture_end_tick,
       const ppc::GuestInvocationRecorderResult& result, std::string* error)>;
 
   static std::unique_ptr<GuestInvocationCaptureCoordinator> Create(
@@ -141,7 +144,7 @@ class GuestInvocationCaptureCoordinator final
 
  private:
   GuestInvocationCaptureCoordinator(
-      uint64_t segment_ordinal, uint64_t segment_start_tick,
+      uint64_t segment_ordinal, uint64_t capture_start_tick,
       std::unique_ptr<ppc::GuestInvocationRecorder> recorder,
       const ppc::GuestInvocationRecorderClock& clock,
       SegmentHandler segment_handler);
@@ -153,8 +156,8 @@ class GuestInvocationCaptureCoordinator final
   // explicit reentry rejection rather than deadlocking this coordinator.
   mutable std::recursive_mutex mutex_;
   uint64_t segment_ordinal_ = 0;
-  uint64_t segment_start_tick_ = 0;
-  uint64_t segment_end_tick_ = 0;
+  uint64_t capture_start_tick_ = 0;
+  uint64_t capture_end_tick_ = 0;
   std::unique_ptr<ppc::GuestInvocationRecorder> recorder_;
   const ppc::GuestInvocationRecorderClock& clock_;
   SegmentHandler segment_handler_;
