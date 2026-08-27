@@ -32,6 +32,7 @@ import platform
 import re
 import signal
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,10 @@ SCHEMA = "xenia-guest-invocation-result-v3"
 METRIC_PREFIX = "XENIA_GUEST_INVOCATION_BENCHMARK_V3"
 PAGE_SIZE = 4096
 MAX_PAIRS = 64
+JIT_CORPUS_MAGIC = 0x3143584A
+JIT_CORPUS_VERSION = 3
+JIT_CORPUS_CONFIG_GUEST_SCHEDULER = 1 << 0
+JIT_CORPUS_KNOWN_CONFIG_FLAGS = JIT_CORPUS_CONFIG_GUEST_SCHEDULER
 METRIC_FIELDS = (
     "artifact_sha256",
     "corpus_sha256",
@@ -116,7 +121,6 @@ PHASE_SCHEDULE = (
 )
 FIXED_RUNNER_FLAGS = (
     "--test_benchmark_warmed=false",
-    "--guest_scheduler=false",
     "--log_safepoint_pc=false",
     "--jit_corpus_allow_incomplete=false",
     "--count_call_paths=false",
@@ -141,6 +145,28 @@ def file_sha256(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def corpus_scheduler_flag(path):
+    try:
+        with pathlib.Path(path).open("rb") as stream:
+            header = stream.read(16)
+    except OSError as error:
+        raise BenchmarkError(
+            f"unable to read JIT corpus header from {path}: {error}") from error
+    if len(header) != 16:
+        raise BenchmarkError("JIT corpus header is truncated")
+    magic, version, page_size, config_flags = struct.unpack("<4I", header)
+    if magic != JIT_CORPUS_MAGIC:
+        raise BenchmarkError("JIT corpus magic is invalid")
+    if version != JIT_CORPUS_VERSION:
+        raise BenchmarkError("JIT corpus version is unsupported for execution")
+    if page_size != PAGE_SIZE:
+        raise BenchmarkError("JIT corpus page size is unsupported")
+    if config_flags & ~JIT_CORPUS_KNOWN_CONFIG_FLAGS:
+        raise BenchmarkError("JIT corpus configuration contains unsupported flags")
+    enabled = bool(config_flags & JIT_CORPUS_CONFIG_GUEST_SCHEDULER)
+    return f"--guest_scheduler={'true' if enabled else 'false'}"
 
 
 def _parse_canonical_uint(field, value, positive):
@@ -233,6 +259,7 @@ def build_command(exe, extra, artifact, corpus, iterations):
         str(exe),
         *extra,
         *FIXED_RUNNER_FLAGS,
+        corpus_scheduler_flag(corpus),
         f"--guest_invocation_in={artifact}",
         f"--jit_corpus_in={corpus}",
         f"--guest_invocation_iterations={iterations}",

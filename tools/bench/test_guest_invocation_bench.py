@@ -100,11 +100,45 @@ def phase_samples(aa, bb, ab, ba):
     }
 
 
+def write_corpus_header(path, config_flags):
+    values = (
+        benchmark.JIT_CORPUS_MAGIC,
+        benchmark.JIT_CORPUS_VERSION,
+        benchmark.PAGE_SIZE,
+        config_flags,
+    )
+    path.write_bytes(b"".join(value.to_bytes(4, "little") for value in values))
+
+
 class MarkerParserTest(unittest.TestCase):
     def test_accepts_exact_canonical_marker(self):
         parsed = benchmark.parse_metric(
             "diagnostic\n" + metric_line() + "\nmore")
         self.assertEqual(parsed, metric_values())
+
+    def test_corpus_scheduler_mode_is_read_from_canonical_header(self):
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = pathlib.Path(directory) / "input.jcorpus"
+            write_corpus_header(corpus, 0)
+            self.assertEqual(
+                benchmark.corpus_scheduler_flag(corpus),
+                "--guest_scheduler=false",
+            )
+            write_corpus_header(
+                corpus, benchmark.JIT_CORPUS_CONFIG_GUEST_SCHEDULER)
+            self.assertEqual(
+                benchmark.corpus_scheduler_flag(corpus),
+                "--guest_scheduler=true",
+            )
+
+    def test_corpus_scheduler_mode_rejects_unknown_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = pathlib.Path(directory) / "input.jcorpus"
+            write_corpus_header(corpus, 1 << 31)
+            with self.assertRaisesRegex(
+                    benchmark.BenchmarkError,
+                    "configuration contains unsupported flags"):
+                benchmark.corpus_scheduler_flag(corpus)
 
     def test_rejects_superseded_markers(self):
         legacy = metric_line().replace(
@@ -372,11 +406,13 @@ class RunnerTest(unittest.TestCase):
         process = types.SimpleNamespace(
             stdout=metric_line(), stderr="", returncode=0)
         with mock.patch.object(
-                benchmark.subprocess, "run", return_value=process) as run:
+                benchmark, "corpus_scheduler_flag",
+                return_value="--guest_scheduler=true"), mock.patch.object(
+                    benchmark.subprocess, "run", return_value=process) as run:
             result = benchmark.run_once(
                 "/tmp/a", [
                     "--guest_invocation_iterations=1",
-                    "--guest_scheduler=true",
+                    "--guest_scheduler=false",
                     "--log_safepoint_pc=true",
                     "--emit_mmio_aware_stores_for_recorded_exception_addresses=true",
                     "--enable_early_precompilation=true",
@@ -392,8 +428,8 @@ class RunnerTest(unittest.TestCase):
             command.index("--guest_invocation_iterations=100"),
             command.index("--guest_invocation_iterations=1"))
         self.assertGreater(
-            command.index("--guest_scheduler=false"),
-            command.index("--guest_scheduler=true"))
+            command.index("--guest_scheduler=true"),
+            command.index("--guest_scheduler=false"))
         self.assertGreater(
             command.index(
                 "--emit_mmio_aware_stores_for_recorded_exception_addresses=false"),
@@ -419,7 +455,11 @@ class RunnerTest(unittest.TestCase):
         ])
         self.assertEqual(result["thread_cpu_ns_per_invocation"], 1000.0)
 
-    def test_rejects_nonzero_exit_signal_missing_marker_and_timeout(self):
+    @mock.patch.object(
+        benchmark, "corpus_scheduler_flag",
+        return_value="--guest_scheduler=false")
+    def test_rejects_nonzero_exit_signal_missing_marker_and_timeout(
+            self, _scheduler_flag):
         failed = types.SimpleNamespace(
             stdout="", stderr="failed", returncode=3)
         with mock.patch.object(
