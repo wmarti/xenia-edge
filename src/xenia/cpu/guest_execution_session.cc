@@ -32,6 +32,7 @@ constexpr uint32_t kManifestEnvelopeKind = 1;
 constexpr uint32_t kManifestOrdinal = UINT32_MAX;
 constexpr uint32_t kKnownEnvelopeFlags = 0;
 constexpr uint64_t kGuestAddressSpaceSize = uint64_t{1} << 32;
+constexpr uint64_t kNanosecondsPerSecond = 1000000000;
 
 bool Fail(std::string* error, std::string_view message) {
   if (error) {
@@ -54,6 +55,34 @@ bool CheckedMultiply(uint64_t left, uint64_t right, uint64_t* result) {
   }
   *result = left * right;
   return true;
+}
+
+// Computes ceil(nanoseconds * frequency / 1e9) without overflowing an
+// intermediate product. Splitting both operands around 1e9 keeps the one
+// remaining product below 1e18; every other term is checked explicitly.
+bool ComputeDurationTargetTicks(uint64_t nanoseconds, uint64_t frequency,
+                                uint64_t* target_ticks) {
+  const uint64_t whole_seconds = nanoseconds / kNanosecondsPerSecond;
+  const uint64_t remaining_nanoseconds = nanoseconds % kNanosecondsPerSecond;
+  const uint64_t frequency_seconds = frequency / kNanosecondsPerSecond;
+  const uint64_t frequency_remainder = frequency % kNanosecondsPerSecond;
+
+  uint64_t whole_ticks = 0;
+  uint64_t cross_ticks = 0;
+  uint64_t fractional_product = 0;
+  if (!CheckedMultiply(whole_seconds, frequency, &whole_ticks) ||
+      !CheckedMultiply(remaining_nanoseconds, frequency_seconds,
+                       &cross_ticks) ||
+      !CheckedMultiply(remaining_nanoseconds, frequency_remainder,
+                       &fractional_product)) {
+    return false;
+  }
+  uint64_t fractional_ticks = fractional_product / kNanosecondsPerSecond;
+  if (fractional_product % kNanosecondsPerSecond) {
+    ++fractional_ticks;
+  }
+  return CheckedAdd(whole_ticks, cross_ticks, target_ticks) &&
+         CheckedAdd(*target_ticks, fractional_ticks, target_ticks);
 }
 
 bool IsNonzeroHash(const GuestExecutionSessionSha256& hash) {
@@ -313,8 +342,66 @@ bool DecodeEnvelope(const uint8_t* data, size_t data_size,
   return true;
 }
 
+bool IsKnownMarkerSource(GuestExecutionSessionMarkerSource source) {
+  switch (source) {
+    case GuestExecutionSessionMarkerSource::kNone:
+    case GuestExecutionSessionMarkerSource::kGuestDefined:
+    case GuestExecutionSessionMarkerSource::kPm4Swap:
+    case GuestExecutionSessionMarkerSource::kKernel:
+    case GuestExecutionSessionMarkerSource::kOtherInstrumented:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsKnownStopReason(GuestExecutionSessionStopReason reason) {
+  switch (reason) {
+    case GuestExecutionSessionStopReason::kManualRequest:
+    case GuestExecutionSessionStopReason::kRequestedBoundary:
+    case GuestExecutionSessionStopReason::kMaximumSegmentCount:
+    case GuestExecutionSessionStopReason::kMaximumEventCount:
+    case GuestExecutionSessionStopReason::kMaximumGuestInstructionCount:
+    case GuestExecutionSessionStopReason::kMaximumGuestMarkerCount:
+    case GuestExecutionSessionStopReason::kMaximumDuration:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsSafetyStopReason(GuestExecutionSessionStopReason reason) {
+  return reason != GuestExecutionSessionStopReason::kManualRequest &&
+         reason != GuestExecutionSessionStopReason::kRequestedBoundary;
+}
+
+bool IsKnownBoundaryArrivalKind(GuestExecutionSessionBoundaryArrivalKind kind) {
+  switch (kind) {
+    case GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside:
+    case GuestExecutionSessionBoundaryArrivalKind::kJitSafepoint:
+    case GuestExecutionSessionBoundaryArrivalKind::kOuterHostCallReturn:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsKnownInitialOuterCallState(
+    GuestExecutionSessionInitialOuterCallState state) {
+  switch (state) {
+    case GuestExecutionSessionInitialOuterCallState::kOutside:
+    case GuestExecutionSessionInitialOuterCallState::kActive:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool ValidateBoundaryPolicy(const GuestExecutionSessionBoundaryPolicy& policy,
                             std::string* error) {
+  if (!IsKnownMarkerSource(policy.marker_source)) {
+    return Fail(error, "session boundary marker source is unknown");
+  }
   switch (policy.kind) {
     case GuestExecutionSessionBoundaryKind::kManual:
       if (policy.value || policy.marker_identity ||
@@ -335,10 +422,7 @@ bool ValidateBoundaryPolicy(const GuestExecutionSessionBoundaryPolicy& policy,
       return true;
     case GuestExecutionSessionBoundaryKind::kGuestMarkerCount:
       if (!policy.value || !policy.marker_identity ||
-          policy.marker_source == GuestExecutionSessionMarkerSource::kNone ||
-          static_cast<uint32_t>(policy.marker_source) >
-              static_cast<uint32_t>(
-                  GuestExecutionSessionMarkerSource::kOtherInstrumented)) {
+          policy.marker_source == GuestExecutionSessionMarkerSource::kNone) {
         return Fail(error, "guest-marker boundary identity is invalid");
       }
       return true;
@@ -386,6 +470,70 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
       manifest.capture_end_tick < manifest.capture_start_tick) {
     return Fail(error, "manifest actual capture timing is invalid");
   }
+  if (!IsKnownStopReason(manifest.stop_reason) ||
+      manifest.stop_request_event_sequence < manifest.first_event_sequence ||
+      manifest.stop_request_event_sequence >= manifest.last_event_sequence ||
+      manifest.stop_request_tick < manifest.capture_start_tick ||
+      manifest.stop_request_tick > manifest.capture_end_tick ||
+      manifest.stop_request_accepted_segment_count >
+          manifest.accepted_segment_count ||
+      !manifest.maximum_stop_tail_event_count ||
+      !manifest.maximum_stop_tail_guest_instruction_count ||
+      !manifest.maximum_stop_tail_ticks) {
+    return Fail(error, "manifest stop proof is invalid");
+  }
+  const bool manual_policy =
+      manifest.boundary.kind == GuestExecutionSessionBoundaryKind::kManual;
+  const bool safety_stop = IsSafetyStopReason(manifest.stop_reason);
+  if ((!safety_stop &&
+       manifest.stop_reason !=
+           (manual_policy
+                ? GuestExecutionSessionStopReason::kManualRequest
+                : GuestExecutionSessionStopReason::kRequestedBoundary)) ||
+      (manifest.boundary.kind !=
+           GuestExecutionSessionBoundaryKind::kGuestMarkerCount &&
+       manifest.stop_request_matching_guest_marker_count)) {
+    return Fail(error,
+                "manifest stop reason or non-marker proof is inconsistent");
+  }
+  if (!safety_stop) {
+    switch (manifest.boundary.kind) {
+      case GuestExecutionSessionBoundaryKind::kManual:
+        break;
+      case GuestExecutionSessionBoundaryKind::kSegmentCount:
+        if (manifest.stop_request_accepted_segment_count !=
+            manifest.boundary.value) {
+          return Fail(error, "segment boundary stop proof is inconsistent");
+        }
+        break;
+      case GuestExecutionSessionBoundaryKind::kGuestMarkerCount:
+        if (manifest.stop_request_matching_guest_marker_count !=
+            manifest.boundary.value) {
+          return Fail(error,
+                      "guest-marker boundary stop proof is inconsistent");
+        }
+        break;
+      case GuestExecutionSessionBoundaryKind::kGuestInstructionCount:
+        if (manifest.stop_request_guest_instruction_count !=
+            manifest.boundary.value) {
+          return Fail(error, "instruction boundary stop proof is inconsistent");
+        }
+        break;
+      case GuestExecutionSessionBoundaryKind::kCaptureDurationNanoseconds: {
+        uint64_t target_ticks = 0;
+        if (!ComputeDurationTargetTicks(manifest.boundary.value,
+                                        manifest.capture_tick_frequency,
+                                        &target_ticks) ||
+            manifest.stop_request_tick - manifest.capture_start_tick <
+                target_ticks) {
+          return Fail(error, "duration boundary stop proof is inconsistent");
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
   if (!IsNonzeroHash(manifest.capture_build_sha256) ||
       !IsNonzeroHash(manifest.replay_config_sha256) ||
       !IsNonzeroHash(manifest.title_identity_sha256) ||
@@ -418,17 +566,38 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
   }
 
   std::set<uint32_t> guest_thread_ids;
+  std::set<uint64_t> capture_instance_ids;
   for (size_t i = 0; i < manifest.participants.size(); ++i) {
     const GuestExecutionSessionParticipant& participant =
         manifest.participants[i];
     if (participant.ordinal != i || !participant.guest_thread_id ||
-        !guest_thread_ids.insert(participant.guest_thread_id).second) {
+        !guest_thread_ids.insert(participant.guest_thread_id).second ||
+        !participant.capture_instance_id ||
+        !capture_instance_ids.insert(participant.capture_instance_id).second ||
+        !IsKnownInitialOuterCallState(participant.initial_outer_call_state) ||
+        !IsKnownBoundaryArrivalKind(participant.boundary_arrival_kind)) {
       return Fail(error,
                   "manifest participants are not dense and uniquely named");
     }
-    if (participant.first_event_sequence < manifest.first_event_sequence ||
-        participant.last_event_sequence < participant.first_event_sequence ||
-        participant.last_event_sequence > manifest.last_event_sequence) {
+    const bool has_no_events =
+        !participant.first_event_sequence && !participant.last_event_sequence;
+    if ((!has_no_events &&
+         (participant.first_event_sequence < manifest.first_event_sequence ||
+          participant.last_event_sequence < participant.first_event_sequence ||
+          participant.last_event_sequence > manifest.last_event_sequence)) ||
+        (participant.boundary_arrival_kind ==
+                 GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside
+             ? (participant.held_after_event_sequence !=
+                    manifest.stop_request_event_sequence ||
+                (!has_no_events && participant.last_event_sequence >
+                                       manifest.stop_request_event_sequence))
+             : (has_no_events ||
+                participant.held_after_event_sequence <=
+                    manifest.stop_request_event_sequence ||
+                participant.held_after_event_sequence >=
+                    manifest.last_event_sequence ||
+                participant.last_event_sequence !=
+                    participant.held_after_event_sequence))) {
       return Fail(error, "manifest participant event range is invalid");
     }
     if (!participant.initial_state_size ||
@@ -573,6 +742,13 @@ bool IsKnownEventKind(GuestExecutionSessionEventKind kind) {
     case GuestExecutionSessionEventKind::kAtomicOrReservation:
     case GuestExecutionSessionEventKind::kMemoryMutation:
     case GuestExecutionSessionEventKind::kUnsupported:
+    case GuestExecutionSessionEventKind::kInstructionCoverage:
+    case GuestExecutionSessionEventKind::kGuestMarker:
+    case GuestExecutionSessionEventKind::kBoundaryRequest:
+    case GuestExecutionSessionEventKind::kBoundaryHeld:
+    case GuestExecutionSessionEventKind::kOuterHostCallBegin:
+    case GuestExecutionSessionEventKind::kOuterHostCallEnd:
+    case GuestExecutionSessionEventKind::kJitSafepointArrival:
       return true;
     default:
       return false;
@@ -623,7 +799,8 @@ bool ValidateEvent(const GuestExecutionSessionEvent& event,
   }
   if (!IsKnownEventKind(event.kind) || !IsKnownDisposition(event.disposition) ||
       !IsKnownMutationSource(event.mutation_source) ||
-      !IsKnownPayloadKind(event.payload_kind)) {
+      !IsKnownPayloadKind(event.payload_kind) ||
+      !IsKnownMarkerSource(event.marker_source)) {
     return Fail(error, "event contains an unknown typed field");
   }
   const bool payload_is_none =
@@ -644,6 +821,75 @@ bool ValidateEvent(const GuestExecutionSessionEvent& event,
       event.disposition !=
           GuestExecutionSessionEventDisposition::kRejectSession) {
     return Fail(error, "unsupported event does not reject the session");
+  }
+  const bool no_auxiliary_fields =
+      event.mutation_source == GuestExecutionSessionMutationSource::kNone &&
+      payload_is_none && !event.guest_address && !event.byte_count &&
+      event.marker_source == GuestExecutionSessionMarkerSource::kNone &&
+      !event.marker_identity && !event.guest_instruction_delta;
+  const bool has_participant =
+      event.thread_ordinal != kGuestExecutionSessionNoThread;
+  if (event.kind == GuestExecutionSessionEventKind::kInstructionCoverage) {
+    if (!has_participant || !event.guest_instruction_delta ||
+        event.mutation_source != GuestExecutionSessionMutationSource::kNone ||
+        !payload_is_none || event.guest_address || event.byte_count ||
+        event.marker_source != GuestExecutionSessionMarkerSource::kNone ||
+        event.marker_identity ||
+        event.disposition !=
+            GuestExecutionSessionEventDisposition::kValidateDeterministic) {
+      return Fail(error, "instruction coverage event is not canonical");
+    }
+    return true;
+  }
+  if (event.kind == GuestExecutionSessionEventKind::kGuestMarker) {
+    if (event.marker_source == GuestExecutionSessionMarkerSource::kNone ||
+        !event.marker_identity ||
+        event.mutation_source != GuestExecutionSessionMutationSource::kNone ||
+        !payload_is_none || event.guest_address || event.byte_count ||
+        event.guest_instruction_delta) {
+      return Fail(error, "guest-marker event is not canonical");
+    }
+    const bool pm4_marker =
+        event.marker_source == GuestExecutionSessionMarkerSource::kPm4Swap;
+    if (pm4_marker
+            ? (has_participant ||
+               event.disposition !=
+                   GuestExecutionSessionEventDisposition::kReplayCaptured)
+            : (!has_participant || event.disposition !=
+                                       GuestExecutionSessionEventDisposition::
+                                           kValidateDeterministic)) {
+      return Fail(error, "guest-marker ownership is not canonical");
+    }
+    return true;
+  }
+  const bool boundary_control =
+      event.kind == GuestExecutionSessionEventKind::kBoundaryRequest ||
+      event.kind == GuestExecutionSessionEventKind::kBoundaryHeld;
+  const bool participant_control =
+      event.kind == GuestExecutionSessionEventKind::kSegmentBegin ||
+      event.kind == GuestExecutionSessionEventKind::kSegmentEnd ||
+      event.kind == GuestExecutionSessionEventKind::kOuterHostCallBegin ||
+      event.kind == GuestExecutionSessionEventKind::kOuterHostCallEnd ||
+      event.kind == GuestExecutionSessionEventKind::kJitSafepointArrival;
+  if (boundary_control || participant_control) {
+    if (!no_auxiliary_fields ||
+        (boundary_control
+             ? (has_participant ||
+                event.disposition !=
+                    GuestExecutionSessionEventDisposition::kReplayCaptured)
+             : (!has_participant || event.disposition !=
+                                        GuestExecutionSessionEventDisposition::
+                                            kValidateDeterministic))) {
+      return Fail(error, "structural control event is not canonical");
+    }
+    return true;
+  }
+  if (event.guest_instruction_delta) {
+    return Fail(error, "non-coverage event contains an instruction delta");
+  }
+  if (event.marker_source != GuestExecutionSessionMarkerSource::kNone ||
+      event.marker_identity) {
+    return Fail(error, "non-marker event contains guest-marker fields");
   }
 
   if (event.kind == GuestExecutionSessionEventKind::kMemoryMutation) {
@@ -868,8 +1114,12 @@ void WriteParticipant(Writer* writer,
                       const GuestExecutionSessionParticipant& participant) {
   writer->WriteU32(participant.ordinal);
   writer->WriteU32(participant.guest_thread_id);
+  writer->WriteU64(participant.capture_instance_id);
+  writer->WriteU32(static_cast<uint32_t>(participant.boundary_arrival_kind));
+  writer->WriteU32(static_cast<uint32_t>(participant.initial_outer_call_state));
   writer->WriteU64(participant.first_event_sequence);
   writer->WriteU64(participant.last_event_sequence);
+  writer->WriteU64(participant.held_after_event_sequence);
   writer->WriteU64(participant.initial_state_size);
   writer->WriteBytes(participant.initial_state_sha256.data(),
                      participant.initial_state_sha256.size());
@@ -877,13 +1127,28 @@ void WriteParticipant(Writer* writer,
 
 bool ReadParticipant(Reader* reader,
                      GuestExecutionSessionParticipant* participant) {
-  return reader->ReadU32(&participant->ordinal) &&
-         reader->ReadU32(&participant->guest_thread_id) &&
-         reader->ReadU64(&participant->first_event_sequence) &&
-         reader->ReadU64(&participant->last_event_sequence) &&
-         reader->ReadU64(&participant->initial_state_size) &&
-         reader->ReadBytes(participant->initial_state_sha256.data(),
-                           participant->initial_state_sha256.size());
+  uint32_t boundary_arrival_kind = 0;
+  uint32_t initial_outer_call_state = 0;
+  if (!reader->ReadU32(&participant->ordinal) ||
+      !reader->ReadU32(&participant->guest_thread_id) ||
+      !reader->ReadU64(&participant->capture_instance_id) ||
+      !reader->ReadU32(&boundary_arrival_kind) ||
+      !reader->ReadU32(&initial_outer_call_state) ||
+      !reader->ReadU64(&participant->first_event_sequence) ||
+      !reader->ReadU64(&participant->last_event_sequence) ||
+      !reader->ReadU64(&participant->held_after_event_sequence) ||
+      !reader->ReadU64(&participant->initial_state_size) ||
+      !reader->ReadBytes(participant->initial_state_sha256.data(),
+                         participant->initial_state_sha256.size())) {
+    return false;
+  }
+  participant->boundary_arrival_kind =
+      static_cast<GuestExecutionSessionBoundaryArrivalKind>(
+          boundary_arrival_kind);
+  participant->initial_outer_call_state =
+      static_cast<GuestExecutionSessionInitialOuterCallState>(
+          initial_outer_call_state);
+  return true;
 }
 
 void WriteSegment(Writer* writer,
@@ -956,6 +1221,10 @@ void WriteEvent(Writer* writer, const GuestExecutionSessionEvent& event) {
   writer->WriteU64(event.byte_count);
   writer->WriteU64(event.payload_size);
   writer->WriteBytes(event.payload_sha256.data(), event.payload_sha256.size());
+  writer->WriteU32(static_cast<uint32_t>(event.marker_source));
+  writer->WriteU32(0);
+  writer->WriteU64(event.marker_identity);
+  writer->WriteU64(event.guest_instruction_delta);
 }
 
 bool ReadEvent(Reader* reader, GuestExecutionSessionEvent* event) {
@@ -963,7 +1232,9 @@ bool ReadEvent(Reader* reader, GuestExecutionSessionEvent* event) {
   uint32_t disposition = 0;
   uint32_t mutation_source = 0;
   uint32_t payload_kind = 0;
+  uint32_t marker_source = 0;
   uint32_t reserved = 0;
+  uint32_t trailing_reserved = 0;
   if (!reader->ReadU64(&event->global_sequence) ||
       !reader->ReadU32(&event->thread_ordinal) || !reader->ReadU32(&kind) ||
       !reader->ReadU32(&disposition) || !reader->ReadU32(&mutation_source) ||
@@ -972,7 +1243,11 @@ bool ReadEvent(Reader* reader, GuestExecutionSessionEvent* event) {
       !reader->ReadU64(&event->byte_count) ||
       !reader->ReadU64(&event->payload_size) ||
       !reader->ReadBytes(event->payload_sha256.data(),
-                         event->payload_sha256.size())) {
+                         event->payload_sha256.size()) ||
+      !reader->ReadU32(&marker_source) ||
+      !reader->ReadU32(&trailing_reserved) || trailing_reserved ||
+      !reader->ReadU64(&event->marker_identity) ||
+      !reader->ReadU64(&event->guest_instruction_delta)) {
     return false;
   }
   event->kind = static_cast<GuestExecutionSessionEventKind>(kind);
@@ -982,6 +1257,8 @@ bool ReadEvent(Reader* reader, GuestExecutionSessionEvent* event) {
       static_cast<GuestExecutionSessionMutationSource>(mutation_source);
   event->payload_kind =
       static_cast<GuestExecutionSessionPayloadKind>(payload_kind);
+  event->marker_source =
+      static_cast<GuestExecutionSessionMarkerSource>(marker_source);
   return true;
 }
 
@@ -1092,6 +1369,16 @@ bool GuestExecutionSessionCodec::EncodeManifest(
   payload_writer.WriteU64(manifest.accepted_event_count);
   payload_writer.WriteU64(manifest.rejected_event_count);
   payload_writer.WriteU64(manifest.unsupported_event_count);
+  payload_writer.WriteU32(static_cast<uint32_t>(manifest.stop_reason));
+  payload_writer.WriteU32(0);
+  payload_writer.WriteU64(manifest.stop_request_event_sequence);
+  payload_writer.WriteU64(manifest.stop_request_tick);
+  payload_writer.WriteU64(manifest.stop_request_accepted_segment_count);
+  payload_writer.WriteU64(manifest.stop_request_guest_instruction_count);
+  payload_writer.WriteU64(manifest.stop_request_matching_guest_marker_count);
+  payload_writer.WriteU64(manifest.maximum_stop_tail_event_count);
+  payload_writer.WriteU64(manifest.maximum_stop_tail_guest_instruction_count);
+  payload_writer.WriteU64(manifest.maximum_stop_tail_ticks);
   for (const GuestExecutionSessionParticipant& participant :
        manifest.participants) {
     WriteParticipant(&payload_writer, participant);
@@ -1148,7 +1435,9 @@ bool GuestExecutionSessionCodec::DecodeManifest(
   uint32_t participant_count = 0;
   uint32_t segment_count = 0;
   uint32_t chunk_count = 0;
+  uint32_t stop_reason = 0;
   uint32_t reserved = 0;
+  uint32_t stop_reserved = 0;
   uint64_t wire_total_chunk_bytes = 0;
   if (!reader.ReadU32(&boundary_kind) || !reader.ReadU32(&marker_source) ||
       !reader.ReadU64(&manifest.boundary.value) ||
@@ -1171,13 +1460,24 @@ bool GuestExecutionSessionCodec::DecodeManifest(
       !reader.ReadU64(&manifest.rejected_segment_count) ||
       !reader.ReadU64(&manifest.accepted_event_count) ||
       !reader.ReadU64(&manifest.rejected_event_count) ||
-      !reader.ReadU64(&manifest.unsupported_event_count)) {
+      !reader.ReadU64(&manifest.unsupported_event_count) ||
+      !reader.ReadU32(&stop_reason) || !reader.ReadU32(&stop_reserved) ||
+      stop_reserved || !reader.ReadU64(&manifest.stop_request_event_sequence) ||
+      !reader.ReadU64(&manifest.stop_request_tick) ||
+      !reader.ReadU64(&manifest.stop_request_accepted_segment_count) ||
+      !reader.ReadU64(&manifest.stop_request_guest_instruction_count) ||
+      !reader.ReadU64(&manifest.stop_request_matching_guest_marker_count) ||
+      !reader.ReadU64(&manifest.maximum_stop_tail_event_count) ||
+      !reader.ReadU64(&manifest.maximum_stop_tail_guest_instruction_count) ||
+      !reader.ReadU64(&manifest.maximum_stop_tail_ticks)) {
     return Fail(error, "manifest payload header is truncated or reserved");
   }
   manifest.boundary.kind =
       static_cast<GuestExecutionSessionBoundaryKind>(boundary_kind);
   manifest.boundary.marker_source =
       static_cast<GuestExecutionSessionMarkerSource>(marker_source);
+  manifest.stop_reason =
+      static_cast<GuestExecutionSessionStopReason>(stop_reason);
 
   uint64_t participant_bytes = 0;
   uint64_t segment_bytes = 0;
@@ -1494,9 +1794,27 @@ bool GuestExecutionSessionCodec::ValidateSession(
     bool has_event = false;
     uint64_t first_event_sequence = 0;
     uint64_t last_event_sequence = 0;
+    bool outer_host_call_active = false;
   };
   std::vector<ObservedParticipantRange> observed_participant_ranges(
       manifest.participants.size());
+  for (size_t i = 0; i < manifest.participants.size(); ++i) {
+    observed_participant_ranges[i].outer_host_call_active =
+        manifest.participants[i].initial_outer_call_state ==
+        GuestExecutionSessionInitialOuterCallState::kActive;
+  }
+  std::vector<uint32_t> observed_arrival_counts(manifest.participants.size());
+  uint64_t stop_request_accepted_segment_count = 0;
+  uint64_t stop_request_guest_instruction_count = 0;
+  uint64_t stop_request_matching_guest_marker_count = 0;
+  uint64_t stop_tail_guest_instruction_count = 0;
+  GuestExecutionSessionEventKind request_trigger_kind =
+      GuestExecutionSessionEventKind::kUnsupported;
+  GuestExecutionSessionMarkerSource request_trigger_marker_source =
+      GuestExecutionSessionMarkerSource::kNone;
+  uint64_t request_trigger_marker_identity = 0;
+  bool saw_boundary_request = false;
+  bool saw_boundary_held = false;
   bool saw_initial_checkpoint = false;
   bool saw_final_checkpoint = false;
 
@@ -1564,6 +1882,139 @@ bool GuestExecutionSessionCodec::ValidateSession(
             observed.first_event_sequence = event.global_sequence;
           }
           observed.last_event_sequence = event.global_sequence;
+          if (event.global_sequence > participant.held_after_event_sequence) {
+            return Fail(error,
+                        "participant owns an event after its held boundary");
+          }
+          if (event.kind ==
+              GuestExecutionSessionEventKind::kOuterHostCallBegin) {
+            if (observed.outer_host_call_active) {
+              return Fail(error, "participant begins a nested outer host call");
+            }
+            observed.outer_host_call_active = true;
+          } else if (event.kind ==
+                     GuestExecutionSessionEventKind::kOuterHostCallEnd) {
+            if (!observed.outer_host_call_active) {
+              return Fail(error,
+                          "participant ends an inactive outer host call");
+            }
+            observed.outer_host_call_active = false;
+          } else if (event.kind ==
+                         GuestExecutionSessionEventKind::kJitSafepointArrival &&
+                     !observed.outer_host_call_active) {
+            return Fail(error,
+                        "participant reaches a JIT arrival while outside");
+          }
+          if (event.global_sequence > manifest.stop_request_event_sequence) {
+            const bool jit_arrival =
+                event.kind ==
+                GuestExecutionSessionEventKind::kJitSafepointArrival;
+            const bool outer_return =
+                event.kind == GuestExecutionSessionEventKind::kOuterHostCallEnd;
+            if (jit_arrival || outer_return) {
+              const bool expected =
+                  (jit_arrival && participant.boundary_arrival_kind ==
+                                      GuestExecutionSessionBoundaryArrivalKind::
+                                          kJitSafepoint) ||
+                  (outer_return &&
+                   participant.boundary_arrival_kind ==
+                       GuestExecutionSessionBoundaryArrivalKind::
+                           kOuterHostCallReturn);
+              if (!expected ||
+                  event.global_sequence !=
+                      participant.held_after_event_sequence ||
+                  observed_arrival_counts[event.thread_ordinal] == UINT32_MAX) {
+                return Fail(error,
+                            "participant boundary arrival is inconsistent");
+              }
+              ++observed_arrival_counts[event.thread_ordinal];
+            }
+          }
+        }
+
+        if (event.kind == GuestExecutionSessionEventKind::kBoundaryRequest) {
+          if (event.global_sequence != manifest.stop_request_event_sequence ||
+              saw_boundary_request) {
+            return Fail(error, "session boundary request is not unique");
+          }
+          for (size_t participant_index = 0;
+               participant_index < manifest.participants.size();
+               ++participant_index) {
+            const bool expected_active =
+                manifest.participants[participant_index]
+                    .boundary_arrival_kind !=
+                GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside;
+            if (observed_participant_ranges[participant_index]
+                    .outer_host_call_active != expected_active) {
+              return Fail(
+                  error, "participant outer-call state differs at the request");
+            }
+          }
+          saw_boundary_request = true;
+        } else if (event.global_sequence ==
+                   manifest.stop_request_event_sequence) {
+          return Fail(error, "stop request sequence is not a boundary request");
+        }
+        if (event.kind == GuestExecutionSessionEventKind::kBoundaryHeld) {
+          if (event.global_sequence != manifest.last_event_sequence ||
+              saw_boundary_held) {
+            return Fail(error, "session held boundary is not the final event");
+          }
+          saw_boundary_held = true;
+        } else if (event.global_sequence == manifest.last_event_sequence) {
+          return Fail(error, "session final event is not a held boundary");
+        }
+        if (event.kind ==
+                GuestExecutionSessionEventKind::kJitSafepointArrival &&
+            event.global_sequence <= manifest.stop_request_event_sequence) {
+          return Fail(error, "JIT boundary arrival precedes the request");
+        }
+        if (event.kind == GuestExecutionSessionEventKind::kOuterHostCallBegin &&
+            event.global_sequence > manifest.stop_request_event_sequence) {
+          return Fail(error,
+                      "outer host call begins after the boundary request");
+        }
+        if (event.global_sequence == manifest.stop_request_event_sequence - 1) {
+          request_trigger_kind = event.kind;
+          request_trigger_marker_source = event.marker_source;
+          request_trigger_marker_identity = event.marker_identity;
+        }
+
+        const bool in_timed_prefix =
+            event.global_sequence < manifest.stop_request_event_sequence;
+        const bool in_stop_tail =
+            event.global_sequence > manifest.stop_request_event_sequence &&
+            event.global_sequence < manifest.last_event_sequence;
+        if (in_timed_prefix) {
+          if (event.kind == GuestExecutionSessionEventKind::kSegmentEnd &&
+              !CheckedAdd(stop_request_accepted_segment_count, 1,
+                          &stop_request_accepted_segment_count)) {
+            return Fail(error, "session request segment count overflows");
+          }
+          if (event.kind ==
+                  GuestExecutionSessionEventKind::kInstructionCoverage &&
+              !CheckedAdd(stop_request_guest_instruction_count,
+                          event.guest_instruction_delta,
+                          &stop_request_guest_instruction_count)) {
+            return Fail(error, "session request instruction count overflows");
+          }
+          if (manifest.boundary.kind ==
+                  GuestExecutionSessionBoundaryKind::kGuestMarkerCount &&
+              event.kind == GuestExecutionSessionEventKind::kGuestMarker &&
+              event.marker_source == manifest.boundary.marker_source &&
+              event.marker_identity == manifest.boundary.marker_identity &&
+              !CheckedAdd(stop_request_matching_guest_marker_count, 1,
+                          &stop_request_matching_guest_marker_count)) {
+            return Fail(error, "session request guest-marker count overflows");
+          }
+        }
+        if (in_stop_tail &&
+            event.kind ==
+                GuestExecutionSessionEventKind::kInstructionCoverage &&
+            !CheckedAdd(stop_tail_guest_instruction_count,
+                        event.guest_instruction_delta,
+                        &stop_tail_guest_instruction_count)) {
+          return Fail(error, "session stop-tail instruction count overflows");
         }
 
         const auto start = segment_starts.find(event.global_sequence);
@@ -1672,11 +2123,25 @@ bool GuestExecutionSessionCodec::ValidateSession(
     const GuestExecutionSessionParticipant& participant =
         manifest.participants[i];
     const ObservedParticipantRange& observed = observed_participant_ranges[i];
-    if (!observed.has_event ||
-        observed.first_event_sequence != participant.first_event_sequence ||
-        observed.last_event_sequence != participant.last_event_sequence) {
+    const bool has_no_events = !participant.first_event_sequence;
+    const uint32_t expected_arrival_count =
+        participant.boundary_arrival_kind ==
+                GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside
+            ? 0
+            : 1;
+    const bool expected_outer_call_active =
+        participant.boundary_arrival_kind ==
+        GuestExecutionSessionBoundaryArrivalKind::kJitSafepoint;
+    if ((has_no_events ? observed.has_event
+                       : (!observed.has_event ||
+                          observed.first_event_sequence !=
+                              participant.first_event_sequence ||
+                          observed.last_event_sequence !=
+                              participant.last_event_sequence)) ||
+        observed_arrival_counts[i] != expected_arrival_count ||
+        observed.outer_host_call_active != expected_outer_call_active) {
       return Fail(error,
-                  "participant event range does not match the event stream");
+                  "participant event range, arrival, or held state differs");
     }
   }
   if (accepted_event_count != manifest.accepted_event_count ||
@@ -1684,15 +2149,67 @@ bool GuestExecutionSessionCodec::ValidateSession(
       unsupported_event_count != manifest.unsupported_event_count) {
     return Fail(error, "session event coverage accounting does not match");
   }
+  uint64_t first_held_boundary_sequence = 0;
+  if (!saw_boundary_request || !saw_boundary_held ||
+      stop_request_accepted_segment_count !=
+          manifest.stop_request_accepted_segment_count ||
+      stop_request_guest_instruction_count !=
+          manifest.stop_request_guest_instruction_count ||
+      stop_request_matching_guest_marker_count !=
+          manifest.stop_request_matching_guest_marker_count ||
+      !CheckedAdd(manifest.stop_request_event_sequence, 1,
+                  &first_held_boundary_sequence) ||
+      manifest.last_event_sequence < first_held_boundary_sequence) {
+    return Fail(error, "session stop-request evidence does not match");
+  }
+  const uint64_t stop_tail_event_count =
+      manifest.last_event_sequence - first_held_boundary_sequence;
+  const uint64_t stop_tail_ticks =
+      manifest.capture_end_tick - manifest.stop_request_tick;
+  if (stop_tail_event_count > manifest.maximum_stop_tail_event_count ||
+      stop_tail_guest_instruction_count >
+          manifest.maximum_stop_tail_guest_instruction_count ||
+      stop_tail_ticks > manifest.maximum_stop_tail_ticks) {
+    return Fail(error, "session stop tail exceeds a configured hard maximum");
+  }
   if (manifest.rejected_segment_count || rejected_event_count ||
       unsupported_event_count) {
     return Fail(error, "session contains rejected or unsupported work");
   }
-  if (manifest.boundary.kind ==
-          GuestExecutionSessionBoundaryKind::kSegmentCount &&
-      manifest.boundary.value != manifest.accepted_segment_count) {
-    return Fail(error,
-                "session did not reach its requested accepted-segment count");
+  if (IsSafetyStopReason(manifest.stop_reason)) {
+    return Fail(error, "session stopped at a safety hard limit");
+  }
+  switch (manifest.boundary.kind) {
+    case GuestExecutionSessionBoundaryKind::kManual:
+    case GuestExecutionSessionBoundaryKind::kCaptureDurationNanoseconds:
+      break;
+    case GuestExecutionSessionBoundaryKind::kSegmentCount:
+      if (request_trigger_kind != GuestExecutionSessionEventKind::kSegmentEnd) {
+        return Fail(error,
+                    "segment boundary does not immediately precede request");
+      }
+      break;
+    case GuestExecutionSessionBoundaryKind::kGuestMarkerCount:
+      if (request_trigger_kind !=
+              GuestExecutionSessionEventKind::kGuestMarker ||
+          request_trigger_marker_source != manifest.boundary.marker_source ||
+          request_trigger_marker_identity !=
+              manifest.boundary.marker_identity) {
+        return Fail(error,
+                    "guest-marker boundary does not immediately precede "
+                    "request");
+      }
+      break;
+    case GuestExecutionSessionBoundaryKind::kGuestInstructionCount:
+      if (request_trigger_kind !=
+          GuestExecutionSessionEventKind::kInstructionCoverage) {
+        return Fail(error,
+                    "instruction boundary does not immediately precede "
+                    "request");
+      }
+      break;
+    default:
+      return Fail(error, "session boundary kind is unknown");
   }
   return true;
 }

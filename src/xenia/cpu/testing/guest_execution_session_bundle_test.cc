@@ -139,6 +139,8 @@ GuestExecutionSessionBundle MakeBundle() {
   begin.global_sequence = 1;
   begin.thread_ordinal = 0;
   begin.kind = GuestExecutionSessionEventKind::kSegmentBegin;
+  begin.disposition =
+      GuestExecutionSessionEventDisposition::kValidateDeterministic;
   events.events.push_back(begin);
   GuestExecutionSessionEvent external;
   external.global_sequence = 2;
@@ -163,12 +165,22 @@ GuestExecutionSessionBundle MakeBundle() {
   end.global_sequence = 4;
   end.thread_ordinal = 0;
   end.kind = GuestExecutionSessionEventKind::kSegmentEnd;
+  end.disposition =
+      GuestExecutionSessionEventDisposition::kValidateDeterministic;
   events.events.push_back(end);
+  GuestExecutionSessionEvent request;
+  request.global_sequence = 5;
+  request.kind = GuestExecutionSessionEventKind::kBoundaryRequest;
+  events.events.push_back(request);
+  GuestExecutionSessionEvent held;
+  held.global_sequence = 6;
+  held.kind = GuestExecutionSessionEventKind::kBoundaryHeld;
+  events.events.push_back(held);
 
   GuestExecutionSessionCheckpointChunk final;
   final.session_epoch = kEpoch;
   final.ordinal = 2;
-  final.checkpoint.global_sequence = 4;
+  final.checkpoint.global_sequence = 6;
   final.checkpoint.thread_states.push_back({0, 64, final_state});
   final.checkpoint.content = initial.checkpoint.content;
 
@@ -186,7 +198,7 @@ GuestExecutionSessionBundle MakeBundle() {
   manifest.boundary.kind = GuestExecutionSessionBoundaryKind::kSegmentCount;
   manifest.boundary.value = 1;
   manifest.first_event_sequence = 1;
-  manifest.last_event_sequence = 4;
+  manifest.last_event_sequence = 6;
   manifest.capture_start_tick = 100;
   manifest.capture_end_tick = 900;
   manifest.capture_tick_frequency = 1000000000;
@@ -195,17 +207,35 @@ GuestExecutionSessionBundle MakeBundle() {
   manifest.title_identity_sha256 = IdentityDigest(0x30);
   manifest.module_identity_sha256 = IdentityDigest(0x40);
   manifest.accepted_segment_count = 1;
-  manifest.accepted_event_count = 4;
-  manifest.participants.push_back({0, 7, 1, 4, 64, initial_state});
+  manifest.accepted_event_count = 6;
+  manifest.stop_reason = GuestExecutionSessionStopReason::kRequestedBoundary;
+  manifest.stop_request_event_sequence = 5;
+  manifest.stop_request_tick = 800;
+  manifest.stop_request_accepted_segment_count = 1;
+  manifest.maximum_stop_tail_event_count = 16;
+  manifest.maximum_stop_tail_guest_instruction_count = 64;
+  manifest.maximum_stop_tail_ticks = 1000;
+  GuestExecutionSessionParticipant participant;
+  participant.ordinal = 0;
+  participant.guest_thread_id = 7;
+  participant.capture_instance_id = 0x100;
+  participant.boundary_arrival_kind =
+      GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside;
+  participant.first_event_sequence = 1;
+  participant.last_event_sequence = 4;
+  participant.held_after_event_sequence = 5;
+  participant.initial_state_size = 64;
+  participant.initial_state_sha256 = initial_state;
+  manifest.participants.push_back(participant);
   manifest.segments.push_back(
       {0, 0, 1, 4, 0x82000000, 0x820000FC, corpus, segment_blob});
   manifest.chunks.push_back(
       ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
                    bundle.chunks[0]));
   manifest.chunks.push_back(ReferenceFor(
-      GuestExecutionSessionChunkKind::kEvents, 1, 1, 4, 4, bundle.chunks[1]));
+      GuestExecutionSessionChunkKind::kEvents, 1, 1, 6, 6, bundle.chunks[1]));
   manifest.chunks.push_back(
-      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 2, 4, 4, 1,
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 2, 6, 6, 1,
                    bundle.chunks[2]));
   REQUIRE(GuestExecutionSessionCodec::ValidateSession(manifest, bundle.chunks,
                                                       &error));

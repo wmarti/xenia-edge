@@ -34,9 +34,43 @@ enum class GuestExecutionSessionBoundaryKind : uint32_t {
 enum class GuestExecutionSessionMarkerSource : uint32_t {
   kNone = 0,
   kGuestDefined = 1,
+  // A captured guest-command marker, never evidence of a host presentation.
   kPm4Swap = 2,
   kKernel = 3,
+  // Version 2 permits this source only when owned by a participant.
   kOtherInstrumented = 4,
+};
+
+// The requested policy and the actual stop reason are separate so a safety
+// limit can be preserved diagnostically without being accepted as evidence
+// that the requested interval was captured.
+enum class GuestExecutionSessionStopReason : uint32_t {
+  kManualRequest = 1,
+  kRequestedBoundary = 2,
+  kMaximumSegmentCount = 3,
+  kMaximumEventCount = 4,
+  kMaximumGuestInstructionCount = 5,
+  kMaximumGuestMarkerCount = 6,
+  kMaximumDuration = 7,
+};
+
+// A fixed capture participant reaches the asynchronous stop rendezvous in
+// exactly one of these ways. Version 2 does not support participant lifecycle
+// changes while a session is being captured.
+enum class GuestExecutionSessionBoundaryArrivalKind : uint32_t {
+  kAlreadyOutside = 1,
+  kJitSafepoint = 2,
+  kOuterHostCallReturn = 3,
+};
+
+// Capture may begin while a participant is parked at a real JIT safepoint
+// inside an outer host-to-guest call. This state seeds the version-2 outer-call
+// validator; it is not inferred from the opaque initial PPC state blob. Native
+// host stacks are not serialized or restored: offline replay starts a fresh
+// outer dispatch at the participant's captured PPC checkpoint.
+enum class GuestExecutionSessionInitialOuterCallState : uint32_t {
+  kOutside = 1,
+  kActive = 2,
 };
 
 struct GuestExecutionSessionBoundaryPolicy {
@@ -68,6 +102,18 @@ enum class GuestExecutionSessionEventKind : uint32_t {
   kAtomicOrReservation = 10,
   kMemoryMutation = 11,
   kUnsupported = 12,
+  // An exact delta of architecturally executed guest PPC instructions. Host
+  // instructions, translation and fault/retry work are not included.
+  kInstructionCoverage = 13,
+  // An instrumented guest-side marker, not evidence of a host presentation.
+  kGuestMarker = 14,
+  // The timed capture prefix ends at this coordinator request event.
+  kBoundaryRequest = 15,
+  // The final event, emitted after every participant and external sink is held.
+  kBoundaryHeld = 16,
+  kOuterHostCallBegin = 17,
+  kOuterHostCallEnd = 18,
+  kJitSafepointArrival = 19,
 };
 
 // The disposition is explicit for every nondeterministic input or mutation.
@@ -89,7 +135,7 @@ enum class GuestExecutionSessionMutationSource : uint32_t {
 };
 
 // Payload bytes are content-addressed and interpreted only according to these
-// version-1 formats. No event may smuggle an opaque, unversioned sub-format.
+// version-2 formats. No event may smuggle an opaque, unversioned sub-format.
 enum class GuestExecutionSessionPayloadKind : uint32_t {
   kNone = 0,
   kGuestBytes = 1,
@@ -109,8 +155,18 @@ constexpr uint32_t kGuestExecutionSessionNoThread = UINT32_MAX;
 struct GuestExecutionSessionParticipant {
   uint32_t ordinal = 0;
   uint32_t guest_thread_id = 0;
+  // Unique for the fixed ThreadState/XThread lifecycle instance in this
+  // capture, even if an emulator thread identifier is later reused.
+  uint64_t capture_instance_id = 0;
+  GuestExecutionSessionInitialOuterCallState initial_outer_call_state =
+      GuestExecutionSessionInitialOuterCallState::kOutside;
+  GuestExecutionSessionBoundaryArrivalKind boundary_arrival_kind =
+      GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside;
   uint64_t first_event_sequence = 0;
   uint64_t last_event_sequence = 0;
+  // The participant is quiescent immediately after this event. For an
+  // already-outside participant this is the no-thread boundary request.
+  uint64_t held_after_event_sequence = 0;
   uint64_t initial_state_size = 0;
   GuestExecutionSessionSha256 initial_state_sha256 = {};
 
@@ -151,6 +207,9 @@ struct GuestExecutionSessionManifest {
   uint64_t first_event_sequence = 0;
   uint64_t last_event_sequence = 0;
   uint64_t capture_start_tick = 0;
+  // Tick at which all participants and external sinks were held and the final
+  // checkpoint at kBoundaryHeld was latched. Primary timing ends earlier at
+  // stop_request_tick.
   uint64_t capture_end_tick = 0;
   uint64_t capture_tick_frequency = 0;
   GuestExecutionSessionSha256 capture_build_sha256 = {};
@@ -162,6 +221,21 @@ struct GuestExecutionSessionManifest {
   uint64_t accepted_event_count = 0;
   uint64_t rejected_event_count = 0;
   uint64_t unsupported_event_count = 0;
+  GuestExecutionSessionStopReason stop_reason =
+      GuestExecutionSessionStopReason::kManualRequest;
+  // The exact no-thread kBoundaryRequest ending the timed capture prefix.
+  // Event-driven policies place their triggering event immediately before it.
+  uint64_t stop_request_event_sequence = 0;
+  // Capture clock tick assigned to that kBoundaryRequest.
+  uint64_t stop_request_tick = 0;
+  uint64_t stop_request_accepted_segment_count = 0;
+  uint64_t stop_request_guest_instruction_count = 0;
+  uint64_t stop_request_matching_guest_marker_count = 0;
+  // Configured fail-closed maxima for the untimed rendezvous tail. Actual
+  // totals are derived from the event stream and capture ticks.
+  uint64_t maximum_stop_tail_event_count = 0;
+  uint64_t maximum_stop_tail_guest_instruction_count = 0;
+  uint64_t maximum_stop_tail_ticks = 0;
   std::vector<GuestExecutionSessionParticipant> participants;
   std::vector<GuestExecutionSessionSegmentReference> segments;
   std::vector<GuestExecutionSessionChunkReference> chunks;
@@ -187,6 +261,12 @@ struct GuestExecutionSessionEvent {
   uint64_t byte_count = 0;
   uint64_t payload_size = 0;
   GuestExecutionSessionSha256 payload_sha256 = {};
+  // These fields are canonical only for kGuestMarker.
+  GuestExecutionSessionMarkerSource marker_source =
+      GuestExecutionSessionMarkerSource::kNone;
+  uint64_t marker_identity = 0;
+  // Canonical and nonzero only for kInstructionCoverage.
+  uint64_t guest_instruction_delta = 0;
 
   bool operator==(const GuestExecutionSessionEvent&) const = default;
 };
@@ -253,20 +333,22 @@ struct GuestExecutionSessionLimits {
   uint32_t maximum_checkpoint_content_references = 1u << 20;
 };
 
-// Portable little-endian version 1 metadata format. Every envelope has a
-// header and a duplicated closure footer binding its epoch, type, order,
-// sequence range, record count, byte count and payload SHA-256. Manifest chunk
-// references additionally bind SHA-256 of each complete encoded envelope.
+// Portable little-endian version 2 metadata format. Version 1 never produced
+// an accepted real-title session and is intentionally rejected after adding
+// the participant's initial outer-call state. Every envelope has a header and
+// a duplicated closure footer binding its epoch, type, order, sequence range,
+// record count, byte count and payload SHA-256. Manifest chunk references
+// additionally bind SHA-256 of each complete encoded envelope.
 class GuestExecutionSessionCodec {
  public:
-  static constexpr uint32_t kVersion = 1;
+  static constexpr uint32_t kVersion = 2;
   static constexpr uint32_t kEnvelopeHeaderSize = 96;
   static constexpr uint32_t kEnvelopeFooterSize = 96;
-  static constexpr uint32_t kManifestPayloadHeaderSize = 240;
-  static constexpr uint32_t kParticipantRecordSize = 64;
+  static constexpr uint32_t kManifestPayloadHeaderSize = 312;
+  static constexpr uint32_t kParticipantRecordSize = 88;
   static constexpr uint32_t kSegmentRecordSize = 96;
   static constexpr uint32_t kChunkReferenceRecordSize = 72;
-  static constexpr uint32_t kEventRecordSize = 88;
+  static constexpr uint32_t kEventRecordSize = 112;
   static constexpr uint32_t kCheckpointPayloadHeaderSize = 16;
   static constexpr uint32_t kThreadStateReferenceSize = 48;
   static constexpr uint32_t kContentReferenceSize = 56;
