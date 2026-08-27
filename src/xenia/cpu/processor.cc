@@ -117,8 +117,10 @@ thread_local bool guest_execution_capture_callback_active = false;
 thread_local uint32_t guest_invocation_capture_sink_callback_depth = 0;
 
 uint32_t NextGuestInvocationCaptureGeneration(uint32_t generation) {
-  generation = (generation + 1) & kGuestInvocationCaptureControlGenerationMask;
-  return generation ? generation : 1;
+  if (generation == kGuestInvocationCaptureControlGenerationMask) {
+    std::abort();
+  }
+  return generation + 1;
 }
 
 class GuestExecutionCaptureCallbackScope final {
@@ -182,7 +184,9 @@ Processor::Processor(xe::Memory* memory, ExportResolver* export_resolver)
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 void Processor::set_guest_invocation_capture_sink(
     GuestInvocationCaptureEventSink* sink) {
-  ReconfigureGuestInvocationCaptureSink(nullptr, sink, false);
+  if (!ReconfigureGuestInvocationCaptureSink(nullptr, sink, false)) {
+    std::abort();
+  }
 }
 
 bool Processor::TrySetGuestInvocationCaptureSink(
@@ -220,6 +224,9 @@ bool Processor::ReconfigureGuestInvocationCaptureSink(
     GuestInvocationCaptureEventSink* sink, bool require_expected_sink) {
   if (guest_invocation_capture_sink_callback_depth) {
     std::abort();
+  }
+  if (guest_execution_capture_callback_active) {
+    return false;
   }
   const uint32_t root_address = sink ? sink->root_address() : 0;
   const uint8_t initial_event_mask = sink ? sink->initial_event_mask() : 0;

@@ -598,16 +598,26 @@ class ReentrantObserver final : public GuestExecutionCaptureHostCallObserver {
     return rejections_;
   }
 
+  std::vector<bool> sink_reconfiguration_results() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sink_reconfiguration_results_;
+  }
+
  private:
   void RecordReentry() const {
+    const bool sink_reconfigured =
+        processor_.TrySetGuestInvocationCaptureSink(nullptr, &invocation_sink_);
     const GuestExecutionCaptureThreadStateRegistrySnapshot snapshot =
         processor_.QueryGuestExecutionCaptureParticipants();
     std::lock_guard<std::mutex> lock(mutex_);
+    sink_reconfiguration_results_.push_back(sink_reconfigured);
     rejections_.push_back(snapshot.rejection);
   }
 
   Processor& processor_;
+  mutable RegistryInvocationCaptureSink invocation_sink_;
   mutable std::mutex mutex_;
+  mutable std::vector<bool> sink_reconfiguration_results_;
   mutable std::vector<GuestExecutionCaptureThreadStateRegistryRejection>
       rejections_;
 };
@@ -619,6 +629,8 @@ class ReentrantThreadStateVisitor final
       : processor_(processor) {}
 
   bool VisitThreadState(const ThreadState& thread_state) noexcept override {
+    sink_reconfigured_ =
+        processor_.TrySetGuestInvocationCaptureSink(nullptr, &invocation_sink_);
     rejection_ = processor_.QueryGuestExecutionCaptureParticipants().rejection;
     return true;
   }
@@ -626,9 +638,12 @@ class ReentrantThreadStateVisitor final
   GuestExecutionCaptureThreadStateRegistryRejection rejection() const {
     return rejection_;
   }
+  bool sink_reconfigured() const { return sink_reconfigured_; }
 
  private:
   Processor& processor_;
+  RegistryInvocationCaptureSink invocation_sink_;
+  bool sink_reconfigured_ = true;
   GuestExecutionCaptureThreadStateRegistryRejection rejection_ =
       GuestExecutionCaptureThreadStateRegistryRejection::kNone;
 };
@@ -1211,6 +1226,7 @@ TEST_CASE("Guest capture callbacks reject Processor reentry without deadlock",
   REQUIRE(visitor.rejection() ==
           GuestExecutionCaptureThreadStateRegistryRejection::
               kObserverCallbackReentry);
+  REQUIRE_FALSE(visitor.sink_reconfigured());
 
   CallbackGuestFunction function(0x82000000, 0x8200001C,
                                  [](ThreadState* call_thread_state,
@@ -1220,12 +1236,19 @@ TEST_CASE("Guest capture callbacks reject Processor reentry without deadlock",
   REQUIRE_FALSE(attachment.Detach());
 
   const auto rejections = observer->rejections();
+  const auto sink_reconfiguration_results =
+      observer->sink_reconfiguration_results();
   REQUIRE(rejections.size() == 7);
+  REQUIRE(sink_reconfiguration_results.size() == rejections.size());
   for (GuestExecutionCaptureThreadStateRegistryRejection rejection :
        rejections) {
     REQUIRE(rejection == GuestExecutionCaptureThreadStateRegistryRejection::
                              kObserverCallbackReentry);
   }
+  for (bool sink_reconfigured : sink_reconfiguration_results) {
+    REQUIRE_FALSE(sink_reconfigured);
+  }
+  REQUIRE(environment.processor->guest_invocation_capture_sink() == nullptr);
 }
 
 TEST_CASE("Guest ThreadState registry tolerates concurrent lifecycle stress",

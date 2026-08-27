@@ -126,11 +126,13 @@ class Processor {
 
   // Processor does not own the sink. Reconfiguration disables inline hooks and
   // drains callback leases before replacing it, so the owner may destroy the
-  // previous sink after this returns. Calling this from a leased callback is a
-  // contract violation.
+  // previous sink after this returns. Calling this from any capture callback is
+  // a contract violation.
   void set_guest_invocation_capture_sink(GuestInvocationCaptureEventSink* sink);
   // Reconfigures only if the expected identity is still installed. The check,
   // callback drain and generation publication are one serialized transition.
+  // Guest-execution callback reentry returns false; invocation-sink callback
+  // reentry remains a contract violation.
   bool TrySetGuestInvocationCaptureSink(
       GuestInvocationCaptureEventSink* expected_sink,
       GuestInvocationCaptureEventSink* sink);
