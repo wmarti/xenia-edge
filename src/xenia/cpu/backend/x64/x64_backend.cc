@@ -1912,7 +1912,7 @@ bool X64Backend::ResetGuestInvocationReplayState(void* ctx) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   ppc_context->capture_rendezvous_requested = 0;
-  ppc_context->guest_invocation_capture_event_mask = 0;
+  ppc_context->guest_invocation_capture_control = 0;
 #endif
   ppc_context->scratch = 0;
   ppc_context->last_safepoint_pc = 0;

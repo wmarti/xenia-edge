@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -37,7 +38,8 @@ class GuestInvocationCaptureDeadlinePoller final {
   static std::unique_ptr<GuestInvocationCaptureDeadlinePoller> Create(
       GuestInvocationCaptureCoordinator& coordinator,
       std::chrono::milliseconds interval = kDefaultInterval,
-      std::string* error = nullptr);
+      std::string* error = nullptr,
+      std::function<void()> terminal_callback = {});
 
   ~GuestInvocationCaptureDeadlinePoller();
   GuestInvocationCaptureDeadlinePoller(
@@ -52,11 +54,13 @@ class GuestInvocationCaptureDeadlinePoller final {
  private:
   GuestInvocationCaptureDeadlinePoller(
       GuestInvocationCaptureCoordinator& coordinator,
-      std::chrono::milliseconds interval);
+      std::chrono::milliseconds interval,
+      std::function<void()> terminal_callback);
   void ThreadMain();
 
   GuestInvocationCaptureCoordinator& coordinator_;
   const std::chrono::milliseconds interval_;
+  std::function<void()> terminal_callback_;
   std::mutex mutex_;
   std::condition_variable condition_;
   bool stop_requested_ = false;

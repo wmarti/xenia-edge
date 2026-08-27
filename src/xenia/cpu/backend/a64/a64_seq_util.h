@@ -63,6 +63,7 @@ inline void EmitGuestInvocationCapturePreparedMemoryAccess(
              : kGuestInvocationCaptureOwnerEventBit,
       skip);
   e.mov(e.w3, static_cast<uint64_t>(access));
+  e.mov(e.x4, e.x8);
   e.CallNativeSafe(
       reinterpret_cast<void*>(&CaptureGuestInvocationMemoryAccess));
   e.L(skip);
@@ -87,6 +88,7 @@ inline void EmitGuestInvocationCaptureUnsupportedDependency(
   e.EmitGuestInvocationCaptureEventGuard(kGuestInvocationCaptureOwnerEventBit,
                                          skip);
   e.mov(e.w1, static_cast<uint64_t>(dependency_flags));
+  e.mov(e.x2, e.x8);
   e.CallNativeSafe(
       reinterpret_cast<void*>(&CaptureGuestInvocationUnsupportedDependency));
   e.L(skip);

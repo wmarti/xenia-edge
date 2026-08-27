@@ -114,6 +114,12 @@ using namespace xe::literals;
 namespace {
 
 thread_local bool guest_execution_capture_callback_active = false;
+thread_local uint32_t guest_invocation_capture_sink_callback_depth = 0;
+
+uint32_t NextGuestInvocationCaptureGeneration(uint32_t generation) {
+  generation = (generation + 1) & kGuestInvocationCaptureControlGenerationMask;
+  return generation ? generation : 1;
+}
 
 class GuestExecutionCaptureCallbackScope final {
  public:
@@ -176,29 +182,245 @@ Processor::Processor(xe::Memory* memory, ExportResolver* export_resolver)
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 void Processor::set_guest_invocation_capture_sink(
     GuestInvocationCaptureEventSink* sink) {
-  const uint32_t root_address = sink ? sink->root_address() : 0;
-  const uint8_t initial_event_mask = sink ? sink->initial_event_mask() : 0;
+  ReconfigureGuestInvocationCaptureSink(nullptr, sink, false);
+}
+
+bool Processor::TrySetGuestInvocationCaptureSink(
+    GuestInvocationCaptureEventSink* expected_sink,
+    GuestInvocationCaptureEventSink* sink) {
+  return ReconfigureGuestInvocationCaptureSink(expected_sink, sink, true);
+}
+
+bool Processor::DisableGuestInvocationCaptureEventsForSink(
+    GuestInvocationCaptureEventSink* expected_sink) {
   std::lock_guard<std::mutex> lock(guest_execution_capture_thread_state_mutex_);
-  if (sink) {
-    guest_invocation_capture_sink_ = sink;
-    guest_invocation_capture_root_address_ = root_address;
-    guest_invocation_capture_initial_event_mask_.store(
-        initial_event_mask, std::memory_order_release);
-  } else {
-    guest_invocation_capture_initial_event_mask_.store(
-        0, std::memory_order_release);
+  if (guest_invocation_capture_sink_transition_pending_ ||
+      guest_invocation_capture_sink_ != expected_sink) {
+    return false;
   }
+  const uint64_t control =
+      guest_invocation_capture_control_.load(std::memory_order_relaxed);
+  const uint64_t disabled_control = MakeGuestInvocationCaptureControl(
+      GuestInvocationCaptureControlRoot(control), 0,
+      GuestInvocationCaptureControlGeneration(control));
+  guest_invocation_capture_control_.store(disabled_control,
+                                          std::memory_order_release);
   for (ThreadState* thread_state = guest_execution_capture_thread_state_head_;
        thread_state;
        thread_state = thread_state->guest_execution_capture_next_) {
-    std::atomic_ref<uint8_t>(
-        thread_state->context()->guest_invocation_capture_event_mask)
-        .store(initial_event_mask, std::memory_order_release);
+    std::atomic_ref<uint64_t>(
+        thread_state->context()->guest_invocation_capture_control)
+        .store(disabled_control, std::memory_order_release);
   }
-  if (!sink) {
-    guest_invocation_capture_root_address_ = 0;
-    guest_invocation_capture_sink_ = nullptr;
+  return true;
+}
+
+bool Processor::ReconfigureGuestInvocationCaptureSink(
+    GuestInvocationCaptureEventSink* expected_sink,
+    GuestInvocationCaptureEventSink* sink, bool require_expected_sink) {
+  if (guest_invocation_capture_sink_callback_depth) {
+    std::abort();
   }
+  const uint32_t root_address = sink ? sink->root_address() : 0;
+  const uint8_t initial_event_mask = sink ? sink->initial_event_mask() : 0;
+  std::unique_lock<std::mutex> lock(
+      guest_execution_capture_thread_state_mutex_);
+  guest_invocation_capture_sink_condition_.wait(lock, [this] {
+    return !guest_invocation_capture_sink_transition_pending_;
+  });
+  if (require_expected_sink &&
+      guest_invocation_capture_sink_ != expected_sink) {
+    return false;
+  }
+  guest_invocation_capture_sink_transition_pending_ = true;
+  const uint64_t old_control =
+      guest_invocation_capture_control_.load(std::memory_order_relaxed);
+  const uint64_t disabled_control = MakeGuestInvocationCaptureControl(
+      GuestInvocationCaptureControlRoot(old_control), 0,
+      GuestInvocationCaptureControlGeneration(old_control));
+  guest_invocation_capture_control_.store(disabled_control,
+                                          std::memory_order_release);
+  for (ThreadState* thread_state = guest_execution_capture_thread_state_head_;
+       thread_state;
+       thread_state = thread_state->guest_execution_capture_next_) {
+    std::atomic_ref<uint64_t>(
+        thread_state->context()->guest_invocation_capture_control)
+        .store(disabled_control, std::memory_order_release);
+  }
+  guest_invocation_capture_sink_condition_.wait(lock, [this] {
+    return guest_invocation_capture_sink_callback_count_ == 0;
+  });
+
+  const uint32_t generation = NextGuestInvocationCaptureGeneration(
+      GuestInvocationCaptureControlGeneration(old_control));
+  const uint64_t new_control = MakeGuestInvocationCaptureControl(
+      root_address, initial_event_mask, generation);
+  guest_invocation_capture_sink_ = sink;
+  guest_invocation_capture_control_.store(new_control,
+                                          std::memory_order_release);
+  for (ThreadState* thread_state = guest_execution_capture_thread_state_head_;
+       thread_state;
+       thread_state = thread_state->guest_execution_capture_next_) {
+    std::atomic_ref<uint64_t>(
+        thread_state->context()->guest_invocation_capture_control)
+        .store(new_control, std::memory_order_release);
+  }
+  guest_invocation_capture_sink_transition_pending_ = false;
+  lock.unlock();
+  guest_invocation_capture_sink_condition_.notify_all();
+  return true;
+}
+
+Processor::GuestInvocationCaptureSinkLease::GuestInvocationCaptureSinkLease(
+    GuestInvocationCaptureSinkLease&& other) noexcept
+    : processor_(other.processor_),
+      sink_(other.sink_),
+      generation_(other.generation_),
+      context_(other.context_) {
+  other.processor_ = nullptr;
+  other.sink_ = nullptr;
+  other.generation_ = 0;
+  other.context_ = nullptr;
+}
+
+Processor::GuestInvocationCaptureSinkLease::~GuestInvocationCaptureSinkLease() {
+  if (processor_) {
+    processor_->ReleaseGuestInvocationCaptureSink(sink_, generation_, context_);
+  }
+}
+
+GuestInvocationCaptureEventSink* Processor::guest_invocation_capture_sink()
+    const {
+  std::lock_guard<std::mutex> lock(guest_execution_capture_thread_state_mutex_);
+  return guest_invocation_capture_sink_;
+}
+
+uint32_t Processor::guest_invocation_capture_root_address() const {
+  return GuestInvocationCaptureControlRoot(
+      guest_invocation_capture_control_.load(std::memory_order_acquire));
+}
+
+uint8_t Processor::guest_invocation_capture_initial_event_mask() const {
+  return GuestInvocationCaptureControlEventMask(
+      guest_invocation_capture_control_.load(std::memory_order_acquire));
+}
+
+uint64_t Processor::guest_invocation_capture_control() const {
+  return guest_invocation_capture_control_.load(std::memory_order_acquire);
+}
+
+Processor::GuestInvocationCaptureSinkLease
+Processor::AcquireGuestInvocationCaptureSink(uint64_t observed_control,
+                                             uint8_t required_event_mask,
+                                             ppc::PPCContext* context) {
+  if (!GuestInvocationCaptureControlGeneration(observed_control) ||
+      (required_event_mask &&
+       !(GuestInvocationCaptureControlEventMask(observed_control) &
+         required_event_mask))) {
+    return {};
+  }
+  std::lock_guard<std::mutex> lock(guest_execution_capture_thread_state_mutex_);
+  const uint64_t current_control =
+      guest_invocation_capture_control_.load(std::memory_order_relaxed);
+  const uint32_t generation =
+      GuestInvocationCaptureControlGeneration(observed_control);
+  if (guest_invocation_capture_sink_transition_pending_ ||
+      !guest_invocation_capture_sink_ ||
+      generation != GuestInvocationCaptureControlGeneration(current_control) ||
+      GuestInvocationCaptureControlRoot(observed_control) !=
+          GuestInvocationCaptureControlRoot(current_control) ||
+      (required_event_mask &&
+       !GuestInvocationCaptureControlEventMask(current_control))) {
+    return {};
+  }
+  ++guest_invocation_capture_sink_callback_count_;
+  ++guest_invocation_capture_sink_callback_depth;
+  return {this, guest_invocation_capture_sink_, generation, context};
+}
+
+void Processor::ReleaseGuestInvocationCaptureSink(
+    GuestInvocationCaptureEventSink* sink, uint32_t generation,
+    ppc::PPCContext* context) {
+  const uint8_t initial_event_mask = sink->initial_event_mask();
+  uint8_t context_event_mask = 0;
+  if (context) {
+    context_event_mask = sink->event_mask(
+        {reinterpret_cast<uintptr_t>(context), context->thread_id});
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_execution_capture_thread_state_mutex_);
+    const uint64_t current_control =
+        guest_invocation_capture_control_.load(std::memory_order_relaxed);
+    const uint32_t current_generation =
+        GuestInvocationCaptureControlGeneration(current_control);
+    if (!guest_invocation_capture_sink_transition_pending_ &&
+        sink == guest_invocation_capture_sink_ &&
+        generation == current_generation) {
+      if (!initial_event_mask ||
+          !GuestInvocationCaptureControlEventMask(current_control)) {
+        const uint64_t disabled_control = MakeGuestInvocationCaptureControl(
+            GuestInvocationCaptureControlRoot(current_control), 0,
+            current_generation);
+        guest_invocation_capture_control_.store(disabled_control,
+                                                std::memory_order_release);
+        for (ThreadState* thread_state =
+                 guest_execution_capture_thread_state_head_;
+             thread_state;
+             thread_state = thread_state->guest_execution_capture_next_) {
+          std::atomic_ref<uint64_t>(
+              thread_state->context()->guest_invocation_capture_control)
+              .store(disabled_control, std::memory_order_release);
+        }
+      } else if (context) {
+        const uint64_t context_control =
+            std::atomic_ref<uint64_t>(context->guest_invocation_capture_control)
+                .load(std::memory_order_acquire);
+        if (GuestInvocationCaptureControlGeneration(context_control) ==
+            current_generation) {
+          std::atomic_ref<uint64_t>(context->guest_invocation_capture_control)
+              .store(MakeGuestInvocationCaptureControl(
+                         GuestInvocationCaptureControlRoot(current_control),
+                         context_event_mask, current_generation),
+                     std::memory_order_release);
+        }
+      }
+    }
+    if (!guest_invocation_capture_sink_callback_count_) {
+      std::abort();
+    }
+    --guest_invocation_capture_sink_callback_count_;
+    if (!guest_invocation_capture_sink_callback_count_) {
+      guest_invocation_capture_sink_condition_.notify_all();
+    }
+  }
+  if (!guest_invocation_capture_sink_callback_depth) {
+    std::abort();
+  }
+  --guest_invocation_capture_sink_callback_depth;
+}
+
+void Processor::NotifyGuestInvocationCaptureFunctionDependency(
+    uint32_t source_address, uint32_t target_address) {
+  const uint64_t control = guest_invocation_capture_control();
+  GuestInvocationCaptureSinkLease lease =
+      AcquireGuestInvocationCaptureSink(control, 0);
+  if (!lease) {
+    return;
+  }
+  lease.sink()->OnFunctionDependency(source_address, target_address);
+}
+
+void Processor::NotifyGuestInvocationCaptureFunctionDefined(
+    uint32_t address, uint32_t end_address) {
+  const uint64_t control = guest_invocation_capture_control();
+  GuestInvocationCaptureSinkLease lease =
+      AcquireGuestInvocationCaptureSink(control, 0);
+  if (!lease) {
+    return;
+  }
+  lease.sink()->OnFunctionDefined(address, end_address);
 }
 #endif
 
@@ -217,6 +439,8 @@ Processor::~Processor() {
     std::lock_guard<std::mutex> observer_lock(
         guest_execution_capture_host_call_observer_mutex_);
     if (guest_execution_capture_thread_state_head_ ||
+        guest_invocation_capture_sink_callback_count_ ||
+        guest_invocation_capture_sink_transition_pending_ ||
         guest_execution_capture_host_call_dispatch_count_ ||
         guest_execution_capture_host_call_observer_transition_pending_) {
       std::abort();
@@ -543,11 +767,11 @@ void Processor::RegisterGuestExecutionCaptureThreadState(
       }
       insertion = &(*insertion)->guest_execution_capture_next_;
     }
-    std::atomic_ref<uint8_t>(
-        thread_state.context()->guest_invocation_capture_event_mask)
-        .store(guest_invocation_capture_initial_event_mask_.load(
-                   std::memory_order_acquire),
-               std::memory_order_release);
+    std::atomic_ref<uint64_t>(
+        thread_state.context()->guest_invocation_capture_control)
+        .store(
+            guest_invocation_capture_control_.load(std::memory_order_acquire),
+            std::memory_order_release);
     thread_state.guest_execution_capture_next_ = nullptr;
     *insertion = &thread_state;
 
@@ -1410,10 +1634,8 @@ bool Processor::DemandFunction(Function* function) {
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-    if (guest_invocation_capture_sink_) {
-      guest_invocation_capture_sink_->OnFunctionDefined(
-          function->address(), function->end_address());
-    }
+    NotifyGuestInvocationCaptureFunctionDefined(function->address(),
+                                                function->end_address());
 #endif
 
     auto* guest_function = static_cast<GuestFunction*>(function);

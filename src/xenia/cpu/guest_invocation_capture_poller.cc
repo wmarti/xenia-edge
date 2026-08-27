@@ -15,6 +15,7 @@
 #include <exception>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 namespace xe {
 namespace cpu {
@@ -33,7 +34,8 @@ bool Fail(std::string* error, std::string_view message) {
 std::unique_ptr<GuestInvocationCaptureDeadlinePoller>
 GuestInvocationCaptureDeadlinePoller::Create(
     GuestInvocationCaptureCoordinator& coordinator,
-    std::chrono::milliseconds interval, std::string* error) {
+    std::chrono::milliseconds interval, std::string* error,
+    std::function<void()> terminal_callback) {
   if (error) {
     error->clear();
   }
@@ -43,7 +45,8 @@ GuestInvocationCaptureDeadlinePoller::Create(
   }
 
   std::unique_ptr<GuestInvocationCaptureDeadlinePoller> poller(
-      new GuestInvocationCaptureDeadlinePoller(coordinator, interval));
+      new GuestInvocationCaptureDeadlinePoller(coordinator, interval,
+                                               std::move(terminal_callback)));
   try {
     poller->thread_ = std::thread(
         &GuestInvocationCaptureDeadlinePoller::ThreadMain, poller.get());
@@ -59,8 +62,10 @@ GuestInvocationCaptureDeadlinePoller::Create(
 
 GuestInvocationCaptureDeadlinePoller::GuestInvocationCaptureDeadlinePoller(
     GuestInvocationCaptureCoordinator& coordinator,
-    std::chrono::milliseconds interval)
-    : coordinator_(coordinator), interval_(interval) {}
+    std::chrono::milliseconds interval, std::function<void()> terminal_callback)
+    : coordinator_(coordinator),
+      interval_(interval),
+      terminal_callback_(std::move(terminal_callback)) {}
 
 GuestInvocationCaptureDeadlinePoller::~GuestInvocationCaptureDeadlinePoller() {
   StopAndJoin();
@@ -93,6 +98,10 @@ void GuestInvocationCaptureDeadlinePoller::ThreadMain() {
     lock.unlock();
     coordinator_.Poll();
     const GuestInvocationCaptureState state = coordinator_.status().state;
+    if (state != GuestInvocationCaptureState::kRecording &&
+        terminal_callback_) {
+      terminal_callback_();
+    }
     lock.lock();
     if (state != GuestInvocationCaptureState::kRecording) {
       break;

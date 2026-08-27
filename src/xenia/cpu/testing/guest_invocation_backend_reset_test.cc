@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include "xenia/cpu/backend/null_backend.h"
+#include "xenia/cpu/guest_invocation_capture.h"
 #include "xenia/cpu/thread_state.h"
 
 #if XE_ARCH_ARM64 && XE_COMPILER_MSVC
@@ -188,7 +189,9 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     context->capture_rendezvous_requested = 1;
-    context->guest_invocation_capture_event_mask = 0xFF;
+    context->guest_invocation_capture_control =
+        MakeGuestInvocationCaptureControl(0x82000000,
+                                          kGuestInvocationCaptureAllEvents, 7);
 #endif
     context->scratch = 0x99999999AAAAAAAAull;
     context->last_safepoint_pc = 0xBBBBBBBBu;
@@ -213,7 +216,7 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     REQUIRE(context->capture_rendezvous_requested == 0);
-    REQUIRE(context->guest_invocation_capture_event_mask == 0);
+    REQUIRE(context->guest_invocation_capture_control == 0);
 #endif
     REQUIRE(context->scratch == 0);
     REQUIRE(context->last_safepoint_pc == 0);
@@ -297,7 +300,9 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     context->capture_rendezvous_requested = 1;
-    context->guest_invocation_capture_event_mask = 0xFF;
+    context->guest_invocation_capture_control =
+        MakeGuestInvocationCaptureControl(0x82000000,
+                                          kGuestInvocationCaptureAllEvents, 7);
 #endif
     context->scratch = 0x99999999AAAAAAAAull;
     context->last_safepoint_pc = 0xBBBBBBBBu;
@@ -321,7 +326,7 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     REQUIRE(context->capture_rendezvous_requested == 0);
-    REQUIRE(context->guest_invocation_capture_event_mask == 0);
+    REQUIRE(context->guest_invocation_capture_control == 0);
 #endif
     REQUIRE(context->scratch == 0);
     REQUIRE(context->last_safepoint_pc == 0);

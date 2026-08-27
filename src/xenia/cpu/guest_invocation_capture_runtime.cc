@@ -467,15 +467,23 @@ GuestInvocationCaptureRuntime::Create(Memory& memory, Processor& processor,
 
   auto runtime = std::unique_ptr<GuestInvocationCaptureRuntime>(
       new GuestInvocationCaptureRuntime(std::move(impl)));
-  processor.set_guest_invocation_capture_sink(
-      runtime->impl_->coordinator.get());
+  if (!processor.TrySetGuestInvocationCaptureSink(
+          nullptr, runtime->impl_->coordinator.get())) {
+    Fail(error, "capture event sink was registered during startup");
+    return nullptr;
+  }
   runtime->impl_->attached = true;
   runtime->impl_->deadline_poller =
       GuestInvocationCaptureDeadlinePoller::Create(
           *runtime->impl_->coordinator,
-          GuestInvocationCaptureDeadlinePoller::kDefaultInterval, error);
+          GuestInvocationCaptureDeadlinePoller::kDefaultInterval, error,
+          [impl_pointer] {
+            impl_pointer->processor.DisableGuestInvocationCaptureEventsForSink(
+                impl_pointer->coordinator.get());
+          });
   if (!runtime->impl_->deadline_poller) {
-    processor.set_guest_invocation_capture_sink(nullptr);
+    processor.TrySetGuestInvocationCaptureSink(
+        runtime->impl_->coordinator.get(), nullptr);
     runtime->impl_->attached = false;
     return nullptr;
   }
@@ -496,11 +504,8 @@ void GuestInvocationCaptureRuntime::Stop() {
   // sink. Once this returns it cannot race detachment or coordinator teardown.
   impl_->deadline_poller.reset();
   if (impl_->attached) {
-    GuestInvocationCaptureEventSink* const registered_sink =
-        impl_->processor.guest_invocation_capture_sink();
-    if (registered_sink == impl_->coordinator.get()) {
-      impl_->processor.set_guest_invocation_capture_sink(nullptr);
-    } else if (registered_sink) {
+    if (!impl_->processor.TrySetGuestInvocationCaptureSink(
+            impl_->coordinator.get(), nullptr)) {
       XELOGE(
           "Guest invocation capture sink changed before runtime shutdown; "
           "leaving the replacement registered");

@@ -90,20 +90,68 @@ class Processor {
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-  // The owner must install this before guest translation starts and clear it
-  // only after capture callbacks have stopped. The sink serializes and routes
-  // all recorder access; Processor does not own it.
+  class GuestInvocationCaptureSinkLease final {
+   public:
+    GuestInvocationCaptureSinkLease() = default;
+    ~GuestInvocationCaptureSinkLease();
+    GuestInvocationCaptureSinkLease(
+        GuestInvocationCaptureSinkLease&& other) noexcept;
+    GuestInvocationCaptureSinkLease(const GuestInvocationCaptureSinkLease&) =
+        delete;
+    GuestInvocationCaptureSinkLease& operator=(
+        const GuestInvocationCaptureSinkLease&) = delete;
+    GuestInvocationCaptureSinkLease& operator=(
+        GuestInvocationCaptureSinkLease&&) = delete;
+
+    explicit operator bool() const { return sink_ != nullptr; }
+    GuestInvocationCaptureEventSink* sink() const { return sink_; }
+
+   private:
+    friend class Processor;
+
+    GuestInvocationCaptureSinkLease(Processor* processor,
+                                    GuestInvocationCaptureEventSink* sink,
+                                    uint32_t generation,
+                                    ppc::PPCContext* context)
+        : processor_(processor),
+          sink_(sink),
+          generation_(generation),
+          context_(context) {}
+
+    Processor* processor_ = nullptr;
+    GuestInvocationCaptureEventSink* sink_ = nullptr;
+    uint32_t generation_ = 0;
+    ppc::PPCContext* context_ = nullptr;
+  };
+
+  // Processor does not own the sink. Reconfiguration disables inline hooks and
+  // drains callback leases before replacing it, so the owner may destroy the
+  // previous sink after this returns. Calling this from a leased callback is a
+  // contract violation.
   void set_guest_invocation_capture_sink(GuestInvocationCaptureEventSink* sink);
-  GuestInvocationCaptureEventSink* guest_invocation_capture_sink() const {
-    return guest_invocation_capture_sink_;
-  }
-  uint32_t guest_invocation_capture_root_address() const {
-    return guest_invocation_capture_root_address_;
-  }
-  uint8_t guest_invocation_capture_initial_event_mask() const {
-    return guest_invocation_capture_initial_event_mask_.load(
-        std::memory_order_acquire);
-  }
+  // Reconfigures only if the expected identity is still installed. The check,
+  // callback drain and generation publication are one serialized transition.
+  bool TrySetGuestInvocationCaptureSink(
+      GuestInvocationCaptureEventSink* expected_sink,
+      GuestInvocationCaptureEventSink* sink);
+  // Disables every inline hook if the expected sink is still installed. This
+  // is used when an owner-side poll, rather than a leased callback, observes a
+  // terminal sink.
+  bool DisableGuestInvocationCaptureEventsForSink(
+      GuestInvocationCaptureEventSink* expected_sink);
+  // An identity snapshot for ownership checks only. Callbacks must acquire a
+  // lease because the returned pointer may become stale immediately.
+  GuestInvocationCaptureEventSink* guest_invocation_capture_sink() const;
+  uint32_t guest_invocation_capture_root_address() const;
+  uint8_t guest_invocation_capture_initial_event_mask() const;
+  uint64_t guest_invocation_capture_control() const;
+  GuestInvocationCaptureSinkLease AcquireGuestInvocationCaptureSink(
+      uint64_t observed_control, uint8_t required_event_mask,
+      ppc::PPCContext* context = nullptr);
+  void NotifyGuestInvocationCaptureFunctionDependency(uint32_t source_address,
+                                                      uint32_t target_address);
+  void NotifyGuestInvocationCaptureFunctionDefined(uint32_t address,
+                                                   uint32_t end_address);
 
   // Orthogonal to the one-invocation event sink above. Continuous capture must
   // install one observer before title dispatch, then arm and disarm internally.
@@ -418,9 +466,18 @@ class Processor {
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  bool ReconfigureGuestInvocationCaptureSink(
+      GuestInvocationCaptureEventSink* expected_sink,
+      GuestInvocationCaptureEventSink* sink, bool require_expected_sink);
+  void ReleaseGuestInvocationCaptureSink(GuestInvocationCaptureEventSink* sink,
+                                         uint32_t generation,
+                                         ppc::PPCContext* context);
+
   GuestInvocationCaptureEventSink* guest_invocation_capture_sink_ = nullptr;
-  uint32_t guest_invocation_capture_root_address_ = 0;
-  std::atomic<uint8_t> guest_invocation_capture_initial_event_mask_{0};
+  std::atomic<uint64_t> guest_invocation_capture_control_{0};
+  bool guest_invocation_capture_sink_transition_pending_ = false;
+  uint32_t guest_invocation_capture_sink_callback_count_ = 0;
+  std::condition_variable guest_invocation_capture_sink_condition_;
 
   // Intrusive and allocation-free so every successfully constructed
   // ThreadState is registered. Always acquire this before the observer mutex

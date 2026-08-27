@@ -83,6 +83,10 @@ struct CaptureEvent {
 
 class RecordingCaptureSink final : public GuestInvocationCaptureEventSink {
  public:
+  uint32_t root_address() const override { return selected_root_address; }
+
+  uint8_t initial_event_mask() const override { return initial_mask; }
+
   bool Poll() override {
     events.push_back({CaptureEventKind::kPoll});
     return true;
@@ -114,7 +118,13 @@ class RecordingCaptureSink final : public GuestInvocationCaptureEventSink {
     event.address = address;
     event.second_address = end_address;
     event.state = state;
+    if (entry_observer) {
+      entry_observer(event);
+    }
     events.push_back(std::move(event));
+    if (terminal_after_entry) {
+      initial_mask = 0;
+    }
     return true;
   }
 
@@ -206,7 +216,11 @@ class RecordingCaptureSink final : public GuestInvocationCaptureEventSink {
   }
 
   std::vector<CaptureEvent> events;
+  uint32_t selected_root_address = 0;
+  uint8_t initial_mask = kGuestInvocationCaptureAllEvents;
+  bool terminal_after_entry = false;
   std::function<bool(uint32_t, uint32_t)> definition_observer;
+  std::function<void(const CaptureEvent&)> entry_observer;
   std::function<void(const CaptureEvent&)> memory_observer;
   std::function<void(const CaptureEvent&)> unsupported_observer;
 };
@@ -1073,8 +1087,8 @@ TEST_CASE("A64_CAPTURE_HELPERS_FORWARD_EXACT_CONTROL_EVENTS",
   ppc::PPCContext context = {};
   context.processor = &processor;
   context.thread_id = 0x12345678;
-  context.guest_invocation_capture_event_mask =
-      processor.guest_invocation_capture_initial_event_mask();
+  context.guest_invocation_capture_control =
+      processor.guest_invocation_capture_control();
   const ppc::GuestPPCRegisterState state = MakeRegisterState(0x55);
   ppc::RestoreGuestPPCRegisterState(state, &context);
 
@@ -1116,6 +1130,192 @@ TEST_CASE("A64_CAPTURE_HELPERS_FORWARD_EXACT_CONTROL_EVENTS",
     REQUIRE(event.identity.context_id == reinterpret_cast<uintptr_t>(&context));
     REQUIRE(event.identity.thread_id == context.thread_id);
   }
+}
+
+TEST_CASE("A64_CAPTURE_ENTRY_GUARD_USES_CURRENT_ROOT_AFTER_TRANSLATION",
+          "[backend][guest-invocation-capture]") {
+  constexpr uint32_t kRootA = 0x80001000;
+  constexpr uint32_t kRootB = 0x80000000;
+
+  TestFunction test([](hir::HIRBuilder& builder) { builder.Return(); });
+  REQUIRE(test.processors.size() == 1);
+  Processor* processor = test.processors[0].get();
+
+  RecordingCaptureSink capture_a;
+  capture_a.selected_root_address = kRootA;
+  capture_a.initial_mask = kGuestInvocationCaptureRootEvent;
+  RecordingCaptureSink capture_b;
+  capture_b.selected_root_address = kRootB;
+  capture_b.initial_mask = kGuestInvocationCaptureRootEvent;
+
+  {
+    ScopedCaptureSink scoped_capture(*processor, capture_a);
+    test.Run(
+        [&](ppc::PPCContext* context) {
+          REQUIRE(processor->QueryFunction(kRootB) != nullptr);
+          const uint32_t old_generation =
+              GuestInvocationCaptureControlGeneration(
+                  context->guest_invocation_capture_control);
+          processor->set_guest_invocation_capture_sink(&capture_b);
+          REQUIRE(GuestInvocationCaptureControlRoot(
+                      context->guest_invocation_capture_control) == kRootB);
+          REQUIRE(GuestInvocationCaptureControlGeneration(
+                      context->guest_invocation_capture_control) !=
+                  old_generation);
+        },
+        [](ppc::PPCContext*) {});
+  }
+
+  REQUIRE(std::any_of(capture_a.events.cbegin(), capture_a.events.cend(),
+                      [](const CaptureEvent& event) {
+                        return event.kind == CaptureEventKind::kDefined &&
+                               event.address == kRootB;
+                      }));
+  const std::vector<CaptureEvent> events = capture_b.ControlEvents();
+  REQUIRE(events.size() == 1);
+  REQUIRE(events[0].kind == CaptureEventKind::kEntry);
+  REQUIRE(events[0].address == kRootB);
+}
+
+TEST_CASE("A64_CAPTURE_SINK_TRANSITION_DRAINS_AND_REJECTS_STALE_CONTROL",
+          "[backend][guest-invocation-capture]") {
+  constexpr uint32_t kRootA = 0x80000000;
+  constexpr uint32_t kRootB = 0x80001000;
+  TestFunction test([](hir::HIRBuilder& builder) { builder.Return(); });
+  Processor* processor = test.processors[0].get();
+
+  RecordingCaptureSink capture_a;
+  capture_a.selected_root_address = kRootA;
+  capture_a.initial_mask = kGuestInvocationCaptureRootEvent;
+  processor->set_guest_invocation_capture_sink(&capture_a);
+  auto thread_a = std::make_unique<ThreadState>(processor, 0xA1);
+  auto thread_b = std::make_unique<ThreadState>(processor, 0xB2);
+  ppc::PPCContext* context_a = thread_a->context();
+  ppc::PPCContext* context_b = thread_b->context();
+  const auto load_control = [](ppc::PPCContext* context) {
+    return std::atomic_ref<uint64_t>(context->guest_invocation_capture_control)
+        .load(std::memory_order_acquire);
+  };
+  const uint64_t old_control = load_control(context_a);
+
+  std::mutex callback_mutex;
+  std::condition_variable callback_condition;
+  bool callback_entered = false;
+  bool callback_release = false;
+  capture_a.entry_observer = [&](const CaptureEvent&) {
+    std::unique_lock<std::mutex> lock(callback_mutex);
+    callback_entered = true;
+    callback_condition.notify_all();
+    callback_condition.wait(lock, [&] { return callback_release; });
+  };
+  std::thread callback([&] {
+    CaptureGuestInvocationFunctionEntry(context_a, kRootA, kRootA + 4,
+                                        old_control);
+  });
+  {
+    std::unique_lock<std::mutex> lock(callback_mutex);
+    REQUIRE(callback_condition.wait_for(lock, std::chrono::seconds(5),
+                                        [&] { return callback_entered; }));
+  }
+
+  std::atomic<bool> detach_finished = false;
+  std::thread detach([&] {
+    processor->set_guest_invocation_capture_sink(nullptr);
+    detach_finished.store(true, std::memory_order_release);
+  });
+  const auto disable_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while ((GuestInvocationCaptureControlEventMask(load_control(context_a)) ||
+          GuestInvocationCaptureControlEventMask(load_control(context_b))) &&
+         std::chrono::steady_clock::now() < disable_deadline) {
+    std::this_thread::yield();
+  }
+  REQUIRE(GuestInvocationCaptureControlEventMask(load_control(context_a)) == 0);
+  REQUIRE(GuestInvocationCaptureControlEventMask(load_control(context_b)) == 0);
+  REQUIRE_FALSE(detach_finished.load(std::memory_order_acquire));
+
+  {
+    std::lock_guard<std::mutex> lock(callback_mutex);
+    callback_release = true;
+  }
+  callback_condition.notify_all();
+  callback.join();
+  detach.join();
+  REQUIRE(detach_finished.load(std::memory_order_acquire));
+  const uint64_t detached_control_a = load_control(context_a);
+  const uint64_t detached_control_b = load_control(context_b);
+  REQUIRE(detached_control_a == detached_control_b);
+  REQUIRE(GuestInvocationCaptureControlRoot(detached_control_a) == 0);
+  REQUIRE(GuestInvocationCaptureControlEventMask(detached_control_a) == 0);
+  REQUIRE(GuestInvocationCaptureControlGeneration(detached_control_a) !=
+          GuestInvocationCaptureControlGeneration(old_control));
+
+  RecordingCaptureSink capture_b;
+  capture_b.selected_root_address = kRootB;
+  capture_b.initial_mask = kGuestInvocationCaptureRootEvent;
+  processor->set_guest_invocation_capture_sink(&capture_b);
+  const uint64_t new_control = load_control(context_a);
+  REQUIRE(GuestInvocationCaptureControlRoot(new_control) == kRootB);
+  REQUIRE(GuestInvocationCaptureControlEventMask(new_control) ==
+          kGuestInvocationCaptureRootEvent);
+  RecordingCaptureSink capture_c;
+  capture_c.selected_root_address = kRootA;
+  capture_c.initial_mask = kGuestInvocationCaptureAllEvents;
+  REQUIRE_FALSE(
+      processor->TrySetGuestInvocationCaptureSink(&capture_a, &capture_c));
+  REQUIRE(processor->guest_invocation_capture_sink() == &capture_b);
+  REQUIRE(load_control(context_a) == new_control);
+  CaptureGuestInvocationFunctionEntry(context_a, kRootA, kRootA + 4,
+                                      old_control);
+  REQUIRE(capture_b.ControlEvents().empty());
+  REQUIRE(load_control(context_a) == new_control);
+
+  REQUIRE(processor->TrySetGuestInvocationCaptureSink(&capture_b, nullptr));
+  thread_b.reset();
+  thread_a.reset();
+}
+
+TEST_CASE("A64_CAPTURE_TERMINAL_ENTRY_CLEARS_ALL_CONTEXT_MASKS",
+          "[backend][guest-invocation-capture]") {
+  constexpr uint32_t kRoot = 0x80000000;
+  TestFunction test([](hir::HIRBuilder& builder) { builder.Return(); });
+  Processor* processor = test.processors[0].get();
+  RecordingCaptureSink capture;
+  capture.selected_root_address = kRoot;
+  capture.initial_mask = kGuestInvocationCaptureRootEvent;
+  capture.terminal_after_entry = true;
+  processor->set_guest_invocation_capture_sink(&capture);
+  auto thread_a = std::make_unique<ThreadState>(processor, 0xC1);
+  auto thread_b = std::make_unique<ThreadState>(processor, 0xC2);
+
+  CaptureGuestInvocationFunctionEntry(
+      thread_a->context(), kRoot, kRoot + 4,
+      thread_a->context()->guest_invocation_capture_control);
+  REQUIRE(GuestInvocationCaptureControlEventMask(
+              thread_a->context()->guest_invocation_capture_control) == 0);
+  REQUIRE(GuestInvocationCaptureControlEventMask(
+              thread_b->context()->guest_invocation_capture_control) == 0);
+  REQUIRE(capture.ControlEvents().size() == 1);
+
+  processor->set_guest_invocation_capture_sink(nullptr);
+  thread_b.reset();
+  thread_a.reset();
+}
+
+TEST_CASE("A64_CAPTURE_ZERO_ROOT_REMAINS_A_GENERIC_ENTRY_WILDCARD",
+          "[backend][guest-invocation-capture]") {
+  TestFunction test([](hir::HIRBuilder& builder) { builder.Return(); });
+  RecordingCaptureSink capture;
+  capture.selected_root_address = 0;
+  capture.initial_mask = kGuestInvocationCaptureRootEvent;
+  {
+    ScopedCaptureSink scoped_capture(*test.processors[0], capture);
+    test.Run([](ppc::PPCContext*) {}, [](ppc::PPCContext*) {});
+  }
+  const std::vector<CaptureEvent> events = capture.ControlEvents();
+  REQUIRE(events.size() == 1);
+  REQUIRE(events[0].kind == CaptureEventKind::kEntry);
+  REQUIRE(events[0].address == 0x80000000);
 }
 
 TEST_CASE("A64_CAPTURE_ENTRY_EXIT_PRESERVE_STATE_AND_SAVED_RETURN",
@@ -1637,8 +1837,8 @@ TEST_CASE("A64_CAPTURE_MEMORY_HELPER_VALIDATES_LOGICAL_RANGES",
   ppc::PPCContext context = {};
   context.processor = processor.get();
   context.thread_id = 0x12345678;
-  context.guest_invocation_capture_event_mask =
-      processor->guest_invocation_capture_initial_event_mask();
+  context.guest_invocation_capture_control =
+      processor->guest_invocation_capture_control();
 
   using MemoryAccess = ppc::GuestInvocationRecorderMemoryAccess;
   constexpr uint32_t kCrossPageAddress = 0x00001FFEu;

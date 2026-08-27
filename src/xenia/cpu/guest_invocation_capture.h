@@ -35,6 +35,37 @@ constexpr uint8_t kGuestInvocationCaptureAllEvents =
     kGuestInvocationCaptureRootEvent | kGuestInvocationCaptureOwnerEvent |
     kGuestInvocationCaptureWriteEvent;
 
+constexpr uint32_t kGuestInvocationCaptureControlMaskShift = 32;
+constexpr uint32_t kGuestInvocationCaptureControlGenerationShift = 35;
+constexpr uint32_t kGuestInvocationCaptureControlGenerationBits = 29;
+constexpr uint32_t kGuestInvocationCaptureControlGenerationMask =
+    (1u << kGuestInvocationCaptureControlGenerationBits) - 1;
+
+constexpr uint64_t MakeGuestInvocationCaptureControl(uint32_t root_address,
+                                                     uint8_t event_mask,
+                                                     uint32_t generation) {
+  return uint64_t(root_address) |
+         (uint64_t(event_mask & kGuestInvocationCaptureAllEvents)
+          << kGuestInvocationCaptureControlMaskShift) |
+         (uint64_t(generation & kGuestInvocationCaptureControlGenerationMask)
+          << kGuestInvocationCaptureControlGenerationShift);
+}
+
+constexpr uint32_t GuestInvocationCaptureControlRoot(uint64_t control) {
+  return static_cast<uint32_t>(control);
+}
+
+constexpr uint8_t GuestInvocationCaptureControlEventMask(uint64_t control) {
+  return static_cast<uint8_t>(control >>
+                              kGuestInvocationCaptureControlMaskShift) &
+         kGuestInvocationCaptureAllEvents;
+}
+
+constexpr uint32_t GuestInvocationCaptureControlGeneration(uint64_t control) {
+  return static_cast<uint32_t>(control >>
+                               kGuestInvocationCaptureControlGenerationShift);
+}
+
 enum class GuestInvocationCaptureState : uint8_t {
   kRecording,
   kPublishing,

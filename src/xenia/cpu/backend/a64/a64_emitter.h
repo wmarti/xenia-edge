@@ -329,14 +329,24 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
                 const Xbyak_aarch64::Label& label) {
     CodeGenerator::tbz(rt, bit, label);
   }
+  void tbz_near(const Xbyak_aarch64::XReg& rt, uint32_t bit,
+                const Xbyak_aarch64::Label& label) {
+    CodeGenerator::tbz(rt, bit, label);
+  }
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   void EmitGuestInvocationCaptureEventGuard(uint32_t event_bit,
                                             const Xbyak_aarch64::Label& skip);
+  void EmitGuestInvocationCaptureFunctionEntryGuard(
+      uint32_t function_address, const Xbyak_aarch64::Label& skip);
 #endif
   // +/-32 KiB only; guard with near_tbz_branches_safe_.
   void tbnz_near(const Xbyak_aarch64::WReg& rt, uint32_t bit,
+                 const Xbyak_aarch64::Label& label) {
+    CodeGenerator::tbnz(rt, bit, label);
+  }
+  void tbnz_near(const Xbyak_aarch64::XReg& rt, uint32_t bit,
                  const Xbyak_aarch64::Label& label) {
     CodeGenerator::tbnz(rt, bit, label);
   }

@@ -26,31 +26,30 @@ namespace backend {
 namespace a64 {
 namespace {
 
-GuestInvocationCaptureEventSink* GetCaptureSink(
-    const ppc::PPCContext* context) {
-  if (!context || !context->processor) {
-    return nullptr;
-  }
-  return context->processor->guest_invocation_capture_sink();
-}
-
-bool IsCaptureEventEnabled(ppc::PPCContext* context, uint8_t event_mask) {
-  return context &&
-         (std::atomic_ref<uint8_t>(context->guest_invocation_capture_event_mask)
-              .load(std::memory_order_acquire) &
-          event_mask) != 0;
-}
-
 ppc::GuestInvocationRecorderIdentity GetCaptureIdentity(
     const ppc::PPCContext& context) {
   return {reinterpret_cast<uintptr_t>(&context), context.thread_id};
 }
 
-void RefreshCaptureEventMask(
-    ppc::PPCContext& context, GuestInvocationCaptureEventSink& sink,
-    const ppc::GuestInvocationRecorderIdentity& identity) {
-  std::atomic_ref<uint8_t>(context.guest_invocation_capture_event_mask)
-      .store(sink.event_mask(identity), std::memory_order_release);
+uint64_t GetCaptureControl(ppc::PPCContext* context,
+                           uint64_t observed_control) {
+  if (!context) {
+    return 0;
+  }
+  return observed_control ? observed_control
+                          : std::atomic_ref<uint64_t>(
+                                context->guest_invocation_capture_control)
+                                .load(std::memory_order_acquire);
+}
+
+Processor::GuestInvocationCaptureSinkLease AcquireCaptureSink(
+    ppc::PPCContext* context, uint64_t observed_control,
+    uint8_t required_event_mask) {
+  if (!context || !context->processor) {
+    return {};
+  }
+  return context->processor->AcquireGuestInvocationCaptureSink(
+      observed_control, required_event_mask, context);
 }
 
 bool IsMmioAccess(const ppc::PPCContext& context, uint32_t address,
@@ -93,61 +92,57 @@ bool IsMmioAccess(const ppc::PPCContext& context, uint32_t address,
 
 uint64_t CaptureGuestInvocationFunctionEntry(void* raw_context,
                                              uint64_t function_address,
-                                             uint64_t function_end_address) {
+                                             uint64_t function_end_address,
+                                             uint64_t observed_control) {
   auto* context = reinterpret_cast<ppc::PPCContext*>(raw_context);
-  const uint32_t root_address =
-      context && context->processor
-          ? context->processor->guest_invocation_capture_root_address()
-          : 0;
+  const uint64_t control = GetCaptureControl(context, observed_control);
+  const uint32_t root_address = GuestInvocationCaptureControlRoot(control);
   const uint8_t event_mask = !root_address || function_address == root_address
                                  ? kGuestInvocationCaptureRootEvent
                                  : kGuestInvocationCaptureOwnerEvent;
-  if (!IsCaptureEventEnabled(context, event_mask)) {
+  auto lease = AcquireCaptureSink(context, control, event_mask);
+  if (!lease) {
     return 0;
   }
-  auto* sink = GetCaptureSink(context);
-  if (sink) {
-    const auto identity = GetCaptureIdentity(*context);
-    sink->OnFunctionEntry(identity, static_cast<uint32_t>(function_address),
-                          static_cast<uint32_t>(function_end_address),
-                          ppc::CaptureGuestPPCRegisterState(*context));
-    RefreshCaptureEventMask(*context, *sink, identity);
-  }
+  lease.sink()->OnFunctionEntry(GetCaptureIdentity(*context),
+                                static_cast<uint32_t>(function_address),
+                                static_cast<uint32_t>(function_end_address),
+                                ppc::CaptureGuestPPCRegisterState(*context));
   return 0;
 }
 
 uint64_t CaptureGuestInvocationFunctionExit(void* raw_context,
                                             uint64_t function_address,
-                                            uint64_t return_address) {
+                                            uint64_t return_address,
+                                            uint64_t observed_control) {
   auto* context = reinterpret_cast<ppc::PPCContext*>(raw_context);
-  if (!IsCaptureEventEnabled(context, kGuestInvocationCaptureOwnerEvent)) {
+  const uint64_t control = GetCaptureControl(context, observed_control);
+  auto lease =
+      AcquireCaptureSink(context, control, kGuestInvocationCaptureOwnerEvent);
+  if (!lease) {
     return 0;
   }
-  auto* sink = GetCaptureSink(context);
-  if (sink) {
-    const auto identity = GetCaptureIdentity(*context);
-    sink->OnFunctionExit(identity, static_cast<uint32_t>(function_address),
-                         static_cast<uint32_t>(return_address),
-                         ppc::CaptureGuestPPCRegisterState(*context));
-    RefreshCaptureEventMask(*context, *sink, identity);
-  }
+  lease.sink()->OnFunctionExit(GetCaptureIdentity(*context),
+                               static_cast<uint32_t>(function_address),
+                               static_cast<uint32_t>(return_address),
+                               ppc::CaptureGuestPPCRegisterState(*context));
   return 0;
 }
 
 uint64_t CaptureGuestInvocationTailCall(void* raw_context,
                                         uint64_t from_address,
-                                        uint64_t target_address) {
+                                        uint64_t target_address,
+                                        uint64_t observed_control) {
   auto* context = reinterpret_cast<ppc::PPCContext*>(raw_context);
-  if (!IsCaptureEventEnabled(context, kGuestInvocationCaptureOwnerEvent)) {
+  const uint64_t control = GetCaptureControl(context, observed_control);
+  auto lease =
+      AcquireCaptureSink(context, control, kGuestInvocationCaptureOwnerEvent);
+  if (!lease) {
     return static_cast<uint32_t>(target_address);
   }
-  auto* sink = GetCaptureSink(context);
-  if (sink) {
-    const auto identity = GetCaptureIdentity(*context);
-    sink->OnTailCall(identity, static_cast<uint32_t>(from_address),
-                     static_cast<uint32_t>(target_address));
-    RefreshCaptureEventMask(*context, *sink, identity);
-  }
+  lease.sink()->OnTailCall(GetCaptureIdentity(*context),
+                           static_cast<uint32_t>(from_address),
+                           static_cast<uint32_t>(target_address));
   // An indirect target may arrive in a caller-saved register. Returning it
   // through x0 lets the emitter restore the exact target after the callback.
   return static_cast<uint32_t>(target_address);
@@ -155,7 +150,8 @@ uint64_t CaptureGuestInvocationTailCall(void* raw_context,
 
 uint64_t CaptureGuestInvocationMemoryAccess(void* raw_context,
                                             uint64_t logical_address,
-                                            uint64_t size, uint64_t access) {
+                                            uint64_t size, uint64_t access,
+                                            uint64_t observed_control) {
   auto* context = reinterpret_cast<ppc::PPCContext*>(raw_context);
   const auto memory_access =
       static_cast<ppc::GuestInvocationRecorderMemoryAccess>(access);
@@ -163,11 +159,9 @@ uint64_t CaptureGuestInvocationMemoryAccess(void* raw_context,
       memory_access == ppc::GuestInvocationRecorderMemoryAccess::kRead
           ? kGuestInvocationCaptureOwnerEvent
           : kGuestInvocationCaptureWriteEvent;
-  if (!IsCaptureEventEnabled(context, event_mask)) {
-    return 0;
-  }
-  auto* sink = GetCaptureSink(context);
-  if (!sink) {
+  const uint64_t control = GetCaptureControl(context, observed_control);
+  auto lease = AcquireCaptureSink(context, control, event_mask);
+  if (!lease) {
     return 0;
   }
   const auto identity = GetCaptureIdentity(*context);
@@ -176,65 +170,59 @@ uint64_t CaptureGuestInvocationMemoryAccess(void* raw_context,
   if (logical_address > std::numeric_limits<uint32_t>::max() ||
       size > kMaximumGuestInvocationCaptureMemoryAccessSize ||
       access > maximum_access) {
-    sink->OnUnsupportedDependency(
+    lease.sink()->OnUnsupportedDependency(
         identity,
         ppc::kGuestInvocationDependencyUnsupportedMappingOrProtection);
-    RefreshCaptureEventMask(*context, *sink, identity);
     return 0;
   }
   const uint32_t address32 = static_cast<uint32_t>(logical_address);
   const uint32_t size32 = static_cast<uint32_t>(size);
   if (IsMmioAccess(*context, address32, size32)) {
-    sink->OnUnsupportedDependency(identity,
-                                  ppc::kGuestInvocationDependencyMmio);
+    lease.sink()->OnUnsupportedDependency(identity,
+                                          ppc::kGuestInvocationDependencyMmio);
   } else {
-    sink->OnMemoryAccess(identity, address32, size32, memory_access);
+    lease.sink()->OnMemoryAccess(identity, address32, size32, memory_access);
   }
-  RefreshCaptureEventMask(*context, *sink, identity);
   return 0;
 }
 
 uint64_t CaptureGuestInvocationUnsupportedDependency(
-    void* raw_context, uint64_t dependency_flags) {
+    void* raw_context, uint64_t dependency_flags, uint64_t observed_control) {
   auto* context = reinterpret_cast<ppc::PPCContext*>(raw_context);
-  if (!IsCaptureEventEnabled(context, kGuestInvocationCaptureOwnerEvent)) {
+  const uint64_t control = GetCaptureControl(context, observed_control);
+  auto lease =
+      AcquireCaptureSink(context, control, kGuestInvocationCaptureOwnerEvent);
+  if (!lease) {
     return 0;
   }
-  auto* sink = GetCaptureSink(context);
-  if (sink) {
-    const auto identity = GetCaptureIdentity(*context);
-    sink->OnUnsupportedDependency(identity,
-                                  static_cast<uint32_t>(dependency_flags));
-    RefreshCaptureEventMask(*context, *sink, identity);
-  }
+  lease.sink()->OnUnsupportedDependency(
+      GetCaptureIdentity(*context), static_cast<uint32_t>(dependency_flags));
   return 0;
 }
 
-uint64_t CaptureGuestInvocationUnwindOrLongjmp(void* raw_context) {
+uint64_t CaptureGuestInvocationUnwindOrLongjmp(void* raw_context,
+                                               uint64_t observed_control) {
   auto* context = reinterpret_cast<ppc::PPCContext*>(raw_context);
-  if (!IsCaptureEventEnabled(context, kGuestInvocationCaptureOwnerEvent)) {
+  const uint64_t control = GetCaptureControl(context, observed_control);
+  auto lease =
+      AcquireCaptureSink(context, control, kGuestInvocationCaptureOwnerEvent);
+  if (!lease) {
     return 0;
   }
-  auto* sink = GetCaptureSink(context);
-  if (sink) {
-    const auto identity = GetCaptureIdentity(*context);
-    sink->OnUnwindOrLongjmp(identity);
-    RefreshCaptureEventMask(*context, *sink, identity);
-  }
+  lease.sink()->OnUnwindOrLongjmp(GetCaptureIdentity(*context));
   return 0;
 }
 
-uint64_t CaptureGuestInvocationAsyncReentry(void* raw_context) {
+uint64_t CaptureGuestInvocationAsyncReentry(void* raw_context,
+                                            uint64_t observed_control) {
   auto* context = reinterpret_cast<ppc::PPCContext*>(raw_context);
-  if (!IsCaptureEventEnabled(context, kGuestInvocationCaptureOwnerEvent)) {
+  const uint64_t control = GetCaptureControl(context, observed_control);
+  auto lease =
+      AcquireCaptureSink(context, control, kGuestInvocationCaptureOwnerEvent);
+  if (!lease) {
     return 0;
   }
-  auto* sink = GetCaptureSink(context);
-  if (sink) {
-    const auto identity = GetCaptureIdentity(*context);
-    sink->OnAsyncReentry(identity);
-    RefreshCaptureEventMask(*context, *sink, identity);
-  }
+  lease.sink()->OnAsyncReentry(GetCaptureIdentity(*context));
   return 0;
 }
 

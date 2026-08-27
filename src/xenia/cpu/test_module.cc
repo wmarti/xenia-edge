@@ -139,13 +139,8 @@ Symbol::Status TestModule::DeclareFunction(uint32_t address,
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     // TestModule assembles directly in DeclareFunction, bypassing the normal
     // Processor::DemandFunction definition callback. Preserve its ordering.
-    if (auto* capture = processor_->guest_invocation_capture_sink()) {
-      if (!capture->OnFunctionDefined(function->address(),
-                                      function->end_address())) {
-        function->set_status(Symbol::Status::kFailed);
-        return Symbol::Status::kFailed;
-      }
-    }
+    processor_->NotifyGuestInvocationCaptureFunctionDefined(
+        function->address(), function->end_address());
 #endif
     if (!processor_->backend()->PublishGuestFunction(function)) {
       function->set_status(Symbol::Status::kFailed);

@@ -29,6 +29,7 @@
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/guest_execution_capture.h"
+#include "xenia/cpu/guest_invocation_capture.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/memory.h"
@@ -55,15 +56,50 @@ class GuestExecutionCaptureRegistryTestAccess final {
         .guest_execution_capture_thread_state_registration_gate_test_release_ =
         release;
   }
-
-  static void SetInitialEventMask(Processor& processor, uint8_t event_mask) {
-    processor.guest_invocation_capture_initial_event_mask_.store(
-        event_mask, std::memory_order_release);
-  }
 };
 
 namespace testing {
 namespace {
+
+class RegistryInvocationCaptureSink final
+    : public GuestInvocationCaptureEventSink {
+ public:
+  uint32_t root_address() const override { return root; }
+  uint8_t initial_event_mask() const override { return mask; }
+  bool Poll() override { return true; }
+  bool OnFunctionDependency(uint32_t, uint32_t) override { return true; }
+  bool OnFunctionDefined(uint32_t, uint32_t) override { return true; }
+  bool OnFunctionEntry(const ppc::GuestInvocationRecorderIdentity&, uint32_t,
+                       uint32_t, const ppc::GuestPPCRegisterState&) override {
+    return true;
+  }
+  bool OnFunctionExit(const ppc::GuestInvocationRecorderIdentity&, uint32_t,
+                      uint32_t, const ppc::GuestPPCRegisterState&) override {
+    return true;
+  }
+  bool OnMemoryAccess(const ppc::GuestInvocationRecorderIdentity&, uint32_t,
+                      uint32_t,
+                      ppc::GuestInvocationRecorderMemoryAccess) override {
+    return true;
+  }
+  bool OnUnsupportedDependency(const ppc::GuestInvocationRecorderIdentity&,
+                               uint32_t) override {
+    return true;
+  }
+  bool OnTailCall(const ppc::GuestInvocationRecorderIdentity&, uint32_t,
+                  uint32_t) override {
+    return true;
+  }
+  bool OnUnwindOrLongjmp(const ppc::GuestInvocationRecorderIdentity&) override {
+    return true;
+  }
+  bool OnAsyncReentry(const ppc::GuestInvocationRecorderIdentity&) override {
+    return true;
+  }
+
+  uint32_t root = 0;
+  uint8_t mask = 0;
+};
 
 class StubBackend final : public backend::Backend {
  public:
@@ -1297,41 +1333,118 @@ TEST_CASE("Guest ThreadState locked visitor excludes destruction",
               .participants.empty());
 }
 
-TEST_CASE("Guest ThreadState registration publishes current capture event mask",
+TEST_CASE("Guest ThreadState registration publishes current capture control",
           "[guest-execution-capture]") {
   CaptureTestEnvironment environment;
-  std::atomic<bool> registration_reached = false;
-  std::atomic<bool> registration_release = false;
-  GuestExecutionCaptureRegistryTestAccess::SetThreadStateRegistrationGate(
-      *environment.processor, &registration_reached, &registration_release);
-
+  constexpr uint32_t kOldRoot = 0x82060600;
+  constexpr uint32_t kPublishedRoot = 0x82060700;
+  constexpr uint8_t kPublishedEventMask =
+      kGuestInvocationCaptureRootEvent | kGuestInvocationCaptureWriteEvent;
+  RegistryInvocationCaptureSink old_sink;
+  old_sink.root = kOldRoot;
+  old_sink.mask = kGuestInvocationCaptureRootEvent;
+  RegistryInvocationCaptureSink new_sink;
+  new_sink.root = kPublishedRoot;
+  new_sink.mask = kPublishedEventMask;
+  environment.processor->set_guest_invocation_capture_sink(&old_sink);
+  auto existing_thread = environment.MakeThread(0x606);
+  const uint64_t old_control =
+      std::atomic_ref<uint64_t>(
+          existing_thread->context()->guest_invocation_capture_control)
+          .load(std::memory_order_acquire);
   std::unique_ptr<ThreadState> thread_state;
-  std::thread constructor([&] {
-    thread_state =
-        std::make_unique<ThreadState>(environment.processor.get(), 0x607);
-  });
-  const auto gate_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (!registration_reached.load(std::memory_order_acquire) &&
-         std::chrono::steady_clock::now() < gate_deadline) {
-    std::this_thread::yield();
-  }
-  const bool registration_reached_observed =
-      registration_reached.load(std::memory_order_acquire);
-  constexpr uint8_t kPublishedEventMask = 0x05;
-  GuestExecutionCaptureRegistryTestAccess::SetInitialEventMask(
-      *environment.processor, kPublishedEventMask);
-  registration_release.store(true, std::memory_order_release);
-  constructor.join();
-  GuestExecutionCaptureRegistryTestAccess::SetThreadStateRegistrationGate(
-      *environment.processor, nullptr, nullptr);
+  std::atomic<bool> replacement_finished = false;
+  bool replacement_succeeded = false;
+  bool masks_disabled_during_transition = false;
+  bool replacement_finished_while_leased = false;
+  uint64_t registered_control_during_transition = 0;
+  std::thread replacement;
+  {
+    auto lease = environment.processor->AcquireGuestInvocationCaptureSink(
+        old_control, kGuestInvocationCaptureRootEvent,
+        existing_thread->context());
+    REQUIRE(lease);
 
-  REQUIRE(registration_reached_observed);
+    std::atomic<bool> registration_reached = false;
+    std::atomic<bool> registration_release = false;
+    GuestExecutionCaptureRegistryTestAccess::SetThreadStateRegistrationGate(
+        *environment.processor, &registration_reached, &registration_release);
+    std::thread constructor([&] {
+      thread_state =
+          std::make_unique<ThreadState>(environment.processor.get(), 0x607);
+    });
+    const auto gate_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!registration_reached.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < gate_deadline) {
+      std::this_thread::yield();
+    }
+    const bool registration_reached_observed =
+        registration_reached.load(std::memory_order_acquire);
+    if (!registration_reached_observed) {
+      registration_release.store(true, std::memory_order_release);
+      constructor.join();
+      GuestExecutionCaptureRegistryTestAccess::SetThreadStateRegistrationGate(
+          *environment.processor, nullptr, nullptr);
+    }
+    REQUIRE(registration_reached_observed);
+
+    replacement = std::thread([&] {
+      replacement_succeeded =
+          environment.processor->TrySetGuestInvocationCaptureSink(&old_sink,
+                                                                  &new_sink);
+      replacement_finished.store(true, std::memory_order_release);
+    });
+    const auto disable_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (GuestInvocationCaptureControlEventMask(
+               std::atomic_ref<uint64_t>(
+                   existing_thread->context()->guest_invocation_capture_control)
+                   .load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < disable_deadline) {
+      std::this_thread::yield();
+    }
+    masks_disabled_during_transition = !GuestInvocationCaptureControlEventMask(
+        std::atomic_ref<uint64_t>(
+            existing_thread->context()->guest_invocation_capture_control)
+            .load(std::memory_order_acquire));
+    registration_release.store(true, std::memory_order_release);
+    constructor.join();
+    registered_control_during_transition =
+        std::atomic_ref<uint64_t>(
+            thread_state->context()->guest_invocation_capture_control)
+            .load(std::memory_order_acquire);
+    replacement_finished_while_leased =
+        replacement_finished.load(std::memory_order_acquire);
+    GuestExecutionCaptureRegistryTestAccess::SetThreadStateRegistrationGate(
+        *environment.processor, nullptr, nullptr);
+  }
+  replacement.join();
+
   REQUIRE(thread_state);
-  REQUIRE(std::atomic_ref<uint8_t>(
-              thread_state->context()->guest_invocation_capture_event_mask)
-              .load(std::memory_order_acquire) == kPublishedEventMask);
+  REQUIRE(masks_disabled_during_transition);
+  REQUIRE(GuestInvocationCaptureControlEventMask(
+              registered_control_during_transition) == 0);
+  REQUIRE_FALSE(replacement_finished_while_leased);
+  REQUIRE(replacement_finished.load(std::memory_order_acquire));
+  REQUIRE(replacement_succeeded);
+  const uint64_t published_control =
+      std::atomic_ref<uint64_t>(
+          thread_state->context()->guest_invocation_capture_control)
+          .load(std::memory_order_acquire);
+  REQUIRE(GuestInvocationCaptureControlRoot(published_control) ==
+          kPublishedRoot);
+  REQUIRE(GuestInvocationCaptureControlEventMask(published_control) ==
+          kPublishedEventMask);
+  REQUIRE(GuestInvocationCaptureControlGeneration(published_control) !=
+          GuestInvocationCaptureControlGeneration(old_control));
+  REQUIRE(std::atomic_ref<uint64_t>(
+              existing_thread->context()->guest_invocation_capture_control)
+              .load(std::memory_order_acquire) == published_control);
+  REQUIRE(environment.processor->TrySetGuestInvocationCaptureSink(&new_sink,
+                                                                  nullptr));
   thread_state.reset();
+  existing_thread.reset();
 }
 
 TEST_CASE("Guest JIT safepoint requests are independent and consumed once",

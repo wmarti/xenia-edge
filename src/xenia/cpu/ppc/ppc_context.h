@@ -386,11 +386,6 @@ typedef struct alignas(64) PPCContext_s {
   // through a locked ThreadState visit, and the next JIT safepoint consumes it
   // before entering the permanent capture observer.
   uint8_t capture_rendezvous_requested;
-
-  // Inline capture hooks test this before crossing into the host. Root and
-  // write observation remain enabled while a session is discovering an
-  // invocation; owner-only events are enabled only during an attempt.
-  uint8_t guest_invocation_capture_event_mask;
 #endif
 
   // Most frequently used registers first.
@@ -459,6 +454,14 @@ typedef struct alignas(64) PPCContext_s {
   // call it made, which is often nowhere near the loop it is actually stuck in;
   // this names a block it provably reached.
   uint32_t last_safepoint_pc;
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // One atomic publication unit for the selected root, inline event mask and
+  // sink generation. Emitted hooks retain this value across the host call so
+  // a callback from an older generation cannot bind to or rearm a new sink.
+  alignas(8) uint64_t guest_invocation_capture_control;
+#endif
 
   template <typename T = uint8_t*>
   inline T TranslateVirtual(uint32_t guest_address) XE_RESTRICT const {

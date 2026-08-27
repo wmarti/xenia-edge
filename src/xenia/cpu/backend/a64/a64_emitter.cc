@@ -67,12 +67,33 @@ static constexpr size_t kMaxCodeSize = 1_MiB;
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 void A64Emitter::EmitGuestInvocationCaptureEventGuard(
     uint32_t event_bit, const Xbyak_aarch64::Label& skip) {
-  static_assert(offsetof(ppc::PPCContext, guest_invocation_capture_event_mask) <
-                4096);
-  ldrb(w8,
-       ptr(x20, static_cast<uint32_t>(offsetof(
-                    ppc::PPCContext, guest_invocation_capture_event_mask))));
-  tbz_near(w8, event_bit, skip);
+  constexpr uint32_t kControlOffset = static_cast<uint32_t>(
+      offsetof(ppc::PPCContext, guest_invocation_capture_control));
+  static_assert(!(kControlOffset & 7) && kControlOffset <= 32760);
+  ldr(x8, ptr(x20, kControlOffset));
+  tbz_near(x8, kGuestInvocationCaptureControlMaskShift + event_bit, skip);
+}
+
+void A64Emitter::EmitGuestInvocationCaptureFunctionEntryGuard(
+    uint32_t function_address, const Xbyak_aarch64::Label& skip) {
+  Label capture;
+  constexpr uint32_t kControlOffset = static_cast<uint32_t>(
+      offsetof(ppc::PPCContext, guest_invocation_capture_control));
+  static_assert(!(kControlOffset & 7) && kControlOffset <= 32760);
+  ldr(x8, ptr(x20, kControlOffset));
+  tbnz_near(x8,
+            kGuestInvocationCaptureControlMaskShift +
+                kGuestInvocationCaptureOwnerEventBit,
+            capture);
+  tbz_near(x8,
+           kGuestInvocationCaptureControlMaskShift +
+               kGuestInvocationCaptureRootEventBit,
+           skip);
+  cbz_near(w8, capture);
+  mov(w9, function_address);
+  cmp(w8, w9);
+  b_near(NE, skip);
+  L(capture);
 }
 #endif
 
@@ -316,15 +337,11 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   // CallNativeSafe preserves every guest-allocatable GPR and vector register
   // while the callback snapshots the fully materialized PPC context.
   Label skip_capture_entry;
-  const uint32_t capture_root =
-      processor()->guest_invocation_capture_root_address();
-  EmitGuestInvocationCaptureEventGuard(
-      !capture_root || current_guest_function_ == capture_root
-          ? kGuestInvocationCaptureRootEventBit
-          : kGuestInvocationCaptureOwnerEventBit,
-      skip_capture_entry);
+  EmitGuestInvocationCaptureFunctionEntryGuard(current_guest_function_,
+                                               skip_capture_entry);
   mov(x1, static_cast<uint64_t>(current_guest_function_));
   mov(x2, static_cast<uint64_t>(current_guest_function_end_));
+  mov(x3, x8);
   CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationFunctionEntry));
   L(skip_capture_entry);
 #endif
@@ -473,6 +490,7 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
                                        skip_capture_exit);
   mov(x1, static_cast<uint64_t>(current_guest_function_));
   ldr(x2, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+  mov(x3, x8);
   CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationFunctionExit));
   L(skip_capture_exit);
 #endif
@@ -910,6 +928,9 @@ void EmitInlineSaverestCaptureAccesses(
     e.sub(e.w1, guest_stack, first_slot_offset - offset);
     e.mov(e.w2, static_cast<uint64_t>(size));
     e.mov(e.w3, static_cast<uint64_t>(access));
+    e.ldr(e.x4,
+          ptr(e.x20, static_cast<uint32_t>(offsetof(
+                         ppc::PPCContext, guest_invocation_capture_control))));
     e.CallNativeSafe(
         reinterpret_cast<void*>(&CaptureGuestInvocationMemoryAccess));
   }
@@ -935,6 +956,7 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
                                          skip_capture_tail);
     mov(x1, static_cast<uint64_t>(current_guest_function_));
     mov(x2, static_cast<uint64_t>(function->address()));
+    mov(x3, x8);
     CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationTailCall));
     L(skip_capture_tail);
   }
@@ -1191,6 +1213,7 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
                                          skip_capture_tail);
     mov(w2, target_w);
     mov(x1, static_cast<uint64_t>(current_guest_function_));
+    mov(x3, x8);
     CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationTailCall));
     mov(target_w, w0);
     if (hoist_ret_slots) {
@@ -1312,6 +1335,7 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
   EmitGuestInvocationCaptureEventGuard(kGuestInvocationCaptureOwnerEventBit,
                                        skip_capture_dependency);
   mov(x1, static_cast<uint64_t>(dependency_flags));
+  mov(x2, x8);
   CallNativeSafe(
       reinterpret_cast<void*>(&CaptureGuestInvocationUnsupportedDependency));
   L(skip_capture_dependency);

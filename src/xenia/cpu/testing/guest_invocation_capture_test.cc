@@ -398,9 +398,11 @@ TEST_CASE("guest invocation capture deadline poller rejects a quiet attempt",
   clock.now = 1100;
 
   std::string error;
+  std::atomic<uint32_t> terminal_callback_count = 0;
   std::unique_ptr<GuestInvocationCaptureDeadlinePoller> poller =
       GuestInvocationCaptureDeadlinePoller::Create(
-          *coordinator, std::chrono::milliseconds(1), &error);
+          *coordinator, std::chrono::milliseconds(1), &error,
+          [&] { terminal_callback_count.fetch_add(1); });
   REQUIRE(poller);
   REQUIRE(error.empty());
   REQUIRE(WaitUntil([&] {
@@ -414,6 +416,7 @@ TEST_CASE("guest invocation capture deadline poller rejects a quiet attempt",
           ppc::GuestInvocationRecorderRejection::kDeadlineExceeded);
   REQUIRE(status.rejected_segment_count == 1);
   REQUIRE(status.capture_end_tick == 1100);
+  REQUIRE(terminal_callback_count.load() == 1);
 }
 
 TEST_CASE("guest invocation capture deadline polling is owner bounded",
