@@ -43,8 +43,34 @@ struct Pm4MarkerEvent {
   uint64_t ordinal = 0;
   // Clock::QueryHostTickCount() sampled after IssueSwap returns.
   uint64_t host_tick = 0;
+  // Attachment generation under which this event was admitted. A hold drains
+  // every event in its generation before returning, and resume starts a new
+  // generation.
+  uint64_t sink_generation = 0;
 
   bool operator==(const Pm4MarkerEvent&) const = default;
+};
+
+struct Pm4MarkerHoldToken {
+  uint64_t sink_generation = 0;
+  uint64_t hold_epoch = 0;
+  uint64_t last_ordinal = 0;
+
+  explicit operator bool() const noexcept {
+    return sink_generation && hold_epoch;
+  }
+  bool operator==(const Pm4MarkerHoldToken&) const = default;
+};
+
+struct Pm4MarkerDispatcherStatus {
+  uint64_t marker_count = 0;
+  uint64_t sink_generation = 0;
+  uint64_t hold_epoch = 0;
+  bool sink_attached = false;
+  bool sink_held = false;
+  bool sink_failed = false;
+  bool source_advanced_while_held = false;
+  bool shut_down = false;
 };
 
 class Pm4MarkerSink {
@@ -65,25 +91,53 @@ class Pm4MarkerSink {
 class Pm4MarkerDispatcher {
  public:
   bool AttachSink(std::shared_ptr<Pm4MarkerSink> sink);
+  // Synchronously removes sink from admission after draining every callback
+  // admitted in the current generation. Repeating a healthy hold for the same
+  // sink returns the same token. False leaves attachment state unchanged.
+  bool HoldSink(const std::shared_ptr<Pm4MarkerSink>& sink,
+                Pm4MarkerHoldToken* token);
+  // Reattaches only the held sink named by the exact hold token and starts a
+  // new generation. Any ordinal produced while held permanently prevents
+  // resume and leaves the sink held.
+  bool ResumeSink(const std::shared_ptr<Pm4MarkerSink>& sink,
+                  const Pm4MarkerHoldToken& token);
+  // Terminal removal of either an attached or held sink. This invalidates any
+  // outstanding hold token.
   bool DetachSink(const std::shared_ptr<Pm4MarkerSink>& sink);
 
   uint64_t marker_count() const noexcept {
     return marker_count_.load(std::memory_order_acquire);
   }
   bool sink_failed() const;
+  Pm4MarkerDispatcherStatus status() const;
 
   void NotifyPm4Swap(uint64_t host_tick) noexcept;
   void Shutdown() noexcept;
 
  private:
+  friend class Pm4MarkerDispatcherTestAccess;
+
+  void SetPostOrdinalAssignmentHookForTesting(void (*hook)(void*),
+                                              void* context);
+
   mutable std::mutex mutex_;
   std::condition_variable dispatch_condition_;
   std::shared_ptr<Pm4MarkerSink> sink_;
+  std::shared_ptr<Pm4MarkerSink> held_sink_;
   std::thread::id dispatch_thread_;
+  Pm4MarkerHoldToken hold_token_;
+  uint64_t sink_generation_ = 0;
+  std::atomic<uint64_t> hold_epoch_{0};
   bool dispatching_ = false;
   bool sink_failed_ = false;
+  bool source_advanced_while_held_ = false;
   bool shut_down_ = false;
+  void (*post_ordinal_assignment_hook_)(void*) = nullptr;
+  void* post_ordinal_assignment_context_ = nullptr;
   std::atomic<uint64_t> marker_count_{0};
+  std::atomic<uint64_t> next_admission_ticket_{0};
+  uint64_t serving_admission_ticket_ = 0;
+  std::atomic<bool> admission_open_{false};
 };
 
 }  // namespace gpu

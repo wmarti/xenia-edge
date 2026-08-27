@@ -23,6 +23,7 @@
 
 #include "xenia/cpu/guest_execution_capture.h"
 #include "xenia/cpu/guest_execution_session_assembler.h"
+#include "xenia/gpu/pm4_marker_sink.h"
 #include "xenia/kernel/guest_scheduler_capture_observer.h"
 #include "xenia/kernel/guest_scheduler_checkpoint.h"
 
@@ -59,6 +60,7 @@ enum class GuestExecutionSessionCaptureRuntimeRejection : uint8_t {
   kProviderFailure,
   kAssemblerFailure,
   kEventBridgeFailure,
+  kExternalSinkControl,
   kBundleValidation,
   kPublicationFailure,
   kCancelled,
@@ -158,6 +160,27 @@ class GuestExecutionSessionCaptureRuntimeCheckpointController {
       kernel::GuestSchedulerCheckpointBarrierSnapshot* snapshot) = 0;
 };
 
+// Control-worker seam for the configured PM4 marker source. Hold returns an
+// attestation only after admission is closed and every callback in its sink
+// generation has returned. A repeated healthy hold returns the same token;
+// false must not change attachment state. AcknowledgeArmAndResumeAfterStart
+// must acknowledge the marker controller's arm boundary while the source is
+// still held, then resume using exactly that token. False leaves it held.
+// IsSourceHealthy covers dispatcher loss and marker-controller rejection after
+// attach. The owner must keep this object and its callback target alive through
+// runtime Shutdown. If control fails while status is unheld, the owner must
+// terminally detach the source before destroying either dependency.
+class GuestExecutionSessionCaptureRuntimeExternalSink {
+ public:
+  virtual ~GuestExecutionSessionCaptureRuntimeExternalSink() = default;
+
+  virtual bool Hold(gpu::Pm4MarkerHoldToken* token,
+                    std::string* error) noexcept = 0;
+  virtual bool AcknowledgeArmAndResumeAfterStart(
+      const gpu::Pm4MarkerHoldToken& token, std::string* error) noexcept = 0;
+  virtual bool IsSourceHealthy(std::string* error) const noexcept = 0;
+};
+
 struct GuestExecutionSessionCaptureRuntimeDependencies {
   const ppc::GuestInvocationRecorderClock* clock = nullptr;
   GuestExecutionSessionCaptureRuntimeProvider* provider = nullptr;
@@ -165,6 +188,7 @@ struct GuestExecutionSessionCaptureRuntimeDependencies {
   GuestExecutionSessionAssemblerPublisher* publisher = nullptr;
   GuestExecutionSessionCaptureRuntimeCheckpointController*
       checkpoint_controller = nullptr;
+  GuestExecutionSessionCaptureRuntimeExternalSink* pm4_external_sink = nullptr;
 };
 
 struct GuestExecutionSessionCaptureRuntimeStatus {
@@ -180,6 +204,14 @@ struct GuestExecutionSessionCaptureRuntimeStatus {
   bool processor_attached = false;
   bool scheduler_attached = false;
   bool provider_armed = false;
+  bool external_sink_registered = false;
+  bool external_sink_held = false;
+  bool external_sink_control_failed = false;
+  // Most recent successful Hold attestation. These remain observable after a
+  // start resume and are replaced by the terminal-stop hold.
+  uint64_t external_sink_attested_generation = 0;
+  uint64_t external_sink_hold_epoch = 0;
+  uint64_t external_sink_last_ordinal = 0;
   bool canonical_output_published = false;
   bool worker_running = false;
   bool shutdown_pending = false;

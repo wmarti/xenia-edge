@@ -274,6 +274,17 @@ bool CommandProcessor::AttachPm4MarkerSink(
   return pm4_marker_dispatcher_.AttachSink(std::move(sink));
 }
 
+bool CommandProcessor::HoldPm4MarkerSink(
+    const std::shared_ptr<Pm4MarkerSink>& sink, Pm4MarkerHoldToken* token) {
+  return pm4_marker_dispatcher_.HoldSink(sink, token);
+}
+
+bool CommandProcessor::ResumePm4MarkerSink(
+    const std::shared_ptr<Pm4MarkerSink>& sink,
+    const Pm4MarkerHoldToken& token) {
+  return pm4_marker_dispatcher_.ResumeSink(sink, token);
+}
+
 bool CommandProcessor::DetachPm4MarkerSink(
     const std::shared_ptr<Pm4MarkerSink>& sink) {
   return pm4_marker_dispatcher_.DetachSink(sink);
@@ -281,6 +292,11 @@ bool CommandProcessor::DetachPm4MarkerSink(
 
 bool CommandProcessor::pm4_marker_sink_failed() const {
   return pm4_marker_dispatcher_.sink_failed();
+}
+
+Pm4MarkerDispatcherStatus CommandProcessor::pm4_marker_dispatcher_status()
+    const {
+  return pm4_marker_dispatcher_.status();
 }
 
 void CommandProcessor::NotifyPm4SwapMarker() {

@@ -207,11 +207,16 @@ class CommandProcessor {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   bool AttachPm4MarkerSink(std::shared_ptr<Pm4MarkerSink> sink);
+  bool HoldPm4MarkerSink(const std::shared_ptr<Pm4MarkerSink>& sink,
+                         Pm4MarkerHoldToken* token);
+  bool ResumePm4MarkerSink(const std::shared_ptr<Pm4MarkerSink>& sink,
+                           const Pm4MarkerHoldToken& token);
   bool DetachPm4MarkerSink(const std::shared_ptr<Pm4MarkerSink>& sink);
   uint64_t pm4_marker_count() const noexcept {
     return pm4_marker_dispatcher_.marker_count();
   }
   bool pm4_marker_sink_failed() const;
+  Pm4MarkerDispatcherStatus pm4_marker_dispatcher_status() const;
 #endif
 
   // May be called not only from the command processor thread when the command

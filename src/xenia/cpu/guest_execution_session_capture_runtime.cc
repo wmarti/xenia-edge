@@ -484,7 +484,24 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     assembler_config.defer_duration_boundaries = true;
     assembler = GuestExecutionSessionAssembler::Create(
         assembler_config, assembler_dependencies, error);
-    return assembler != nullptr;
+    if (!assembler) {
+      return false;
+    }
+    if (!dependencies.pm4_external_sink) {
+      return true;
+    }
+    uint32_t ordinal = GuestExecutionSessionAssembler::kNoExternalSink;
+    if (!assembler->RegisterExternalSink("pm4-swap-marker-source", &ordinal)) {
+      return Fail(error,
+                  "capture runtime could not register its PM4 external sink");
+    }
+    if (ordinal != config.assembler.pm4_marker_sink_ordinal) {
+      return Fail(error,
+                  "capture runtime PM4 external sink ordinal differs from "
+                  "the assembler configuration");
+    }
+    external_sink_registered = true;
+    return true;
   }
 
   void StartWorker() {
@@ -731,6 +748,85 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     return true;
   }
 
+  bool HoldExternalSink(std::string* error) {
+    if (!dependencies.pm4_external_sink) {
+      return true;
+    }
+    if (external_sink_hold_token) {
+      return true;
+    }
+    gpu::Pm4MarkerHoldToken token;
+    std::string source_error;
+    if (!dependencies.pm4_external_sink->Hold(&token, &source_error) ||
+        !token) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      std::string message =
+          "capture runtime could not hold its PM4 external sink; the owner "
+          "must detach it before dependency teardown";
+      if (!source_error.empty()) {
+        message += ": " + source_error;
+      }
+      return Fail(error, std::move(message));
+    }
+    external_sink_hold_token = token;
+    external_sink_attested_generation.store(token.sink_generation,
+                                            std::memory_order_release);
+    external_sink_hold_epoch.store(token.hold_epoch, std::memory_order_release);
+    external_sink_last_ordinal.store(token.last_ordinal,
+                                     std::memory_order_release);
+    external_sink_held.store(true, std::memory_order_release);
+    if (!dependencies.pm4_external_sink->IsSourceHealthy(&source_error)) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      return Fail(error, source_error.empty()
+                             ? "capture runtime PM4 external sink is unhealthy"
+                             : std::move(source_error));
+    }
+    return true;
+  }
+
+  bool ResumeExternalSinkAfterStart(std::string* error) {
+    if (!dependencies.pm4_external_sink) {
+      return true;
+    }
+    if (!external_sink_hold_token) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      return Fail(error,
+                  "capture runtime cannot resume an unheld PM4 external sink");
+    }
+    std::string source_error;
+    if (!dependencies.pm4_external_sink->AcknowledgeArmAndResumeAfterStart(
+            *external_sink_hold_token, &source_error)) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      return Fail(error,
+                  source_error.empty()
+                      ? "capture runtime could not resume its PM4 external sink"
+                      : std::move(source_error));
+    }
+    external_sink_hold_token.reset();
+    external_sink_held.store(false, std::memory_order_release);
+    if (!dependencies.pm4_external_sink->IsSourceHealthy(&source_error)) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      return Fail(error, source_error.empty()
+                             ? "capture runtime PM4 source failed after resume"
+                             : std::move(source_error));
+    }
+    return true;
+  }
+
+  bool CheckExternalSinkHealth(std::string* error) {
+    if (!dependencies.pm4_external_sink) {
+      return true;
+    }
+    std::string source_error;
+    if (dependencies.pm4_external_sink->IsSourceHealthy(&source_error)) {
+      return true;
+    }
+    external_sink_control_failed.store(true, std::memory_order_release);
+    return Fail(error, source_error.empty()
+                           ? "capture runtime PM4 external source was lost"
+                           : std::move(source_error));
+  }
+
   void EndProvider(bool accepted) noexcept {
     if (!provider_armed.load(std::memory_order_acquire)) {
       return;
@@ -772,6 +868,14 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   }
 
   void Reject(RuntimeRejection rejection_value, std::string message) {
+    std::string sink_error;
+    if (!HoldExternalSink(&sink_error)) {
+      rejection_value = RuntimeRejection::kExternalSinkControl;
+      if (!message.empty()) {
+        message += "; ";
+      }
+      message += sink_error;
+    }
     capture_gate.store(false, std::memory_order_release);
     session_active.store(false, std::memory_order_release);
     WaitForCallbacks();
@@ -828,6 +932,14 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     }
     checkpoint_generation.store(provisional.generation,
                                 std::memory_order_release);
+    std::string error;
+    // Hold as soon as the scheduler is quiescent. Ordinal assignment and sink
+    // generation admission are now closed before roster/provider setup, so no
+    // PM4 callback can straddle that comparatively expensive work.
+    if (!HoldExternalSink(&error)) {
+      Reject(RuntimeRejection::kExternalSinkControl, std::move(error));
+      return;
+    }
     if (shutdown_requested.load(std::memory_order_acquire)) {
       return;
     }
@@ -841,7 +953,6 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     session_active.store(true, std::memory_order_release);
     const auto registry = processor.QueryGuestExecutionCaptureParticipants();
     const auto host_calls = host_call_roster.snapshot();
-    std::string error;
     if (!ValidateCheckpoint(provisional, registry, host_calls, &error)) {
       Reject(RuntimeRejection::kCheckpointRoster, std::move(error));
       return;
@@ -872,8 +983,19 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     if (shutdown_requested.load(std::memory_order_acquire)) {
       return;
     }
-    if (!assembler->Arm(&error) || !assembler->RequestStart(&error) ||
-        !ArriveActiveParticipants(provisional, &error) ||
+    if (!assembler->Arm(&error) || !assembler->RequestStart(&error)) {
+      Reject(RuntimeRejection::kAssemblerFailure,
+             error.empty() ? assembler->status().message : std::move(error));
+      return;
+    }
+    if (dependencies.pm4_external_sink &&
+        assembler->OnExternalSinkHeld(
+            config.assembler.pm4_marker_sink_ordinal) ==
+            AssemblerAction::kReject) {
+      Reject(RuntimeRejection::kAssemblerFailure, assembler->status().message);
+      return;
+    }
+    if (!ArriveActiveParticipants(provisional, &error) ||
         assembler->status().state != AssemblerState::kRecording) {
       Reject(RuntimeRejection::kAssemblerFailure,
              error.empty() ? assembler->status().message : std::move(error));
@@ -911,6 +1033,13 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       return;
     }
     initial_scheduler_checkpoint = std::move(final);
+    if (!ResumeExternalSinkAfterStart(&error)) {
+      Reject(RuntimeRejection::kExternalSinkControl, std::move(error));
+      return;
+    }
+    if (shutdown_requested.load(std::memory_order_acquire)) {
+      return;
+    }
     SetState(RuntimeState::kRecording);
   }
 
@@ -1021,10 +1150,15 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     }
     checkpoint_generation.store(provisional.generation,
                                 std::memory_order_release);
+
+    std::string error;
+    if (!HoldExternalSink(&error)) {
+      Reject(RuntimeRejection::kExternalSinkControl, std::move(error));
+      return;
+    }
     capture_gate.store(false, std::memory_order_release);
     WaitForCallbacks();
 
-    std::string error;
     if (scheduler.capture_rejected()) {
       Reject(RuntimeRejection::kEventBridgeFailure,
              "capture runtime scheduler source rejected delivery");
@@ -1068,6 +1202,13 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
         assembler_state != AssemblerState::kPublishing) {
       Reject(RuntimeRejection::kAssemblerFailure,
              "capture runtime stop did not establish a boundary");
+      return;
+    }
+    if (dependencies.pm4_external_sink &&
+        assembler->OnExternalSinkHeld(
+            config.assembler.pm4_marker_sink_ordinal) ==
+            AssemblerAction::kReject) {
+      Reject(RuntimeRejection::kAssemblerFailure, assembler->status().message);
       return;
     }
     // These are the last source snapshots inside the capture. Processor closes
@@ -1181,6 +1322,10 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
                            : std::move(error));
       return;
     }
+    if (!CheckExternalSinkHealth(&error)) {
+      Reject(RuntimeRejection::kExternalSinkControl, std::move(error));
+      return;
+    }
     if (!AdmitPublication()) {
       return;
     }
@@ -1212,6 +1357,10 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       return;
     }
     std::string error;
+    if (!CheckExternalSinkHealth(&error)) {
+      Reject(RuntimeRejection::kExternalSinkControl, std::move(error));
+      return;
+    }
     if (ProcessSourceEvent(event, &error) == AssemblerAction::kReject) {
       Reject(event.kind == RuntimeEventKind::kScheduler
                  ? RuntimeRejection::kEventBridgeFailure
@@ -1232,6 +1381,11 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   void PollAssembler() {
     if (state_atomic.load(std::memory_order_acquire) !=
         RuntimeState::kRecording) {
+      return;
+    }
+    std::string error;
+    if (!CheckExternalSinkHealth(&error)) {
+      Reject(RuntimeRejection::kExternalSinkControl, std::move(error));
       return;
     }
     const AssemblerState coverage_state = assembler->status().state;
@@ -1314,6 +1468,8 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     }
     if (shutdown_requested.load(std::memory_order_acquire) &&
         !IsTerminal(state_atomic.load(std::memory_order_acquire))) {
+      std::string sink_error;
+      const bool sink_held = HoldExternalSink(&sink_error);
       capture_gate.store(false, std::memory_order_release);
       session_active.store(false, std::memory_order_release);
       WaitForCallbacks();
@@ -1326,8 +1482,12 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       }
       {
         std::lock_guard<std::mutex> lock(status_mutex);
-        rejection = RuntimeRejection::kCancelled;
+        rejection = sink_held ? RuntimeRejection::kCancelled
+                              : RuntimeRejection::kExternalSinkControl;
         status_message = "capture runtime shut down";
+        if (!sink_error.empty()) {
+          status_message += "; " + sink_error;
+        }
         if (!barrier_error.empty()) {
           status_message += "; " + barrier_error;
         }
@@ -1385,6 +1545,13 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   bool processor_attached = false;
   bool scheduler_attached = false;
   std::atomic<bool> provider_armed{false};
+  bool external_sink_registered = false;
+  std::atomic<bool> external_sink_held{false};
+  std::atomic<bool> external_sink_control_failed{false};
+  std::optional<gpu::Pm4MarkerHoldToken> external_sink_hold_token;
+  std::atomic<uint64_t> external_sink_attested_generation{0};
+  std::atomic<uint64_t> external_sink_hold_epoch{0};
+  std::atomic<uint64_t> external_sink_last_ordinal{0};
   std::atomic<void (*)(void*)> request_start_prequeue_test_hook{nullptr};
   std::atomic<void*> request_start_prequeue_test_context{nullptr};
   bool canonical_output_published = false;
@@ -1404,6 +1571,15 @@ GuestExecutionSessionCaptureRuntime::CreateAndAttach(
   if (!dependencies.clock || !dependencies.provider ||
       !dependencies.event_bridge || !dependencies.publisher) {
     Fail(error, "capture runtime dependencies are missing");
+    return nullptr;
+  }
+  const bool pm4_sink_configured =
+      config.assembler.pm4_marker_sink_ordinal !=
+      GuestExecutionSessionAssembler::kNoExternalSink;
+  if (pm4_sink_configured != (dependencies.pm4_external_sink != nullptr)) {
+    Fail(error,
+         "capture runtime PM4 external sink configuration and dependency "
+         "differ");
     return nullptr;
   }
   if (config.assembler.coverage_mode !=
@@ -1604,6 +1780,17 @@ GuestExecutionSessionCaptureRuntime::status() const {
   result.processor_attached = impl_->processor_attached;
   result.scheduler_attached = impl_->scheduler_attached;
   result.provider_armed = impl_->provider_armed.load(std::memory_order_relaxed);
+  result.external_sink_registered = impl_->external_sink_registered;
+  result.external_sink_held =
+      impl_->external_sink_held.load(std::memory_order_relaxed);
+  result.external_sink_control_failed =
+      impl_->external_sink_control_failed.load(std::memory_order_relaxed);
+  result.external_sink_attested_generation =
+      impl_->external_sink_attested_generation.load(std::memory_order_relaxed);
+  result.external_sink_hold_epoch =
+      impl_->external_sink_hold_epoch.load(std::memory_order_relaxed);
+  result.external_sink_last_ordinal =
+      impl_->external_sink_last_ordinal.load(std::memory_order_relaxed);
   result.canonical_output_published = impl_->canonical_output_published;
   result.worker_running = impl_->worker_running;
   result.shutdown_pending =
