@@ -2752,6 +2752,7 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
         case kernel::GuestSchedulerCaptureEventKind::kSafepoint:
           event.reason = kernel::GuestSchedulerCaptureReason::kForcedIrql;
           event.flags = kernel::kGuestSchedulerCaptureFlagSchedulerRequested;
+          event.count = 1;
           break;
         case kernel::GuestSchedulerCaptureEventKind::kBlock:
           event.flags = kernel::kGuestSchedulerCaptureFlagGated;
@@ -2835,6 +2836,26 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
     safepoint.reason = kernel::GuestSchedulerCaptureReason::kYielded;
     safepoint.flags = kernel::kGuestSchedulerCaptureFlagSchedulerRequested;
     safepoint.guest_pc = 0;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, safepoint,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("safepoint provenance") != std::string::npos);
+  }
+
+  SECTION("capture-only safepoint provenance fails closed") {
+    kernel::GuestSchedulerCaptureEvent safepoint = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kSafepoint);
+    safepoint.reason = kernel::GuestSchedulerCaptureReason::kYielded;
+    safepoint.flags = kernel::kGuestSchedulerCaptureFlagCaptureRequested;
+    REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, safepoint,
+                                    &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("safepoint provenance") != std::string::npos);
+  }
+
+  SECTION("forced safepoint without declined visits fails closed") {
+    kernel::GuestSchedulerCaptureEvent safepoint = BridgeSchedulerEvent(
+        10, kernel::GuestSchedulerCaptureEventKind::kSafepoint);
+    safepoint.reason = kernel::GuestSchedulerCaptureReason::kForcedIrql;
+    safepoint.flags = kernel::kGuestSchedulerCaptureFlagSchedulerRequested;
     REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, safepoint,
                                     &harness.error) == Action::kReject);
     REQUIRE(harness.error.find("safepoint provenance") != std::string::npos);
@@ -3017,6 +3038,62 @@ TEST_CASE("scheduler event bridge authenticates every cooperative wait kind",
                     [](auto* payload) { (*payload)[60] = 0; });
   require_malformed(kernel::GuestSchedulerCaptureWaitKind::kSocketIo,
                     [](auto* payload) { (*payload)[60] = 0; });
+
+  const auto clear_event_flag = [](std::vector<uint8_t>* payload,
+                                   uint16_t flag) {
+    (*payload)[40] &= static_cast<uint8_t>(~flag);
+    (*payload)[41] &= static_cast<uint8_t>(~(flag >> 8));
+  };
+  const auto set_event_flag = [](std::vector<uint8_t>* payload, uint16_t flag) {
+    (*payload)[40] |= static_cast<uint8_t>(flag);
+    (*payload)[41] |= static_cast<uint8_t>(flag >> 8);
+  };
+  require_malformed(
+      kernel::GuestSchedulerCaptureWaitKind::kSingle, [&](auto* payload) {
+        clear_event_flag(payload,
+                         kernel::kGuestSchedulerCaptureFlagInterruptible);
+        (*payload)[61] &= static_cast<uint8_t>(
+            ~kernel::kGuestSchedulerCaptureWaitFlagInterruptible);
+      });
+  require_malformed(
+      kernel::GuestSchedulerCaptureWaitKind::kDelay, [&](auto* payload) {
+        clear_event_flag(payload, kernel::kGuestSchedulerCaptureFlagGated);
+        (*payload)[61] &=
+            static_cast<uint8_t>(~kernel::kGuestSchedulerCaptureWaitFlagGated);
+      });
+  require_malformed(
+      kernel::GuestSchedulerCaptureWaitKind::kDelay, [&](auto* payload) {
+        set_event_flag(payload, kernel::kGuestSchedulerCaptureFlagAlertable);
+        (*payload)[61] |= kernel::kGuestSchedulerCaptureWaitFlagAlertable;
+      });
+  require_malformed(
+      kernel::GuestSchedulerCaptureWaitKind::kFence, [&](auto* payload) {
+        set_event_flag(payload, kernel::kGuestSchedulerCaptureFlagAlertable);
+        (*payload)[61] |= kernel::kGuestSchedulerCaptureWaitFlagAlertable;
+      });
+  require_malformed(
+      kernel::GuestSchedulerCaptureWaitKind::kIoOffload, [&](auto* payload) {
+        set_event_flag(payload,
+                       kernel::kGuestSchedulerCaptureFlagInterruptible);
+        (*payload)[61] |= kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
+      });
+  require_malformed(
+      kernel::GuestSchedulerCaptureWaitKind::kSpinBackoff, [&](auto* payload) {
+        set_event_flag(payload, kernel::kGuestSchedulerCaptureFlagAlertable);
+        (*payload)[61] |= kernel::kGuestSchedulerCaptureWaitFlagAlertable;
+      });
+  require_malformed(
+      kernel::GuestSchedulerCaptureWaitKind::kIoCompletion, [&](auto* payload) {
+        set_event_flag(payload, kernel::kGuestSchedulerCaptureFlagAlertable);
+        (*payload)[61] |= kernel::kGuestSchedulerCaptureWaitFlagAlertable;
+      });
+  require_malformed(
+      kernel::GuestSchedulerCaptureWaitKind::kSocketIo, [&](auto* payload) {
+        clear_event_flag(payload,
+                         kernel::kGuestSchedulerCaptureFlagInterruptible);
+        (*payload)[61] &= static_cast<uint8_t>(
+            ~kernel::kGuestSchedulerCaptureWaitFlagInterruptible);
+      });
 
   std::vector<uint8_t> high_bit_kind =
       encoded_by_wait_kind[static_cast<uint8_t>(

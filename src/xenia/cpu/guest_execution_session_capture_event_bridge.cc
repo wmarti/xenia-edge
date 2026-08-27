@@ -314,6 +314,10 @@ bool ValidateWaitState(const CaptureEvent& event, std::string* error) {
     return Fail(error, "scheduler delay wait has no deadline");
   }
   const bool gated = wait.flags & kernel::kGuestSchedulerCaptureWaitFlagGated;
+  const bool alertable =
+      wait.flags & kernel::kGuestSchedulerCaptureWaitFlagAlertable;
+  const bool interruptible =
+      wait.flags & kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
   if ((wait_kind == kernel::GuestSchedulerCaptureWaitKind::kFence ||
        wait_kind == kernel::GuestSchedulerCaptureWaitKind::kIoOffload ||
        wait_kind == kernel::GuestSchedulerCaptureWaitKind::kSpinBackoff ||
@@ -321,6 +325,37 @@ bool ValidateWaitState(const CaptureEvent& event, std::string* error) {
        wait_kind == kernel::GuestSchedulerCaptureWaitKind::kSocketIo) &&
       gated) {
     return Fail(error, "scheduler polling wait is incorrectly gated");
+  }
+  switch (wait_kind) {
+    case kernel::GuestSchedulerCaptureWaitKind::kSingle:
+    case kernel::GuestSchedulerCaptureWaitKind::kMultiAny:
+    case kernel::GuestSchedulerCaptureWaitKind::kMultiAll:
+      if (!interruptible) {
+        return Fail(error,
+                    "scheduler object wait is incorrectly non-interruptible");
+      }
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kDelay:
+      if (!interruptible || gated == alertable) {
+        return Fail(error, "scheduler delay wait flags are impossible");
+      }
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kFence:
+    case kernel::GuestSchedulerCaptureWaitKind::kIoOffload:
+      if (alertable || interruptible) {
+        return Fail(error, "scheduler stack-owned wait flags are impossible");
+      }
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kSpinBackoff:
+    case kernel::GuestSchedulerCaptureWaitKind::kIoCompletion:
+    case kernel::GuestSchedulerCaptureWaitKind::kSocketIo:
+      if (alertable || !interruptible) {
+        return Fail(error, "scheduler polling wait flags are impossible");
+      }
+      break;
+    case kernel::GuestSchedulerCaptureWaitKind::kNone:
+    default:
+      return Fail(error, "scheduler capture wait kind is invalid");
   }
   if (event.kind == CaptureKind::kBlock) {
     const uint8_t expected_wait_flags =
@@ -420,8 +455,8 @@ bool ValidateSchedulerEvent(const CaptureEvent& event, std::string* error) {
   }
   if (event.kind == CaptureKind::kSafepoint) {
     if (!event.guest_pc || (event.guest_pc & 3) ||
-        !(event.flags & (kernel::kGuestSchedulerCaptureFlagSchedulerRequested |
-                         kernel::kGuestSchedulerCaptureFlagCaptureRequested)) ||
+        !(event.flags & kernel::kGuestSchedulerCaptureFlagSchedulerRequested) ||
+        (event.reason == CaptureReason::kForcedIrql && !event.count) ||
         ((event.reason == CaptureReason::kDeferredLock ||
           event.reason == CaptureReason::kDeferredIrql) &&
          event.count)) {
