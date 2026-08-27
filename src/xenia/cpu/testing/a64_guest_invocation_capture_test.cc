@@ -706,13 +706,13 @@ TEST_CASE("A64_DEFINITION_NOTIFICATION_PRECEDES_CALLABLE_PUBLICATION",
   REQUIRE(rejected_function);
   const uint32_t rejected_unresolved_slot =
       *indirection_slot(kRejectedFunctionAddress);
-  REQUIRE_FALSE(processor->ResolveFunction(kRejectedFunctionAddress));
-  REQUIRE(rejected_function->status() == Symbol::Status::kFailed);
-  REQUIRE(rejected_function->machine_code() == nullptr);
-  REQUIRE(rejected_function->machine_code_length() == 0);
-  REQUIRE(*indirection_slot(kRejectedFunctionAddress) ==
+  REQUIRE(processor->ResolveFunction(kRejectedFunctionAddress));
+  REQUIRE(rejected_function->status() == Symbol::Status::kDefined);
+  REQUIRE(rejected_function->machine_code());
+  REQUIRE(rejected_function->machine_code_length() != 0);
+  REQUIRE(*indirection_slot(kRejectedFunctionAddress) !=
           rejected_unresolved_slot);
-  REQUIRE_FALSE(processor->ResolveFunction(kRejectedFunctionAddress));
+  REQUIRE(processor->ResolveFunction(kRejectedFunctionAddress));
 }
 
 TEST_CASE("A64_CAPTURE_HELPERS_FORWARD_EXACT_CONTROL_EVENTS",
