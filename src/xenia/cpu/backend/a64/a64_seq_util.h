@@ -23,6 +23,7 @@
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 #include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
+#include "xenia/cpu/guest_invocation_capture.h"
 #include "xenia/cpu/guest_invocation_recorder.h"
 #endif
 
@@ -55,9 +56,16 @@ using Xbyak_aarch64::XReg;
 
 inline void EmitGuestInvocationCapturePreparedMemoryAccess(
     A64Emitter& e, ppc::GuestInvocationRecorderMemoryAccess access) {
+  const bool writes = access != ppc::GuestInvocationRecorderMemoryAccess::kRead;
+  Xbyak_aarch64::Label skip;
+  e.EmitGuestInvocationCaptureEventGuard(
+      writes ? kGuestInvocationCaptureWriteEventBit
+             : kGuestInvocationCaptureOwnerEventBit,
+      skip);
   e.mov(e.w3, static_cast<uint64_t>(access));
   e.CallNativeSafe(
       reinterpret_cast<void*>(&CaptureGuestInvocationMemoryAccess));
+  e.L(skip);
 }
 
 inline void EmitGuestInvocationCaptureMemoryAccess(
@@ -75,9 +83,13 @@ inline void EmitGuestInvocationCaptureMemoryAccess(
 
 inline void EmitGuestInvocationCaptureUnsupportedDependency(
     A64Emitter& e, uint32_t dependency_flags) {
+  Xbyak_aarch64::Label skip;
+  e.EmitGuestInvocationCaptureEventGuard(kGuestInvocationCaptureOwnerEventBit,
+                                         skip);
   e.mov(e.w1, static_cast<uint64_t>(dependency_flags));
   e.CallNativeSafe(
       reinterpret_cast<void*>(&CaptureGuestInvocationUnsupportedDependency));
+  e.L(skip);
 }
 
 #endif

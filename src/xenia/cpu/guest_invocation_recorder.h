@@ -180,6 +180,9 @@ class GuestInvocationRecorder {
   bool OnAsyncReentry(const GuestInvocationRecorderIdentity& identity);
 
   GuestInvocationRecorderState state() const;
+  bool is_recording_attempt() const;
+  bool is_recording_identity(
+      const GuestInvocationRecorderIdentity& identity) const;
   GuestInvocationRecorderRejection rejection() const;
   uint32_t rejected_dependency_flags() const;
   const std::string& rejection_message() const;

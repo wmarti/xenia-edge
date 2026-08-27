@@ -123,6 +123,12 @@ ThreadState::ThreadState(Processor* processor, uint32_t thread_id,
   context_->thread_state = this;
   context_->thread_id = thread_id_;
   context_->trace_counts = processor->AcquireTraceCounts(thread_id_);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  std::atomic_ref<uint8_t>(context_->guest_invocation_capture_event_mask)
+      .store(processor->guest_invocation_capture_initial_event_mask(),
+             std::memory_order_release);
+#endif
 
   // Set initial registers.
   context_->r[1] = stack_base;

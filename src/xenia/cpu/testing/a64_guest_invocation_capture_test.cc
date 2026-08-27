@@ -1073,6 +1073,8 @@ TEST_CASE("A64_CAPTURE_HELPERS_FORWARD_EXACT_CONTROL_EVENTS",
   ppc::PPCContext context = {};
   context.processor = &processor;
   context.thread_id = 0x12345678;
+  context.guest_invocation_capture_event_mask =
+      processor.guest_invocation_capture_initial_event_mask();
   const ppc::GuestPPCRegisterState state = MakeRegisterState(0x55);
   ppc::RestoreGuestPPCRegisterState(state, &context);
 
@@ -1635,6 +1637,8 @@ TEST_CASE("A64_CAPTURE_MEMORY_HELPER_VALIDATES_LOGICAL_RANGES",
   ppc::PPCContext context = {};
   context.processor = processor.get();
   context.thread_id = 0x12345678;
+  context.guest_invocation_capture_event_mask =
+      processor->guest_invocation_capture_initial_event_mask();
 
   using MemoryAccess = ppc::GuestInvocationRecorderMemoryAccess;
   constexpr uint32_t kCrossPageAddress = 0x00001FFEu;

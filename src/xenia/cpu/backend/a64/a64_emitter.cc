@@ -23,6 +23,7 @@
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 #include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
+#include "xenia/cpu/guest_invocation_capture.h"
 #include "xenia/cpu/guest_invocation_recorder.h"
 #endif
 #include "xenia/cpu/backend/a64/a64_sequences.h"
@@ -61,6 +62,19 @@ static uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
 }
 
 static constexpr size_t kMaxCodeSize = 1_MiB;
+
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+void A64Emitter::EmitGuestInvocationCaptureEventGuard(
+    uint32_t event_bit, const Xbyak_aarch64::Label& skip) {
+  static_assert(offsetof(ppc::PPCContext, guest_invocation_capture_event_mask) <
+                4096);
+  ldrb(w8,
+       ptr(x20, static_cast<uint32_t>(offsetof(
+                    ppc::PPCContext, guest_invocation_capture_event_mask))));
+  tbz_near(w8, event_bit, skip);
+}
+#endif
 
 // Register maps:
 // GPR allocatable registers: x22, x23, x24, x25, x26, x27, x28
@@ -301,9 +315,18 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   // The prolog has saved host bookkeeping, but no guest HIR has executed yet.
   // CallNativeSafe preserves every guest-allocatable GPR and vector register
   // while the callback snapshots the fully materialized PPC context.
+  Label skip_capture_entry;
+  const uint32_t capture_root =
+      processor()->guest_invocation_capture_root_address();
+  EmitGuestInvocationCaptureEventGuard(
+      !capture_root || current_guest_function_ == capture_root
+          ? kGuestInvocationCaptureRootEventBit
+          : kGuestInvocationCaptureOwnerEventBit,
+      skip_capture_entry);
   mov(x1, static_cast<uint64_t>(current_guest_function_));
   mov(x2, static_cast<uint64_t>(current_guest_function_end_));
   CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationFunctionEntry));
+  L(skip_capture_entry);
 #endif
 
   // FTrace: log guest function entry when the backend was built with
@@ -445,9 +468,13 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   // Use the return boundary saved by this frame's prolog, not the mutable PPC
   // LR. A function may legally change LR before taking its normal return path.
+  Label skip_capture_exit;
+  EmitGuestInvocationCaptureEventGuard(kGuestInvocationCaptureOwnerEventBit,
+                                       skip_capture_exit);
   mov(x1, static_cast<uint64_t>(current_guest_function_));
   ldr(x2, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
   CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationFunctionExit));
+  L(skip_capture_exit);
 #endif
   // FTrace: log the guest return value (r3) on normal return.
   if (IsTracingFunc()) {
@@ -864,6 +891,12 @@ namespace {
 void EmitInlineSaverestCaptureAccesses(
     A64Emitter& e, const WReg& guest_stack, uint32_t first_slot_offset,
     uint32_t span, ppc::GuestInvocationRecorderMemoryAccess access) {
+  const bool writes = access != ppc::GuestInvocationRecorderMemoryAccess::kRead;
+  Label skip;
+  e.EmitGuestInvocationCaptureEventGuard(
+      writes ? kGuestInvocationCaptureWriteEventBit
+             : kGuestInvocationCaptureOwnerEventBit,
+      skip);
   for (uint32_t offset = 0; offset < span;
        offset += kMaximumGuestInvocationCaptureMemoryAccessSize) {
     const uint32_t size =
@@ -880,6 +913,7 @@ void EmitInlineSaverestCaptureAccesses(
     e.CallNativeSafe(
         reinterpret_cast<void*>(&CaptureGuestInvocationMemoryAccess));
   }
+  e.L(skip);
   e.ldr(guest_stack,
         ptr(e.x20, static_cast<int32_t>(offsetof(ppc::PPCContext, r[1]))));
 }
@@ -896,9 +930,13 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   if (instr->flags & hir::CALL_TAIL) {
+    Label skip_capture_tail;
+    EmitGuestInvocationCaptureEventGuard(kGuestInvocationCaptureOwnerEventBit,
+                                         skip_capture_tail);
     mov(x1, static_cast<uint64_t>(current_guest_function_));
     mov(x2, static_cast<uint64_t>(function->address()));
     CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationTailCall));
+    L(skip_capture_tail);
   }
 #endif
 
@@ -1148,6 +1186,9 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
   if (instr->flags & hir::CALL_TAIL) {
     // x0-x18 are caller-saved. Round-trip the target through the callback's
     // return value so w16 and any future scratch assignment are both safe.
+    Label skip_capture_tail;
+    EmitGuestInvocationCaptureEventGuard(kGuestInvocationCaptureOwnerEventBit,
+                                         skip_capture_tail);
     mov(w2, target_w);
     mov(x1, static_cast<uint64_t>(current_guest_function_));
     CallNativeSafe(reinterpret_cast<void*>(&CaptureGuestInvocationTailCall));
@@ -1157,6 +1198,7 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
       // and host return boundaries that the tail transition passes onward.
       ldp(x0, x30, ptr(sp, static_cast<int32_t>(StackLayout::GUEST_RET_ADDR)));
     }
+    L(skip_capture_tail);
   }
 #endif
 
@@ -1266,9 +1308,13 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
   if (function->behavior() == Function::Behavior::kExtern) {
     dependency_flags |= ppc::kGuestInvocationDependencyKernelExport;
   }
+  Label skip_capture_dependency;
+  EmitGuestInvocationCaptureEventGuard(kGuestInvocationCaptureOwnerEventBit,
+                                       skip_capture_dependency);
   mov(x1, static_cast<uint64_t>(dependency_flags));
   CallNativeSafe(
       reinterpret_cast<void*>(&CaptureGuestInvocationUnsupportedDependency));
+  L(skip_capture_dependency);
 #endif
   bool undefined = true;
   if (function->behavior() == Function::Behavior::kBuiltin) {

@@ -93,12 +93,16 @@ class Processor {
   // The owner must install this before guest translation starts and clear it
   // only after capture callbacks have stopped. The sink serializes and routes
   // all recorder access; Processor does not own it.
-  void set_guest_invocation_capture_sink(
-      GuestInvocationCaptureEventSink* sink) {
-    guest_invocation_capture_sink_ = sink;
-  }
+  void set_guest_invocation_capture_sink(GuestInvocationCaptureEventSink* sink);
   GuestInvocationCaptureEventSink* guest_invocation_capture_sink() const {
     return guest_invocation_capture_sink_;
+  }
+  uint32_t guest_invocation_capture_root_address() const {
+    return guest_invocation_capture_root_address_;
+  }
+  uint8_t guest_invocation_capture_initial_event_mask() const {
+    return guest_invocation_capture_initial_event_mask_.load(
+        std::memory_order_acquire);
   }
 
   // Orthogonal to the one-invocation event sink above. Continuous capture must
@@ -415,6 +419,8 @@ class Processor {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   GuestInvocationCaptureEventSink* guest_invocation_capture_sink_ = nullptr;
+  uint32_t guest_invocation_capture_root_address_ = 0;
+  std::atomic<uint8_t> guest_invocation_capture_initial_event_mask_{0};
 
   // Intrusive and allocation-free so every successfully constructed
   // ThreadState is registered. Always acquire this before the observer mutex

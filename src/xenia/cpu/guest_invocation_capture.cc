@@ -51,13 +51,14 @@ GuestInvocationCaptureCoordinator::Create(
     return nullptr;
   }
   return std::unique_ptr<GuestInvocationCaptureCoordinator>(
-      new GuestInvocationCaptureCoordinator(segment_ordinal, capture_start_tick,
-                                            std::move(recorder), clock,
-                                            std::move(segment_handler)));
+      new GuestInvocationCaptureCoordinator(
+          segment_ordinal, capture_start_tick, selection.root_address,
+          std::move(recorder), clock, std::move(segment_handler)));
 }
 
 GuestInvocationCaptureCoordinator::GuestInvocationCaptureCoordinator(
     uint64_t segment_ordinal, uint64_t capture_start_tick,
+    uint32_t root_address,
     std::unique_ptr<ppc::GuestInvocationRecorder> recorder,
     const ppc::GuestInvocationRecorderClock& clock,
     SegmentHandler segment_handler)
@@ -65,10 +66,56 @@ GuestInvocationCaptureCoordinator::GuestInvocationCaptureCoordinator(
       capture_start_tick_(capture_start_tick),
       recorder_(std::move(recorder)),
       clock_(clock),
-      segment_handler_(std::move(segment_handler)) {}
+      segment_handler_(std::move(segment_handler)),
+      root_address_(root_address) {}
 
 GuestInvocationCaptureCoordinator::~GuestInvocationCaptureCoordinator() {
   Stop();
+}
+
+uint8_t GuestInvocationCaptureCoordinator::initial_event_mask() const {
+  return common_event_mask_.load(std::memory_order_acquire);
+}
+
+uint8_t GuestInvocationCaptureCoordinator::event_mask(
+    const ppc::GuestInvocationRecorderIdentity& identity) const {
+  uint8_t mask = common_event_mask_.load(std::memory_order_acquire);
+  if (!mask || !active_identity_.load(std::memory_order_acquire)) {
+    return mask;
+  }
+  if (active_context_id_.load(std::memory_order_relaxed) ==
+          identity.context_id &&
+      active_thread_id_.load(std::memory_order_relaxed) == identity.thread_id) {
+    mask |= kGuestInvocationCaptureOwnerEvent;
+  }
+  return mask;
+}
+
+void GuestInvocationCaptureCoordinator::ClearFastStateLocked() {
+  active_identity_.store(false, std::memory_order_release);
+  common_event_mask_.store(0, std::memory_order_release);
+}
+
+void GuestInvocationCaptureCoordinator::RefreshActiveIdentityLocked(
+    const ppc::GuestInvocationRecorderIdentity* identity) {
+  if (!recorder_->is_recording_attempt()) {
+    active_identity_.store(false, std::memory_order_release);
+    return;
+  }
+  if (!identity || !recorder_->is_recording_identity(*identity)) {
+    return;
+  }
+  active_identity_.store(false, std::memory_order_relaxed);
+  active_context_id_.store(identity->context_id, std::memory_order_relaxed);
+  active_thread_id_.store(identity->thread_id, std::memory_order_relaxed);
+  active_identity_.store(true, std::memory_order_release);
+}
+
+bool GuestInvocationCaptureCoordinator::FinishIdentityCallbackLocked(
+    bool callback_succeeded,
+    const ppc::GuestInvocationRecorderIdentity& identity) {
+  RefreshActiveIdentityLocked(&identity);
+  return FinishCallbackLocked(callback_succeeded);
 }
 
 bool GuestInvocationCaptureCoordinator::IsTerminalLocked() const {
@@ -82,6 +129,7 @@ bool GuestInvocationCaptureCoordinator::FinishCallbackLocked(
   }
   if (recorder_->state() == ppc::GuestInvocationRecorderState::kRejected) {
     state_ = GuestInvocationCaptureState::kRejected;
+    ClearFastStateLocked();
     capture_end_tick_ = clock_.NowTicks();
     message_ = recorder_->rejection_message();
     if (message_.empty()) {
@@ -102,6 +150,7 @@ bool GuestInvocationCaptureCoordinator::FinishCallbackLocked(
   const ppc::GuestInvocationRecorderResult* result = recorder_->result();
   if (!result) {
     state_ = GuestInvocationCaptureState::kPublicationFailed;
+    ClearFastStateLocked();
     capture_end_tick_ = clock_.NowTicks();
     message_ = "completed capture has no recorder result";
     segment_handler_ = {};
@@ -116,6 +165,7 @@ bool GuestInvocationCaptureCoordinator::FinishCallbackLocked(
   if (!segment_handler_(segment_ordinal_, capture_start_tick_,
                         capture_end_tick_, *result, &publication_error)) {
     state_ = GuestInvocationCaptureState::kPublicationFailed;
+    ClearFastStateLocked();
     message_ = publication_error.empty()
                    ? std::string(kMissingPublicationDiagnostic)
                    : std::move(publication_error);
@@ -123,6 +173,7 @@ bool GuestInvocationCaptureCoordinator::FinishCallbackLocked(
     return false;
   }
   state_ = GuestInvocationCaptureState::kPublished;
+  ClearFastStateLocked();
   message_.clear();
   segment_handler_ = {};
   return true;
@@ -163,8 +214,9 @@ bool GuestInvocationCaptureCoordinator::OnFunctionEntry(
   if (IsTerminalLocked()) {
     return state_ == GuestInvocationCaptureState::kPublished;
   }
-  return FinishCallbackLocked(
-      recorder_->OnFunctionEntry(identity, address, end_address, state));
+  return FinishIdentityCallbackLocked(
+      recorder_->OnFunctionEntry(identity, address, end_address, state),
+      identity);
 }
 
 bool GuestInvocationCaptureCoordinator::OnFunctionExit(
@@ -174,8 +226,9 @@ bool GuestInvocationCaptureCoordinator::OnFunctionExit(
   if (IsTerminalLocked()) {
     return state_ == GuestInvocationCaptureState::kPublished;
   }
-  return FinishCallbackLocked(
-      recorder_->OnFunctionExit(identity, address, return_address, state));
+  return FinishIdentityCallbackLocked(
+      recorder_->OnFunctionExit(identity, address, return_address, state),
+      identity);
 }
 
 bool GuestInvocationCaptureCoordinator::OnMemoryAccess(
@@ -185,8 +238,8 @@ bool GuestInvocationCaptureCoordinator::OnMemoryAccess(
   if (IsTerminalLocked()) {
     return state_ == GuestInvocationCaptureState::kPublished;
   }
-  return FinishCallbackLocked(
-      recorder_->OnMemoryAccess(identity, address, size, access));
+  return FinishIdentityCallbackLocked(
+      recorder_->OnMemoryAccess(identity, address, size, access), identity);
 }
 
 bool GuestInvocationCaptureCoordinator::OnUnsupportedDependency(
@@ -196,8 +249,8 @@ bool GuestInvocationCaptureCoordinator::OnUnsupportedDependency(
   if (IsTerminalLocked()) {
     return state_ == GuestInvocationCaptureState::kPublished;
   }
-  return FinishCallbackLocked(
-      recorder_->OnUnsupportedDependency(identity, dependency_flags));
+  return FinishIdentityCallbackLocked(
+      recorder_->OnUnsupportedDependency(identity, dependency_flags), identity);
 }
 
 bool GuestInvocationCaptureCoordinator::OnTailCall(
@@ -207,8 +260,8 @@ bool GuestInvocationCaptureCoordinator::OnTailCall(
   if (IsTerminalLocked()) {
     return state_ == GuestInvocationCaptureState::kPublished;
   }
-  return FinishCallbackLocked(
-      recorder_->OnTailCall(identity, from_address, target_address));
+  return FinishIdentityCallbackLocked(
+      recorder_->OnTailCall(identity, from_address, target_address), identity);
 }
 
 bool GuestInvocationCaptureCoordinator::OnUnwindOrLongjmp(
@@ -217,7 +270,8 @@ bool GuestInvocationCaptureCoordinator::OnUnwindOrLongjmp(
   if (IsTerminalLocked()) {
     return state_ == GuestInvocationCaptureState::kPublished;
   }
-  return FinishCallbackLocked(recorder_->OnUnwindOrLongjmp(identity));
+  return FinishIdentityCallbackLocked(recorder_->OnUnwindOrLongjmp(identity),
+                                      identity);
 }
 
 bool GuestInvocationCaptureCoordinator::OnAsyncReentry(
@@ -226,7 +280,8 @@ bool GuestInvocationCaptureCoordinator::OnAsyncReentry(
   if (IsTerminalLocked()) {
     return state_ == GuestInvocationCaptureState::kPublished;
   }
-  return FinishCallbackLocked(recorder_->OnAsyncReentry(identity));
+  return FinishIdentityCallbackLocked(recorder_->OnAsyncReentry(identity),
+                                      identity);
 }
 
 void GuestInvocationCaptureCoordinator::Stop() {
@@ -235,6 +290,7 @@ void GuestInvocationCaptureCoordinator::Stop() {
     return;
   }
   state_ = GuestInvocationCaptureState::kStopped;
+  ClearFastStateLocked();
   message_.assign(kStoppedDiagnostic);
   capture_end_tick_ = clock_.NowTicks();
   segment_handler_ = {};

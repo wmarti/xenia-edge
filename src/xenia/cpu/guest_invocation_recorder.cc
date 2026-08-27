@@ -1327,6 +1327,15 @@ GuestInvocationRecorderState GuestInvocationRecorder::state() const {
   return impl_->state;
 }
 
+bool GuestInvocationRecorder::is_recording_attempt() const {
+  return impl_->IsRecordingAttempt();
+}
+
+bool GuestInvocationRecorder::is_recording_identity(
+    const GuestInvocationRecorderIdentity& identity) const {
+  return impl_->IsRecordingAttempt() && impl_->IsOwner(identity);
+}
+
 GuestInvocationRecorderRejection GuestInvocationRecorder::rejection() const {
   return impl_->rejection;
 }

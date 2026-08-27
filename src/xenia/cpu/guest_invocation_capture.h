@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_GUEST_INVOCATION_CAPTURE_H_
 #define XENIA_CPU_GUEST_INVOCATION_CAPTURE_H_
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -20,6 +21,19 @@
 
 namespace xe {
 namespace cpu {
+
+constexpr uint32_t kGuestInvocationCaptureRootEventBit = 0;
+constexpr uint32_t kGuestInvocationCaptureOwnerEventBit = 1;
+constexpr uint32_t kGuestInvocationCaptureWriteEventBit = 2;
+constexpr uint8_t kGuestInvocationCaptureRootEvent =
+    1u << kGuestInvocationCaptureRootEventBit;
+constexpr uint8_t kGuestInvocationCaptureOwnerEvent =
+    1u << kGuestInvocationCaptureOwnerEventBit;
+constexpr uint8_t kGuestInvocationCaptureWriteEvent =
+    1u << kGuestInvocationCaptureWriteEventBit;
+constexpr uint8_t kGuestInvocationCaptureAllEvents =
+    kGuestInvocationCaptureRootEvent | kGuestInvocationCaptureOwnerEvent |
+    kGuestInvocationCaptureWriteEvent;
 
 enum class GuestInvocationCaptureState : uint8_t {
   kRecording,
@@ -56,6 +70,18 @@ struct GuestInvocationCaptureStatus {
 class GuestInvocationCaptureEventSink {
  public:
   virtual ~GuestInvocationCaptureEventSink() = default;
+
+  // Translation uses the selected root to keep only its discovery entry hook
+  // live while no invocation is recording. A zero root conservatively treats
+  // every function entry as a possible root for generic test sinks.
+  virtual uint32_t root_address() const { return 0; }
+  virtual uint8_t initial_event_mask() const {
+    return kGuestInvocationCaptureAllEvents;
+  }
+  virtual uint8_t event_mask(
+      const ppc::GuestInvocationRecorderIdentity& identity) const {
+    return initial_event_mask();
+  }
 
   virtual bool Poll() = 0;
   virtual bool OnFunctionDependency(uint32_t source_address,
@@ -138,6 +164,11 @@ class GuestInvocationCaptureCoordinator final
   bool OnAsyncReentry(
       const ppc::GuestInvocationRecorderIdentity& identity) override;
 
+  uint32_t root_address() const override { return root_address_; }
+  uint8_t initial_event_mask() const override;
+  uint8_t event_mask(
+      const ppc::GuestInvocationRecorderIdentity& identity) const override;
+
   // Prevents any later callback or publication. An incomplete capture becomes
   // a deterministic terminal result instead of being mistaken for success.
   void Stop();
@@ -146,11 +177,18 @@ class GuestInvocationCaptureCoordinator final
  private:
   GuestInvocationCaptureCoordinator(
       uint64_t segment_ordinal, uint64_t capture_start_tick,
+      uint32_t root_address,
       std::unique_ptr<ppc::GuestInvocationRecorder> recorder,
       const ppc::GuestInvocationRecorderClock& clock,
       SegmentHandler segment_handler);
 
   bool FinishCallbackLocked(bool callback_succeeded);
+  bool FinishIdentityCallbackLocked(
+      bool callback_succeeded,
+      const ppc::GuestInvocationRecorderIdentity& identity);
+  void RefreshActiveIdentityLocked(
+      const ppc::GuestInvocationRecorderIdentity* identity);
+  void ClearFastStateLocked();
   bool IsTerminalLocked() const;
 
   // Recursive so a host callback that reenters capture reaches the recorder's
@@ -164,6 +202,12 @@ class GuestInvocationCaptureCoordinator final
   SegmentHandler segment_handler_;
   GuestInvocationCaptureState state_ = GuestInvocationCaptureState::kRecording;
   std::string message_;
+  uint32_t root_address_ = 0;
+  std::atomic<uint8_t> common_event_mask_{kGuestInvocationCaptureRootEvent |
+                                          kGuestInvocationCaptureWriteEvent};
+  std::atomic<uint64_t> active_context_id_{0};
+  std::atomic<uint64_t> active_thread_id_{0};
+  std::atomic<bool> active_identity_{false};
 };
 
 }  // namespace cpu

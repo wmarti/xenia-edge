@@ -244,6 +244,36 @@ TEST_CASE("guest invocation capture publishes one ordered segment",
   REQUIRE(handler_count == 1);
 }
 
+TEST_CASE("guest invocation capture publishes a narrow event mask",
+          "[guest-invocation-capture]") {
+  FakePageReader reader;
+  FakeClock clock;
+  std::unique_ptr<GuestInvocationCaptureCoordinator> coordinator =
+      MakeCoordinator(reader, clock,
+                      [](uint64_t, uint64_t, uint64_t,
+                         const ppc::GuestInvocationRecorderResult&,
+                         std::string*) { return true; });
+
+  constexpr uint8_t kIdleMask =
+      kGuestInvocationCaptureRootEvent | kGuestInvocationCaptureWriteEvent;
+  constexpr ppc::GuestInvocationRecorderIdentity kOther = {0x3333, 0x4444};
+  REQUIRE(coordinator->root_address() == kRootAddress);
+  REQUIRE(coordinator->initial_event_mask() == kIdleMask);
+  REQUIRE(coordinator->event_mask(kOwner) == kIdleMask);
+
+  REQUIRE(coordinator->OnFunctionEntry(kOwner, kRootAddress, kRootEndAddress,
+                                       MakeState(10)));
+  REQUIRE(coordinator->event_mask(kOwner) == kGuestInvocationCaptureAllEvents);
+  REQUIRE(coordinator->event_mask(kOther) == kIdleMask);
+  REQUIRE(coordinator->OnFunctionExit(kOwner, kRootAddress, kReturnAddress,
+                                      MakeState(11)));
+  REQUIRE(coordinator->event_mask(kOwner) == kIdleMask);
+
+  coordinator->Stop();
+  REQUIRE(coordinator->event_mask(kOwner) == 0);
+  REQUIRE(coordinator->event_mask(kOther) == 0);
+}
+
 TEST_CASE("guest invocation capture fails closed on publication failure",
           "[guest-invocation-capture]") {
   FakePageReader reader;

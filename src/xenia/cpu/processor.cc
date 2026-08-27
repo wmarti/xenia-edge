@@ -172,6 +172,36 @@ class BuiltinModule : public Module {
 Processor::Processor(xe::Memory* memory, ExportResolver* export_resolver)
     : memory_(memory), export_resolver_(export_resolver) {}
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+void Processor::set_guest_invocation_capture_sink(
+    GuestInvocationCaptureEventSink* sink) {
+  const uint32_t root_address = sink ? sink->root_address() : 0;
+  const uint8_t initial_event_mask = sink ? sink->initial_event_mask() : 0;
+  std::lock_guard<std::mutex> lock(guest_execution_capture_thread_state_mutex_);
+  if (sink) {
+    guest_invocation_capture_sink_ = sink;
+    guest_invocation_capture_root_address_ = root_address;
+    guest_invocation_capture_initial_event_mask_.store(
+        initial_event_mask, std::memory_order_release);
+  } else {
+    guest_invocation_capture_initial_event_mask_.store(
+        0, std::memory_order_release);
+  }
+  for (ThreadState* thread_state = guest_execution_capture_thread_state_head_;
+       thread_state;
+       thread_state = thread_state->guest_execution_capture_next_) {
+    std::atomic_ref<uint8_t>(
+        thread_state->context()->guest_invocation_capture_event_mask)
+        .store(initial_event_mask, std::memory_order_release);
+  }
+  if (!sink) {
+    guest_invocation_capture_root_address_ = 0;
+    guest_invocation_capture_sink_ = nullptr;
+  }
+}
+#endif
+
 Processor::~Processor() {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE

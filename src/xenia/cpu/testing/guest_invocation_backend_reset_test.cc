@@ -188,6 +188,7 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     context->capture_rendezvous_requested = 1;
+    context->guest_invocation_capture_event_mask = 0xFF;
 #endif
     context->scratch = 0x99999999AAAAAAAAull;
     context->last_safepoint_pc = 0xBBBBBBBBu;
@@ -212,6 +213,7 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     REQUIRE(context->capture_rendezvous_requested == 0);
+    REQUIRE(context->guest_invocation_capture_event_mask == 0);
 #endif
     REQUIRE(context->scratch == 0);
     REQUIRE(context->last_safepoint_pc == 0);
@@ -295,6 +297,7 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     context->capture_rendezvous_requested = 1;
+    context->guest_invocation_capture_event_mask = 0xFF;
 #endif
     context->scratch = 0x99999999AAAAAAAAull;
     context->last_safepoint_pc = 0xBBBBBBBBu;
@@ -318,6 +321,7 @@ TEST_CASE("GUEST_INVOCATION_BACKEND_RESET", "[backend][replay]") {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     REQUIRE(context->capture_rendezvous_requested == 0);
+    REQUIRE(context->guest_invocation_capture_event_mask == 0);
 #endif
     REQUIRE(context->scratch == 0);
     REQUIRE(context->last_safepoint_pc == 0);

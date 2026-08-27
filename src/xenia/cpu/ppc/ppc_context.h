@@ -386,6 +386,11 @@ typedef struct alignas(64) PPCContext_s {
   // through a locked ThreadState visit, and the next JIT safepoint consumes it
   // before entering the permanent capture observer.
   uint8_t capture_rendezvous_requested;
+
+  // Inline capture hooks test this before crossing into the host. Root and
+  // write observation remain enabled while a session is discovering an
+  // invocation; owner-only events are enabled only during an attempt.
+  uint8_t guest_invocation_capture_event_mask;
 #endif
 
   // Most frequently used registers first.
