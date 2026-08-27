@@ -16,6 +16,7 @@
 
 #include "third_party/catch/include/catch.hpp"
 #include "xenia/kernel/guest_scheduler_checkpoint.h"
+#include "xenia/kernel/xthread.h"
 
 namespace xe {
 namespace kernel {
@@ -382,6 +383,55 @@ TEST_CASE("Scheduler checkpoint preserves a terminal cancellation diagnostic",
   REQUIRE(replayed_snapshot.roster_scope == RosterScope::kSchedulerOwned);
   REQUIRE(replayed_snapshot.release_policy ==
           ReleasePolicy::kRunningSafepointsRequeueAtHead);
+}
+
+TEST_CASE("Scheduler checkpoint route accepts only exact PPC block heads",
+          "[guest_scheduler_checkpoint]") {
+  XThread::SchedulerLinks links;
+  links.has_run = true;
+
+  REQUIRE(links.SetCheckpointJitSafepoint(4));
+  REQUIRE(links.RestorableCheckpointJitSafepointPc(ParticipantState::kReady) ==
+          4);
+  REQUIRE(links.RestorableCheckpointJitSafepointPc(
+              ParticipantState::kSuspended) == 4);
+  REQUIRE(links.RestorableCheckpointJitSafepointPc(
+              ParticipantState::kRunning) == 0);
+  REQUIRE(links.RestorableCheckpointJitSafepointPc(
+              ParticipantState::kBlocked) == 0);
+
+  REQUIRE(links.SetCheckpointJitSafepoint(0xFFFFFFFCull));
+  REQUIRE(links.RestorableCheckpointJitSafepointPc(ParticipantState::kReady) ==
+          0xFFFFFFFCu);
+
+  for (uint64_t invalid_pc :
+       {uint64_t{0}, uint64_t{1}, uint64_t{2}, uint64_t{3},
+        uint64_t{0x82001002}, uint64_t{0x100000000}}) {
+    REQUIRE(links.SetCheckpointJitSafepoint(0x82001000));
+    REQUIRE_FALSE(links.SetCheckpointJitSafepoint(invalid_pc));
+    REQUIRE(links.RestorableCheckpointJitSafepointPc(
+                ParticipantState::kReady) == 0);
+  }
+}
+
+TEST_CASE("Scheduler checkpoint route clears and never claims unrun fibers",
+          "[guest_scheduler_checkpoint]") {
+  XThread::SchedulerLinks links;
+  REQUIRE(links.SetCheckpointJitSafepoint(0x82001000));
+
+  REQUIRE(links.RestorableCheckpointJitSafepointPc(ParticipantState::kReady) ==
+          0);
+  links.has_run = true;
+  REQUIRE(links.RestorableCheckpointJitSafepointPc(ParticipantState::kReady) ==
+          0x82001000);
+
+  // Dispatch, export/host yields, waits, exit and termination all use this
+  // same fail-closed transition before changing scheduler ownership.
+  links.ClearCheckpointResumeRoute();
+  REQUIRE(links.RestorableCheckpointJitSafepointPc(ParticipantState::kReady) ==
+          0);
+  REQUIRE(links.RestorableCheckpointJitSafepointPc(
+              ParticipantState::kSuspended) == 0);
 }
 
 }  // namespace testing

@@ -90,8 +90,11 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   auto* scheduler = self->kernel_state()->guest_scheduler();
-  if (scheduler->TryCheckpointCurrentFiber(
-          self, static_cast<uint32_t>(guest_address))) {
+  const uint32_t exact_guest_pc =
+      guest_address && !(guest_address >> 32) && !(guest_address & 3)
+          ? static_cast<uint32_t>(guest_address)
+          : 0;
+  if (scheduler->TryCheckpointCurrentFiber(self, exact_guest_pc)) {
     return;
   }
 #endif
@@ -173,7 +176,13 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
   links.capture_declined_safepoints = 0;
 #endif
   self->kernel_state()->guest_scheduler()->YieldCurrentThread(true,
-                                                              forced_at_irql);
+                                                              forced_at_irql
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+                                                              ,
+                                                              guest_address
+#endif
+  );
 }
 
 // Raw host ticks per us for the watchdog's deadline math, 0 if unusable.
@@ -240,13 +249,20 @@ void GuestScheduler::AppendCheckpointListLocked(
     participant.thread_id = thread->thread_id();
     participant.cpu = static_cast<int8_t>(thread->scheduler_links().cpu);
     participant.state = state;
-    if (!thread->scheduler_links().has_run) {
+    const auto& links = thread->scheduler_links();
+    if (!links.has_run) {
       participant.resume_kind = GuestSchedulerCheckpointResumeKind::kNotYetRun;
     } else if (state == GuestSchedulerCheckpointParticipantState::kBlocked) {
       participant.guest_pc =
           static_cast<uint32_t>(thread->thread_state()->context()->lr);
       participant.resume_kind =
           GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+    } else if (uint32_t guest_pc =
+                   links.RestorableCheckpointJitSafepointPc(state)) {
+      participant.guest_pc = guest_pc;
+      participant.resume_kind =
+          GuestSchedulerCheckpointResumeKind::kJitSafepoint;
+      participant.restorable = true;
     } else {
       participant.resume_kind =
           GuestSchedulerCheckpointResumeKind::kNativeContinuation;
@@ -496,9 +512,15 @@ bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
                                                guest_pc)) {
       return true;
     }
+    if (!thread->scheduler_links().SetCheckpointJitSafepoint(guest_pc)) {
+      checkpoint_barrier_.Reject(
+          GuestSchedulerCheckpointBarrierRejection::kInvalidGuestPc);
+      return true;
+    }
     const uint64_t generation = checkpoint_barrier_.snapshot().generation;
     auto& held = checkpoint_held_[cpu_index];
     if (!held.state.Arrive(generation)) {
+      thread->scheduler_links().ClearCheckpointResumeRoute();
       checkpoint_barrier_.Reject(
           GuestSchedulerCheckpointBarrierRejection::kUnexpectedSafepoint);
       return true;
@@ -678,6 +700,10 @@ void GuestScheduler::Shutdown() {
       for (XThread* t = head; t;) {
         auto& links = t->scheduler_links();
         XThread* next = links.ready_next;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+        links.ClearCheckpointResumeRoute();
+#endif
         links.queued = false;
         links.blocked = false;
         links.suspended = false;
@@ -730,7 +756,14 @@ void GuestScheduler::Shutdown() {
 }
 
 void GuestScheduler::EnqueueReady(XThread* thread, int cpu_index,
-                                  bool yield_to_other) {
+                                  bool yield_to_other
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+                                  ,
+                                  ReadyCheckpointRoute checkpoint_route,
+                                  uint64_t jit_safepoint_guest_address
+#endif
+) {
   {
     std::lock_guard<std::mutex> lock(lock_);
     auto& links = thread->scheduler_links();
@@ -751,6 +784,16 @@ void GuestScheduler::EnqueueReady(XThread* thread, int cpu_index,
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     RejectCheckpointTopologyChangeLocked();
+    switch (checkpoint_route) {
+      case ReadyCheckpointRoute::kClear:
+        links.ClearCheckpointResumeRoute();
+        break;
+      case ReadyCheckpointRoute::kPreserve:
+        break;
+      case ReadyCheckpointRoute::kJitSafepoint:
+        links.SetCheckpointJitSafepoint(jit_safepoint_guest_address);
+        break;
+    }
 #endif
     links.queued = true;
     links.cpu = cpu_index;
@@ -789,6 +832,10 @@ void GuestScheduler::MarkReady(XThread* thread) {
 
 void GuestScheduler::ResumeThread(XThread* thread) {
   assert_not_null(thread);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  bool preserve_checkpoint_route = false;
+#endif
   {
     std::lock_guard<std::mutex> lock(lock_);
     auto& links = thread->scheduler_links();
@@ -806,10 +853,24 @@ void GuestScheduler::ResumeThread(XThread* thread) {
 #endif
       links.suspended = false;
       links.ready_next = nullptr;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      preserve_checkpoint_route = true;
+#endif
     }
   }
-  // Only enqueues if it was never queued, e.g. created suspended.
+  // Only enqueues if it was never queued, e.g. created suspended. Resuming a
+  // parked exact-PC fiber does not alter its architectural PPC state.
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (preserve_checkpoint_route) {
+    EnqueueReady(thread, CpuOf(thread), false, ReadyCheckpointRoute::kPreserve);
+  } else {
+    MarkReady(thread);
+  }
+#else
   MarkReady(thread);
+#endif
 }
 
 bool GuestScheduler::ParkSuspended(XThread* thread, int cpu_index) {
@@ -1027,6 +1088,10 @@ bool GuestScheduler::ForgetThread(XThread* thread) {
   }
 #endif
   auto& links = thread->scheduler_links();
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  links.ClearCheckpointResumeRoute();
+#endif
   // A thread that ever ran has a live fiber stack and one a dispatch thread
   // owns is about to be switched to, so neither may be freed.
   const bool reclaimable = !links.has_run && !links.running;
@@ -1078,6 +1143,10 @@ bool GuestScheduler::TerminateThread(XThread* thread) {
     RejectCheckpointTopologyChangeLocked();
 #endif
     auto& links = thread->scheduler_links();
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    links.ClearCheckpointResumeRoute();
+#endif
     links.terminate_pending.store(true, std::memory_order_relaxed);
     if (stopped_.load() || !started_.load()) {
       // No dispatcher will ever run it again, detach it and let the caller
@@ -1199,6 +1268,9 @@ void GuestScheduler::SwitchTo(XThread* next) {
       XELOGI("GuestScheduler: first run tid={:08X} '{}'", next->thread_id(),
              next->thread_name());
     }
+    // From this point the native fiber may execute. Its parked block-head
+    // route is no longer durable even before the actual context switch.
+    links.ClearCheckpointResumeRoute();
 #endif
     cpus_[t_current_cpu].switch_seq.fetch_add(1, std::memory_order_relaxed);
     cpus_[t_current_cpu].current_thread = next;
@@ -1363,7 +1435,13 @@ void GuestScheduler::ExitIfTerminated() {
   YieldToScheduler();  // never returns
 }
 
-bool GuestScheduler::YieldCurrentThread(bool quantum_end, bool to_lower) {
+bool GuestScheduler::YieldCurrentThread(bool quantum_end, bool to_lower
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+                                        ,
+                                        uint64_t jit_safepoint_guest_address
+#endif
+) {
   if (!OnDispatchThread("YieldCurrentThread")) {
     return false;
   }
@@ -1393,7 +1471,15 @@ bool GuestScheduler::YieldCurrentThread(bool quantum_end, bool to_lower) {
 #endif
   // Re-queue on the current CPU, not the affinity CPU, because our context is
   // not saved until the yield below and another CPU must not grab it yet.
-  EnqueueReady(self, t_current_cpu, to_lower);
+  EnqueueReady(self, t_current_cpu, to_lower
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+               ,
+               jit_safepoint_guest_address ? ReadyCheckpointRoute::kJitSafepoint
+                                           : ReadyCheckpointRoute::kClear,
+               jit_safepoint_guest_address
+#endif
+  );
   YieldToScheduler();
   // Terminated while queued.
   ExitIfTerminated();
@@ -1653,6 +1739,7 @@ void GuestScheduler::NotifyThreadExited(XThread* thread) {
   {
     std::lock_guard<std::mutex> lock(lock_);
     RejectCheckpointTopologyChangeLocked();
+    thread->scheduler_links().ClearCheckpointResumeRoute();
     cpus_[t_current_cpu].exited_thread = thread;
   }
 #else
@@ -1732,6 +1819,10 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
       }
     }
     auto& links = self->scheduler_links();
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    links.ClearCheckpointResumeRoute();
+#endif
     // Park self (running, in no list) on this CPU's blocked list.
     links.blocked = true;
     links.preempted = false;
@@ -1859,6 +1950,10 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
       }
       links.blocked = false;
       links.queued = true;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      links.ClearCheckpointResumeRoute();
+#endif
       stats_.rereadied.fetch_add(1, std::memory_order_relaxed);
       // Its current guest CPU, not the one it blocked on, since
       // KeSetAffinityThread may have moved it while blocked.

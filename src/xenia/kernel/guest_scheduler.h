@@ -133,7 +133,13 @@ class GuestScheduler {
   // NtYieldExecution, and preemption passes false to keep strict priority.
   // Returns true if another fiber ran on this CPU during the yield, so
   // NtYieldExecution can report NO_YIELD_PERFORMED like NT.
-  bool YieldCurrentThread(bool quantum_end, bool to_lower = true);
+  bool YieldCurrentThread(bool quantum_end, bool to_lower = true
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+                          ,
+                          uint64_t jit_safepoint_guest_address = 0
+#endif
+  );
 
   // Parks the running guest fiber on its CPU's blocked list and yields. Returns
   // once the dispatcher re-readies it so the wait can re-poll. A single-object
@@ -284,9 +290,25 @@ class GuestScheduler {
   // The dispatch thread a thread is pinned to by its guest current_cpu.
   int CpuOf(XThread* thread) const;
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  enum class ReadyCheckpointRoute : uint8_t {
+    kClear,
+    kPreserve,
+    kJitSafepoint,
+  };
+#endif
+
   // |yield_to_other| marks the thread as that CPU's yielder as it is linked.
-  void EnqueueReady(XThread* thread, int cpu_index,
-                    bool yield_to_other = false);
+  void EnqueueReady(
+      XThread* thread, int cpu_index, bool yield_to_other = false
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+      ,
+      ReadyCheckpointRoute checkpoint_route = ReadyCheckpointRoute::kClear,
+      uint64_t jit_safepoint_guest_address = 0
+#endif
+  );
   XThread* DequeueReady(int cpu_index);
   // Highest-priority ready thread on |cpu| other than |except|, or null if
   // |except| is the only ready thread. Used to honor a voluntary yield.

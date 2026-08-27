@@ -45,7 +45,9 @@ struct GuestSchedulerCheckpointRuntimeInspection {
   int cpu = -1;
   bool found = false;
   bool queued = false;
+  bool suspended = false;
   bool running = false;
+  uint32_t checkpoint_jit_safepoint_pc = 0;
 };
 
 class GuestSchedulerCheckpointRuntimeTestAccess final {
@@ -86,9 +88,26 @@ class GuestSchedulerCheckpointRuntimeTestAccess final {
       result.cpu = cpu;
       result.found = true;
       result.queued = thread->scheduler_links().queued;
+      result.suspended = thread->scheduler_links().suspended;
       result.running = thread->scheduler_links().running;
+      result.checkpoint_jit_safepoint_pc =
+          thread->scheduler_links().checkpoint_jit_safepoint_pc;
       break;
     }
+    return result;
+  }
+
+  static GuestSchedulerCheckpointRuntimeInspection InspectThread(
+      GuestScheduler& scheduler, XThread* thread) {
+    GuestSchedulerCheckpointRuntimeInspection result;
+    std::lock_guard<std::mutex> lock(scheduler.lock_);
+    result.found = true;
+    result.cpu = thread->scheduler_links().cpu;
+    result.queued = thread->scheduler_links().queued;
+    result.suspended = thread->scheduler_links().suspended;
+    result.running = thread->scheduler_links().running;
+    result.checkpoint_jit_safepoint_pc =
+        thread->scheduler_links().checkpoint_jit_safepoint_pc;
     return result;
   }
 
@@ -323,7 +342,8 @@ struct CreatedThread {
 
 CreatedThread CreateRuntimeThread(SchedulerEnvironment& environment,
                                   FiberControl& control,
-                                  uint32_t creation_flags) {
+                                  uint32_t creation_flags,
+                                  int32_t priority = -1) {
   CreatedThread result;
   if (!environment.ready()) {
     return result;
@@ -332,6 +352,9 @@ CreatedThread CreateRuntimeThread(SchedulerEnvironment& environment,
       object_ref<CheckpointRuntimeThread>(new CheckpointRuntimeThread(
           environment.emulator()->kernel_state(), &control, creation_flags));
   result.thread->set_name("Checkpoint runtime test");
+  if (priority >= 0) {
+    result.thread->SetPriority(priority);
+  }
   result.status = result.thread->Create();
   return result;
 }
@@ -360,12 +383,37 @@ PauseResult Pause(GuestScheduler& scheduler,
   return result;
 }
 
+bool WaitUntilSuspended(GuestScheduler& scheduler, XThread* thread,
+                        std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(scheduler,
+                                                                 thread)
+            .suspended) {
+      return true;
+    }
+    std::this_thread::yield();
+  }
+  return false;
+}
+
 bool ContainsThread(const GuestSchedulerCheckpointBarrierSnapshot& snapshot,
                     uint32_t thread_id) {
   return std::any_of(snapshot.participants.begin(), snapshot.participants.end(),
                      [thread_id](const auto& participant) {
                        return participant.thread_id == thread_id;
                      });
+}
+
+const GuestSchedulerCheckpointParticipant* FindThread(
+    const GuestSchedulerCheckpointBarrierSnapshot& snapshot,
+    uint32_t thread_id) {
+  auto it =
+      std::find_if(snapshot.participants.begin(), snapshot.participants.end(),
+                   [thread_id](const auto& participant) {
+                     return participant.thread_id == thread_id;
+                   });
+  return it == snapshot.participants.end() ? nullptr : &*it;
 }
 
 bool RegistryContainsThread(
@@ -726,6 +774,94 @@ TEST_CASE("Guest scheduler checkpoint roster and release contract are explicit",
   REQUIRE(result.suspended_started_after_resume);
   REQUIRE(result.running_stopped);
   REQUIRE(result.suspended_stopped);
+}
+
+TEST_CASE("Guest scheduler checkpoint preserves an exact ready JIT route",
+          "[guest_scheduler_checkpoint][runtime]") {
+  FiberControl ready_control;
+  FiberControl higher_priority_control;
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+
+  CreatedThread ready =
+      CreateRuntimeThread(environment, ready_control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(ready.status));
+  REQUIRE(ready_control.WaitForStart(2s));
+
+  CreatedThread higher_priority = CreateRuntimeThread(
+      environment, higher_priority_control, kCpu0CreationFlags, 31);
+  REQUIRE(XSUCCEEDED(higher_priority.status));
+  REQUIRE(higher_priority_control.WaitForStart(2s));
+
+  const auto parked = GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(
+      scheduler, ready.thread.get());
+  REQUIRE(parked.queued);
+  REQUIRE_FALSE(parked.running);
+  REQUIRE(parked.checkpoint_jit_safepoint_pc == kSafepointPc);
+
+  GuestSchedulerCheckpointBarrierSnapshot snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
+          Rejection::kNone);
+  const auto* participant = FindThread(snapshot, ready.thread->thread_id());
+  REQUIRE(participant);
+  REQUIRE(participant->state ==
+          GuestSchedulerCheckpointParticipantState::kReady);
+  REQUIRE(participant->guest_pc == kSafepointPc);
+  REQUIRE(participant->resume_kind == ResumeKind::kJitSafepoint);
+  REQUIRE(participant->restorable);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              snapshot.generation, nullptr) == Rejection::kNone);
+
+  REQUIRE(StopRuntimeThread(higher_priority, higher_priority_control));
+  REQUIRE(ready_control.WaitForSafepointReturn(2s));
+  REQUIRE(GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(
+              scheduler, ready.thread.get())
+              .checkpoint_jit_safepoint_pc == 0);
+  REQUIRE(StopRuntimeThread(ready, ready_control));
+}
+
+TEST_CASE("Guest scheduler checkpoint preserves an exact suspended JIT route",
+          "[guest_scheduler_checkpoint][runtime]") {
+  FiberControl control;
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+
+  CreatedThread suspended =
+      CreateRuntimeThread(environment, control, kCpu0CreationFlags);
+  REQUIRE(XSUCCEEDED(suspended.status));
+  REQUIRE(control.WaitForStart(2s));
+  REQUIRE(XSUCCEEDED(suspended.thread->Suspend()));
+  suspended.thread->thread_state()->context()->preempt_requested = 1;
+  REQUIRE(WaitUntilSuspended(scheduler, suspended.thread.get(), 2s));
+
+  const auto parked = GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(
+      scheduler, suspended.thread.get());
+  REQUIRE_FALSE(parked.queued);
+  REQUIRE(parked.suspended);
+  REQUIRE_FALSE(parked.running);
+  REQUIRE(parked.checkpoint_jit_safepoint_pc == kSafepointPc);
+
+  GuestSchedulerCheckpointBarrierSnapshot snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
+          Rejection::kNone);
+  const auto* participant = FindThread(snapshot, suspended.thread->thread_id());
+  REQUIRE(participant);
+  REQUIRE(participant->state ==
+          GuestSchedulerCheckpointParticipantState::kSuspended);
+  REQUIRE(participant->guest_pc == kSafepointPc);
+  REQUIRE(participant->resume_kind == ResumeKind::kJitSafepoint);
+  REQUIRE(participant->restorable);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              snapshot.generation, nullptr) == Rejection::kNone);
+
+  REQUIRE(XSUCCEEDED(suspended.thread->Resume()));
+  REQUIRE(control.WaitForSafepointReturn(2s));
+  REQUIRE(GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(
+              scheduler, suspended.thread.get())
+              .checkpoint_jit_safepoint_pc == 0);
+  REQUIRE(StopRuntimeThread(suspended, control));
 }
 
 }  // namespace testing

@@ -26,6 +26,10 @@
 #include "xenia/base/threading.h"
 #include "xenia/cpu/thread.h"
 #include "xenia/cpu/thread_state.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/kernel/guest_scheduler_checkpoint.h"
+#endif
 #include "xenia/kernel/util/native_list.h"
 #include "xenia/kernel/util/xfiletime.h"
 #include "xenia/kernel/xmutant.h"
@@ -634,6 +638,33 @@ class XThread : public XObject, public cpu::Thread {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     // Safepoints declined since the last terminal capture safepoint event.
     uint32_t capture_declined_safepoints = 0;
+
+    // Durable exact-PC metadata exists only while this fiber is parked before
+    // a JIT block head. The owning function extent is separate checkpoint
+    // binding metadata; native stacks are deliberately not checkpoint state.
+    uint32_t checkpoint_jit_safepoint_pc = 0;
+
+    bool SetCheckpointJitSafepoint(uint64_t guest_pc) {
+      checkpoint_jit_safepoint_pc = 0;
+      if (!guest_pc || (guest_pc >> 32) || (guest_pc & 3)) {
+        return false;
+      }
+      checkpoint_jit_safepoint_pc = static_cast<uint32_t>(guest_pc);
+      return true;
+    }
+
+    void ClearCheckpointResumeRoute() { checkpoint_jit_safepoint_pc = 0; }
+
+    uint32_t RestorableCheckpointJitSafepointPc(
+        GuestSchedulerCheckpointParticipantState state) const {
+      if (!has_run ||
+          (state != GuestSchedulerCheckpointParticipantState::kReady &&
+           state != GuestSchedulerCheckpointParticipantState::kSuspended) ||
+          !checkpoint_jit_safepoint_pc || (checkpoint_jit_safepoint_pc & 3)) {
+        return 0;
+      }
+      return checkpoint_jit_safepoint_pc;
+    }
 #endif
   };
   SchedulerLinks& scheduler_links() { return scheduler_links_; }
