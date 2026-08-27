@@ -32,6 +32,8 @@ constexpr uint32_t kReservedPage = 0x00020000u;
 constexpr uint32_t kNoAccessPage = 0x00030000u;
 constexpr uint32_t kDecommittedPage = 0x00040000u;
 constexpr uint32_t kFreePage = 0x00050000u;
+constexpr uint32_t kHostReadableUntrackedPage = 0x80100000u;
+constexpr uint32_t kTrackedAliasPage = 0x90100000u;
 
 void AllocatePage(Memory& memory, uint32_t address, uint32_t allocation_type,
                   uint32_t protect) {
@@ -68,6 +70,23 @@ TEST_CASE("guest invocation capture page reader fails closed",
               ->Protect(kReadablePage, 4096, kMemoryProtectRead));
   REQUIRE(reader.ReadPage(kReadablePage, &output));
   REQUIRE(output == expected);
+
+  HeapAllocationInfo untracked_info = {};
+  REQUIRE(memory.LookupHeap(kHostReadableUntrackedPage)
+              ->QueryRegionInfo(kHostReadableUntrackedPage, &untracked_info));
+  REQUIRE(untracked_info.state == 0);
+  REQUIRE(untracked_info.protect == 0);
+  AllocatePage(memory, kTrackedAliasPage,
+               kMemoryAllocationReserve | kMemoryAllocationCommit,
+               kMemoryProtectRead | kMemoryProtectWrite);
+  std::memcpy(memory.TranslateVirtual(kTrackedAliasPage), expected.data(),
+              expected.size());
+  REQUIRE(memory.LookupHeap(kTrackedAliasPage)
+              ->Protect(kTrackedAliasPage, 4096, kMemoryProtectRead));
+  REQUIRE(reader.ReadPage(kHostReadableUntrackedPage, &output));
+  REQUIRE(output == expected);
+  REQUIRE(memory.LookupHeap(kTrackedAliasPage)->Release(kTrackedAliasPage));
+  REQUIRE_FALSE(reader.ReadPage(kHostReadableUntrackedPage, &output));
 
   // A reservation may retain a readable page-table protection while lacking
   // commitment. The reader must validate both attributes.

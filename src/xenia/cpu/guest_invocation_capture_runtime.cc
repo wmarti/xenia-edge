@@ -25,6 +25,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/string.h"
 #include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/function.h"
@@ -138,13 +139,43 @@ bool GuestInvocationCapturePageReader::ReadPage(
   // query and memcpy.
   auto global_lock = xe::global_critical_region::AcquireDirect();
   HeapAllocationInfo allocation_info = {};
-  if (!first_heap->QueryRegionInfo(page_address, &allocation_info) ||
-      !(allocation_info.state & kMemoryAllocationCommit) ||
-      !(allocation_info.protect & kMemoryProtectRead)) {
+  if (!first_heap->QueryRegionInfo(page_address, &allocation_info)) {
     return false;
   }
 
   const void* const translated_page = memory_.TranslateVirtual(page_address);
+  if (allocation_info.state || allocation_info.protect) {
+    if (!(allocation_info.state & kMemoryAllocationCommit) ||
+        !(allocation_info.protect & kMemoryProtectRead)) {
+      return false;
+    }
+  } else {
+    constexpr uint32_t kFirstReplayCodePage = 0x80040000u;
+    constexpr uint32_t kLastReplayCodePage = 0x9FFFE000u;
+    if (page_address < kFirstReplayCodePage ||
+        page_address > kLastReplayCodePage) {
+      return false;
+    }
+    const uint32_t alias_address = page_address ^ 0x10000000u;
+    BaseHeap* const alias_heap = memory_.LookupHeap(alias_address);
+    HeapAllocationInfo alias_info = {};
+    if (!alias_heap || alias_heap == first_heap ||
+        memory_.LookupHeap(alias_address + JitCorpus::kPageSize - 1) !=
+            alias_heap ||
+        !alias_heap->QueryRegionInfo(alias_address, &alias_info) ||
+        !(alias_info.state & kMemoryAllocationCommit) ||
+        !(alias_info.protect & kMemoryProtectRead)) {
+      return false;
+    }
+    size_t readable_length = 0;
+    xe::memory::PageAccess host_access = xe::memory::PageAccess::kNoAccess;
+    if (!xe::memory::QueryProtect(const_cast<void*>(translated_page),
+                                  readable_length, host_access) ||
+        readable_length < JitCorpus::kPageSize ||
+        host_access == xe::memory::PageAccess::kNoAccess) {
+      return false;
+    }
+  }
   std::memcpy(output->data(), translated_page, output->size());
   return true;
 }
