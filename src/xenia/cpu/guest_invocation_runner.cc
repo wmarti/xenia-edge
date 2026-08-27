@@ -463,6 +463,19 @@ const backend::Backend& GuestInvocationRunner::backend() const {
   return *processor_->backend();
 }
 
+uint32_t GuestInvocationRunner::warmed_root_host_code_size() const {
+  if (!warmed_ || !root_function_) {
+    return 0;
+  }
+  const GuestFunction* guest_function =
+      dynamic_cast<const GuestFunction*>(root_function_);
+  if (!guest_function || guest_function->machine_code_length() >
+                             std::numeric_limits<uint32_t>::max()) {
+    return 0;
+  }
+  return static_cast<uint32_t>(guest_function->machine_code_length());
+}
+
 bool GuestInvocationRunner::Initialize(
     std::unique_ptr<backend::Backend> backend, std::string* error) {
   memory_ = std::make_unique<Memory>();

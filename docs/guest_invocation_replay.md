@@ -225,6 +225,45 @@ focused Python test mocks signaled and markerless child results; it proves the
 driver's rejection logic, not the real JIT fault path or operating-system
 containment by itself.
 
+The Release `xenia-cpu-ppc-tests` binary creates the copyright-free inputs for
+that linked gate with one explicit test-only option:
+
+```text
+xenia-cpu-ppc-tests \
+  --cpu=a64 \
+  --guest_invocation_synthetic_fixture_out=/new/explicit/output/directory \
+  --test_benchmark_warmed=false \
+  --guest_scheduler=false \
+  --jit_corpus_allow_incomplete=false \
+  --count_call_paths=false \
+  --count_physical_remap_hits=false \
+  --emit_mmio_aware_stores_for_recorded_exception_addresses=false \
+  --enable_early_precompilation=false \
+  --fold_readonly_guest_memory_loads=false \
+  --inline_mmio_access=false \
+  --serialize_guest_function_definitions=true \
+  --trace_function_coverage=false \
+  --cpu_trace_mask=0
+```
+
+The directory must not already exist. Generation initializes the real backend,
+captures and validates its canonical replay configuration, warms and verifies a
+four-instruction `lwz/addi/stw/blr` function, records the backend's actual host
+code size and hashes the exact running executable. It then publishes one exact
+corpus, a valid single-invocation artifact, omitted-page and `0x7F` fault
+artifacts, and `manifest.json` together by renaming a sibling staging directory.
+Every artifact is encoded, decoded, written, reread, rehashed and decoded again
+before publication.
+
+The manifest contains the complete effective configuration, configuration,
+corpus, artifact and capture-executable hashes, the corpus shape, and the exact
+reset-page and reset-byte expectations. The valid artifact must emit the one
+canonical 15-field benchmark marker. Each fault artifact must be launched as a
+disposable child; a signal, rejection or other nonzero exit with no accepted
+marker is the expected containment result. These fixtures contain only bytes
+constructed by the test generator and must never be replaced with or committed
+alongside title-derived bytes.
+
 Before each timed invocation, replay restores the full architectural input
 state and copies only pages whose accepted final bytes differ from their input
 bytes, plus any additional pages required by the host reset granularity. Reset

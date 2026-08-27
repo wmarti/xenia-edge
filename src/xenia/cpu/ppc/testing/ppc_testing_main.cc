@@ -15,6 +15,7 @@
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/string_buffer.h"
 #include "xenia/cpu/backend/code_cache.h"
@@ -24,6 +25,7 @@
 #include "xenia/cpu/guest_invocation_replay_cli.h"
 #include "xenia/cpu/guest_invocation_replay_config.h"
 #include "xenia/cpu/guest_invocation_runner.h"
+#include "xenia/cpu/guest_invocation_synthetic_fixture.h"
 #include "xenia/cpu/jit_corpus.h"
 
 DECLARE_bool(guest_scheduler);
@@ -35,6 +37,7 @@ DECLARE_bool(guest_scheduler);
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <string_view>
 #include <unordered_set>
 
@@ -82,6 +85,11 @@ DEFINE_uint64(guest_invocation_iterations, 0,
               "Fixed number of reset-plus-call iterations for "
               "--guest_invocation_in (1 through 10000000).",
               "CPU");
+DEFINE_path(guest_invocation_synthetic_fixture_out, "",
+            "Test only: atomically write a copyright-free valid invocation, "
+            "two real fault cases, their exact corpus and a JSON manifest "
+            "into a new explicit output directory.",
+            "CPU");
 
 DEFINE_path(jit_corpus_in, "",
             "Recompile a guest code corpus captured by --jit_corpus_out and "
@@ -983,6 +991,84 @@ std::unique_ptr<backend::Backend> CreateHostBackend() {
   return nullptr;
 }
 
+bool WriteSyntheticFixture(const std::filesystem::path& executable_path) {
+  if (!cvars::guest_invocation_in.empty() || !cvars::jit_corpus_in.empty()) {
+    return Reject("synthetic fixture input validation",
+                  "fixture generation cannot be combined with replay input");
+  }
+  if (executable_path.empty()) {
+    return Reject("synthetic fixture provenance",
+                  "candidate executable path is unavailable");
+  }
+
+  GuestInvocationReplaySha256 capture_build_sha256 = {};
+  std::string error;
+  if (!HashGuestInvocationReplayFile(executable_path, &capture_build_sha256,
+                                     &error)) {
+    return Reject("synthetic fixture executable hash", error);
+  }
+
+  const size_t native_page_size = xe::memory::page_size();
+  if (native_page_size > std::numeric_limits<uint32_t>::max()) {
+    return Reject("synthetic fixture host page size",
+                  "native host page size does not fit the fixture format");
+  }
+  SyntheticGuestInvocationFixture bootstrap_fixture;
+  if (!BuildSyntheticGuestInvocationFixture(
+          static_cast<uint32_t>(native_page_size), 0, &bootstrap_fixture,
+          &error)) {
+    return Reject("synthetic fixture construction", error);
+  }
+
+  std::unique_ptr<backend::Backend> backend = CreateHostBackend();
+  if (!backend) {
+    return Reject("synthetic fixture backend selection",
+                  "no backend exists for this host and --cpu selection");
+  }
+  std::unique_ptr<GuestInvocationRunner> runner = GuestInvocationRunner::Create(
+      bootstrap_fixture.valid_invocation, bootstrap_fixture.corpus,
+      std::move(backend), &error);
+  if (!runner) {
+    return Reject("synthetic fixture runner initialization", error);
+  }
+
+  GuestInvocationReplayConfig replay_config;
+  if (!CaptureCurrentGuestInvocationReplayConfig(runner->backend(),
+                                                 &replay_config, &error)) {
+    return Reject("synthetic fixture configuration capture", error);
+  }
+  if (!ValidateGuestInvocationReplayBenchmarkConfig(replay_config, &error)) {
+    return Reject("synthetic fixture benchmark configuration", error);
+  }
+  if (!runner->WarmAndVerify(&error)) {
+    return Reject("synthetic fixture warm verification", error);
+  }
+  const uint32_t captured_host_code_size = runner->warmed_root_host_code_size();
+  if (!captured_host_code_size) {
+    return Reject("synthetic fixture code size",
+                  "warmed root host code size is unavailable");
+  }
+
+  SyntheticGuestInvocationFixture final_fixture;
+  if (!BuildSyntheticGuestInvocationFixture(
+          static_cast<uint32_t>(native_page_size), captured_host_code_size,
+          &final_fixture, &error)) {
+    return Reject("synthetic fixture final construction", error);
+  }
+  if (!WriteSyntheticGuestInvocationFixture(
+          cvars::guest_invocation_synthetic_fixture_out, final_fixture,
+          capture_build_sha256, replay_config, &error)) {
+    return Reject("synthetic fixture write", error);
+  }
+
+  fprintf(stdout, "XENIA_GUEST_INVOCATION_SYNTHETIC_FIXTURE_V1\tmanifest=%s\n",
+          xe::path_to_utf8(cvars::guest_invocation_synthetic_fixture_out /
+                           kSyntheticGuestInvocationManifestFileName)
+              .c_str());
+  fflush(stdout);
+  return true;
+}
+
 bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
   if (cvars::jit_corpus_in.empty()) {
     return Reject("input validation",
@@ -1702,6 +1788,11 @@ bool RunCorpusReplay() {
 }  // namespace corpus
 
 int main(const std::vector<std::string>& args) {
+  if (!cvars::guest_invocation_synthetic_fixture_out.empty()) {
+    const std::filesystem::path executable_path =
+        args.empty() ? std::filesystem::path() : std::filesystem::path(args[0]);
+    return invocation::WriteSyntheticFixture(executable_path) ? 0 : 1;
+  }
   if (!cvars::guest_invocation_in.empty()) {
     const std::filesystem::path executable_path =
         args.empty() ? std::filesystem::path() : std::filesystem::path(args[0]);

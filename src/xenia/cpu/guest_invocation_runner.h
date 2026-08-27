@@ -125,6 +125,12 @@ class GuestInvocationRunner {
   const GuestInvocationReplayPlan& plan() const { return plan_; }
   const backend::Backend& backend() const;
 
+  // Returns the exact warmed root allocation size reported by the backend, or
+  // zero before successful warm verification. Synthetic fixture generation
+  // records this in the ordinary corpus provenance field instead of inventing
+  // a placeholder size.
+  uint32_t warmed_root_host_code_size() const;
+
  private:
   GuestInvocationRunner(const ppc::GuestFunctionInvocation& invocation,
                         const ExecutionJitCorpus& corpus,
