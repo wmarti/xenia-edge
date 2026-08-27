@@ -342,8 +342,7 @@ struct CreatedThread {
 
 CreatedThread CreateRuntimeThread(SchedulerEnvironment& environment,
                                   FiberControl& control,
-                                  uint32_t creation_flags,
-                                  int32_t priority = -1) {
+                                  uint32_t creation_flags) {
   CreatedThread result;
   if (!environment.ready()) {
     return result;
@@ -352,9 +351,6 @@ CreatedThread CreateRuntimeThread(SchedulerEnvironment& environment,
       object_ref<CheckpointRuntimeThread>(new CheckpointRuntimeThread(
           environment.emulator()->kernel_state(), &control, creation_flags));
   result.thread->set_name("Checkpoint runtime test");
-  if (priority >= 0) {
-    result.thread->SetPriority(priority);
-  }
   result.status = result.thread->Create();
   return result;
 }
@@ -789,9 +785,12 @@ TEST_CASE("Guest scheduler checkpoint preserves an exact ready JIT route",
   REQUIRE(XSUCCEEDED(ready.status));
   REQUIRE(ready_control.WaitForStart(2s));
 
-  CreatedThread higher_priority = CreateRuntimeThread(
-      environment, higher_priority_control, kCpu0CreationFlags, 31);
+  CreatedThread higher_priority =
+      CreateRuntimeThread(environment, higher_priority_control,
+                          kCpu0CreationFlags | X_CREATE_SUSPENDED);
   REQUIRE(XSUCCEEDED(higher_priority.status));
+  higher_priority.thread->SetPriority(31);
+  REQUIRE(XSUCCEEDED(higher_priority.thread->Resume()));
   REQUIRE(higher_priority_control.WaitForStart(2s));
 
   const auto parked = GuestSchedulerCheckpointRuntimeTestAccess::InspectThread(
