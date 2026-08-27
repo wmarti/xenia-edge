@@ -53,12 +53,13 @@ void AppendCorpusPage(std::vector<uint8_t>* encoded, uint32_t address,
   encoded->insert(encoded->end(), data.cbegin(), data.cend());
 }
 
-ExecutionJitCorpus MakeCorpus(uint32_t closure_page_count) {
+ExecutionJitCorpus MakeCorpus(uint32_t closure_page_count,
+                              uint32_t config_flags = 0) {
   std::vector<uint8_t> encoded;
   AppendU32(&encoded, JitCorpus::kMagic);
   AppendU32(&encoded, JitCorpus::kVersion);
   AppendU32(&encoded, JitCorpus::kPageSize);
-  AppendU32(&encoded, 0);
+  AppendU32(&encoded, config_flags);
 
   for (uint32_t i = 0; i < closure_page_count; ++i) {
     std::array<uint8_t, JitCorpus::kPageSize> page = {};
@@ -198,6 +199,31 @@ TEST_CASE("guest invocation planner derives closed reset and access sets",
       plan.protection_granules ==
       std::vector<GuestInvocationReplayProtectionGranule>{
           {kDataAddress, 16 * 1024, true}, {kCodeAddress, 16 * 1024, false}});
+}
+
+TEST_CASE("guest invocation planner rejects corpus configuration drift",
+          "[guest-invocation-runner]") {
+  ppc::GuestFunctionInvocation invocation = MakeInvocation(4);
+  GuestInvocationReplayPlan plan;
+  std::string error;
+
+  ExecutionJitCorpus corpus = MakeCorpus(4, JitCorpus::kConfigGuestScheduler);
+  REQUIRE(corpus.config_flags() == JitCorpus::kConfigGuestScheduler);
+  REQUIRE_FALSE(BuildGuestInvocationReplayPlan(invocation, corpus, 16 * 1024,
+                                               &plan, &error));
+  REQUIRE(error ==
+          "invocation replay v1 requires zero corpus configuration flags");
+  REQUIRE(plan.supplied_page_addresses.empty());
+  REQUIRE(plan.reset_page_addresses.empty());
+  REQUIRE(plan.protection_granules.empty());
+
+#if XE_PLATFORM_MAC && XE_ARCH_ARM64
+  std::unique_ptr<GuestInvocationRunner> runner = GuestInvocationRunner::Create(
+      invocation, corpus, testing::CreateBackend(), &error);
+  REQUIRE_FALSE(runner);
+  REQUIRE(error ==
+          "invocation replay v1 requires zero corpus configuration flags");
+#endif  // XE_PLATFORM_MAC && XE_ARCH_ARM64
 }
 
 TEST_CASE("guest invocation planner bounds eager function count",

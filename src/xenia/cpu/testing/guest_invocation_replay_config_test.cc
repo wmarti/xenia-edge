@@ -153,6 +153,7 @@ GuestInvocationReplayConfig MakeBenchmarkConfig(
   SetValue(&config, "fold_readonly_guest_memory_loads", "false");
   SetValue(&config, "guest_scheduler", "false");
   SetValue(&config, "inline_mmio_access", "false");
+  SetValue(&config, "log_safepoint_pc", "false");
   SetValue(&config, "serialize_guest_function_definitions", "true");
   SetValue(&config, "trace_function_coverage", "false");
   if (backend_name == "x64" &&
@@ -417,6 +418,11 @@ TEST_CASE("timed guest invocation replay requires Apple A64 and fixed controls",
   SetValue(&config, "guest_scheduler", "true");
   REQUIRE_FALSE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));
   REQUIRE(error.find("guest_scheduler=false") != std::string::npos);
+
+  config = MakeBenchmarkConfig("a64");
+  SetValue(&config, "log_safepoint_pc", "true");
+  REQUIRE_FALSE(ValidateGuestInvocationReplayBenchmarkConfig(config, &error));
+  REQUIRE(error.find("log_safepoint_pc=false") != std::string::npos);
 
   config = MakeBenchmarkConfig("a64");
   SetValue(&config, "emit_mmio_aware_stores_for_recorded_exception_addresses",

@@ -34,6 +34,7 @@ import tempfile
 SCHEMA = "xenia-guest-invocation-result-v2"
 METRIC_PREFIX = "XENIA_GUEST_INVOCATION_BENCHMARK_V2"
 PAGE_SIZE = 4096
+MAX_PAIRS = 64
 METRIC_FIELDS = (
     "artifact_sha256",
     "corpus_sha256",
@@ -93,6 +94,7 @@ PHASE_SCHEDULE = (
 FIXED_RUNNER_FLAGS = (
     "--test_benchmark_warmed=false",
     "--guest_scheduler=false",
+    "--log_safepoint_pc=false",
     "--jit_corpus_allow_incomplete=false",
     "--count_call_paths=false",
     "--count_physical_remap_hits=false",
@@ -487,7 +489,9 @@ def main(argv=None):
     parser.add_argument("--config-sha256", required=True)
     parser.add_argument("--iterations", required=True, type=int)
     parser.add_argument("--reset-pages", required=True, type=int)
-    parser.add_argument("--pairs", type=int, default=4)
+    parser.add_argument(
+        "--pairs", type=int, default=4,
+        help=f"pairs per phase; multiple of 4, maximum {MAX_PAIRS}")
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument(
         "--min-thread-cpu-seconds", type=float, default=0.05,
@@ -517,9 +521,10 @@ def main(argv=None):
         if args.iterations <= 0 or args.reset_pages < 0:
             raise BenchmarkError(
                 "iterations must be positive and reset pages nonnegative")
-        if args.pairs < 4 or args.pairs % 4:
+        if args.pairs < 4 or args.pairs > MAX_PAIRS or args.pairs % 4:
             raise BenchmarkError(
-                "--pairs must be a multiple of 4 and at least 4")
+                "--pairs must be a multiple of 4 between 4 and "
+                f"{MAX_PAIRS}")
         validate_positive_finite("--timeout", args.timeout)
         validate_positive_finite(
             "--min-thread-cpu-seconds", args.min_thread_cpu_seconds)

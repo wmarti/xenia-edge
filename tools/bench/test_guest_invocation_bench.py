@@ -224,6 +224,18 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("finite and positive", stderr.getvalue())
 
+    def test_main_rejects_excessive_pairs_before_work(self):
+        stderr = io.StringIO()
+        with mock.patch.object(benchmark, "file_sha256") as file_sha256, \
+                mock.patch.object(benchmark, "collect_phases") as collect, \
+                mock.patch("sys.stderr", stderr):
+            result = benchmark.main(
+                self._main_args() + ["--pairs", str(benchmark.MAX_PAIRS + 4)])
+        self.assertEqual(result, 2)
+        self.assertIn("between 4 and", stderr.getvalue())
+        file_sha256.assert_not_called()
+        collect.assert_not_called()
+
     def test_main_refuses_output_alias_before_writing(self):
         with tempfile.TemporaryDirectory(dir=".") as directory:
             alias = pathlib.Path(directory) / "never-created"
@@ -325,6 +337,7 @@ class RunnerTest(unittest.TestCase):
                 "/tmp/a", [
                     "--guest_invocation_iterations=1",
                     "--guest_scheduler=true",
+                    "--log_safepoint_pc=true",
                     "--emit_mmio_aware_stores_for_recorded_exception_addresses=true",
                     "--enable_early_precompilation=true",
                     "--fold_readonly_guest_memory_loads=true",
@@ -353,6 +366,7 @@ class RunnerTest(unittest.TestCase):
                 ("--fold_readonly_guest_memory_loads=false",
                  "--fold_readonly_guest_memory_loads=true"),
                 ("--inline_mmio_access=false", "--inline_mmio_access=true"),
+                ("--log_safepoint_pc=false", "--log_safepoint_pc=true"),
                 ("--serialize_guest_function_definitions=true",
                  "--serialize_guest_function_definitions=false"),
         ):

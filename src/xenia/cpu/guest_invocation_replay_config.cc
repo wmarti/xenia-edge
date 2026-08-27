@@ -545,7 +545,7 @@ bool ValidateGuestInvocationReplayBenchmarkConfig(
     return false;
   }
 
-  constexpr std::array<std::pair<std::string_view, std::string_view>, 12>
+  constexpr std::array<std::pair<std::string_view, std::string_view>, 13>
       kRequiredValues = {
           {{"break_on_instruction", "0"},
            {"count_call_paths", "false"},
@@ -557,6 +557,7 @@ bool ValidateGuestInvocationReplayBenchmarkConfig(
            {"fold_readonly_guest_memory_loads", "false"},
            {"guest_scheduler", "false"},
            {"inline_mmio_access", "false"},
+           {"log_safepoint_pc", "false"},
            {"serialize_guest_function_definitions", "true"},
            {"trace_function_coverage", "false"}}};
   for (const auto& [name, expected] : kRequiredValues) {
