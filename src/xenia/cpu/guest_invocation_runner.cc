@@ -114,7 +114,18 @@ bool ValidateInvocationPageList(
   return true;
 }
 
-bool ValidateCorpusShape(const ExecutionJitCorpus& corpus, std::string* error) {
+struct CorpusWorkload {
+  uint64_t function_count = 0;
+  uint64_t guest_code_bytes = 0;
+  uint64_t captured_host_code_bytes = 0;
+};
+
+bool ValidateCorpusShape(const ExecutionJitCorpus& corpus,
+                         CorpusWorkload* workload, std::string* error) {
+  if (!workload) {
+    return Fail(error, "replay corpus workload output is null");
+  }
+  *workload = {};
   const std::vector<uint32_t>& page_addresses = corpus.page_addresses();
   if (page_addresses.empty() || corpus.functions().empty() ||
       corpus.function_definition_order().empty()) {
@@ -123,6 +134,9 @@ bool ValidateCorpusShape(const ExecutionJitCorpus& corpus, std::string* error) {
   if (page_addresses.size() > ExecutionJitCorpus::kMaxPageRecords ||
       corpus.functions().size() > ExecutionJitCorpus::kMaxFunctionRecords) {
     return Fail(error, "replay corpus exceeds a resource limit");
+  }
+  if (corpus.functions().size() > kGuestInvocationReplayMaxEagerFunctionCount) {
+    return Fail(error, "replay corpus exceeds the eager function-count budget");
   }
   if (page_addresses.size() >
           std::numeric_limits<size_t>::max() / JitCorpus::kPageSize ||
@@ -149,17 +163,37 @@ bool ValidateCorpusShape(const ExecutionJitCorpus& corpus, std::string* error) {
     has_previous_page = true;
   }
 
+  CorpusWorkload measured_workload;
+  measured_workload.function_count = corpus.functions().size();
   std::set<uint32_t> function_addresses;
   uint32_t previous_function = 0;
   bool has_previous_function = false;
   for (const ExecutionJitCorpus::FunctionRecord& function :
        corpus.functions()) {
+    const uint64_t function_size =
+        uint64_t(function.end_address) - function.address + 4;
     if (!function.address || (function.address & 3) ||
         (function.end_address & 3) || function.end_address < function.address ||
-        uint64_t(function.end_address) - function.address + 4 >
-            ExecutionJitCorpus::kMaxFunctionSize) {
+        function_size > ExecutionJitCorpus::kMaxFunctionSize) {
       return Fail(error, "replay corpus contains an invalid function extent");
     }
+    if (function_size > kGuestInvocationReplayMaxEagerGuestCodeBytes -
+                            measured_workload.guest_code_bytes) {
+      return Fail(error,
+                  "replay corpus exceeds the eager guest-code byte budget");
+    }
+    measured_workload.guest_code_bytes += function_size;
+    if (!function.captured_host_bytes_valid()) {
+      return Fail(error,
+                  "replay corpus function has no captured host-code size");
+    }
+    if (function.host_code_size >
+        kGuestInvocationReplayMaxCapturedHostCodeBytes -
+            measured_workload.captured_host_code_bytes) {
+      return Fail(error,
+                  "replay corpus exceeds the captured host-code byte budget");
+    }
+    measured_workload.captured_host_code_bytes += function.host_code_size;
     JitCorpus::FunctionMetadata metadata;
     if (!JitCorpus::DecodeFunctionFlags(function.flags, &metadata)) {
       return Fail(error, "replay corpus contains invalid function metadata");
@@ -180,6 +214,7 @@ bool ValidateCorpusShape(const ExecutionJitCorpus& corpus, std::string* error) {
                   "replay corpus definition order is not a full permutation");
     }
   }
+  *workload = measured_workload;
   return true;
 }
 
@@ -240,7 +275,8 @@ bool BuildGuestInvocationReplayPlan(
     return FailPlan(output, error,
                     "host page size is unsupported for invocation replay");
   }
-  if (!ValidateCorpusShape(corpus, error)) {
+  CorpusWorkload workload;
+  if (!ValidateCorpusShape(corpus, &workload, error)) {
     return false;
   }
   if (invocation.dependency_flags & ~ppc::kGuestInvocationKnownDependencyMask) {
@@ -356,6 +392,9 @@ bool BuildGuestInvocationReplayPlan(
 
   GuestInvocationReplayPlan plan;
   plan.host_page_size = host_page_size;
+  plan.eager_function_count = workload.function_count;
+  plan.eager_guest_code_bytes = workload.guest_code_bytes;
+  plan.captured_host_code_bytes = workload.captured_host_code_bytes;
   plan.supplied_page_addresses.reserve(supplied_pages.size());
   for (const auto& supplied_page : supplied_pages) {
     plan.supplied_page_addresses.push_back(supplied_page.first);

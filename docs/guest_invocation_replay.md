@@ -40,6 +40,13 @@ not require it to equal the capture build: an optimized A/B candidate is a
 different executable by definition. Captured title bytes and title-derived
 artifacts are benchmark inputs and must not be committed to the source tree.
 
+The paired v1 corpus is expected to be the compile closure needed by the
+selected invocation, not an unfiltered whole-session function archive. Replay
+still validates the complete recorded successful-definition order and resolves
+every entry before timing; the recorder should therefore reject an invocation
+whose required closure cannot be represented within the replay workload
+budget, rather than truncating the order.
+
 The file format is pointer-free and endian-defined. It never serializes
 `PPCContext` as a raw host structure: host pointers, padding, preemption state
 and backend-private storage are not portable execution state.
@@ -170,6 +177,23 @@ Replay performs these operations outside the timed region:
 7. Reset state, resolve the root again and snapshot code-cache placement.
 8. Run a bounded batch, checking placement again before accepting timing.
 9. Reset once more and require a final verified invocation to match.
+
+Before creating guest memory or compiling a function, replay also applies a
+checked aggregate workload budget to the paired corpus: at most 32,768 eager
+function definitions, 16 MiB summed across their inclusive guest extents and
+128 MiB of nonzero captured host-code sizes. Overlapping guest extents are
+charged once per function because the runner compiles each function. Every
+addition is checked against the remaining budget, so a large encoded value
+cannot wrap an accumulator. These are conservative safety ceilings with more
+than two times the measured full-title function and guest-byte workload, not
+capture targets; an invocation-specific corpus should normally be much
+smaller.
+
+The captured-host byte total is a bounded-work and provenance heuristic, not a
+promise that a changed candidate backend emits the same number of bytes. The
+128 MiB ceiling leaves substantial headroom in the current 256 MiB generated
+code cache, but candidate expansion and other backend failures remain fatal
+subprocess results and are never accepted as benchmark samples.
 
 Execution replay rejects truncated or non-canonical corpora, duplicate records,
 missing extent pages, data/code overlap, MMIO pages and physical aliases. During

@@ -33,6 +33,16 @@ namespace backend {
 class Backend;
 }  // namespace backend
 
+// Replay resolves every function in the paired corpus before timing. Keep that
+// eager work well below the backend's 256 MiB generated-code cache. These are
+// safety ceilings for one invocation-specific compile closure, not capture
+// targets.
+constexpr uint64_t kGuestInvocationReplayMaxEagerFunctionCount = 32'768;
+constexpr uint64_t kGuestInvocationReplayMaxEagerGuestCodeBytes =
+    16ull * 1024ull * 1024ull;
+constexpr uint64_t kGuestInvocationReplayMaxCapturedHostCodeBytes =
+    128ull * 1024ull * 1024ull;
+
 // One host-protection granule that replay may access after closing the full
 // guest virtual and physical views. Guest code is read-only unless its granule
 // also contains captured data.
@@ -50,6 +60,9 @@ struct GuestInvocationReplayProtectionGranule {
 // and gives focused tests a way to exercise the protection-closure contract.
 struct GuestInvocationReplayPlan {
   uint32_t host_page_size = 0;
+  uint64_t eager_function_count = 0;
+  uint64_t eager_guest_code_bytes = 0;
+  uint64_t captured_host_code_bytes = 0;
   std::vector<uint32_t> supplied_page_addresses;
   std::vector<uint32_t> reset_page_addresses;
   std::vector<GuestInvocationReplayProtectionGranule> protection_granules;

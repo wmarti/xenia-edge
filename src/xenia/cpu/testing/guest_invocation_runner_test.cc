@@ -84,6 +84,59 @@ ExecutionJitCorpus MakeCorpus(uint32_t closure_page_count) {
   return corpus;
 }
 
+ExecutionJitCorpus MakeUniformWorkloadCorpus(
+    uint32_t function_count, uint32_t guest_code_bytes_per_function,
+    uint32_t captured_host_code_bytes_per_function,
+    uint32_t final_guest_code_bytes = 0,
+    uint32_t final_captured_host_code_bytes = 0) {
+  REQUIRE(function_count > 0);
+  REQUIRE(guest_code_bytes_per_function > 0);
+  REQUIRE(!(guest_code_bytes_per_function & 3));
+  REQUIRE((!final_guest_code_bytes || !(final_guest_code_bytes & 3)));
+
+  const uint32_t last_guest_code_bytes = final_guest_code_bytes
+                                             ? final_guest_code_bytes
+                                             : guest_code_bytes_per_function;
+  const uint64_t last_function_address =
+      uint64_t(kCodeAddress) + uint64_t(function_count - 1) * 4;
+  const uint64_t last_function_end =
+      last_function_address + last_guest_code_bytes - 4;
+  REQUIRE(last_function_end <= UINT32_MAX);
+  const uint32_t code_page_count = static_cast<uint32_t>(
+      (last_function_end - kCodeAddress) / JitCorpus::kPageSize + 1);
+
+  std::vector<uint8_t> encoded;
+  AppendU32(&encoded, JitCorpus::kMagic);
+  AppendU32(&encoded, JitCorpus::kVersion);
+  AppendU32(&encoded, JitCorpus::kPageSize);
+  AppendU32(&encoded, 0);
+  for (uint32_t i = 0; i < code_page_count; ++i) {
+    AppendCorpusPage(&encoded, kCodeAddress + i * JitCorpus::kPageSize, {});
+  }
+  for (uint32_t i = 0; i < function_count; ++i) {
+    const uint32_t guest_code_bytes =
+        i + 1 == function_count && final_guest_code_bytes
+            ? final_guest_code_bytes
+            : guest_code_bytes_per_function;
+    const uint32_t captured_host_code_bytes =
+        i + 1 == function_count && final_captured_host_code_bytes
+            ? final_captured_host_code_bytes
+            : captured_host_code_bytes_per_function;
+    const uint32_t address = kCodeAddress + i * 4;
+    AppendU32(&encoded, JitCorpus::kTagFunction);
+    AppendU32(&encoded, address);
+    AppendU32(&encoded, address + guest_code_bytes - 4);
+    AppendU32(&encoded, captured_host_code_bytes);
+    AppendU32(&encoded, 0);
+  }
+
+  ExecutionJitCorpus corpus;
+  std::string error;
+  REQUIRE(ExecutionJitCorpus::Decode(encoded, &corpus, &error));
+  REQUIRE(error.empty());
+  return corpus;
+}
+
 ppc::GuestInvocationPage MakeDataPage(uint32_t address, uint8_t seed) {
   ppc::GuestInvocationPage page;
   page.guest_address = address;
@@ -93,10 +146,11 @@ ppc::GuestInvocationPage MakeDataPage(uint32_t address, uint8_t seed) {
   return page;
 }
 
-ppc::GuestFunctionInvocation MakeInvocation(uint32_t closure_page_count) {
+ppc::GuestFunctionInvocation MakeInvocation(uint32_t closure_page_count,
+                                            uint32_t function_size = 16) {
   ppc::GuestFunctionInvocation invocation;
   invocation.function_address = kCodeAddress;
-  invocation.function_end_address = kCodeAddress + 12;
+  invocation.function_end_address = kCodeAddress + function_size - 4;
   invocation.entry_address = kCodeAddress;
   invocation.expected_return_address = kReturnAddress;
   invocation.input.link_register = kReturnAddress;
@@ -133,6 +187,9 @@ TEST_CASE("guest invocation planner derives closed reset and access sets",
                                          &error));
   REQUIRE(error.empty());
   REQUIRE(plan.host_page_size == 16 * 1024);
+  REQUIRE(plan.eager_function_count == 1);
+  REQUIRE(plan.eager_guest_code_bytes == 16);
+  REQUIRE(plan.captured_host_code_bytes == 64);
   REQUIRE(plan.supplied_page_addresses.size() == 8);
   REQUIRE(plan.reset_page_addresses ==
           std::vector<uint32_t>{kDataAddress, kDataAddress + 0x1000,
@@ -141,6 +198,114 @@ TEST_CASE("guest invocation planner derives closed reset and access sets",
       plan.protection_granules ==
       std::vector<GuestInvocationReplayProtectionGranule>{
           {kDataAddress, 16 * 1024, true}, {kCodeAddress, 16 * 1024, false}});
+}
+
+TEST_CASE("guest invocation planner bounds eager function count",
+          "[guest-invocation-runner]") {
+  constexpr uint32_t kFunctionLimit =
+      static_cast<uint32_t>(kGuestInvocationReplayMaxEagerFunctionCount);
+  ppc::GuestFunctionInvocation invocation = MakeInvocation(1, 4);
+  GuestInvocationReplayPlan plan;
+  std::string error;
+
+  SECTION("accepts the exact boundary") {
+    ExecutionJitCorpus corpus =
+        MakeUniformWorkloadCorpus(kFunctionLimit, 4, 16);
+    REQUIRE(BuildGuestInvocationReplayPlan(invocation, corpus, 4096, &plan,
+                                           &error));
+    REQUIRE(error.empty());
+    REQUIRE(plan.eager_function_count == kFunctionLimit);
+    REQUIRE(plan.eager_guest_code_bytes == uint64_t(kFunctionLimit) * 4);
+    REQUIRE(plan.captured_host_code_bytes == uint64_t(kFunctionLimit) * 16);
+  }
+
+  SECTION("rejects one function over the boundary") {
+    ExecutionJitCorpus corpus =
+        MakeUniformWorkloadCorpus(kFunctionLimit + 1, 4, 16);
+    REQUIRE_FALSE(BuildGuestInvocationReplayPlan(invocation, corpus, 4096,
+                                                 &plan, &error));
+    REQUIRE(error == "replay corpus exceeds the eager function-count budget");
+    REQUIRE(plan.eager_function_count == 0);
+  }
+}
+
+TEST_CASE("guest invocation planner bounds aggregate eager guest code",
+          "[guest-invocation-runner]") {
+  constexpr uint32_t kFunctionCount = 16;
+  constexpr uint32_t kGuestBytesPerFunction = 1 * 1024 * 1024;
+  static_assert(uint64_t(kFunctionCount) * kGuestBytesPerFunction ==
+                kGuestInvocationReplayMaxEagerGuestCodeBytes);
+  ppc::GuestFunctionInvocation invocation =
+      MakeInvocation(1, kGuestBytesPerFunction);
+  GuestInvocationReplayPlan plan;
+  std::string error;
+
+  SECTION("accepts the exact boundary") {
+    ExecutionJitCorpus corpus =
+        MakeUniformWorkloadCorpus(kFunctionCount, kGuestBytesPerFunction, 16);
+    REQUIRE(BuildGuestInvocationReplayPlan(invocation, corpus, 4096, &plan,
+                                           &error));
+    REQUIRE(error.empty());
+    REQUIRE(plan.eager_guest_code_bytes ==
+            kGuestInvocationReplayMaxEagerGuestCodeBytes);
+  }
+
+  SECTION("rejects an addition beyond the remaining budget") {
+    ExecutionJitCorpus corpus = MakeUniformWorkloadCorpus(
+        kFunctionCount, kGuestBytesPerFunction, 16, kGuestBytesPerFunction + 4);
+    REQUIRE_FALSE(BuildGuestInvocationReplayPlan(invocation, corpus, 4096,
+                                                 &plan, &error));
+    REQUIRE(error == "replay corpus exceeds the eager guest-code byte budget");
+    REQUIRE(plan.eager_guest_code_bytes == 0);
+  }
+}
+
+TEST_CASE("guest invocation planner bounds captured host code",
+          "[guest-invocation-runner]") {
+  constexpr uint32_t kHostBytesPerFunction = 64 * 1024 * 1024;
+  static_assert(uint64_t(kHostBytesPerFunction) * 2 ==
+                kGuestInvocationReplayMaxCapturedHostCodeBytes);
+  ppc::GuestFunctionInvocation invocation = MakeInvocation(1, 4);
+  GuestInvocationReplayPlan plan;
+  std::string error;
+
+  SECTION("accepts the exact boundary") {
+    ExecutionJitCorpus corpus =
+        MakeUniformWorkloadCorpus(2, 4, kHostBytesPerFunction);
+    REQUIRE(BuildGuestInvocationReplayPlan(invocation, corpus, 4096, &plan,
+                                           &error));
+    REQUIRE(error.empty());
+    REQUIRE(plan.captured_host_code_bytes ==
+            kGuestInvocationReplayMaxCapturedHostCodeBytes);
+  }
+
+  SECTION("rejects one aligned unit over the boundary") {
+    ExecutionJitCorpus corpus = MakeUniformWorkloadCorpus(
+        2, 4, kHostBytesPerFunction, 0, kHostBytesPerFunction + 4);
+    REQUIRE_FALSE(BuildGuestInvocationReplayPlan(invocation, corpus, 4096,
+                                                 &plan, &error));
+    REQUIRE(error ==
+            "replay corpus exceeds the captured host-code byte budget");
+    REQUIRE(plan.captured_host_code_bytes == 0);
+  }
+
+  SECTION("a large encoded size cannot wrap the accumulator") {
+    ExecutionJitCorpus corpus =
+        MakeUniformWorkloadCorpus(2, 4, kHostBytesPerFunction, 0, UINT32_MAX);
+    REQUIRE_FALSE(BuildGuestInvocationReplayPlan(invocation, corpus, 4096,
+                                                 &plan, &error));
+    REQUIRE(error ==
+            "replay corpus exceeds the captured host-code byte budget");
+    REQUIRE(plan.captured_host_code_bytes == 0);
+  }
+
+  SECTION("missing captured size cannot bypass the budget") {
+    ExecutionJitCorpus corpus = MakeUniformWorkloadCorpus(1, 4, 0);
+    REQUIRE_FALSE(BuildGuestInvocationReplayPlan(invocation, corpus, 4096,
+                                                 &plan, &error));
+    REQUIRE(error == "replay corpus function has no captured host-code size");
+    REQUIRE(plan.captured_host_code_bytes == 0);
+  }
 }
 
 TEST_CASE("guest invocation planner rejects unsafe page layouts",
