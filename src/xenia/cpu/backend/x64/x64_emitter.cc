@@ -268,17 +268,6 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
   auto block = builder->first_block();
   synchronize_stack_on_next_instruction_ = false;
   while (block) {
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-    uint32_t block_guest_instruction_count = 0;
-    for (const Instr* counted = block->instr_head; counted;
-         counted = counted->next) {
-      if (counted->GetOpcodeNum() == hir::OPCODE_SOURCE_OFFSET) {
-        ++block_guest_instruction_count;
-      }
-    }
-    bool block_instruction_coverage_emitted = false;
-#endif
     ForgetMxcsrMode();  // at start of block, mxcsr mode is undefined
 
     // Mark block labels.
@@ -294,15 +283,6 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
     // Process instructions.
     const Instr* instr = block->instr_head;
     while (instr) {
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-      if (!block_instruction_coverage_emitted && !instr->IsFake() &&
-          instr->GetOpcodeNum() != hir::OPCODE_CHECK_PREEMPT) {
-        EmitGuestExecutionSessionInstructionCoverage(
-            block_guest_instruction_count);
-        block_instruction_coverage_emitted = true;
-      }
-#endif
       if (synchronize_stack_on_next_instruction_) {
         // Skip annotations as well as SOURCE_OFFSET: under full debug info
         // the frontend emits COMMENT first, and a check emitted there sits
@@ -323,25 +303,8 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
         XELOGE("Unable to process HIR opcode {}", GetOpcodeName(instr->opcode));
         break;
       }
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-      if (!block_instruction_coverage_emitted &&
-          instr->GetOpcodeNum() == hir::OPCODE_CHECK_PREEMPT) {
-        EmitGuestExecutionSessionInstructionCoverage(
-            block_guest_instruction_count);
-        block_instruction_coverage_emitted = true;
-      }
-#endif
       instr = new_tail;
     }
-
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-    if (!block_instruction_coverage_emitted) {
-      EmitGuestExecutionSessionInstructionCoverage(
-          block_guest_instruction_count);
-    }
-#endif
 
     block = block->next;
   }

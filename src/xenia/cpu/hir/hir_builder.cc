@@ -819,6 +819,13 @@ Instr* HIRBuilder::CheckPreempt() {
   return AppendInstr(OPCODE_CHECK_PREEMPT_info, 0);
 }
 
+Instr* HIRBuilder::GuestInstructionCoverage(uint32_t guest_instruction_count) {
+  Instr* i = AppendInstr(OPCODE_GUEST_INSTRUCTION_COVERAGE_info, 0);
+  i->src1.offset = guest_instruction_count;
+  i->src2.value = i->src3.value = NULL;
+  return i;
+}
+
 void HIRBuilder::SourceOffset(uint32_t offset) {
   Instr* i = AppendInstr(OPCODE_SOURCE_OFFSET_info, 0);
   i->src1.offset = offset;

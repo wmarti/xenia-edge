@@ -60,6 +60,12 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
 
   bool validate = cvars::validate_hir;
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  compiler_->AddPass(
+      std::make_unique<passes::GuestInstructionCoverageInjectionPass>());
+#endif
+
   // Merge blocks early. This will let us use more context in other passes.
   // The CFG is required for simplification and dirtied by it.
   compiler_->AddPass(std::make_unique<passes::ControlFlowAnalysisPass>());

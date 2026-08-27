@@ -171,6 +171,20 @@ struct CHECK_PREEMPT
 EMITTER_OPCODE_TABLE(OPCODE_CHECK_PREEMPT, CHECK_PREEMPT);
 
 // ============================================================================
+// OPCODE_GUEST_INSTRUCTION_COVERAGE
+// ============================================================================
+struct GUEST_INSTRUCTION_COVERAGE
+    : Sequence<GUEST_INSTRUCTION_COVERAGE,
+               I<OPCODE_GUEST_INSTRUCTION_COVERAGE, VoidOp>> {
+  static void Emit(A64Emitter& e, const EmitArgType& i) {
+    e.EmitGuestExecutionSessionInstructionCoverage(
+        uint32_t(i.instr->src1.offset));
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_GUEST_INSTRUCTION_COVERAGE,
+                     GUEST_INSTRUCTION_COVERAGE);
+
+// ============================================================================
 // OPCODE_DEBUG_BREAK_TRUE
 // ============================================================================
 struct DEBUG_BREAK_TRUE_I8

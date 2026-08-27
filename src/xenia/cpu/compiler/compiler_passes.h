@@ -20,6 +20,7 @@
 #include "xenia/cpu/compiler/passes/dead_code_elimination_pass.h"
 #include "xenia/cpu/compiler/passes/dead_cr_store_elimination_pass.h"
 #include "xenia/cpu/compiler/passes/finalization_pass.h"
+#include "xenia/cpu/compiler/passes/guest_instruction_coverage_injection_pass.h"
 #include "xenia/cpu/compiler/passes/memory_sequence_combination_pass.h"
 #include "xenia/cpu/compiler/passes/preempt_check_injection_pass.h"
 #include "xenia/cpu/compiler/passes/register_allocation_pass.h"

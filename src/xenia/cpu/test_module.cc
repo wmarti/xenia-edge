@@ -49,6 +49,12 @@ TestModule::TestModule(Processor* processor, const std::string_view name,
   assembler_ = processor->backend()->CreateAssembler();
   assembler_->Initialize();
 
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  compiler_->AddPass(
+      std::make_unique<passes::GuestInstructionCoverageInjectionPass>());
+#endif
+
   // Merge blocks early. This will let us use more context in other passes.
   // The CFG is required for simplification and dirtied by it.
   compiler_->AddPass(std::make_unique<passes::ControlFlowAnalysisPass>());

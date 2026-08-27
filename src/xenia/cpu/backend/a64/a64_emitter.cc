@@ -362,17 +362,6 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   auto block = builder->first_block();
   synchronize_stack_on_next_instruction_ = false;
   while (block) {
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-    uint32_t block_guest_instruction_count = 0;
-    for (const hir::Instr* counted = block->instr_head; counted;
-         counted = counted->next) {
-      if (counted->GetOpcodeNum() == hir::OPCODE_SOURCE_OFFSET) {
-        ++block_guest_instruction_count;
-      }
-    }
-    bool block_instruction_coverage_emitted = false;
-#endif
     // FPCR tracking across blocks: msr fpcr is a serializing write on most
     // cores, and resetting the mode at every block entry makes the first
     // float op of every block re-emit it. Every branch emission records the
@@ -412,15 +401,6 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
     // Process each instruction in the block.
     const hir::Instr* instr = block->instr_head;
     while (instr) {
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-      if (!block_instruction_coverage_emitted && !instr->IsFake() &&
-          instr->GetOpcodeNum() != hir::OPCODE_CHECK_PREEMPT) {
-        EmitGuestExecutionSessionInstructionCoverage(
-            block_guest_instruction_count);
-        block_instruction_coverage_emitted = true;
-      }
-#endif
       // After a guest call, check for longjmp on the next real instruction.
       // Skip SOURCE_OFFSET because the return address from the call would
       // point past the check, so it would never execute.
@@ -444,15 +424,6 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
         // One-shot handoff: whatever this sequence declared about NZCV is
         // visible to exactly the next sequence and nothing later.
         ShiftFlagsZeroTest();
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-        if (!block_instruction_coverage_emitted &&
-            instr->GetOpcodeNum() == hir::OPCODE_CHECK_PREEMPT) {
-          EmitGuestExecutionSessionInstructionCoverage(
-              block_guest_instruction_count);
-          block_instruction_coverage_emitted = true;
-        }
-#endif
         // Record the FPCR mode this branch carries to its target (branches
         // can sit mid-block; the mode here is the mode the jump takes).
         {
@@ -489,14 +460,6 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
       }
       instr = new_tail;
     }
-
-#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
-    XE_ENABLE_GUEST_INVOCATION_CAPTURE
-    if (!block_instruction_coverage_emitted) {
-      EmitGuestExecutionSessionInstructionCoverage(
-          block_guest_instruction_count);
-    }
-#endif
 
     if (!MaybeFlushV128ConstPool()) {
       return false;

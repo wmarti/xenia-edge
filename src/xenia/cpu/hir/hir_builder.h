@@ -119,6 +119,9 @@ class HIRBuilder {
   // Preemption safepoint. Returns the instr so the caller can place it.
   Instr* CheckPreempt();
 
+  // Executed guest instruction weight for one pre-simplification basic block.
+  Instr* GuestInstructionCoverage(uint32_t guest_instruction_count);
+
   // trace info/etc
   void DebugBreak();
   void DebugBreakTrue(Value* cond);
