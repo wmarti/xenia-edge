@@ -1273,11 +1273,8 @@ bool Processor::DemandFunction(Function* function) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
     if (guest_invocation_capture_sink_) {
-      if (!guest_invocation_capture_sink_->OnFunctionDefined(
-              function->address(), function->end_address())) {
-        function->set_status(Symbol::Status::kFailed);
-        return false;
-      }
+      guest_invocation_capture_sink_->OnFunctionDefined(
+          function->address(), function->end_address());
     }
 #endif
 

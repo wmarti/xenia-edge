@@ -12,6 +12,8 @@
 #include <string_view>
 #include <utility>
 
+#include "xenia/base/logging.h"
+
 namespace xe {
 namespace cpu {
 
@@ -85,6 +87,11 @@ bool GuestInvocationCaptureCoordinator::FinishCallbackLocked(
     if (message_.empty()) {
       message_ = "capture recorder rejected without a diagnostic";
     }
+    XELOGE(
+        "Guest invocation capture rejected: rejection={} dependency_flags="
+        "{:08X} diagnostic={}",
+        static_cast<uint32_t>(recorder_->rejection()),
+        recorder_->rejected_dependency_flags(), message_);
     segment_handler_ = {};
     return false;
   }

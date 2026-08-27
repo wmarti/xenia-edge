@@ -198,12 +198,16 @@ TEST_CASE("GUEST_INVOCATION_CAPTURE_FRONTEND_DEFINITION_CLOSURE",
   REQUIRE(capture.dependencies.size() == 1);
   REQUIRE(capture.definitions.size() == 2);
 
-  // A rejected definition must not become available to title execution.
+  // A rejected capture must not poison title execution. Definition callbacks
+  // observe JIT publication just like dependency callbacks; their return value
+  // belongs to the capture lifecycle only.
   capture.accept_callbacks = false;
-  REQUIRE_FALSE(processor->ResolveFunction(kAfterCaptureAddress));
+  REQUIRE(processor->ResolveFunction(kAfterCaptureAddress));
   REQUIRE((capture.definitions.back() ==
            FunctionExtent{kAfterCaptureAddress, kAfterCaptureAddress}));
-  REQUIRE_FALSE(processor->ResolveFunction(kAfterCaptureAddress));
+  const size_t definition_count = capture.definitions.size();
+  REQUIRE(processor->ResolveFunction(kAfterCaptureAddress));
+  REQUIRE(capture.definitions.size() == definition_count);
 
   processor->set_guest_invocation_capture_sink(nullptr);
   REQUIRE(processor->guest_invocation_capture_sink() == nullptr);

@@ -51,7 +51,8 @@ struct GuestInvocationCaptureStatus {
 // may implement this interface by coordinating multiple independent recorder
 // segments and aggregating their ordered results. Translation and A64
 // execution hooks must depend only on this interface, not on the current
-// one-segment primitive.
+// one-segment primitive. A false callback result rejects the capture, not the
+// title operation being observed.
 class GuestInvocationCaptureEventSink {
  public:
   virtual ~GuestInvocationCaptureEventSink() = default;
