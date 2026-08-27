@@ -1113,6 +1113,8 @@ TEST_CASE("session capture runtime rejects a partial preemption episode",
   REQUIRE(harness.runtime->RequestStart());
   REQUIRE(harness.runtime->WaitForTerminal(2s));
   const auto status = harness.runtime->status();
+  INFO(status.message);
+  INFO(static_cast<uint32_t>(status.rejection));
   REQUIRE(status.state == RuntimeState::kRejected);
   REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
   REQUIRE(status.message.find("in-flight scheduler preemption episode") !=
@@ -1138,6 +1140,8 @@ TEST_CASE("session capture runtime rejects a partial final preemption episode",
   REQUIRE(harness.runtime->RequestStop());
   REQUIRE(harness.runtime->WaitForTerminal(2s));
   const auto status = harness.runtime->status();
+  INFO(status.message);
+  INFO(static_cast<uint32_t>(status.rejection));
   REQUIRE(status.state == RuntimeState::kRejected);
   REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
   REQUIRE(status.message.find("in-flight scheduler preemption episode") !=
