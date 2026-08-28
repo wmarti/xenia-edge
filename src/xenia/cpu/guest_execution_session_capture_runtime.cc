@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "fmt/format.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
@@ -113,6 +114,18 @@ bool IsPassiveOutsideGuestParticipant(
   }
   return participant.resume_kind == CheckpointResumeKind::kNativeContinuation ||
          participant.resume_kind == CheckpointResumeKind::kNotYetRun;
+}
+
+// The rejection diagnostic is one parsed log line, so its census is bounded.
+constexpr size_t kMaxReportedUnsupportedParticipants = 32;
+
+std::string DescribeCheckpointParticipant(
+    const CheckpointParticipant& participant) {
+  return fmt::format(
+      "tid={:08X} state={} resume_kind={} restorable={} pc={:08X}",
+      participant.thread_id, static_cast<uint32_t>(participant.state),
+      static_cast<uint32_t>(participant.resume_kind), participant.restorable,
+      participant.guest_pc);
 }
 
 bool CurrentTitleCaptureConfig(GuestExecutionSessionTitleCaptureConfig* output,
@@ -1222,22 +1235,33 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       return Fail(error, "capture runtime host-call roster is rejected");
     }
     size_t scheduler_owned_count = 0;
+    size_t unsupported_count = 0;
+    std::string unsupported_diagnostic;
+    auto fail_unsupported = [&]() {
+      return Fail(error,
+                  unsupported_diagnostic +
+                      fmt::format("; unsupported={}/{}", unsupported_count,
+                                  checkpoint.participants.size()));
+    };
+    auto fail_participant = [&](const char* message) {
+      return unsupported_count ? fail_unsupported() : Fail(error, message);
+    };
     for (size_t index = 0; index < registry.participants.size(); ++index) {
       const auto& lifecycle = registry.participants[index];
       if (lifecycle.state !=
               GuestExecutionCaptureThreadStateLifecycleState::kReady ||
           !lifecycle.participant.capture_instance_id ||
           !lifecycle.participant.guest_thread_id) {
-        return Fail(error,
-                    "capture runtime participant identity is not publishable");
+        return fail_participant(
+            "capture runtime participant identity is not publishable");
       }
       for (size_t prior = 0; prior < index; ++prior) {
         if (registry.participants[prior].participant.capture_instance_id ==
                 lifecycle.participant.capture_instance_id ||
             registry.participants[prior].participant.guest_thread_id ==
                 lifecycle.participant.guest_thread_id) {
-          return Fail(error,
-                      "capture runtime Processor roster contains a duplicate");
+          return fail_participant(
+              "capture runtime Processor roster contains a duplicate");
         }
       }
       const CheckpointParticipant* checkpoint_participant =
@@ -1248,16 +1272,14 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       }
       if (checkpoint_participant->capture_instance_id !=
           lifecycle.participant.capture_instance_id) {
-        return Fail(error,
-                    "capture runtime checkpoint and Processor identities "
-                    "differ");
+        return fail_participant(
+            "capture runtime checkpoint and Processor identities differ");
       }
       ++scheduler_owned_count;
       if (checkpoint_participant->preempt_defers_irql ||
           checkpoint_participant->preempt_defers_lock ||
           checkpoint_participant->capture_declined_safepoints) {
-        return Fail(
-            error,
+        return fail_participant(
             "capture runtime checkpoint intersects an in-flight scheduler "
             "preemption episode");
       }
@@ -1266,19 +1288,29 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
                       host_calls.active_calls.cend(), [&](const auto& call) {
                         return call.participant == lifecycle.participant;
                       })) {
-        return Fail(error,
-                    "capture runtime passive scheduler participant has an "
-                    "active outer host call");
+        return fail_participant(
+            "capture runtime passive scheduler participant has an "
+            "active outer host call");
       }
       std::string capability_error;
       if (!dependencies.provider->SupportsCheckpointParticipant(
               *checkpoint_participant, &capability_error)) {
-        return Fail(error,
-                    capability_error.empty()
-                        ? "capture runtime provider cannot encode a durable "
-                          "continuation for a checkpoint participant"
-                        : std::move(capability_error));
+        if (!unsupported_count) {
+          unsupported_diagnostic =
+              capability_error.empty()
+                  ? "capture runtime provider cannot encode a durable "
+                    "continuation for a checkpoint participant"
+                  : std::move(capability_error);
+        } else if (unsupported_count < kMaxReportedUnsupportedParticipants) {
+          unsupported_diagnostic.append("; also: ");
+          unsupported_diagnostic.append(
+              DescribeCheckpointParticipant(*checkpoint_participant));
+        }
+        ++unsupported_count;
       }
+    }
+    if (unsupported_count) {
+      return fail_unsupported();
     }
     if (scheduler_owned_count != checkpoint.participants.size()) {
       return Fail(error,

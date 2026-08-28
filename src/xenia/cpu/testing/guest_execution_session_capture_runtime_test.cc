@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "third_party/catch/include/catch.hpp"
+#include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/cvar.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/execution_jit_corpus.h"
@@ -324,14 +325,24 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
   }
 
   bool SupportsCheckpointParticipant(const CheckpointParticipant& participant,
-                                     std::string*) noexcept override {
-    return participant.restorable ||
-           (!participant.restorable && !participant.guest_pc &&
-            (participant.resume_kind ==
-                 kernel::GuestSchedulerCheckpointResumeKind::
-                     kNativeContinuation ||
-             participant.resume_kind ==
-                 kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun));
+                                     std::string* error) noexcept override {
+    if (participant.restorable ||
+        (!participant.guest_pc &&
+         (participant.resume_kind ==
+              kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation ||
+          participant.resume_kind ==
+              kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun))) {
+      return true;
+    }
+    if (error) {
+      *error = fmt::format(
+          "fake provider supports only restorable or passive participants: "
+          "tid={:08X} state={} resume_kind={} restorable={} pc={:08X}",
+          participant.thread_id, static_cast<uint32_t>(participant.state),
+          static_cast<uint32_t>(participant.resume_kind),
+          participant.restorable, participant.guest_pc);
+    }
+    return false;
   }
 
   bool BeginCapture(
@@ -1840,6 +1851,48 @@ TEST_CASE(
   REQUIRE(call_result);
   harness.runtime->Shutdown();
   thread.reset();
+}
+
+TEST_CASE("session capture runtime reports every unsupported participant",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto first = environment.MakeThread(1);
+  auto second = environment.MakeThread(2);
+  RuntimeHarness harness(environment, *first, 8);
+  REQUIRE(harness.runtime);
+
+  auto& participants = harness.checkpoint.provisional.participants;
+  participants.front().restorable = false;
+  CheckpointParticipant blocked;
+  blocked.thread_id = second->thread_id();
+  blocked.capture_instance_id = second->guest_execution_capture_instance_id();
+  blocked.guest_pc = 0x82081740;
+  blocked.cpu = 0;
+  blocked.state = kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
+  blocked.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+  blocked.restorable = false;
+  participants.push_back(blocked);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  INFO(status.message);
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
+  REQUIRE(status.message.find("tid=00000001") != std::string::npos);
+  REQUIRE(status.message.find("tid=00000002 state=2 resume_kind=2 "
+                              "restorable=false pc=82081740") !=
+          std::string::npos);
+  REQUIRE(status.message.find("; also: tid=") != std::string::npos);
+  REQUIRE(status.message.find("unsupported=2/2") != std::string::npos);
+  REQUIRE(status.message.find('\n') == std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.provider.begin_count.load() == 0);
+
+  harness.runtime->Shutdown();
+  second.reset();
+  first.reset();
 }
 
 TEST_CASE("session capture runtime rejects a partial preemption episode",
