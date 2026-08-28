@@ -799,7 +799,6 @@ struct RereadyRaceControl {
     }
     control->decision_wait = wait;
     control->entered.store(true, std::memory_order_release);
-    control->condition.notify_all();
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while (control->event->cooperative_signal_epoch() ==
                wait.observed_wait_epoch &&
@@ -811,21 +810,38 @@ struct RereadyRaceControl {
         std::memory_order_release);
   }
 
+  // A parked signaller would have to be woken from inside the very window it is
+  // racing, so it announces itself and then spins already on-CPU.
   bool WaitForHook(std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lock(mutex);
-    return condition.wait_for(lock, timeout, [this]() {
-      return entered.load(std::memory_order_acquire);
-    });
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    signaler_ready.store(true, std::memory_order_release);
+    while (!entered.load(std::memory_order_acquire)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return entered.load(std::memory_order_acquire);
+      }
+      std::this_thread::yield();
+    }
+    return true;
+  }
+
+  bool WaitForSignaler(std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!signaler_ready.load(std::memory_order_acquire)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::yield();
+    }
+    return true;
   }
 
   XThread* thread = nullptr;
   XEvent* event = nullptr;
   GuestSchedulerCaptureWaitState decision_wait;
   std::atomic<bool> claimed{false};
+  std::atomic<bool> signaler_ready{false};
   std::atomic<bool> entered{false};
   std::atomic<bool> signal_observed{false};
-  std::mutex mutex;
-  std::condition_variable condition;
 };
 
 struct RereadyWaitControl {
@@ -1433,6 +1449,7 @@ TEST_CASE("Guest scheduler reready capture freezes decision-time provenance",
       race.event->Set(0, false);
     }
   });
+  const bool signaler_ready = race.WaitForSignaler(2s);
   const bool armed = GuestSchedulerCaptureWaitRuntimeTestAccess::
       ArmRereadyDecisionHookAndForce(scheduler, thread.get(),
                                      &RereadyRaceControl::Hook, &race);
@@ -1442,6 +1459,7 @@ TEST_CASE("Guest scheduler reready capture freezes decision-time provenance",
       scheduler, nullptr, nullptr);
   scheduler.Shutdown();
 
+  REQUIRE(signaler_ready);
   REQUIRE(armed);
   REQUIRE(completed);
   REQUIRE(race.entered.load(std::memory_order_acquire));
