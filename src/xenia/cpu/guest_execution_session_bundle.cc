@@ -465,11 +465,60 @@ bool ValidateContinuousCheckpointBlobs(
   return true;
 }
 
+struct PendingExportTransitions {
+  bool has_transition = false;
+  uint32_t last_kind = 0;
+  uint32_t last_reason = 0;
+  bool blocked_before_export = false;
+};
+
+// The participant's scheduler transitions before its export, reduced to the
+// last one and to whether any of them put it back to sleep.
+bool ScanPendingExportTransitions(
+    const GuestExecutionSessionBundle& bundle, const ValidatedBundle& validated,
+    const std::vector<GuestExecutionSessionEvent>& canonical_events,
+    uint32_t participant_ordinal, size_t pending_index,
+    PendingExportTransitions* transitions, std::string* error) {
+  for (size_t index = 0; index < pending_index; ++index) {
+    const GuestExecutionSessionEvent& event = canonical_events[index];
+    if (event.kind != GuestExecutionSessionEventKind::kThreadDispatch &&
+        event.kind != GuestExecutionSessionEventKind::kSynchronization) {
+      continue;
+    }
+    const auto payload = validated.blobs.find(event.payload_sha256);
+    uint32_t subject_ordinal = kGuestExecutionSessionNoThread;
+    uint32_t raw_kind = 0;
+    uint32_t raw_reason = 0;
+    if (payload == validated.blobs.end() ||
+        !GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
+            event.kind, payload->second->bytes, bundle.manifest.participants,
+            &subject_ordinal, nullptr, &raw_kind, &raw_reason)) {
+      return Fail(error,
+                  "scheduler blocked-export witness payload is unreadable");
+    }
+    if (subject_ordinal != participant_ordinal) {
+      continue;
+    }
+    if (raw_kind == static_cast<uint32_t>(
+                        GuestExecutionSessionSchedulerEventKind::kBlock)) {
+      transitions->blocked_before_export = true;
+    }
+    transitions->last_kind = raw_kind;
+    transitions->last_reason = raw_reason;
+    transitions->has_transition = true;
+  }
+  return true;
+}
+
 // A blocked-export route claims that a recorded export completed the
 // participant's wait inside this interval. Prove every part of that claim from
 // the tape: the named event exists, it is that participant's export, it is the
 // first thing the participant did, and a modeled reready released the wait
 // before it.
+//
+// A participant the barrier caught on a ready queue instead is parked in the
+// same frame and takes the same route, but its wake fired before the interval
+// opened, so nothing on the tape can witness it.
 bool ValidateBlockedExportRoutes(
     const GuestExecutionSessionBundle& bundle, const ValidatedBundle& validated,
     const GuestExecutionSessionSchedulerTopologyChunk& start_topology,
@@ -478,8 +527,14 @@ bool ValidateBlockedExportRoutes(
     std::string* error) {
   for (const GuestExecutionSessionSchedulerTopologyParticipant& participant :
        start_topology.participants) {
-    if (participant.resume_kind !=
-        GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport) {
+    const bool blocked_row =
+        participant.resume_kind ==
+        GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport;
+    const bool woken_row =
+        participant.resume_kind ==
+            GuestExecutionSessionSchedulerResumeKind::kNativeContinuation &&
+        IsGuestExecutionSessionWokenInWaitParticipant(participant);
+    if (!blocked_row && !woken_row) {
       continue;
     }
     if (participant.ordinal >= bundle.manifest.participants.size() ||
@@ -497,6 +552,13 @@ bool ValidateBlockedExportRoutes(
         !ppc::GuestPPCThreadCheckpointCodec::Decode(blob->second->bytes,
                                                     &decoded, error)) {
       return Fail(error, "scheduler blocked-export start state is unreadable");
+    }
+    // A ready row is also the shape of a participant that never entered guest
+    // code, so only the state it carries can claim this route.
+    if (woken_row &&
+        decoded.resume_kind !=
+            ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern) {
+      continue;
     }
     const uint64_t pending = decoded.pending_external_event_sequence;
     if (pending < bundle.manifest.first_event_sequence ||
@@ -529,48 +591,33 @@ bool ValidateBlockedExportRoutes(
     }
     // The last scheduler transition this participant was the subject of before
     // its export returned is the wake that released the wait.
-    bool has_witness = false;
-    uint32_t witness_kind = 0;
-    uint32_t witness_reason = 0;
-    for (size_t index = 0;
-         index <
-         static_cast<size_t>(pending - bundle.manifest.first_event_sequence);
-         ++index) {
-      const GuestExecutionSessionEvent& event = canonical_events[index];
-      if (event.kind != GuestExecutionSessionEventKind::kThreadDispatch &&
-          event.kind != GuestExecutionSessionEventKind::kSynchronization) {
-        continue;
-      }
-      const auto payload = validated.blobs.find(event.payload_sha256);
-      uint32_t subject_ordinal = kGuestExecutionSessionNoThread;
-      uint32_t raw_kind = 0;
-      uint32_t raw_reason = 0;
-      if (payload == validated.blobs.end() ||
-          !GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
-              event.kind, payload->second->bytes, bundle.manifest.participants,
-              &subject_ordinal, nullptr, &raw_kind, &raw_reason)) {
-        return Fail(error,
-                    "scheduler blocked-export witness payload is unreadable");
-      }
-      if (subject_ordinal != participant.ordinal) {
-        continue;
-      }
-      witness_kind = raw_kind;
-      witness_reason = raw_reason;
-      has_witness = true;
+    PendingExportTransitions transitions;
+    if (!ScanPendingExportTransitions(
+            bundle, validated, canonical_events, participant.ordinal,
+            static_cast<size_t>(pending - bundle.manifest.first_event_sequence),
+            &transitions, error)) {
+      return false;
     }
-    if (!has_witness ||
-        witness_kind !=
+    if (woken_row) {
+      if (transitions.blocked_before_export) {
+        return Fail(error,
+                    "scheduler woken-export participant re-blocked before its "
+                    "export event");
+      }
+      continue;
+    }
+    if (!transitions.has_transition ||
+        transitions.last_kind !=
             static_cast<uint32_t>(
                 GuestExecutionSessionSchedulerEventKind::kReready)) {
       return Fail(error,
                   "scheduler blocked-export wake has no kReready witness "
                   "before its export event");
     }
-    if (witness_reason !=
+    if (transitions.last_reason !=
             static_cast<uint32_t>(
                 GuestExecutionSessionSchedulerEventReason::kSignalEpoch) &&
-        witness_reason !=
+        transitions.last_reason !=
             static_cast<uint32_t>(
                 GuestExecutionSessionSchedulerEventReason::kDeadline)) {
       return Fail(error, "scheduler blocked-export wake reason is not modeled");
@@ -736,6 +783,25 @@ bool ValidateSchedulerTopologyCheckpointBindings(
           }
           break;
         case GuestExecutionSessionSchedulerResumeKind::kNativeContinuation:
+          if (decoded.resume_kind ==
+              ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern) {
+            // Start boundary only, for the blocked class's reason: an export
+            // still open at the stop returns after the interval.
+            if (!start_boundary) {
+              return Fail(error,
+                          "scheduler final woken export has no durable replay "
+                          "route");
+            }
+            // A ready row serializes neither a PC nor a wait, so the seeded
+            // queue position is all it can witness for this route.
+            if (!IsGuestExecutionSessionWokenInWaitParticipant(participant)) {
+              return Fail(error,
+                          "scheduler start woken-export participant has no "
+                          "seeded ready position");
+            }
+            break;
+          }
+          [[fallthrough]];
         case GuestExecutionSessionSchedulerResumeKind::kNotYetRun:
           if (participant.restorable || participant.guest_pc ||
               decoded.resume_kind !=

@@ -1661,7 +1661,7 @@ std::vector<uint8_t> SchedulerPayload(uint32_t raw_kind, uint64_t sequence,
   return payload;
 }
 
-struct BlockedExportOptions {
+struct PendingExportOptions {
   uint32_t export_guest_address = 0x82000080;
   // Zero means the checkpoint names the same thunk the tape's event does.
   uint32_t checkpoint_export_address = 0;
@@ -1682,26 +1682,45 @@ struct BlockedExportOptions {
   GuestExecutionSessionEventDisposition export_disposition =
       GuestExecutionSessionEventDisposition::kReplayCaptured;
   bool blocked_final_topology = false;
+  // The start row is a participant the barrier caught on a ready queue rather
+  // than on a wait list, holding the same open export.
+  bool woken_route = false;
+  bool suspended_woken_row = false;
+  bool woken_final_topology = false;
+  bool block_head_start_state = false;
 };
 
 // A zero-segment continuous bundle whose only participant begins the interval
-// parked inside a modeled blocking export and wakes inside it.
-GuestExecutionSessionBundle MakeBlockedExportBundle(
-    BlockedExportOptions options = {}) {
+// parked inside a modeled blocking export and wakes inside it, held at the
+// boundary either on its wait list or on a ready queue.
+GuestExecutionSessionBundle MakePendingExportBundle(
+    PendingExportOptions options = {}) {
   constexpr uint64_t kEpoch = 0x123456789ABCDEF0ull;
   constexpr uint32_t kThreadId = 7;
   constexpr uint64_t kInstanceId = 0x100;
   constexpr uint32_t kResumePc = 0x82000040;
 
   GuestExecutionSessionBundle bundle;
-  const std::vector<uint8_t> initial_state_bytes = ThreadCheckpointBytes(
-      0, kThreadId, kResumePc, 1,
-      ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern,
-      options.pending_sequence,
-      options.checkpoint_export_address ? options.checkpoint_export_address
-                                        : options.export_guest_address);
+  const std::vector<uint8_t> initial_state_bytes =
+      options.block_head_start_state
+          ? ThreadCheckpointBytes(0, kThreadId, kResumePc, 1)
+          : ThreadCheckpointBytes(
+                0, kThreadId, kResumePc, 1,
+                ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern,
+                options.pending_sequence,
+                options.checkpoint_export_address
+                    ? options.checkpoint_export_address
+                    : options.export_guest_address);
   const std::vector<uint8_t> final_state_bytes =
-      ThreadCheckpointBytes(0, kThreadId, 0x82000044, 2);
+      options.woken_final_topology
+          ? ThreadCheckpointBytes(
+                0, kThreadId, 0x82000044, 2,
+                ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern,
+                options.pending_sequence,
+                options.checkpoint_export_address
+                    ? options.checkpoint_export_address
+                    : options.export_guest_address)
+          : ThreadCheckpointBytes(0, kThreadId, 0x82000044, 2);
   const GuestExecutionSessionSha256 initial_state =
       AddBlob(&bundle, initial_state_bytes);
   const GuestExecutionSessionSha256 final_state =
@@ -1805,6 +1824,10 @@ GuestExecutionSessionBundle MakeBlockedExportBundle(
     continuous.kind = event.kind;
     if (event.thread_ordinal != kGuestExecutionSessionNoThread) {
       continuous.actor = {event.thread_ordinal, kThreadId};
+      if (options.woken_final_topology &&
+          continuous.global_sequence == options.pending_sequence) {
+        continuous.subject = continuous.actor;
+      }
     }
     continuous_events.push_back(continuous);
   }
@@ -1838,12 +1861,27 @@ GuestExecutionSessionBundle MakeBlockedExportBundle(
       GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport;
   row.guest_pc = kResumePc;
   row.restorable = false;
-  row.blocked_wait.kind = options.wait_kind;
-  row.blocked_wait.handle_count = options.wait_handle_count;
-  row.blocked_wait.flags = options.wait_flags;
-  row.blocked_wait.deadline_ms = options.wait_deadline_ms;
-  for (uint32_t index = 0; index < options.wait_handle_count; ++index) {
-    row.blocked_wait.handles[index] = 0x40 + index;
+  if (options.woken_route) {
+    row.state = options.suspended_woken_row
+                    ? GuestExecutionSessionSchedulerParticipantState::kSuspended
+                    : GuestExecutionSessionSchedulerParticipantState::kReady;
+    row.resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kNativeContinuation;
+    row.guest_pc = 0;
+    if (options.suspended_woken_row) {
+      row.suspension_count = 1;
+    } else {
+      row.ready_queue_level = row.effective_priority;
+      row.ready_queue_fifo_ordinal = 0;
+    }
+  } else {
+    row.blocked_wait.kind = options.wait_kind;
+    row.blocked_wait.handle_count = options.wait_handle_count;
+    row.blocked_wait.flags = options.wait_flags;
+    row.blocked_wait.deadline_ms = options.wait_deadline_ms;
+    for (uint32_t index = 0; index < options.wait_handle_count; ++index) {
+      row.blocked_wait.handles[index] = 0x40 + index;
+    }
   }
   start_topology.participants.push_back(row);
 
@@ -1852,7 +1890,7 @@ GuestExecutionSessionBundle MakeBlockedExportBundle(
   final_topology.boundary =
       GuestExecutionSessionSchedulerTopologyBoundary::kFinal;
   final_topology.global_sequence = 6;
-  if (!options.blocked_final_topology) {
+  if (!options.blocked_final_topology && !options.woken_final_topology) {
     final_topology.participants[0].state =
         GuestExecutionSessionSchedulerParticipantState::kRunning;
     final_topology.participants[0].resume_kind =
@@ -1861,6 +1899,8 @@ GuestExecutionSessionBundle MakeBlockedExportBundle(
     final_topology.participants[0].guest_pc = 0x82000044;
     final_topology.participants[0].blocked_wait = {};
     final_topology.participants[0].ready_queue_level =
+        kGuestExecutionSessionSchedulerNoValue;
+    final_topology.participants[0].ready_queue_fifo_ordinal =
         kGuestExecutionSessionSchedulerNoValue;
   }
 
@@ -1940,7 +1980,7 @@ GuestExecutionSessionBundle MakeBlockedExportBundle(
 
 TEST_CASE("session bundle admits a blocked export replay route",
           "[guest-execution-session-bundle]") {
-  const GuestExecutionSessionBundle bundle = MakeBlockedExportBundle();
+  const GuestExecutionSessionBundle bundle = MakePendingExportBundle();
   std::string error;
   REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
                                                       bundle.chunks, &error));
@@ -1960,116 +2000,200 @@ TEST_CASE("session bundle proves every blocked export obligation",
   };
 
   SECTION("a final-boundary blocked participant has no route") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.blocked_final_topology = true;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "final blocked export has no durable replay route");
   }
   SECTION("an alertable wait is outside the modeled allowlist") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagAlertable;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "blocked-export wait is outside the modeled allowlist");
   }
   SECTION("an APC-pending wait is outside the modeled allowlist") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagAlertable |
                           kGuestExecutionSessionSchedulerWaitFlagUserApcPending;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "blocked-export wait is outside the modeled allowlist");
   }
   SECTION("a delay wait is outside the modeled allowlist") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.wait_kind = GuestExecutionSessionSchedulerWaitKind::kDelay;
     options.wait_handle_count = 0;
     options.wait_deadline_ms = 1000;
     options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagGated;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "blocked-export wait is outside the modeled allowlist");
   }
   SECTION("a multi-object wait stays inside the modeled allowlist") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.wait_kind = GuestExecutionSessionSchedulerWaitKind::kMultiAny;
     options.wait_handle_count = 2;
     error.clear();
     REQUIRE(ValidateGuestExecutionSessionBundle(
-        MakeBlockedExportBundle(options), &error));
+        MakePendingExportBundle(options), &error));
   }
   SECTION("a pending sequence past the interval rejects") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.pending_sequence = 9;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "pending event is outside the captured interval");
   }
   SECTION("the boundary-held sequence is not inside the interval") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.pending_sequence = 6;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "pending event is outside the captured interval");
   }
   SECTION("a pending sequence naming another event rejects") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.pending_sequence = 5;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "pending event does not name the participant's export");
   }
   SECTION("a deterministic export disposition rejects") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.export_disposition =
         GuestExecutionSessionEventDisposition::kValidateDeterministic;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "pending event does not name the participant's export");
   }
   SECTION("an export at a different thunk rejects") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.checkpoint_export_address = 0x820000C0;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "pending event does not name the participant's export");
   }
   SECTION("the export is not the participant's first captured event") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.witness_owns_participant = true;
     options.participant_first_event = 1;
     require_rejected(
-        MakeBlockedExportBundle(options),
+        MakePendingExportBundle(options),
         "pending event is not the participant's first captured event");
   }
   SECTION("a wake witnessed by a block rather than a reready rejects") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.witness_kind = 8;  // kBlock
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "wake has no kReready witness before its export event");
   }
   SECTION("a wake witnessing a thread off the roster rejects") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.witness_thread_id = 9;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "scheduler event subject is not a session participant");
   }
   SECTION("a polled wake reason is not modeled") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.witness_reason = 10;  // kPolled
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "wake reason is not modeled");
   }
   SECTION("a user-APC wake reason is not modeled") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.witness_reason = 13;  // kUserApc
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "wake reason is not modeled");
   }
   SECTION("a version-1 witness payload is unreadable") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.witness_payload_is_v1 = true;
-    require_rejected(MakeBlockedExportBundle(options),
+    require_rejected(MakePendingExportBundle(options),
                      "version 1 is not deterministic-replayable");
   }
   SECTION("a deadline wake is modeled") {
-    BlockedExportOptions options;
+    PendingExportOptions options;
     options.witness_reason = 12;  // kDeadline
     error.clear();
     REQUIRE(ValidateGuestExecutionSessionBundle(
-        MakeBlockedExportBundle(options), &error));
+        MakePendingExportBundle(options), &error));
+  }
+}
+
+TEST_CASE("session bundle admits a woken export replay route",
+          "[guest-execution-session-bundle]") {
+  PendingExportOptions options;
+  options.woken_route = true;
+  const GuestExecutionSessionBundle bundle = MakePendingExportBundle(options);
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                      bundle.chunks, &error));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  REQUIRE(error.empty());
+}
+
+TEST_CASE("session bundle proves every woken export obligation",
+          "[guest-execution-session-bundle]") {
+  std::string error;
+  const auto woken_options = []() {
+    PendingExportOptions options;
+    options.woken_route = true;
+    return options;
+  };
+  const auto require_rejected = [&error](
+                                    const GuestExecutionSessionBundle& bundle,
+                                    std::string_view text) {
+    error.clear();
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(error.find(text) != std::string::npos);
+  };
+
+  SECTION("a final-boundary woken participant has no route") {
+    PendingExportOptions options = woken_options();
+    options.woken_final_topology = true;
+    require_rejected(
+        MakePendingExportBundle(options),
+        "scheduler final woken export has no durable replay route");
+  }
+  SECTION("a suspended participant has no seeded ready position") {
+    PendingExportOptions options = woken_options();
+    options.suspended_woken_row = true;
+    require_rejected(MakePendingExportBundle(options),
+                     "scheduler start woken-export participant has no seeded "
+                     "ready position");
+  }
+  SECTION("a participant re-blocked before its export rejects") {
+    PendingExportOptions options = woken_options();
+    options.witness_kind = 8;  // kBlock
+    require_rejected(MakePendingExportBundle(options),
+                     "scheduler woken-export participant re-blocked before its "
+                     "export event");
+  }
+  SECTION("a ready row without a pending export stays passive") {
+    PendingExportOptions options = woken_options();
+    options.block_head_start_state = true;
+    require_rejected(MakePendingExportBundle(options),
+                     "start passive topology has an executable PPC route");
+  }
+  SECTION("a pending sequence past the interval rejects") {
+    PendingExportOptions options = woken_options();
+    options.pending_sequence = 9;
+    require_rejected(MakePendingExportBundle(options),
+                     "pending event is outside the captured interval");
+  }
+  SECTION("an export at a different thunk rejects") {
+    PendingExportOptions options = woken_options();
+    options.checkpoint_export_address = 0x820000C0;
+    require_rejected(MakePendingExportBundle(options),
+                     "pending event does not name the participant's export");
+  }
+  SECTION("the export is not the participant's first captured event") {
+    PendingExportOptions options = woken_options();
+    options.witness_owns_participant = true;
+    options.participant_first_event = 1;
+    require_rejected(
+        MakePendingExportBundle(options),
+        "pending event is not the participant's first captured event");
+  }
+  SECTION("no wake reason is required of a route woken before the interval") {
+    PendingExportOptions options = woken_options();
+    options.witness_reason = 10;  // kPolled
+    error.clear();
+    REQUIRE(ValidateGuestExecutionSessionBundle(
+        MakePendingExportBundle(options), &error));
   }
 }
 
