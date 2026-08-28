@@ -214,6 +214,15 @@ bool ValidateThreadCheckpointRoute(
   if (!guest_thread_id) {
     return Fail(error, "thread checkpoint guest thread ID is zero");
   }
+  if (resume_kind == GuestPPCThreadResumeKind::kOutsideGuest) {
+    if (resume_pc || owning_function_address || owning_function_end_address ||
+        outer_guest_return_address || pending_external_event_sequence ||
+        pending_export_guest_address) {
+      return Fail(error,
+                  "outside-guest checkpoint contains an executable route");
+    }
+    return true;
+  }
   if (!resume_pc || (resume_pc & 3)) {
     return Fail(error, "thread checkpoint resume PC is invalid");
   }

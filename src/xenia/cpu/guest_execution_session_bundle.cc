@@ -519,7 +519,18 @@ bool ValidateSchedulerTopologyCheckpointBindings(
       }
       if (participant.state ==
           GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned) {
+        if (decoded.resume_kind !=
+            ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+          return Fail(error, std::string("scheduler ") + std::string(boundary) +
+                                 " unowned topology has an executable PPC "
+                                 "route");
+        }
         continue;
+      }
+      if (decoded.resume_kind == ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+        return Fail(error, std::string("scheduler ") + std::string(boundary) +
+                               " owned topology lacks an executable PPC "
+                               "route");
       }
       switch (participant.resume_kind) {
         case GuestExecutionSessionSchedulerResumeKind::kJitSafepoint:
@@ -550,8 +561,30 @@ bool ValidateSchedulerTopologyCheckpointBindings(
     }
     return true;
   };
-  return validate_boundary(start_topology, initial_checkpoint, "start") &&
-         validate_boundary(final_topology, final_checkpoint, "final");
+  if (!validate_boundary(start_topology, initial_checkpoint, "start") ||
+      !validate_boundary(final_topology, final_checkpoint, "final")) {
+    return false;
+  }
+  for (size_t ordinal = 0; ordinal < start_topology.participants.size();
+       ++ordinal) {
+    const bool start_unowned =
+        start_topology.participants[ordinal].state ==
+        GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned;
+    const bool final_unowned =
+        final_topology.participants[ordinal].state ==
+        GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned;
+    if (start_unowned != final_unowned) {
+      return Fail(error,
+                  "scheduler ownership changed without a typed entry route");
+    }
+    if (start_unowned &&
+        initial_checkpoint.checkpoint.thread_states[ordinal] !=
+            final_checkpoint.checkpoint.thread_states[ordinal]) {
+      return Fail(error,
+                  "scheduler-unowned participant changed between boundaries");
+    }
+  }
+  return true;
 }
 
 bool ValidateContinuousCodeClosure(

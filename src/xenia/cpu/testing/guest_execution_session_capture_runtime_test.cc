@@ -536,27 +536,38 @@ class CanonicalEventBridge final
         return Fail(error, "test bridge cannot close the scheduler tape");
       }
       const size_t final_index = bundle->chunks.size() - 1;
+      auto decode_checkpoint_state =
+          [&](size_t index, GuestExecutionSessionCheckpointChunk* chunk,
+              ppc::GuestPPCThreadCheckpoint* state) {
+            if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
+                    bundle->chunks[index], chunk, error) ||
+                chunk->checkpoint.thread_states.size() != 1) {
+              return false;
+            }
+            const GuestExecutionSessionThreadStateReference& reference =
+                chunk->checkpoint.thread_states.front();
+            const auto blob = std::find_if(
+                bundle->content_blobs.cbegin(), bundle->content_blobs.cend(),
+                [&reference](
+                    const GuestExecutionSessionContentBlob& candidate) {
+                  return candidate.sha256 == reference.sha256;
+                });
+            return blob != bundle->content_blobs.cend() &&
+                   ppc::GuestPPCThreadCheckpointCodec::Decode(blob->bytes,
+                                                              state, error);
+          };
+      GuestExecutionSessionCheckpointChunk initial_checkpoint;
       GuestExecutionSessionCheckpointChunk final_checkpoint;
-      if (!GuestExecutionSessionCodec::DecodeCheckpointChunk(
-              bundle->chunks[final_index], &final_checkpoint, error) ||
-          final_checkpoint.checkpoint.thread_states.size() != 1) {
+      ppc::GuestPPCThreadCheckpoint initial_thread_state;
+      ppc::GuestPPCThreadCheckpoint final_thread_state;
+      if (!decode_checkpoint_state(0, &initial_checkpoint,
+                                   &initial_thread_state) ||
+          !decode_checkpoint_state(final_index, &final_checkpoint,
+                                   &final_thread_state)) {
         return false;
       }
       const GuestExecutionSessionThreadStateReference& final_state =
           final_checkpoint.checkpoint.thread_states.front();
-      const auto state_blob = std::find_if(
-          bundle->content_blobs.cbegin(), bundle->content_blobs.cend(),
-          [&final_state](const GuestExecutionSessionContentBlob& blob) {
-            return blob.sha256 == final_state.sha256;
-          });
-      if (state_blob == bundle->content_blobs.cend()) {
-        return Fail(error, "test bridge final state blob is missing");
-      }
-      ppc::GuestPPCThreadCheckpoint checkpoint;
-      if (!ppc::GuestPPCThreadCheckpointCodec::Decode(state_blob->bytes,
-                                                      &checkpoint, error)) {
-        return false;
-      }
 
       std::vector<GuestExecutionSessionEvent> canonical_events;
       for (size_t index = 0; index < final_index; ++index) {
@@ -599,7 +610,7 @@ class CanonicalEventBridge final
           final_checkpoint.checkpoint.global_sequence;
       boundary.checkpoint.state_size = final_state.byte_size;
       boundary.checkpoint.state_sha256 = final_state.sha256;
-      boundary.checkpoint.binding = BindingFor(checkpoint);
+      boundary.checkpoint.binding = BindingFor(final_thread_state);
 
       std::vector<uint8_t> overlay_bytes;
       if (!GuestExecutionContinuousEventCodec::Encode(continuous_events,
@@ -607,14 +618,61 @@ class CanonicalEventBridge final
         return false;
       }
       const uint32_t overlay_ordinal = static_cast<uint32_t>(final_index);
-      final_checkpoint.ordinal = overlay_ordinal + 1;
+      const uint32_t start_topology_ordinal = overlay_ordinal + 1;
+      const uint32_t final_topology_ordinal = overlay_ordinal + 2;
+      final_checkpoint.ordinal = overlay_ordinal + 3;
+      auto make_topology =
+          [&](const ppc::GuestPPCThreadCheckpoint& state,
+              GuestExecutionSessionSchedulerTopologyBoundary boundary_kind,
+              uint32_t ordinal, uint64_t global_sequence) {
+            GuestExecutionSessionSchedulerTopologyChunk topology;
+            topology.session_epoch = bundle->manifest.session_epoch;
+            topology.ordinal = ordinal;
+            topology.boundary = boundary_kind;
+            topology.global_sequence = global_sequence;
+            GuestExecutionSessionSchedulerTopologyParticipant durable;
+            durable.ordinal = participant.ordinal;
+            durable.guest_thread_id = participant.guest_thread_id;
+            durable.capture_instance_id = participant.capture_instance_id;
+            durable.state =
+                GuestExecutionSessionSchedulerParticipantState::kRunning;
+            durable.cpu = 0;
+            durable.effective_priority = 0;
+            durable.base_priority = 0;
+            durable.suspension_count = 0;
+            durable.quantum_remaining_us = 0;
+            durable.resume_kind =
+                GuestExecutionSessionSchedulerResumeKind::kJitSafepoint;
+            durable.guest_pc = state.resume_pc;
+            durable.restorable = true;
+            topology.participants.push_back(durable);
+            return topology;
+          };
+      const auto start_topology =
+          make_topology(initial_thread_state,
+                        GuestExecutionSessionSchedulerTopologyBoundary::kStart,
+                        start_topology_ordinal, 0);
+      const auto final_topology = make_topology(
+          final_thread_state,
+          GuestExecutionSessionSchedulerTopologyBoundary::kFinal,
+          final_topology_ordinal, bundle->manifest.last_event_sequence);
+      std::vector<uint8_t> start_topology_bytes;
+      std::vector<uint8_t> final_topology_bytes;
       std::vector<uint8_t> final_bytes;
-      if (!GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      if (!GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+              start_topology, &start_topology_bytes, error) ||
+          !GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+              final_topology, &final_topology_bytes, error) ||
+          !GuestExecutionSessionCodec::EncodeCheckpointChunk(
               final_checkpoint, &final_bytes, error)) {
         return false;
       }
       bundle->chunks.insert(bundle->chunks.begin() + final_index,
                             std::move(overlay_bytes));
+      bundle->chunks.insert(bundle->chunks.end() - 1,
+                            std::move(start_topology_bytes));
+      bundle->chunks.insert(bundle->chunks.end() - 1,
+                            std::move(final_topology_bytes));
       bundle->chunks.back() = std::move(final_bytes);
       bundle->manifest.chunks.insert(
           bundle->manifest.chunks.begin() + final_index,
@@ -624,6 +682,18 @@ class CanonicalEventBridge final
                        continuous_events.back().global_sequence,
                        static_cast<uint32_t>(continuous_events.size()),
                        bundle->chunks[final_index]));
+      bundle->manifest.chunks.insert(
+          bundle->manifest.chunks.end() - 1,
+          ReferenceFor(GuestExecutionSessionChunkKind::kSchedulerTopology,
+                       start_topology.ordinal, start_topology.global_sequence,
+                       start_topology.global_sequence, 1,
+                       bundle->chunks[start_topology_ordinal]));
+      bundle->manifest.chunks.insert(
+          bundle->manifest.chunks.end() - 1,
+          ReferenceFor(GuestExecutionSessionChunkKind::kSchedulerTopology,
+                       final_topology.ordinal, final_topology.global_sequence,
+                       final_topology.global_sequence, 1,
+                       bundle->chunks[final_topology_ordinal]));
       bundle->manifest.chunks.back() = ReferenceFor(
           GuestExecutionSessionChunkKind::kCheckpoint, final_checkpoint.ordinal,
           final_checkpoint.checkpoint.global_sequence,
@@ -765,6 +835,8 @@ class FakeCheckpointController final
         kRunningSafepointsRequeueAtHead;
     CheckpointParticipant participant;
     participant.thread_id = thread_state.thread_id();
+    participant.capture_instance_id =
+        thread_state.guest_execution_capture_instance_id();
     participant.guest_pc = kResumePc;
     participant.cpu = 0;
     participant.state =
@@ -1619,6 +1691,26 @@ TEST_CASE("session capture runtime timeout never publishes",
 
   harness.runtime->Shutdown();
   thread.reset();
+}
+
+TEST_CASE("session capture runtime admits a scheduler-unowned participant",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto scheduler_owned = environment.MakeThread(1);
+  auto scheduler_unowned = environment.MakeThread(2);
+  RuntimeHarness harness(environment, *scheduler_owned, 8);
+  REQUIRE(harness.runtime);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRecording);
+  REQUIRE(status.rejection == RuntimeRejection::kNone);
+  REQUIRE(harness.provider.begin_count.load() == 1);
+
+  harness.runtime->Shutdown();
+  scheduler_unowned.reset();
+  scheduler_owned.reset();
 }
 
 TEST_CASE("session capture runtime rejects a partial preemption episode",

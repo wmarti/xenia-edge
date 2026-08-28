@@ -1125,11 +1125,48 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::FinalizeBundle(
          bundle->manifest.participants) {
       if (checkpoint_subject.ordinal >=
               final_checkpoint.checkpoint.thread_states.size() ||
+          checkpoint_subject.ordinal >=
+              final_scheduler_topology_.participants.size() ||
           checkpoint_subject.held_after_event_sequence <
               bundle->manifest.first_event_sequence ||
           checkpoint_subject.held_after_event_sequence >
               bundle->manifest.last_event_sequence) {
         return Fail(error, "scheduler event bridge boundary route is invalid");
+      }
+      const GuestExecutionSessionThreadStateReference& boundary_state =
+          final_checkpoint.checkpoint.thread_states[checkpoint_subject.ordinal];
+      const auto boundary_blob = blob_catalog.find(boundary_state.sha256);
+      ppc::GuestPPCThreadCheckpoint boundary_checkpoint;
+      if (boundary_state.thread_ordinal != checkpoint_subject.ordinal ||
+          boundary_blob == blob_catalog.end() ||
+          boundary_blob->second->size() != boundary_state.byte_size ||
+          !ppc::GuestPPCThreadCheckpointCodec::Decode(
+              *boundary_blob->second, &boundary_checkpoint, error) ||
+          boundary_checkpoint.participant_ordinal !=
+              checkpoint_subject.ordinal ||
+          boundary_checkpoint.guest_thread_id !=
+              checkpoint_subject.guest_thread_id) {
+        return Fail(error,
+                    "scheduler event bridge final state identity is invalid");
+      }
+      const bool scheduler_unowned =
+          final_scheduler_topology_.participants[checkpoint_subject.ordinal]
+              .state ==
+          GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned;
+      if (scheduler_unowned) {
+        if (boundary_checkpoint.resume_kind !=
+                ppc::GuestPPCThreadResumeKind::kOutsideGuest ||
+            checkpoint_subject.boundary_arrival_kind !=
+                GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside) {
+          return Fail(error,
+                      "scheduler-unowned boundary has an executable route");
+        }
+        continue;
+      }
+      if (boundary_checkpoint.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+        return Fail(error,
+                    "scheduler-owned boundary lacks an executable route");
       }
       const uint64_t arrival_index =
           checkpoint_subject.held_after_event_sequence -

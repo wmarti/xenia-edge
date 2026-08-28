@@ -752,7 +752,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     if (host_calls.rejection !=
             GuestExecutionCaptureHostCallRosterRejection::kNone ||
         participants.empty() ||
-        checkpoint.participants.size() != participants.size() ||
+        checkpoint.participants.size() > participants.size() ||
         captured.size() != participants.size()) {
       return RejectLocked(
           "capture provider checkpoint inputs have inconsistent rosters");
@@ -786,18 +786,9 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     std::map<uint64_t, std::vector<uint8_t>> encoded;
     std::map<std::pair<uint64_t, uint64_t>, uint64_t> execution_identities;
     std::map<uint64_t, uint32_t> outer_return_addresses;
+    std::set<uint64_t> outside_guest_participants;
     for (size_t ordinal = 0; ordinal < ordered.size(); ++ordinal) {
       const auto& identity = ordered[ordinal];
-      const CheckpointParticipant* scheduler_participant =
-          FindCheckpointParticipant(checkpoint, identity.guest_thread_id);
-      if (!scheduler_participant || !scheduler_participant->restorable ||
-          scheduler_participant->resume_kind !=
-              kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint ||
-          !scheduler_participant->guest_pc ||
-          (scheduler_participant->guest_pc & 3)) {
-        return RejectLocked(
-            "capture provider supports only exact-PC JIT safepoints");
-      }
       const auto thread = std::find_if(
           captured.cbegin(), captured.cend(), [&](const auto& candidate) {
             return candidate.participant == identity;
@@ -808,32 +799,57 @@ struct GuestExecutionSessionCaptureProvider::Impl {
         return RejectLocked(
             "capture provider scheduler and ThreadState identities differ");
       }
-      uint32_t outer_return = 0;
-      if (!FindOuterReturn(identity, host_calls, &outer_return)) {
-        return false;
-      }
-      outer_return_addresses.emplace(identity.capture_instance_id,
-                                     outer_return);
-      const DefinitionRecord* owner =
-          FindOwningDefinitionLocked(scheduler_participant->guest_pc);
-      if (!owner) {
-        return false;
-      }
-      const uint32_t owner_address = FindDefinitionAddressLocked(owner);
-      if (!owner_address || !owner->code_pages_snapshotted ||
-          !AddClosureSeedLocked(owner_address, owner->end_address)) {
-        return false;
-      }
 
       ppc::GuestPPCThreadCheckpoint state_blob;
       state_blob.participant_ordinal = static_cast<uint32_t>(ordinal);
       state_blob.guest_thread_id = identity.guest_thread_id;
-      state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kGuestBlockHead;
-      state_blob.resume_pc = scheduler_participant->guest_pc;
-      state_blob.owning_function_address = owner_address;
-      state_blob.owning_function_end_address = owner->end_address;
-      state_blob.outer_guest_return_address = outer_return;
       state_blob.registers = thread->registers;
+      const CheckpointParticipant* scheduler_participant =
+          FindCheckpointParticipant(checkpoint, identity.guest_thread_id);
+      if (scheduler_participant) {
+        if (scheduler_participant->capture_instance_id !=
+                identity.capture_instance_id ||
+            !scheduler_participant->restorable ||
+            scheduler_participant->resume_kind !=
+                kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint ||
+            !scheduler_participant->guest_pc ||
+            (scheduler_participant->guest_pc & 3)) {
+          return RejectLocked(
+              "capture provider supports only exact-PC JIT safepoints");
+        }
+        uint32_t outer_return = 0;
+        if (!FindOuterReturn(identity, host_calls, &outer_return)) {
+          return false;
+        }
+        outer_return_addresses.emplace(identity.capture_instance_id,
+                                       outer_return);
+        const DefinitionRecord* owner =
+            FindOwningDefinitionLocked(scheduler_participant->guest_pc);
+        if (!owner) {
+          return false;
+        }
+        const uint32_t owner_address = FindDefinitionAddressLocked(owner);
+        if (!owner_address || !owner->code_pages_snapshotted ||
+            !AddClosureSeedLocked(owner_address, owner->end_address)) {
+          return false;
+        }
+        state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kGuestBlockHead;
+        state_blob.resume_pc = scheduler_participant->guest_pc;
+        state_blob.owning_function_address = owner_address;
+        state_blob.owning_function_end_address = owner->end_address;
+        state_blob.outer_guest_return_address = outer_return;
+      } else {
+        if (std::any_of(host_calls.active_calls.cbegin(),
+                        host_calls.active_calls.cend(), [&](const auto& call) {
+                          return call.participant == identity;
+                        })) {
+          return RejectLocked(
+              "capture provider cannot encode an active host call as "
+              "outside guest");
+        }
+        state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+        outside_guest_participants.insert(identity.capture_instance_id);
+      }
       std::vector<uint8_t> bytes;
       std::string error;
       if (!ppc::GuestPPCThreadCheckpointCodec::Encode(state_blob, &bytes,
@@ -849,16 +865,32 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     }
     if (encoded.size() != ordered.size() ||
         execution_identities.size() != ordered.size() ||
-        outer_return_addresses.size() != ordered.size()) {
+        outer_return_addresses.size() != checkpoint.participants.size()) {
       return RejectLocked(
           "capture provider checkpoint identity mapping is not one-to-one");
     }
     if (establish_execution_identities) {
       active_invocation_identities = std::move(execution_identities);
       initial_outer_return_addresses = std::move(outer_return_addresses);
-    } else if (execution_identities != active_invocation_identities) {
+      initial_outside_guest_participants =
+          std::move(outside_guest_participants);
+    } else if (execution_identities != active_invocation_identities ||
+               outside_guest_participants !=
+                   initial_outside_guest_participants) {
       return RejectLocked(
-          "capture provider ThreadState context identity changed in-session");
+          "capture provider participant boundary class changed in-session");
+    }
+    if (!establish_execution_identities) {
+      for (uint64_t participant : outside_guest_participants) {
+        const auto initial = initial_states.find(participant);
+        const auto final = encoded.find(participant);
+        if (initial == initial_states.cend() || final == encoded.cend() ||
+            initial->second != final->second) {
+          return RejectLocked(
+              "capture provider outside-guest participant changed at the "
+              "boundary");
+        }
+      }
     }
     *output = std::move(encoded);
     return true;
@@ -876,6 +908,11 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     if (found == active_invocation_identities.cend()) {
       return RejectLocked(
           "capture provider callback came from outside the held roster");
+    }
+    if (initial_outside_guest_participants.contains(found->second)) {
+      return RejectLocked(
+          "capture provider outside-guest participant executed without a "
+          "typed entry checkpoint");
     }
     *participant = found->second;
     return true;
@@ -1214,6 +1251,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
   std::map<std::pair<uint64_t, uint64_t>, uint64_t>
       active_invocation_identities;
   std::map<uint64_t, uint32_t> initial_outer_return_addresses;
+  std::set<uint64_t> initial_outside_guest_participants;
   std::map<uint64_t, std::vector<uint8_t>> initial_states;
   std::map<uint64_t, std::vector<uint8_t>> final_states;
   std::vector<InstructionCounter> instruction_counters;
@@ -1415,6 +1453,16 @@ bool GuestExecutionSessionCaptureProvider::CollectInstructionCoverageDeltas(
           "capture provider could not atomically drain the exact instruction "
           "counter roster");
       return impl_->SetErrorFromRejection(error);
+    }
+    for (const auto& delta : *output) {
+      if (impl_->initial_outside_guest_participants.contains(
+              delta.participant.capture_instance_id)) {
+        impl_->RejectLocked(
+            "capture provider outside-guest participant accumulated guest "
+            "instructions");
+        output->clear();
+        return impl_->SetErrorFromRejection(error);
+      }
     }
     return true;
   } catch (...) {
@@ -1665,8 +1713,10 @@ bool GuestExecutionSessionCaptureProvider::OnFunctionEntry(
       return true;
     }
     uint64_t participant = 0;
-    return impl_->IsKnownExecutionIdentityLocked(identity, &participant) &&
-           impl_->RetryPendingDefinitionsLocked(true) &&
+    if (!impl_->IsKnownExecutionIdentityLocked(identity, &participant)) {
+      return false;
+    }
+    return impl_->RetryPendingDefinitionsLocked(true) &&
            impl_->AddClosureSeedLocked(address, end_address);
   });
 }

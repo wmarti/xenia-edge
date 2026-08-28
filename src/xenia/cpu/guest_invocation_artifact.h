@@ -135,6 +135,7 @@ class GuestPPCRegisterStateCodec {
 enum class GuestPPCThreadResumeKind : uint32_t {
   kGuestBlockHead = 1,
   kPendingModeledBlockingExtern = 2,
+  kOutsideGuest = 3,
 };
 
 // Pointer-free semantic state for one fixed session participant. Host stacks,

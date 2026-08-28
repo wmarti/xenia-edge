@@ -196,11 +196,12 @@ bool ValidateRuntimeCheckpointStateBindings(
     std::string* error) {
   if (checkpoint.checkpoint.thread_states.size() !=
           bundle.manifest.participants.size() ||
-      scheduler_checkpoint.participants.size() !=
+      scheduler_checkpoint.participants.size() >
           bundle.manifest.participants.size()) {
     return Fail(error, std::string("capture runtime ") + boundary +
                            " checkpoint roster differs from the bundle");
   }
+  size_t scheduler_owned_count = 0;
   for (const GuestExecutionSessionThreadStateReference& state :
        checkpoint.checkpoint.thread_states) {
     if (state.thread_ordinal >= bundle.manifest.participants.size()) {
@@ -238,9 +239,18 @@ bool ValidateRuntimeCheckpointStateBindings(
         FindCheckpointParticipant(scheduler_checkpoint,
                                   decoded.guest_thread_id);
     if (!scheduler_participant) {
+      if (decoded.resume_kind != ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+        return Fail(error, std::string("capture runtime ") + boundary +
+                               " scheduler-unowned participant has an "
+                               "executable PPC continuation");
+      }
+      continue;
+    }
+    ++scheduler_owned_count;
+    if (scheduler_participant->capture_instance_id !=
+        participant.capture_instance_id) {
       return Fail(error, std::string("capture runtime ") + boundary +
-                             " checkpoint state has no held scheduler "
-                             "participant");
+                             " scheduler and bundle identities differ");
     }
     if (scheduler_participant->resume_kind !=
             CheckpointResumeKind::kJitSafepoint ||
@@ -251,6 +261,10 @@ bool ValidateRuntimeCheckpointStateBindings(
                              " PPC continuation differs from the held "
                              "scheduler JIT safepoint");
     }
+  }
+  if (scheduler_owned_count != scheduler_checkpoint.participants.size()) {
+    return Fail(error, std::string("capture runtime ") + boundary +
+                           " scheduler checkpoint has no bundle identity");
   }
   return true;
 }
@@ -278,26 +292,48 @@ bool ValidateRuntimePublicationBundle(
   }
   bool saw_canonical_events = false;
   bool saw_continuous_events = false;
+  uint32_t scheduler_topology_count = 0;
   for (size_t index = 2; index + 1 < bundle.manifest.chunks.size(); ++index) {
     const GuestExecutionSessionChunkKind kind =
         bundle.manifest.chunks[index].kind;
     if (kind == GuestExecutionSessionChunkKind::kEvents &&
-        !saw_continuous_events) {
+        !saw_continuous_events && !scheduler_topology_count) {
       saw_canonical_events = true;
     } else if (kind == GuestExecutionSessionChunkKind::kContinuousEvents &&
-               saw_canonical_events) {
+               saw_canonical_events && !scheduler_topology_count) {
       saw_continuous_events = true;
+    } else if (kind == GuestExecutionSessionChunkKind::kSchedulerTopology &&
+               saw_continuous_events && scheduler_topology_count < 2) {
+      GuestExecutionSessionSchedulerTopologyChunk topology;
+      if (!GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+              bundle.chunks[index], &topology, error, limits.session)) {
+        return false;
+      }
+      const bool expected_start = scheduler_topology_count == 0;
+      if ((expected_start &&
+           (topology.boundary !=
+                GuestExecutionSessionSchedulerTopologyBoundary::kStart ||
+            topology.global_sequence != 0)) ||
+          (!expected_start &&
+           (topology.boundary !=
+                GuestExecutionSessionSchedulerTopologyBoundary::kFinal ||
+            topology.global_sequence != bundle.manifest.last_event_sequence))) {
+        return Fail(error,
+                    "capture runtime scheduler topology order is invalid");
+      }
+      ++scheduler_topology_count;
     } else {
       return Fail(error,
                   "capture runtime publication chunk order is not initial "
-                  "checkpoint, corpus, canonical events, overlay, final "
-                  "checkpoint");
+                  "checkpoint, corpus, canonical events, overlay, scheduler "
+                  "topologies, final checkpoint");
     }
   }
-  if (!saw_canonical_events || !saw_continuous_events) {
+  if (!saw_canonical_events || !saw_continuous_events ||
+      scheduler_topology_count != 2) {
     return Fail(error,
-                "capture runtime publication lacks an authenticated event "
-                "overlay");
+                "capture runtime publication lacks its authenticated event "
+                "overlay or scheduler topology boundaries");
   }
   if (!ValidateGuestExecutionSessionBundle(bundle, error, limits)) {
     return false;
@@ -325,6 +361,14 @@ bool ValidateRuntimePublicationBundle(
   }
   std::vector<bool> participant_binding_seen(
       bundle.manifest.participants.size(), false);
+  std::vector<bool> participant_binding_required(
+      bundle.manifest.participants.size(), false);
+  for (const GuestExecutionSessionParticipant& participant :
+       bundle.manifest.participants) {
+    participant_binding_required[participant.ordinal] =
+        FindCheckpointParticipant(final_scheduler_checkpoint,
+                                  participant.guest_thread_id) != nullptr;
+  }
   GuestExecutionContinuousEventLimits continuous_limits;
   continuous_limits.maximum_encoded_bytes = limits.session.maximum_chunk_bytes;
   continuous_limits.maximum_records = limits.session.maximum_events_per_chunk;
@@ -354,7 +398,9 @@ bool ValidateRuntimePublicationBundle(
           bundle.manifest.participants[ordinal];
       const GuestExecutionSessionThreadStateReference& state =
           final_checkpoint.checkpoint.thread_states[ordinal];
-      if (event.subject.guest_thread_id != participant.guest_thread_id ||
+      if (!participant_binding_required[ordinal] ||
+          participant_binding_seen[ordinal] ||
+          event.subject.guest_thread_id != participant.guest_thread_id ||
           event.checkpoint.state_size != state.byte_size ||
           event.checkpoint.state_sha256 != state.sha256) {
         return Fail(error,
@@ -364,12 +410,14 @@ bool ValidateRuntimePublicationBundle(
       participant_binding_seen[ordinal] = true;
     }
   }
-  if (std::find(participant_binding_seen.begin(),
-                participant_binding_seen.end(),
-                false) != participant_binding_seen.end()) {
-    return Fail(error,
-                "capture runtime publication lacks an exact-PC final state "
-                "binding for every participant");
+  for (size_t ordinal = 0; ordinal < participant_binding_seen.size();
+       ++ordinal) {
+    if (participant_binding_seen[ordinal] !=
+        participant_binding_required[ordinal]) {
+      return Fail(error,
+                  "capture runtime publication final state bindings differ "
+                  "from scheduler ownership");
+    }
   }
   return true;
 }
@@ -1078,13 +1126,12 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       return Fail(error,
                   "capture runtime Processor participant roster is not ready");
     }
-    if (registry.participants.size() != checkpoint.participants.size()) {
-      return Fail(
-          error,
-          "capture runtime checkpoint omits a Processor participant; "
-          "created-suspended and otherwise scheduler-unowned lifetimes are "
-          "an explicit unsupported contract");
+    if (checkpoint.participants.size() > registry.participants.size()) {
+      return Fail(error,
+                  "capture runtime scheduler checkpoint exceeds the "
+                  "Processor participant roster");
     }
+    size_t scheduler_owned_count = 0;
     for (size_t index = 0; index < registry.participants.size(); ++index) {
       const auto& lifecycle = registry.participants[index];
       if (lifecycle.state !=
@@ -1093,21 +1140,6 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
           !lifecycle.participant.guest_thread_id) {
         return Fail(error,
                     "capture runtime participant identity is not publishable");
-      }
-      const CheckpointParticipant* checkpoint_participant =
-          FindCheckpointParticipant(checkpoint,
-                                    lifecycle.participant.guest_thread_id);
-      if (!checkpoint_participant) {
-        return Fail(error,
-                    "capture runtime checkpoint and Processor rosters differ");
-      }
-      if (checkpoint_participant->preempt_defers_irql ||
-          checkpoint_participant->preempt_defers_lock ||
-          checkpoint_participant->capture_declined_safepoints) {
-        return Fail(
-            error,
-            "capture runtime checkpoint intersects an in-flight scheduler "
-            "preemption episode");
       }
       for (size_t prior = 0; prior < index; ++prior) {
         if (registry.participants[prior].participant.capture_instance_id ==
@@ -1118,6 +1150,27 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
                       "capture runtime Processor roster contains a duplicate");
         }
       }
+      const CheckpointParticipant* checkpoint_participant =
+          FindCheckpointParticipant(checkpoint,
+                                    lifecycle.participant.guest_thread_id);
+      if (!checkpoint_participant) {
+        continue;
+      }
+      if (checkpoint_participant->capture_instance_id !=
+          lifecycle.participant.capture_instance_id) {
+        return Fail(error,
+                    "capture runtime checkpoint and Processor identities "
+                    "differ");
+      }
+      ++scheduler_owned_count;
+      if (checkpoint_participant->preempt_defers_irql ||
+          checkpoint_participant->preempt_defers_lock ||
+          checkpoint_participant->capture_declined_safepoints) {
+        return Fail(
+            error,
+            "capture runtime checkpoint intersects an in-flight scheduler "
+            "preemption episode");
+      }
       std::string capability_error;
       if (!dependencies.provider->SupportsCheckpointParticipant(
               *checkpoint_participant, &capability_error)) {
@@ -1127,6 +1180,11 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
                           "continuation for a checkpoint participant"
                         : std::move(capability_error));
       }
+    }
+    if (scheduler_owned_count != checkpoint.participants.size()) {
+      return Fail(error,
+                  "capture runtime checkpoint contains a non-Processor "
+                  "participant");
     }
     if (host_calls.rejection !=
         GuestExecutionCaptureHostCallRosterRejection::kNone) {

@@ -949,6 +949,11 @@ bool BuildGuestExecutionContinuousReplayPlan(
     if (ordinal >= manifest.participants.size()) {
       return fail("continuous checkpoint route names an unknown participant");
     }
+    if (plan.final_scheduler_topology.participants[ordinal].state ==
+        GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned) {
+      return fail(
+          "continuous scheduler-unowned participant has a checkpoint route");
+    }
     const uint64_t checkpoint_sequence =
         event.control.checkpoint.checkpoint_global_sequence;
     const GuestExecutionSessionCheckpoint* checkpoint = nullptr;
@@ -986,7 +991,18 @@ bool BuildGuestExecutionContinuousReplayPlan(
   for (size_t i = 0; i < manifest.participants.size(); ++i) {
     const GuestExecutionSessionParticipant& participant =
         manifest.participants[i];
-    if (!final_routes[i]) {
+    const bool initial_scheduler_unowned =
+        plan.initial_scheduler_topology.participants[i].state ==
+        GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned;
+    const bool final_scheduler_unowned =
+        plan.final_scheduler_topology.participants[i].state ==
+        GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned;
+    if (initial_scheduler_unowned != final_scheduler_unowned) {
+      return fail(
+          "continuous participant scheduler ownership changes without a "
+          "typed entry route");
+    }
+    if (!final_scheduler_unowned && !final_routes[i]) {
       return fail("continuous final checkpoint route is missing");
     }
     const GuestExecutionSessionThreadStateReference& initial_state =
@@ -1022,6 +1038,9 @@ bool BuildGuestExecutionContinuousReplayPlan(
         return Fail(error, std::string("continuous ") + std::string(boundary) +
                                " checkpoint participant differs");
       }
+      if (route.resume_kind == ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+        return true;
+      }
       const ExecutionJitCorpus::FunctionRecord* owner =
           plan.corpus.FindFunction(route.owning_function_address);
       if (!owner || owner->end_address != route.owning_function_end_address) {
@@ -1041,15 +1060,38 @@ bool BuildGuestExecutionContinuousReplayPlan(
       *output = {};
       return false;
     }
-    const ppc::GuestPPCThreadCheckpointBinding& final_binding =
-        final_routes[i]->control.checkpoint.binding;
-    if (!ppc::GuestPPCThreadCheckpointCodec::ValidateBinding(
-            planned.final_checkpoint, final_binding, error)) {
-      *output = {};
-      return false;
+    if (final_scheduler_unowned) {
+      if (final_routes[i] || initial_state != final_state ||
+          planned.initial_checkpoint.resume_kind !=
+              ppc::GuestPPCThreadResumeKind::kOutsideGuest ||
+          planned.final_checkpoint.resume_kind !=
+              ppc::GuestPPCThreadResumeKind::kOutsideGuest ||
+          planned.initial_checkpoint != planned.final_checkpoint ||
+          participant.initial_outer_call_state !=
+              GuestExecutionSessionInitialOuterCallState::kOutside ||
+          participant.boundary_arrival_kind !=
+              GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside) {
+        return fail("continuous scheduler-unowned participant is not dormant");
+      }
+    } else {
+      if (planned.initial_checkpoint.resume_kind ==
+              ppc::GuestPPCThreadResumeKind::kOutsideGuest ||
+          planned.final_checkpoint.resume_kind ==
+              ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+        return fail(
+            "continuous scheduler-owned participant lacks a replay route");
+      }
+      const ppc::GuestPPCThreadCheckpointBinding& final_binding =
+          final_routes[i]->control.checkpoint.binding;
+      if (!ppc::GuestPPCThreadCheckpointCodec::ValidateBinding(
+              planned.final_checkpoint, final_binding, error)) {
+        *output = {};
+        return false;
+      }
     }
-    if (planned.initial_checkpoint.resume_pc !=
-        planned.initial_checkpoint.owning_function_address) {
+    if (!initial_scheduler_unowned &&
+        planned.initial_checkpoint.resume_pc !=
+            planned.initial_checkpoint.owning_function_address) {
       const GuestExecutionContinuousReplayResumeEntry resume = {
           planned.initial_checkpoint.resume_pc,
           planned.initial_checkpoint.owning_function_address,

@@ -433,6 +433,90 @@ TEST_CASE(
           GuestExecutionSessionCaptureProviderState::kAccepted);
 }
 
+TEST_CASE("guest execution session provider checkpoints a dormant participant",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.second_thread->context()->r[3] = 0x8899AABBCCDDEEFFull;
+  std::string error;
+  REQUIRE(harness.provider->BeginCapture(harness.Checkpoint(),
+                                         harness.TwoThreadParticipants(),
+                                         harness.HostCalls(), &error));
+  REQUIRE(error.empty());
+
+  std::vector<uint8_t> initial_state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(
+      harness.second_participant, &initial_state_bytes, &error));
+  ppc::GuestPPCThreadCheckpoint initial_state;
+  REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(initial_state_bytes,
+                                                     &initial_state, &error));
+  REQUIRE(initial_state.participant_ordinal == 1);
+  REQUIRE(initial_state.guest_thread_id == kSecondThreadId);
+  REQUIRE(initial_state.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kOutsideGuest);
+  REQUIRE(initial_state.resume_pc == 0);
+  REQUIRE(initial_state.owning_function_address == 0);
+  REQUIRE(initial_state.owning_function_end_address == 0);
+  REQUIRE(initial_state.outer_guest_return_address == 0);
+  REQUIRE(initial_state.registers.gpr[3] == 0x8899AABBCCDDEEFFull);
+
+  REQUIRE(harness.provider->SealCapture(harness.Checkpoint(),
+                                        harness.HostCalls(), &error));
+  REQUIRE(error.empty());
+  std::vector<uint8_t> final_state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(harness.second_participant,
+                                                   &final_state_bytes, &error));
+  ppc::GuestPPCThreadCheckpoint final_state;
+  REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(final_state_bytes,
+                                                     &final_state, &error));
+  REQUIRE(final_state == initial_state);
+}
+
+TEST_CASE("guest execution session provider rejects an untyped dormant entry",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  std::string error;
+  REQUIRE(harness.provider->BeginCapture(harness.Checkpoint(),
+                                         harness.TwoThreadParticipants(),
+                                         harness.HostCalls(), &error));
+  SECTION("function entry") {
+    REQUIRE_FALSE(harness.provider->OnFunctionEntry(
+        harness.SecondInvocationIdentity(), kFunctionAddress,
+        kFunctionEndAddress,
+        ppc::CaptureGuestPPCRegisterState(*harness.second_thread->context())));
+  }
+  SECTION("memory callback") {
+    REQUIRE_FALSE(harness.provider->OnMemoryAccess(
+        harness.SecondInvocationIdentity(), harness.data_address, 4,
+        ppc::GuestInvocationRecorderMemoryAccess::kRead));
+  }
+  SECTION("instruction counter") {
+    std::atomic_ref<uint64_t>(harness.second_thread->context()
+                                  ->guest_execution_session_instruction_count)
+        .fetch_add(1, std::memory_order_relaxed);
+    std::vector<GuestExecutionSessionInstructionCoverageDelta> deltas;
+    REQUIRE_FALSE(
+        harness.provider->CollectInstructionCoverageDeltas(&deltas, &error));
+    REQUIRE(deltas.empty());
+  }
+  const auto status = harness.provider->status();
+  REQUIRE(status.state == GuestExecutionSessionCaptureProviderState::kRejected);
+  REQUIRE(status.message.find("outside-guest participant") !=
+          std::string::npos);
+}
+
+TEST_CASE("guest execution session provider rejects an active dormant call",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  std::string error;
+  REQUIRE_FALSE(harness.provider->BeginCapture(
+      harness.Checkpoint(), harness.TwoThreadParticipants(),
+      harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.find("active host call as outside guest") != std::string::npos);
+}
+
 TEST_CASE("guest execution session provider owns instruction counters",
           "[guest-execution-session-capture-provider]") {
   ProviderHarness harness;

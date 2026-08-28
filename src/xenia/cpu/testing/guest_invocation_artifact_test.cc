@@ -155,6 +155,11 @@ GuestPPCThreadCheckpoint MakeThreadCheckpoint(
   if (resume_kind == GuestPPCThreadResumeKind::kPendingModeledBlockingExtern) {
     checkpoint.pending_external_event_sequence = 0x1020304050607080ull;
     checkpoint.pending_export_guest_address = 0x80008000;
+  } else if (resume_kind == GuestPPCThreadResumeKind::kOutsideGuest) {
+    checkpoint.resume_pc = 0;
+    checkpoint.owning_function_address = 0;
+    checkpoint.owning_function_end_address = 0;
+    checkpoint.outer_guest_return_address = 0;
   }
   checkpoint.registers = MakeRegisterState(0x6B, 0x90006000);
   return checkpoint;
@@ -390,7 +395,8 @@ TEST_CASE("PPC thread checkpoint wraps one exact canonical register blob",
 
   for (GuestPPCThreadResumeKind resume_kind :
        {GuestPPCThreadResumeKind::kGuestBlockHead,
-        GuestPPCThreadResumeKind::kPendingModeledBlockingExtern}) {
+        GuestPPCThreadResumeKind::kPendingModeledBlockingExtern,
+        GuestPPCThreadResumeKind::kOutsideGuest}) {
     INFO("resume kind " << static_cast<uint32_t>(resume_kind));
     const GuestPPCThreadCheckpoint expected = MakeThreadCheckpoint(resume_kind);
     std::vector<uint8_t> encoded;
@@ -574,7 +580,7 @@ TEST_CASE("PPC thread checkpoint enforces canonical resume identities",
   checkpoint = MakeThreadCheckpoint();
   checkpoint.resume_kind = static_cast<GuestPPCThreadResumeKind>(0);
   RequireThreadCheckpointEncodeFailure(checkpoint);
-  checkpoint.resume_kind = static_cast<GuestPPCThreadResumeKind>(3);
+  checkpoint.resume_kind = static_cast<GuestPPCThreadResumeKind>(4);
   RequireThreadCheckpointEncodeFailure(checkpoint);
   checkpoint.resume_kind = static_cast<GuestPPCThreadResumeKind>(UINT32_MAX);
   RequireThreadCheckpointEncodeFailure(checkpoint);
@@ -599,7 +605,7 @@ TEST_CASE("PPC thread checkpoint enforces canonical resume identities",
   checkpoint.pending_export_guest_address = 0x80008002;
   RequireThreadCheckpointEncodeFailure(checkpoint);
 
-  for (uint32_t forged_kind : {0u, 3u, UINT32_MAX}) {
+  for (uint32_t forged_kind : {0u, 4u, UINT32_MAX}) {
     INFO("forged resume kind " << forged_kind);
     std::vector<uint8_t> malformed = EncodeValidThreadCheckpoint();
     WriteU32(&malformed, kThreadResumeKindOffset, forged_kind);
