@@ -80,6 +80,19 @@ std::array<uint8_t, 8> EncodeLittleEndian(uint64_t value) {
   return bytes;
 }
 
+std::array<uint8_t, kGuestExecutionCaptureExternalEventVolatileRegisterBytes>
+EncodeLittleEndian(
+    const GuestExecutionCaptureExternalEventVolatileRegisterState& registers) {
+  std::array<uint8_t, kGuestExecutionCaptureExternalEventVolatileRegisterBytes>
+      bytes = {};
+  for (size_t i = 0; i < registers.values.size(); ++i) {
+    const std::array<uint8_t, 8> value =
+        EncodeLittleEndian(registers.values[i]);
+    std::copy(value.begin(), value.end(), bytes.begin() + i * 8);
+  }
+  return bytes;
+}
+
 }  // namespace
 
 struct GuestExecutionCaptureExternalEventLog::Impl {
@@ -121,6 +134,7 @@ GuestExecutionCaptureExternalEventLog::OnExternalEventBegin(
     return {};
   }
   if (!begin.participant.capture_instance_id || !IsKnownKind(begin.kind) ||
+      (begin.guest_address & 3) ||
       begin.effect_ranges.size() > impl_->limits.max_effect_ranges ||
       effect_preimage.size() > impl_->limits.max_effect_bytes) {
     impl_->RejectLocked(
@@ -165,6 +179,7 @@ GuestExecutionCaptureExternalEventLog::OnExternalEventBegin(
     active_call.participant = begin.participant;
     active_call.kind = begin.kind;
     active_call.export_ordinal = begin.export_ordinal;
+    active_call.guest_address = begin.guest_address;
     active_call.call_site_address = begin.call_site_address;
     active_call.effect_ranges.assign(begin.effect_ranges.begin(),
                                      begin.effect_ranges.end());
@@ -236,8 +251,12 @@ bool GuestExecutionCaptureExternalEventLog::OnExternalEventEnd(
   }
   const size_t active_index =
       static_cast<size_t>(active_it - impl_->active_calls.begin());
-  const uint64_t payload_bytes = uint64_t(active_call.effect_byte_count) * 2 +
-                                 (end.has_returned_value ? 8 : 0);
+  const uint64_t payload_bytes =
+      uint64_t(active_call.effect_byte_count) * 2 +
+      (end.has_returned_value ? 8 : 0) +
+      (end.has_volatile_registers
+           ? kGuestExecutionCaptureExternalEventVolatileRegisterBytes
+           : 0);
   if (payload_bytes >
       impl_->limits.max_total_payload_bytes - impl_->total_payload_bytes) {
     impl_->RejectLocked(
@@ -257,10 +276,15 @@ bool GuestExecutionCaptureExternalEventLog::OnExternalEventEnd(
   record.disposition = end.disposition;
   record.mutation_source = end.mutation_source;
   record.export_ordinal = active_call.export_ordinal;
+  record.guest_address = active_call.guest_address;
   record.call_site_address = active_call.call_site_address;
   record.has_returned_value = end.has_returned_value;
   if (end.has_returned_value) {
     record.returned_value_le = EncodeLittleEndian(end.returned_value);
+  }
+  record.has_volatile_registers = end.has_volatile_registers;
+  if (end.has_volatile_registers) {
+    record.volatile_registers_le = EncodeLittleEndian(end.volatile_registers);
   }
   record.effect_byte_count = active_call.effect_byte_count;
   try {

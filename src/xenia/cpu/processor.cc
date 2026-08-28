@@ -667,6 +667,45 @@ bool Processor::DetachGuestExecutionCaptureHostCallObserver(
   return can_detach;
 }
 
+bool Processor::AttachGuestExecutionCaptureExternalEventLog(
+    std::shared_ptr<GuestExecutionCaptureExternalEventLog> log) {
+  if (!log) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(
+      guest_execution_capture_external_event_log_mutex_);
+  if (guest_execution_capture_external_event_log_) {
+    return false;
+  }
+  guest_execution_capture_external_event_log_ = std::move(log);
+  guest_execution_capture_external_event_log_installed_.store(
+      true, std::memory_order_release);
+  return true;
+}
+
+bool Processor::DetachGuestExecutionCaptureExternalEventLog(
+    const std::shared_ptr<GuestExecutionCaptureExternalEventLog>& log) {
+  std::lock_guard<std::mutex> lock(
+      guest_execution_capture_external_event_log_mutex_);
+  // A still-open dispatch is parked inside the export it recorded; releasing
+  // the log there would drop an event the log already promised.
+  if (!log || guest_execution_capture_external_event_log_ != log ||
+      !log->CanDetach()) {
+    return false;
+  }
+  guest_execution_capture_external_event_log_installed_.store(
+      false, std::memory_order_release);
+  guest_execution_capture_external_event_log_ = nullptr;
+  return true;
+}
+
+std::shared_ptr<GuestExecutionCaptureExternalEventLog>
+Processor::guest_execution_capture_external_event_log() const {
+  std::lock_guard<std::mutex> lock(
+      guest_execution_capture_external_event_log_mutex_);
+  return guest_execution_capture_external_event_log_;
+}
+
 GuestExecutionCaptureHostCallToken
 Processor::BeginGuestExecutionCaptureHostCall(const ThreadState& thread_state,
                                               const GuestFunction& function,

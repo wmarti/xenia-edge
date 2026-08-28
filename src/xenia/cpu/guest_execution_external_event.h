@@ -83,6 +83,26 @@ struct GuestExecutionCaptureExternalEventEffectRange {
       default;
 };
 
+// Post-return volatile register state, in this order: r0, r3-r12, ctr, cr.
+// The PPC ABI lets a callee clobber these, so a caller resumed at the return
+// address must not read them; but that is a property of well-formed caller
+// code, not a guarantee the recording can make, so the record carries the
+// values the dispatch actually left rather than trusting title code.
+inline constexpr size_t kGuestExecutionCaptureExternalEventVolatileRegisters =
+    13;
+inline constexpr size_t
+    kGuestExecutionCaptureExternalEventVolatileRegisterBytes =
+        kGuestExecutionCaptureExternalEventVolatileRegisters * 8;
+
+struct GuestExecutionCaptureExternalEventVolatileRegisterState {
+  std::array<uint64_t, kGuestExecutionCaptureExternalEventVolatileRegisters>
+      values = {};
+
+  bool operator==(
+      const GuestExecutionCaptureExternalEventVolatileRegisterState&) const =
+      default;
+};
+
 // Opens one external event. The declared guest-memory effect is a list of
 // canonical ranges the export is expected to write; their exact preimage bytes
 // are supplied separately, concatenated in range order, and snapshotted before
@@ -97,6 +117,10 @@ struct GuestExecutionCaptureExternalEventBegin {
       GuestExecutionCaptureExternalEventKind::kKernelExport;
   // Stable export identity within its module; zero when none applies.
   uint32_t export_ordinal = 0;
+  // Guest address the call site branched to, PPC-aligned. Zero when the
+  // dispatch could not be attributed to one, and no replay route can bind to
+  // a record that carries no address.
+  uint32_t guest_address = 0;
   // Guest return address at the dispatch boundary, for provenance only.
   uint32_t call_site_address = 0;
   // Declared guest-memory effect ranges; the preimage span is exactly their
@@ -108,7 +132,8 @@ struct GuestExecutionCaptureExternalEventBegin {
 // postimage span must be empty when the begin declared no effect, and
 // otherwise exactly as long as the preimage, in the same range order.
 // mutation_source must be kActiveGuestThread exactly when an effect is
-// present.
+// present. The volatile register state is optional; a record without it
+// carries no claim about what the dispatch left in those registers.
 struct GuestExecutionCaptureExternalEventEnd {
   GuestExecutionCaptureExternalEventDisposition disposition =
       GuestExecutionCaptureExternalEventDisposition::kReplayCaptured;
@@ -117,6 +142,8 @@ struct GuestExecutionCaptureExternalEventEnd {
   bool has_returned_value = false;
   // Raw return register value; canonicalized to little-endian in the record.
   uint64_t returned_value = 0;
+  bool has_volatile_registers = false;
+  GuestExecutionCaptureExternalEventVolatileRegisterState volatile_registers;
 };
 
 // One finished external event. Payload bytes are canonical: the return value
@@ -132,9 +159,13 @@ struct GuestExecutionCaptureExternalEventRecord {
   GuestExecutionCaptureExternalEventMutationSource mutation_source =
       GuestExecutionCaptureExternalEventMutationSource::kNone;
   uint32_t export_ordinal = 0;
+  uint32_t guest_address = 0;
   uint32_t call_site_address = 0;
   bool has_returned_value = false;
   std::array<uint8_t, 8> returned_value_le = {};
+  bool has_volatile_registers = false;
+  std::array<uint8_t, kGuestExecutionCaptureExternalEventVolatileRegisterBytes>
+      volatile_registers_le = {};
   std::vector<GuestExecutionCaptureExternalEventEffectRange> effect_ranges;
   // Summed range bytes, which is also each image's length.
   uint32_t effect_byte_count = 0;
@@ -164,6 +195,7 @@ struct GuestExecutionCaptureExternalEventActiveCall {
   GuestExecutionCaptureExternalEventKind kind =
       GuestExecutionCaptureExternalEventKind::kKernelExport;
   uint32_t export_ordinal = 0;
+  uint32_t guest_address = 0;
   uint32_t call_site_address = 0;
   std::vector<GuestExecutionCaptureExternalEventEffectRange> effect_ranges;
   uint32_t effect_byte_count = 0;

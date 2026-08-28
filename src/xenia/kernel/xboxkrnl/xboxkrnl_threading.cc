@@ -14,6 +14,12 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/cpu/processor.h"
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include <span>
+
+#include "xenia/kernel/guest_execution_export_event_adapter.h"
+#endif
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -1035,8 +1041,21 @@ dword_result_t KeWaitForSingleObject_entry(lpvoid_t object_ptr,
                                            lpqword_t timeout_ptr) {
   SCOPE_profile_cpu_i("guestsync", "KeWaitForSingleObject");
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-  return xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode,
-                                 alertable, timeout_ptr ? &timeout : nullptr);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  const uint32_t capture_objects[] = {object_ptr.guest_address()};
+  GuestExecutionExportEventScope capture_scope(
+      ordinals::KeWaitForSingleObject, GuestSchedulerCaptureWaitKind::kSingle,
+      alertable.value() != 0, capture_objects);
+#endif
+  const X_STATUS result =
+      xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode,
+                              alertable, timeout_ptr ? &timeout : nullptr);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  capture_scope.Complete(result);
+#endif
+  return result;
 }
 DECLARE_XBOXKRNL_EXPORT3(KeWaitForSingleObject, kThreading, kImplemented,
                          kBlocking, kHighFrequency);
@@ -1070,8 +1089,24 @@ dword_result_t NtWaitForSingleObjectEx_entry(dword_t object_handle,
                                              lpqword_t timeout_ptr) {
   SCOPE_profile_cpu_i("guestsync", "NtWaitForSingleObjectEx");
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-  return NtWaitForSingleObjectEx(object_handle, wait_mode, alertable,
-                                 timeout_ptr ? &timeout : nullptr);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  uint32_t capture_objects[1] = {};
+  if (IsGuestExecutionExportEventRecording()) {
+    capture_objects[0] =
+        GuestExecutionExportEventObjectAddress(kernel_state(), object_handle);
+  }
+  GuestExecutionExportEventScope capture_scope(
+      ordinals::NtWaitForSingleObjectEx, GuestSchedulerCaptureWaitKind::kSingle,
+      alertable.value() != 0, capture_objects);
+#endif
+  const X_STATUS result = NtWaitForSingleObjectEx(
+      object_handle, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  capture_scope.Complete(result);
+#endif
+  return result;
 }
 DECLARE_XBOXKRNL_EXPORT3(NtWaitForSingleObjectEx, kThreading, kImplemented,
                          kBlocking, kHighFrequency);
@@ -1102,9 +1137,28 @@ dword_result_t KeWaitForMultipleObjects_entry(
     }
   }
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  uint32_t capture_objects[kGuestExecutionExportEventMaximumObjects] = {};
+  const uint32_t capture_object_count =
+      count <= kGuestExecutionExportEventMaximumObjects ? uint32_t(count) : 0;
+  for (uint32_t n = 0; n < capture_object_count; ++n) {
+    capture_objects[n] = objects[n]->guest_object();
+  }
+  GuestExecutionExportEventScope capture_scope(
+      ordinals::KeWaitForMultipleObjects,
+      wait_type ? GuestSchedulerCaptureWaitKind::kMultiAny
+                : GuestSchedulerCaptureWaitKind::kMultiAll,
+      alertable.value() != 0,
+      std::span<const uint32_t>(capture_objects, capture_object_count));
+#endif
   X_STATUS result = XObject::WaitMultiple(
       uint32_t(count), reinterpret_cast<XObject**>(&objects[0]), wait_type,
       wait_reason, processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  capture_scope.Complete(result);
+#endif
   if (alertable) {
     if (result == X_STATUS_USER_APC) {
       xeProcessUserApcs(nullptr);
@@ -1169,9 +1223,33 @@ dword_result_t NtWaitForMultipleObjectsEx_entry(
       (wait_type != X_KWAIT_REASON::WaitAny && wait_type)) {
     return X_STATUS_INVALID_PARAMETER;
   }
-  return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode,
-                                      alertable,
-                                      timeout_ptr ? &timeout : nullptr);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  uint32_t capture_objects[kGuestExecutionExportEventMaximumObjects] = {};
+  uint32_t capture_object_count = 0;
+  if (handles && count <= kGuestExecutionExportEventMaximumObjects &&
+      IsGuestExecutionExportEventRecording()) {
+    capture_object_count = uint32_t(count);
+    for (uint32_t n = 0; n < capture_object_count; ++n) {
+      capture_objects[n] =
+          GuestExecutionExportEventObjectAddress(kernel_state(), handles[n]);
+    }
+  }
+  GuestExecutionExportEventScope capture_scope(
+      ordinals::NtWaitForMultipleObjectsEx,
+      wait_type ? GuestSchedulerCaptureWaitKind::kMultiAny
+                : GuestSchedulerCaptureWaitKind::kMultiAll,
+      alertable.value() != 0,
+      std::span<const uint32_t>(capture_objects, capture_object_count));
+#endif
+  const X_STATUS result =
+      xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode,
+                                   alertable, timeout_ptr ? &timeout : nullptr);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  capture_scope.Complete(result);
+#endif
+  return result;
 }
 DECLARE_XBOXKRNL_EXPORT3(NtWaitForMultipleObjectsEx, kThreading, kImplemented,
                          kBlocking, kHighFrequency);
@@ -1193,9 +1271,24 @@ dword_result_t NtSignalAndWaitForSingleObjectEx_entry(dword_t signal_handle,
   global_critical_region::mutex().unlock();
   if (signal_object && wait_object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    // The signaled object's header is written by this export too, so it is
+    // declared alongside the waited one.
+    const uint32_t capture_objects[] = {signal_object->guest_object(),
+                                        wait_object->guest_object()};
+    GuestExecutionExportEventScope capture_scope(
+        ordinals::NtSignalAndWaitForSingleObjectEx,
+        GuestSchedulerCaptureWaitKind::kSingle, alertable.value() != 0,
+        capture_objects);
+#endif
     result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3,
                                     wait_mode, alertable,
                                     timeout_ptr ? &timeout : nullptr);
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    capture_scope.Complete(result);
+#endif
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }

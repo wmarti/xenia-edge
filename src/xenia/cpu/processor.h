@@ -32,6 +32,7 @@
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 #include "xenia/cpu/guest_execution_capture.h"
+#include "xenia/cpu/guest_execution_external_event.h"
 #endif
 #include "xenia/cpu/module.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
@@ -185,6 +186,24 @@ class Processor {
   GuestExecutionCaptureThreadStateRegistrySnapshot
   QueryGuestExecutionCaptureParticipantsAtCutoff(
       std::atomic<bool>& capture_active) const;
+
+  // Orthogonal to the host-call observer: the modeled kernel-export adapter
+  // records one external event per allowlisted blocking export dispatch. A
+  // dispatch that finds no installed log records nothing, so a capture that
+  // never installs one behaves exactly as it does today. The log is
+  // shared-owned because a dispatch parks inside the export it opened and must
+  // reach the same log when it returns, whatever the owner did meanwhile.
+  bool AttachGuestExecutionCaptureExternalEventLog(
+      std::shared_ptr<GuestExecutionCaptureExternalEventLog> log);
+  bool DetachGuestExecutionCaptureExternalEventLog(
+      const std::shared_ptr<GuestExecutionCaptureExternalEventLog>& log);
+  std::shared_ptr<GuestExecutionCaptureExternalEventLog>
+  guest_execution_capture_external_event_log() const;
+  // Lets a dispatch skip its guest-memory snapshot without taking the lock.
+  bool guest_execution_capture_external_event_log_installed() const {
+    return guest_execution_capture_external_event_log_installed_.load(
+        std::memory_order_acquire);
+  }
 
   // Visits live ThreadState objects while destruction is excluded by the
   // capture-only lifetime registry lock. The visitor must not retain a
@@ -530,6 +549,12 @@ class Processor {
   uint64_t guest_execution_capture_host_call_dispatch_epoch_ = 0;
   bool guest_execution_capture_host_call_dispatch_seen_ = false;
   bool guest_execution_capture_host_call_observer_transition_pending_ = false;
+
+  mutable std::mutex guest_execution_capture_external_event_log_mutex_;
+  std::shared_ptr<GuestExecutionCaptureExternalEventLog>
+      guest_execution_capture_external_event_log_;
+  std::atomic<bool> guest_execution_capture_external_event_log_installed_{
+      false};
 #endif
 
   // Opt-in capture ordering lock. Recursive because defining a guest function
