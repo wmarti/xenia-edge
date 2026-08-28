@@ -30,6 +30,7 @@
 #include "xenia/cpu/guest_execution_continuous_event.h"
 #include "xenia/cpu/guest_execution_session_capture_event_bridge.h"
 #include "xenia/cpu/guest_execution_session_capture_export_event_bridge.h"
+#include "xenia/cpu/guest_scheduler_record.h"
 
 namespace xe {
 namespace cpu {
@@ -510,6 +511,31 @@ kernel::GuestSchedulerCheckpointBarrierSnapshot BridgeCheckpoint(
     checkpoint.participants.push_back(participant);
   }
   return checkpoint;
+}
+
+// Proves the always-compiled record decoder reads a payload the capture
+// encoder really wrote, field for field.
+void RequireUngatedRecordMatches(
+    const std::vector<uint8_t>& payload,
+    const kernel::GuestSchedulerCaptureEvent& event) {
+  DecodedSchedulerRecord record;
+  std::string error;
+  REQUIRE(GuestSchedulerRecordCodec::Decode(payload, &record, &error));
+  REQUIRE(error.empty());
+  REQUIRE(GuestSchedulerRecordCodec::Validate(record, &error));
+  REQUIRE(record.sequence == event.sequence);
+  REQUIRE(record.capture_instance_id == event.capture_instance_id);
+  REQUIRE(record.guest_thread_id == event.guest_thread_id);
+  REQUIRE(record.count == event.count);
+  REQUIRE(record.guest_pc == event.guest_pc);
+  REQUIRE(record.flags == event.flags);
+  REQUIRE(record.kind == event.kind);
+  REQUIRE(record.reason == event.reason);
+  REQUIRE(record.cpu == event.cpu);
+  REQUIRE(record.target_cpu == event.target_cpu);
+  REQUIRE(record.priority == event.priority);
+  REQUIRE(record.value == event.value);
+  REQUIRE(record.wait == event.wait);
 }
 
 kernel::GuestSchedulerCaptureEvent BridgeSchedulerEvent(
@@ -2789,6 +2815,7 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
       REQUIRE(GuestExecutionSessionCaptureSchedulerEventBridge::
                   DecodeSchedulerEventPayload(blob->bytes, &decoded,
                                               &harness.error));
+      RequireUngatedRecordMatches(blob->bytes, decoded);
       decoded_scheduler_sequences.push_back(decoded.sequence);
       if (decoded.sequence == 43) {
         REQUIRE(decoded.wait == reready.wait);
@@ -3125,6 +3152,7 @@ TEST_CASE("scheduler event bridge authenticates every cooperative wait kind",
             DecodeSchedulerEventPayload(blob.bytes, &decoded, &decode_error)) {
       continue;
     }
+    RequireUngatedRecordMatches(blob.bytes, decoded);
     REQUIRE(decoded.kind == kernel::GuestSchedulerCaptureEventKind::kBlock);
     REQUIRE(decoded.value < encoded_by_wait_kind.size());
     if (!decoded_wait_kind[decoded.value]) {

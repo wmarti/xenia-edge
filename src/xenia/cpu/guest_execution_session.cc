@@ -16,12 +16,14 @@
 #include <map>
 #include <new>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
 
 #include "third_party/crypto/sha256.h"
 #include "xenia/cpu/guest_execution_continuous_event.h"
+#include "xenia/cpu/guest_scheduler_record.h"
 
 namespace xe {
 namespace cpu {
@@ -34,8 +36,10 @@ constexpr std::array<uint8_t, 8> kClosureMagic = {'X', 'E', 'G', 'C',
                                                   'L', 'O', 'S', 'E'};
 constexpr std::array<uint8_t, 8> kSchedulerTopologyMagic = {'X', 'E', 'G', 'T',
                                                             'O', 'P', 'O', 0};
-constexpr std::array<uint8_t, 8> kSchedulerEventPayloadMagic = {
-    'X', 'E', 'G', 'S', 'C', 'E', '1', 0};
+static_assert(GuestExecutionSessionCodec::kSchedulerEventPayloadVersion ==
+              GuestSchedulerRecordCodec::kPayloadVersion);
+static_assert(GuestExecutionSessionCodec::kSchedulerEventPayloadSize ==
+              GuestSchedulerRecordCodec::kPayloadSize);
 constexpr uint32_t kManifestEnvelopeKind = 1;
 constexpr uint32_t kManifestOrdinal = UINT32_MAX;
 constexpr uint32_t kKnownEnvelopeFlags = 0;
@@ -2614,68 +2618,42 @@ bool GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
       kind != GuestExecutionSessionEventKind::kSynchronization) {
     return Fail(error, "scheduler event subject kind is not a scheduler kind");
   }
-  if (!data || data_size != kSchedulerEventPayloadSize || data[47] ||
-      data[62] || data[63] ||
-      std::any_of(data + 176, data + kSchedulerEventPayloadSize,
-                  [](uint8_t value) { return value != 0; })) {
+  if (!data) {
     return Fail(error, "scheduler event payload envelope is invalid");
   }
-  Reader reader(data, data_size);
-  std::array<uint8_t, 8> magic = {};
-  uint32_t version = 0;
-  uint32_t record_kind_value = 0;
-  uint64_t sequence = 0;
-  uint64_t capture_instance_id = 0;
-  uint32_t guest_thread_id = 0;
-  if (!reader.ReadBytes(magic.data(), magic.size()) ||
-      magic != kSchedulerEventPayloadMagic || !reader.ReadU32(&version) ||
-      version != kSchedulerEventPayloadVersion ||
-      !reader.ReadU32(&record_kind_value) || !reader.ReadU64(&sequence) ||
-      !reader.ReadU64(&capture_instance_id) ||
-      !reader.ReadU32(&guest_thread_id) || !sequence || !capture_instance_id ||
-      !guest_thread_id) {
-    return Fail(error, "scheduler event payload envelope is invalid");
+  DecodedSchedulerRecord record;
+  if (!GuestSchedulerRecordCodec::Decode(
+          std::span<const uint8_t>(data, data_size), &record, error)) {
+    return false;
   }
-  // Durable kernel::GuestSchedulerCaptureEventKind tape identifiers; the
-  // declaring header is compiled out of capture-disabled builds.
   GuestExecutionSessionEventKind canonical_kind;
-  switch (record_kind_value) {
-    case 7:   // kSafepoint
-    case 8:   // kBlock
-    case 9:   // kReready
-    case 10:  // kParkSuspended
-    case 11:  // kResume
+  switch (record.kind) {
+    case GuestSchedulerCaptureEventKind::kSafepoint:
+    case GuestSchedulerCaptureEventKind::kBlock:
+    case GuestSchedulerCaptureEventKind::kReready:
+    case GuestSchedulerCaptureEventKind::kParkSuspended:
+    case GuestSchedulerCaptureEventKind::kResume:
       canonical_kind = GuestExecutionSessionEventKind::kSynchronization;
       break;
-    case 1:   // kEnqueueReady
-    case 2:   // kDequeueReady
-    case 3:   // kDispatch
-    case 4:   // kSwitchOut
-    case 5:   // kYield
-    case 6:   // kPreemptRequest
-    case 12:  // kPriorityChange
-    case 13:  // kMigrate
+    default:
       canonical_kind = GuestExecutionSessionEventKind::kThreadDispatch;
       break;
-    default:
-      return Fail(error, "scheduler event payload kind is unsupported");
   }
   if (canonical_kind != kind) {
     return Fail(
         error, "scheduler event payload kind differs from its canonical event");
   }
-  // The reason byte the capture bridge writes beside the record kind; the
-  // event-bridge static_asserts pin both spellings.
-  constexpr size_t kRecordReasonOffset = 42;
   for (const GuestExecutionSessionParticipant& participant : participants) {
-    if (participant.capture_instance_id == capture_instance_id &&
-        participant.guest_thread_id == guest_thread_id) {
+    if (participant.capture_instance_id == record.capture_instance_id &&
+        participant.guest_thread_id == record.guest_thread_id) {
       *subject_ordinal = participant.ordinal;
+      // The event-bridge static_asserts pin these against the session-side
+      // spellings a route validator compares them to.
       if (record_kind) {
-        *record_kind = record_kind_value;
+        *record_kind = static_cast<uint32_t>(record.kind);
       }
       if (record_reason) {
-        *record_reason = data[kRecordReasonOffset];
+        *record_reason = static_cast<uint32_t>(record.reason);
       }
       return true;
     }

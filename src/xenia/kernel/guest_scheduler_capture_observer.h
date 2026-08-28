@@ -13,137 +13,45 @@
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <vector>
 
+#include "xenia/cpu/guest_scheduler_record.h"
+
 namespace xe {
 namespace kernel {
 
-// One scheduler transition that changes, or decides, which participant runs
-// next on a dispatch CPU. Values are durable tape identifiers.
-enum class GuestSchedulerCaptureEventKind : uint8_t {
-  kNone = 0,
-  kEnqueueReady = 1,
-  kDequeueReady = 2,
-  kDispatch = 3,
-  kSwitchOut = 4,
-  kYield = 5,
-  kPreemptRequest = 6,
-  kSafepoint = 7,
-  kBlock = 8,
-  kReready = 9,
-  kParkSuspended = 10,
-  kResume = 11,
-  kPriorityChange = 12,
-  kMigrate = 13,
-  kExit = 14,
-  kTerminate = 15,
-  kForget = 16,
-  kShutdown = 17,
-};
-
-enum class GuestSchedulerCaptureReason : uint8_t {
-  kNone = 0,
-  // kPreemptRequest: who raised the running participant's preempt flag.
-  kPriority = 1,
-  kWake = 2,
-  kTimeslice = 3,
-  kTerminate = 4,
-  kShutdown = 5,
-  // kSafepoint: what the handler did with the raised flag.
-  kDeferredLock = 6,
-  kDeferredIrql = 7,
-  kForcedIrql = 8,
-  kYielded = 9,
-  // kReready: which gate released the parked participant.
-  kPolled = 10,
-  kSignalEpoch = 11,
-  kDeadline = 12,
-  kUserApc = 13,
-  kBackstop = 14,
-  // kTerminate: what an external terminate did to the participant.
-  kDetached = 15,
-  kPreemptRequested = 16,
-  kReadied = 17,
-  kNeverRan = 18,
-  kDeferredToDispatcher = 19,
-};
-
-// Kind-specific bits of GuestSchedulerCaptureEvent::flags.
-enum GuestSchedulerCaptureEventFlags : uint16_t {
-  // kEnqueueReady, kReready, kMigrate, kTerminate: linked at its level head.
-  kGuestSchedulerCaptureFlagAtHead = 1u << 0,
-  // kEnqueueReady: a voluntary yield that prefers any other ready thread.
-  kGuestSchedulerCaptureFlagYieldToOther = 1u << 1,
-  // kDequeueReady: the selection passed over the yielder.
-  kGuestSchedulerCaptureFlagHonoredYield = 1u << 2,
-  // kDispatch: the participant's first dispatch.
-  kGuestSchedulerCaptureFlagFirstRun = 1u << 3,
-  // kDispatch: a fresh slice was granted rather than a preempted remainder.
-  kGuestSchedulerCaptureFlagFreshQuantum = 1u << 4,
-  // kYield: YieldCurrentThread arguments and the preempted link state.
-  kGuestSchedulerCaptureFlagQuantumEnd = 1u << 5,
-  kGuestSchedulerCaptureFlagToLower = 1u << 6,
-  kGuestSchedulerCaptureFlagPreempted = 1u << 7,
-  // kSafepoint: which requests were pending when the handler ran.
-  kGuestSchedulerCaptureFlagSchedulerRequested = 1u << 8,
-  kGuestSchedulerCaptureFlagCaptureRequested = 1u << 9,
-  // kBlock: BlockCurrentThread gating and arguments.
-  kGuestSchedulerCaptureFlagGated = 1u << 10,
-  kGuestSchedulerCaptureFlagAlertable = 1u << 11,
-  kGuestSchedulerCaptureFlagInterruptible = 1u << 12,
-  kGuestSchedulerCaptureFlagHasDeadline = 1u << 13,
-};
-
-inline constexpr uint32_t kGuestSchedulerCaptureForcedIrqlMinimumDeclines =
-    4096;
-
-constexpr size_t kGuestSchedulerCaptureMaximumWaitHandles = 8;
-
-// Durable values carried by GuestSchedulerCaptureEvent::value for kBlock and
-// kReready. Keep these synchronized with XThread::CooperativeWaitKind.
-enum class GuestSchedulerCaptureWaitKind : uint8_t {
-  kNone = 0,
-  kSingle = 1,
-  kMultiAny = 2,
-  kMultiAll = 3,
-  kDelay = 4,
-  kFence = 5,
-  kIoOffload = 6,
-  kSpinBackoff = 7,
-  kIoCompletion = 8,
-  kSocketIo = 9,
-};
-
-enum GuestSchedulerCaptureWaitFlags : uint8_t {
-  kGuestSchedulerCaptureWaitFlagGated = 1u << 0,
-  kGuestSchedulerCaptureWaitFlagAlertable = 1u << 1,
-  kGuestSchedulerCaptureWaitFlagInterruptible = 1u << 2,
-  kGuestSchedulerCaptureWaitFlagUserApcPending = 1u << 3,
-};
-
-// Authenticated state of the cooperative wait at kBlock or kReready. The
-// epoch arrays identify which tracked wait object moved without retaining an
-// XObject pointer. A wait naming more handles than fit remains visible through
-// handle_count and is rejected as non-replayable by the session bridge.
-struct GuestSchedulerCaptureWaitState {
-  uint64_t deadline_ms = 0;
-  uint64_t observed_uptime_ms = 0;
-  uint32_t wait_epoch = 0;
-  uint32_t observed_wait_epoch = 0;
-  uint8_t handle_count = 0;
-  uint8_t flags = 0;
-  std::array<uint32_t, kGuestSchedulerCaptureMaximumWaitHandles> handles = {};
-  std::array<uint32_t, kGuestSchedulerCaptureMaximumWaitHandles>
-      signal_epochs_before = {};
-  std::array<uint32_t, kGuestSchedulerCaptureMaximumWaitHandles>
-      signal_epochs_observed = {};
-
-  bool operator==(const GuestSchedulerCaptureWaitState&) const = default;
-};
+// The tape vocabulary is declared by the ungated CPU record header so a
+// capture-disabled replay binary can still decode a recorded scheduler tape;
+// these aliases keep the capture-side spelling.
+using GuestSchedulerCaptureEventKind = cpu::GuestSchedulerCaptureEventKind;
+using GuestSchedulerCaptureReason = cpu::GuestSchedulerCaptureReason;
+using GuestSchedulerCaptureEventFlags = cpu::GuestSchedulerCaptureEventFlags;
+using cpu::kGuestSchedulerCaptureFlagAlertable;
+using cpu::kGuestSchedulerCaptureFlagAtHead;
+using cpu::kGuestSchedulerCaptureFlagCaptureRequested;
+using cpu::kGuestSchedulerCaptureFlagFirstRun;
+using cpu::kGuestSchedulerCaptureFlagFreshQuantum;
+using cpu::kGuestSchedulerCaptureFlagGated;
+using cpu::kGuestSchedulerCaptureFlagHasDeadline;
+using cpu::kGuestSchedulerCaptureFlagHonoredYield;
+using cpu::kGuestSchedulerCaptureFlagInterruptible;
+using cpu::kGuestSchedulerCaptureFlagPreempted;
+using cpu::kGuestSchedulerCaptureFlagQuantumEnd;
+using cpu::kGuestSchedulerCaptureFlagSchedulerRequested;
+using cpu::kGuestSchedulerCaptureFlagToLower;
+using cpu::kGuestSchedulerCaptureFlagYieldToOther;
+using cpu::kGuestSchedulerCaptureForcedIrqlMinimumDeclines;
+using cpu::kGuestSchedulerCaptureMaximumWaitHandles;
+using GuestSchedulerCaptureWaitKind = cpu::GuestSchedulerCaptureWaitKind;
+using GuestSchedulerCaptureWaitFlags = cpu::GuestSchedulerCaptureWaitFlags;
+using cpu::kGuestSchedulerCaptureWaitFlagAlertable;
+using cpu::kGuestSchedulerCaptureWaitFlagGated;
+using cpu::kGuestSchedulerCaptureWaitFlagInterruptible;
+using cpu::kGuestSchedulerCaptureWaitFlagUserApcPending;
+using GuestSchedulerCaptureWaitState = cpu::GuestSchedulerCaptureWaitState;
 
 // Fixed-size, pointer-free record of one scheduler transition. The sequence
 // is the single global order of scheduler state mutation. Participants are

@@ -117,6 +117,13 @@ enough durable lifecycle or wait-cause provenance for deterministic replay;
 observing one poisons the session instead of silently treating it as a control
 echo.
 
+The payload's record types, enums and decoder live in
+`src/xenia/cpu/guest_scheduler_record.{h,cc}`, outside
+`XE_ENABLE_GUEST_INVOCATION_CAPTURE`, because a capture-disabled replay build
+still has to read a recorded tape. The capture observer aliases those
+declarations and the session bridge decodes through them, so there is one
+definition of the wire format and one validator.
+
 `GuestSchedulerCaptureEventRecorder` is the reference nonblocking handoff. Its
 buffer is reserved at construction so a callback never allocates, it validates
 sequence continuity for every delivered event whether or not it is armed, and
