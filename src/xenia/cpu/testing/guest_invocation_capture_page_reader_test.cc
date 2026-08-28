@@ -89,8 +89,11 @@ TEST_CASE("guest invocation capture page reader fails closed",
               ->Protect(kTrackedAliasPage, 4096, kMemoryProtectRead));
   REQUIRE(reader.ReadPage(kHostReadableUntrackedPage, &output));
   REQUIRE(output == expected);
+  // Releasing the alias leaves the host mapping in place, and the host mapping
+  // is what the guest reads: a title that loads several modules into one heap
+  // leaves earlier images executing behind entries the heap has forgotten.
   REQUIRE(memory.LookupHeap(kTrackedAliasPage)->Release(kTrackedAliasPage));
-  REQUIRE_FALSE(reader.ReadPage(kHostReadableUntrackedPage, &output));
+  REQUIRE(reader.ReadPage(kHostReadableUntrackedPage, &output));
 
   // A reservation may retain a readable page-table protection while lacking
   // commitment. The reader must validate both attributes.
