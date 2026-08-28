@@ -145,6 +145,11 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   // compiler_->AddPass(std::make_unique<passes::DeadStoreEliminationPass>());
   // if (validate)
   // compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  // Again, now that context promotion has forwarded each condition read to the
+  // value that produced it. The first run had to keep every store a
+  // load_context still read; those reads are SSA uses by this point, so the
+  // stores behind them are finally visible as dead.
+  compiler_->AddPass(std::make_unique<passes::DeadCRStoreEliminationPass>());
   compiler_->AddPass(std::make_unique<passes::DeadCodeEliminationPass>());
   if (validate) {
     compiler_->AddPass(std::make_unique<passes::ValidationPass>());
