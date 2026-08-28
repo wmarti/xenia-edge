@@ -1233,15 +1233,38 @@ TEST_CASE("guest invocation recorder rejects cross-thread closure writes",
     REQUIRE(recorder->state() ==
             GuestInvocationRecorderState::kWaitingForFinalAttempt);
   }
-  SECTION("cross-thread writes between attempts remain in the watch set") {
+  SECTION("cross-thread writes are watched only inside a recorded attempt") {
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
     DiscoveryAttempt(*recorder, {kDataPageB});
+    // No attempt is in progress, so the next attempt's snapshot records this
+    // write rather than being invalidated by it.
+    REQUIRE(recorder->OnMemoryAccess(
+        kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
+    REQUIRE(recorder->state() ==
+            GuestInvocationRecorderState::kWaitingForDiscoveryAttempt);
+    EnterRoot(*recorder);
+    Access(*recorder, kDataPageB);
     REQUIRE_FALSE(recorder->OnMemoryAccess(
         kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
     RequireRejected(*recorder,
                     GuestInvocationRecorderRejection::kCrossThreadMutation,
                     kGuestInvocationDependencyCrossThreadMutation);
+  }
+  SECTION("a granule neighbour the invocation never read is not watched") {
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    EnterRoot(*recorder);
+    Access(*recorder, kDataPageA);
+    // kDataPageB closes kDataPageA's protection granule without ever being
+    // read, so another thread writing it cannot change this invocation.
+    REQUIRE(recorder->OnMemoryAccess(
+        kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
+    REQUIRE(recorder->rejection() == GuestInvocationRecorderRejection::kNone);
+    REQUIRE(recorder->state() ==
+            GuestInvocationRecorderState::kRecordingDiscovery);
   }
   SECTION("cross-thread pages share the total page budget") {
     GuestInvocationRecorderLimits limits = MakeLimits();

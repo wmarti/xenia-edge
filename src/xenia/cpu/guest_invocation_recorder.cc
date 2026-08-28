@@ -648,6 +648,8 @@ struct GuestInvocationRecorder::Impl {
     }
     ++attempt_count;
     attempt_pages.clear();
+    attempt_read_backing_pages.clear();
+    cross_thread_written_backing_pages.clear();
     inherited_return_address.reset();
     call_stack.clear();
     call_stack.push_back({selection.root_address, return_address});
@@ -934,11 +936,6 @@ struct GuestInvocationRecorder::Impl {
     new_backing_views.clear();
     for (uint32_t page : supplied_pages) {
       const uint32_t backing = BackingPageAddress(page);
-      if (cross_thread_written_backing_pages.contains(backing)) {
-        return Reject(GuestInvocationRecorderRejection::kCrossThreadMutation,
-                      CrossThreadDetail("owner-granule", page),
-                      kGuestInvocationDependencyCrossThreadMutation);
-      }
       const auto code_backing = closure_code_backing_views.find(backing);
       if (code_backing != closure_code_backing_views.cend()) {
         const uint32_t dependency =
@@ -970,6 +967,9 @@ struct GuestInvocationRecorder::Impl {
                     kGuestInvocationDependencyPageDiscoveryOverflow);
     }
     attempt_pages.insert(pages.cbegin(), pages.cend());
+    for (uint32_t page : pages) {
+      attempt_read_backing_pages.insert(BackingPageAddress(page));
+    }
     known_pages.insert(pages.cbegin(), pages.cend());
     supplied_data_pages.insert(supplied_pages.cbegin(), supplied_pages.cend());
     for (const auto& [backing, page] : new_backing_views) {
@@ -980,16 +980,25 @@ struct GuestInvocationRecorder::Impl {
 
   bool AddCrossThreadWritePages(const std::vector<uint32_t>& pages) {
     for (uint32_t page : pages) {
-      const uint32_t backing = BackingPageAddress(page);
-      if (supplied_data_backing_views.contains(backing) ||
-          closure_code_backing_views.contains(backing)) {
-        return Reject(
-            GuestInvocationRecorderRejection::kCrossThreadMutation,
-            CrossThreadDetail(closure_code_backing_views.contains(backing)
-                                  ? "foreign-write-code"
-                                  : "foreign-write-data",
-                              page),
-            kGuestInvocationDependencyCrossThreadMutation);
+      if (closure_code_backing_views.contains(BackingPageAddress(page))) {
+        return Reject(GuestInvocationRecorderRejection::kCrossThreadMutation,
+                      CrossThreadDetail("foreign-write-code", page),
+                      kGuestInvocationDependencyCrossThreadMutation);
+      }
+    }
+    // Invocation input is snapshotted when an attempt begins, so a write
+    // outside one is already reflected in what the next attempt records. Only
+    // a page this attempt actually read can still change what replay must
+    // reproduce; a granule neighbour is left to the initial-versus-final
+    // comparison at completion.
+    if (!IsRecordingAttempt()) {
+      return true;
+    }
+    for (uint32_t page : pages) {
+      if (attempt_read_backing_pages.contains(BackingPageAddress(page))) {
+        return Reject(GuestInvocationRecorderRejection::kCrossThreadMutation,
+                      CrossThreadDetail("foreign-write-data", page),
+                      kGuestInvocationDependencyCrossThreadMutation);
       }
     }
     std::set<uint32_t> new_backing_pages;
@@ -1110,6 +1119,7 @@ struct GuestInvocationRecorder::Impl {
   std::set<uint32_t> supplied_data_pages;
   std::map<uint32_t, uint32_t> supplied_data_backing_views;
   std::set<uint32_t> attempt_pages;
+  std::set<uint32_t> attempt_read_backing_pages;
   std::optional<std::set<uint32_t>> previous_discovery_pages;
   std::set<uint32_t> cross_thread_written_backing_pages;
   std::set<uint32_t> owner_written_pages;
