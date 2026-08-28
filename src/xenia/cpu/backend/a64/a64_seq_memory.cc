@@ -885,8 +885,6 @@ struct STORE_V128
         e, i.src1, sizeof(vec128_t),
         ppc::GuestInvocationRecorderMemoryAccess::kWrite);
 #endif
-    auto addr = ComputeMemoryAddress(e, i.src1);
-
     // Resolve the source into a Q register first: LoadV128Const/SrcVReg
     // clobber x0, which the fallback address computation uses. The guest
     // address register is callee-saved, so it survives the resolve.
