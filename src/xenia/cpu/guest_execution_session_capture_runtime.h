@@ -112,6 +112,14 @@ struct GuestExecutionSessionInstructionCoverageDelta {
 bool IsGuestExecutionSessionWokenInWaitCheckpointParticipant(
     const kernel::GuestSchedulerCheckpointParticipant& participant);
 
+// A fiber the barrier caught on a ready queue carrying no durable block-head
+// route: it has run, so it is parked below the dispatch that owns it, and it
+// is published as passive parity rather than resumed. Whether it owns exactly
+// one root host call and whether anything modeled is open beneath it are
+// decided against the host-call roster and the export event log, not here.
+bool IsGuestExecutionSessionReadyParityCheckpointParticipant(
+    const kernel::GuestSchedulerCheckpointParticipant& participant);
+
 // The checkpoint-side twin of IsGuestExecutionSessionBlockedParityParticipant,
 // decided before a durable topology row exists. The extra clauses are the
 // preemption-episode counters, which no durable row carries.

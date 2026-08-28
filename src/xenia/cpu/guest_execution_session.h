@@ -471,6 +471,14 @@ const char* GuestExecutionSessionSchedulerTopologyPassiveRowFirstDifference(
 bool IsGuestExecutionSessionWokenInWaitParticipant(
     const GuestExecutionSessionSchedulerTopologyParticipant& participant);
 
+// The row a participant parked below a call it never arrived at must carry:
+// ready, no durable resume route, not suspended and holding no wait binding.
+// The queue position is deliberately not part of it, because a participant
+// that stays ready while others are dispatched around it is renumbered by
+// their moves rather than by its own.
+bool IsGuestExecutionSessionReadyParityParticipant(
+    const GuestExecutionSessionSchedulerTopologyParticipant& participant);
+
 struct GuestExecutionSessionSchedulerTopologyChunk {
   uint64_t session_epoch = 0;
   uint32_t ordinal = 0;

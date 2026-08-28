@@ -677,6 +677,11 @@ bool ValidateSchedulerTopologyCheckpointBindings(
   }
   std::set<uint32_t> guest_execution_actors;
   std::set<uint32_t> scheduler_event_subjects;
+  // Every participant any record on the tape names in any role. The two sets
+  // above answer the questions the passive class asks; a participant published
+  // as having executed nothing has to answer this one, and a scheduler record
+  // carries an identity in both its canonical actor and its resolved subject.
+  std::set<uint32_t> tape_named_participants;
   std::vector<GuestExecutionSessionEvent> canonical_events;
   for (size_t index = 0; index < bundle.chunks.size(); ++index) {
     if (bundle.manifest.chunks[index].kind !=
@@ -689,6 +694,9 @@ bool ValidateSchedulerTopologyCheckpointBindings(
       return false;
     }
     for (const GuestExecutionSessionEvent& event : events.events) {
+      if (event.thread_ordinal != kGuestExecutionSessionNoThread) {
+        tape_named_participants.insert(event.thread_ordinal);
+      }
       if (event.kind == GuestExecutionSessionEventKind::kThreadDispatch ||
           event.kind == GuestExecutionSessionEventKind::kSynchronization) {
         const auto payload = validated.blobs.find(event.payload_sha256);
@@ -702,6 +710,9 @@ bool ValidateSchedulerTopologyCheckpointBindings(
           return false;
         }
         scheduler_event_subjects.insert(subject_ordinal);
+        if (subject_ordinal != kGuestExecutionSessionNoThread) {
+          tape_named_participants.insert(subject_ordinal);
+        }
         continue;
       }
       if (event.thread_ordinal != kGuestExecutionSessionNoThread) {
@@ -710,6 +721,33 @@ bool ValidateSchedulerTopologyCheckpointBindings(
     }
     canonical_events.insert(canonical_events.end(), events.events.cbegin(),
                             events.events.cend());
+  }
+  for (size_t index = 0; index < bundle.chunks.size(); ++index) {
+    if (bundle.manifest.chunks[index].kind !=
+        GuestExecutionSessionChunkKind::kContinuousEvents) {
+      continue;
+    }
+    GuestExecutionContinuousEventLimits continuous_limits;
+    continuous_limits.maximum_encoded_bytes =
+        limits.session.maximum_chunk_bytes;
+    continuous_limits.maximum_records = limits.session.maximum_events_per_chunk;
+    std::vector<GuestExecutionContinuousEvent> events;
+    if (!GuestExecutionContinuousEventCodec::Decode(
+            bundle.chunks[index], &events, error, continuous_limits)) {
+      return false;
+    }
+    for (const GuestExecutionContinuousEvent& event : events) {
+      if (event.actor.participant_ordinal != kGuestExecutionSessionNoThread) {
+        tape_named_participants.insert(event.actor.participant_ordinal);
+      }
+      // A checkpoint reference names its own participant as the subject, so
+      // only a scheduler record's subject is a claim about another thread.
+      if ((event.kind == GuestExecutionSessionEventKind::kThreadDispatch ||
+           event.kind == GuestExecutionSessionEventKind::kSynchronization) &&
+          event.subject.participant_ordinal != kGuestExecutionSessionNoThread) {
+        tape_named_participants.insert(event.subject.participant_ordinal);
+      }
+    }
   }
   auto validate_boundary = [&](const auto& topology, const auto& checkpoint,
                                std::string_view boundary) {
@@ -895,6 +933,31 @@ bool ValidateSchedulerTopologyCheckpointBindings(
         scheduler_event_subjects.contains(static_cast<uint32_t>(ordinal))) {
       return Fail(error,
                   "scheduler event subjects an outside-guest participant");
+    }
+    if (ordinal >= bundle.manifest.participants.size()) {
+      return Fail(error, "scheduler topology exceeds the participant catalog");
+    }
+    if (bundle.manifest.participants[ordinal].initial_outer_call_state !=
+        GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall) {
+      continue;
+    }
+    // The class publishes no route at all. It claims a fiber sat below a call
+    // it never arrived at for the whole interval, so it must be outside guest
+    // code at both boundaries, carry the ready-parity row at both, and be
+    // named by nothing the tape recorded in any role.
+    if (!initial_outside ||
+        !IsGuestExecutionSessionReadyParityParticipant(
+            start_topology.participants[ordinal]) ||
+        !IsGuestExecutionSessionReadyParityParticipant(
+            final_topology.participants[ordinal])) {
+      return Fail(error,
+                  "scheduler parked participant has no ready-parity boundary "
+                  "row");
+    }
+    if (tape_named_participants.contains(static_cast<uint32_t>(ordinal))) {
+      return Fail(error,
+                  "scheduler ready-parity participant is named by a tape "
+                  "record");
     }
   }
   return GuestExecutionSessionSchedulerReadyOrderIsStable(

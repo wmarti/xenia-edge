@@ -2008,6 +2008,22 @@ bool IsGuestExecutionSessionWokenInWaitParticipant(
          GuestExecutionSessionSchedulerBlockedWaitBinding{};
 }
 
+bool IsGuestExecutionSessionReadyParityParticipant(
+    const GuestExecutionSessionSchedulerTopologyParticipant& participant) {
+  if (participant.state !=
+          GuestExecutionSessionSchedulerParticipantState::kReady ||
+      participant.resume_kind !=
+          GuestExecutionSessionSchedulerResumeKind::kNativeContinuation ||
+      participant.restorable || participant.guest_pc ||
+      participant.suspension_count) {
+    return false;
+  }
+  // Only a blocked row serializes a wait binding. Restated so the predicate is
+  // self-contained.
+  return participant.blocked_wait ==
+         GuestExecutionSessionSchedulerBlockedWaitBinding{};
+}
+
 bool IsGuestExecutionSessionBlockedParityParticipant(
     const GuestExecutionSessionSchedulerTopologyParticipant& participant) {
   if (participant.state !=

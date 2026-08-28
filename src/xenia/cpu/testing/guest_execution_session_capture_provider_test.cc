@@ -1126,21 +1126,17 @@ TEST_CASE("guest execution session provider binds one woken export dispatch",
   bool nested_host_call = false;
   std::string expected;
 
-  SECTION("a waiter whose only host call is its root guest entry") {
-    // The other face of the class: no export is modeled beneath the root
-    // dispatch, so no captured outcome can ever name this waiter's route.
-    expected =
-        "cannot encode a passive scheduler participant with an active host "
-        "call";
-  }
+  // A wait shape the dispatch cannot bind leaves the participant in neither
+  // class: the export is real and open, so the parity route is unavailable to
+  // it as well.
   SECTION("a wait kind the export dispatch does not model") {
     REQUIRE(harness.OpenExportDispatch(harness.second_participant,
                                        kFunctionAddress, kExportThunkAddress));
     checkpoint = harness.WokenSecondThreadCheckpoint(
         kernel::GuestSchedulerCaptureWaitKind::kDelay);
     expected =
-        "cannot encode a passive scheduler participant with an active host "
-        "call";
+        "ready-parity participant is parked in an open modeled export "
+        "dispatch";
   }
   SECTION("an alertable wait") {
     REQUIRE(harness.OpenExportDispatch(harness.second_participant,
@@ -1149,8 +1145,8 @@ TEST_CASE("guest execution session provider binds one woken export dispatch",
         kernel::GuestSchedulerCaptureWaitKind::kSingle,
         kernel::kGuestSchedulerCaptureWaitFlagAlertable);
     expected =
-        "cannot encode a passive scheduler participant with an active host "
-        "call";
+        "ready-parity participant is parked in an open modeled export "
+        "dispatch";
   }
   SECTION("a pending user APC") {
     REQUIRE(harness.OpenExportDispatch(harness.second_participant,
@@ -1159,8 +1155,8 @@ TEST_CASE("guest execution session provider binds one woken export dispatch",
         kernel::GuestSchedulerCaptureWaitKind::kSingle,
         kernel::kGuestSchedulerCaptureWaitFlagUserApcPending);
     expected =
-        "cannot encode a passive scheduler participant with an active host "
-        "call";
+        "ready-parity participant is parked in an open modeled export "
+        "dispatch";
   }
   SECTION("an unpublished link register") {
     REQUIRE(harness.OpenExportDispatch(harness.second_participant,
@@ -1227,6 +1223,154 @@ TEST_CASE("guest execution session provider binds one woken export dispatch",
   REQUIRE(error.find(expected) != std::string::npos);
   REQUIRE(harness.provider->status().state ==
           GuestExecutionSessionCaptureProviderState::kRejected);
+}
+
+TEST_CASE("guest execution session provider checkpoints a ready-parity park",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.second_thread->context()->r[3] = 0x5566778899AABBCCull;
+  harness.InstallExternalEventLog();
+  std::string error;
+  // The live shape: a re-readied fiber whose only open call is the root
+  // dispatch it has held since it started running, with nothing modeled
+  // beneath it and no export identity to bind.
+  const auto checkpoint = harness.WokenSecondThreadCheckpoint(
+      kernel::GuestSchedulerCaptureWaitKind::kSingle,
+      kernel::kGuestSchedulerCaptureWaitFlagInterruptible);
+  REQUIRE(harness.provider->SupportsCheckpointParticipant(
+      checkpoint.participants.back(), &error));
+  REQUIRE(harness.provider->BeginCapture(checkpoint,
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+  REQUIRE_FALSE(harness.provider->DefersInitialParticipantState(
+      harness.second_participant));
+
+  std::vector<uint8_t> initial_state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(
+      harness.second_participant, true, &initial_state_bytes, &error));
+  ppc::GuestPPCThreadCheckpoint initial_state;
+  REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(initial_state_bytes,
+                                                     &initial_state, &error));
+  REQUIRE(initial_state.participant_ordinal == 1);
+  REQUIRE(initial_state.guest_thread_id == kSecondThreadId);
+  REQUIRE(initial_state.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kOutsideGuest);
+  REQUIRE(initial_state.resume_pc == 0);
+  REQUIRE(initial_state.owning_function_address == 0);
+  REQUIRE(initial_state.outer_guest_return_address == 0);
+  REQUIRE(initial_state.registers.gpr[3] == 0x5566778899AABBCCull);
+
+  // The parity route binds to the absence of an outcome, so unlike a modeled
+  // export it is still admissible where the interval ends.
+  REQUIRE(harness.provider->SealCapture(checkpoint,
+                                        harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+  std::vector<uint8_t> final_state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(
+      harness.second_participant, false, &final_state_bytes, &error));
+  REQUIRE(final_state_bytes == initial_state_bytes);
+}
+
+TEST_CASE("guest execution session provider proves every ready-parity claim",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  auto checkpoint = harness.WokenSecondThreadCheckpoint(
+      kernel::GuestSchedulerCaptureWaitKind::kSingle,
+      kernel::kGuestSchedulerCaptureWaitFlagInterruptible);
+  auto& row = checkpoint.participants.back();
+  bool install_log = true;
+  bool nested_host_call = false;
+  std::string expected =
+      "cannot encode a passive scheduler participant with an active host call";
+
+  SECTION("a suspended fiber is not on a ready queue") {
+    row.state = kernel::GuestSchedulerCheckpointParticipantState::kSuspended;
+  }
+  SECTION("a fiber that has never run holds no dispatch") {
+    row.resume_kind = kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun;
+  }
+  SECTION("a ready row carrying a suspension count") {
+    row.suspension_count = 1;
+  }
+  SECTION("a fiber inside a preemption episode") {
+    row.capture_declined_safepoints = 1;
+  }
+  SECTION("a fiber the export event log cannot answer for") {
+    install_log = false;
+  }
+  SECTION("a fiber below more than its root dispatch") {
+    nested_host_call = true;
+    expected =
+        "ready-parity participant does not own exactly one root host call";
+  }
+
+  if (install_log) {
+    harness.InstallExternalEventLog();
+  }
+  auto host_calls = harness.TwoThreadHostCalls();
+  if (nested_host_call) {
+    host_calls.active_calls.push_back({{3},
+                                       harness.second_participant,
+                                       kMiddleFunctionAddress,
+                                       kMiddleFunctionEndAddress,
+                                       kOuterReturnAddress,
+                                       2});
+  }
+  std::string error;
+  REQUIRE_FALSE(harness.provider->BeginCapture(
+      checkpoint, harness.TwoThreadParticipants(), host_calls, &error));
+  INFO(error);
+  REQUIRE(error.find(expected) != std::string::npos);
+  REQUIRE(harness.provider->status().state ==
+          GuestExecutionSessionCaptureProviderState::kRejected);
+}
+
+TEST_CASE("guest execution session provider rejects ready-parity drift",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.InstallExternalEventLog();
+  // A wait no modeled export dispatch binds keeps every section on the parity
+  // arm, so what the final boundary refuses is the parity claim itself.
+  const auto checkpoint = harness.WokenSecondThreadCheckpoint(
+      kernel::GuestSchedulerCaptureWaitKind::kDelay);
+  std::string error;
+  REQUIRE(harness.provider->BeginCapture(checkpoint,
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+
+  SECTION("a different outer host call is a returned and re-entered dispatch") {
+    auto host_calls = harness.HostCalls();
+    host_calls.active_calls.push_back({{5},
+                                       harness.second_participant,
+                                       kFunctionAddress,
+                                       kFunctionEndAddress,
+                                       kOuterReturnAddress,
+                                       1});
+    REQUIRE_FALSE(
+        harness.provider->SealCapture(checkpoint, host_calls, &error));
+    REQUIRE(
+        error.find("ready-parity participant changed its outer host call") !=
+        std::string::npos);
+  }
+  SECTION("a register that moved is not parity") {
+    harness.second_thread->context()->r[3] = 9;
+    REQUIRE_FALSE(harness.provider->SealCapture(
+        checkpoint, harness.TwoThreadHostCalls(), &error));
+    REQUIRE(error.find("changed at the boundary") != std::string::npos);
+  }
+  SECTION("an export dispatch opened inside the interval is not parity") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE_FALSE(harness.provider->SealCapture(
+        checkpoint, harness.TwoThreadHostCalls(), &error));
+    REQUIRE(error.find("ready-parity participant is parked in an open modeled "
+                       "export dispatch") != std::string::npos);
+  }
 }
 
 TEST_CASE("guest execution session provider owns instruction counters",

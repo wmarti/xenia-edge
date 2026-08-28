@@ -2038,7 +2038,183 @@ GuestExecutionSessionSignalWitness ParticipantSignalWitness(
   return witness;
 }
 
+struct ReadyParityOptions {
+  bool executable_boundary_state = false;
+  bool suspended_row = false;
+  bool overlay_names_participant = false;
+};
+
+// Adds a second participant to the pending-export fixture: a fiber the
+// barrier caught on a ready queue below the root dispatch it never arrived
+// at, byte identical at both boundaries and named by no record on the tape.
+GuestExecutionSessionBundle MakeReadyParityBundle(
+    ReadyParityOptions options = {}) {
+  constexpr uint32_t kParkedThreadId = 8;
+  constexpr uint64_t kParkedInstanceId = 0x101;
+  GuestExecutionSessionBundle bundle = MakePendingExportBundle();
+  std::string error;
+
+  ppc::GuestPPCThreadCheckpoint parked;
+  parked.participant_ordinal = 1;
+  parked.guest_thread_id = kParkedThreadId;
+  parked.registers.gpr.front() = 0x33;
+  if (options.executable_boundary_state) {
+    parked.resume_kind = ppc::GuestPPCThreadResumeKind::kGuestBlockHead;
+    parked.resume_pc = 0x82000040;
+    parked.owning_function_address = 0x82000000;
+    parked.owning_function_end_address = 0x820000FC;
+    parked.outer_guest_return_address = 0x82000100;
+  } else {
+    parked.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+  }
+  const std::vector<uint8_t> parked_bytes = EncodeThreadCheckpoint(parked);
+  const GuestExecutionSessionSha256 parked_state =
+      AddBlob(&bundle, parked_bytes);
+  const GuestExecutionSessionThreadStateReference parked_reference = {
+      1, parked_bytes.size(), parked_state};
+
+  GuestExecutionSessionCheckpointChunk initial;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(bundle.chunks[0],
+                                                            &initial, &error));
+  initial.checkpoint.thread_states.push_back(parked_reference);
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      initial, &bundle.chunks[0], &error));
+  GuestExecutionSessionCheckpointChunk final_checkpoint;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+      bundle.chunks[6], &final_checkpoint, &error));
+  final_checkpoint.checkpoint.thread_states.push_back(parked_reference);
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_checkpoint, &bundle.chunks[6], &error));
+
+  GuestExecutionSessionSchedulerTopologyParticipant row;
+  row.ordinal = 1;
+  row.guest_thread_id = kParkedThreadId;
+  row.capture_instance_id = kParkedInstanceId;
+  row.state = GuestExecutionSessionSchedulerParticipantState::kReady;
+  row.cpu = 1;
+  row.effective_priority = 8;
+  row.base_priority = 6;
+  row.suspension_count = 0;
+  row.quantum_remaining_us = 500;
+  row.ready_queue_level = 8;
+  row.ready_queue_fifo_ordinal = 0;
+  row.resume_kind =
+      GuestExecutionSessionSchedulerResumeKind::kNativeContinuation;
+  row.guest_pc = 0;
+  row.restorable = false;
+  if (options.executable_boundary_state) {
+    row.resume_kind = GuestExecutionSessionSchedulerResumeKind::kJitSafepoint;
+    row.guest_pc = parked.resume_pc;
+    row.restorable = true;
+  }
+  if (options.suspended_row) {
+    row.state = GuestExecutionSessionSchedulerParticipantState::kSuspended;
+    row.suspension_count = 1;
+    row.ready_queue_level = kGuestExecutionSessionSchedulerNoValue;
+    row.ready_queue_fifo_ordinal = kGuestExecutionSessionSchedulerNoValue;
+  }
+  GuestExecutionSessionSchedulerTopologyChunk start_topology;
+  GuestExecutionSessionSchedulerTopologyChunk final_topology;
+  REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+      bundle.chunks[4], &start_topology, &error));
+  REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+      bundle.chunks[5], &final_topology, &error));
+  start_topology.participants.push_back(row);
+  final_topology.participants.push_back(row);
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      start_topology, &bundle.chunks[4], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      final_topology, &bundle.chunks[5], &error));
+
+  if (options.overlay_names_participant) {
+    GuestExecutionContinuousEventLimits continuous_limits;
+    std::vector<GuestExecutionContinuousEvent> continuous_events;
+    REQUIRE(GuestExecutionContinuousEventCodec::Decode(
+        bundle.chunks[3], &continuous_events, &error, continuous_limits));
+    REQUIRE(continuous_events.front().kind ==
+            GuestExecutionSessionEventKind::kSynchronization);
+    continuous_events.front().subject = {1, kParkedThreadId};
+    REQUIRE(GuestExecutionContinuousEventCodec::Encode(
+        continuous_events, &bundle.chunks[3], &error));
+    bundle.manifest.chunks[3] =
+        ReferenceFor(GuestExecutionSessionChunkKind::kContinuousEvents, 3, 1, 6,
+                     6, bundle.chunks[3]);
+  }
+
+  GuestExecutionSessionParticipant participant;
+  participant.ordinal = 1;
+  participant.guest_thread_id = kParkedThreadId;
+  participant.capture_instance_id = kParkedInstanceId;
+  participant.initial_outer_call_state =
+      GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
+  participant.boundary_arrival_kind =
+      GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside;
+  participant.held_after_event_sequence =
+      bundle.manifest.stop_request_event_sequence;
+  participant.initial_state_size = parked_bytes.size();
+  participant.initial_state_sha256 = parked_state;
+  bundle.manifest.participants.push_back(participant);
+  bundle.manifest.chunks[0] =
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                   bundle.chunks[0]);
+  bundle.manifest.chunks[4] =
+      ReferenceFor(GuestExecutionSessionChunkKind::kSchedulerTopology, 4, 0, 0,
+                   2, bundle.chunks[4]);
+  bundle.manifest.chunks[5] =
+      ReferenceFor(GuestExecutionSessionChunkKind::kSchedulerTopology, 5, 6, 6,
+                   2, bundle.chunks[5]);
+  bundle.manifest.chunks[6] =
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 6, 6, 6, 1,
+                   bundle.chunks[6]);
+  return bundle;
+}
+
 }  // namespace
+
+TEST_CASE("session bundle admits a ready-parity park at both boundaries",
+          "[guest-execution-session-bundle]") {
+  const GuestExecutionSessionBundle bundle = MakeReadyParityBundle();
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                      bundle.chunks, &error));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  REQUIRE(error.empty());
+}
+
+TEST_CASE("session bundle proves every ready-parity obligation",
+          "[guest-execution-session-bundle]") {
+  std::string error;
+  const auto require_rejected = [&error](
+                                    const GuestExecutionSessionBundle& bundle,
+                                    std::string_view text) {
+    error.clear();
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    INFO(error);
+    REQUIRE(error.find(text) != std::string::npos);
+  };
+
+  SECTION("a park claimed by an executable boundary state") {
+    ReadyParityOptions options;
+    options.executable_boundary_state = true;
+    require_rejected(MakeReadyParityBundle(options),
+                     "scheduler parked participant has no ready-parity "
+                     "boundary row");
+  }
+  SECTION("a park claimed by a suspended row") {
+    ReadyParityOptions options;
+    options.suspended_row = true;
+    require_rejected(MakeReadyParityBundle(options),
+                     "scheduler parked participant has no ready-parity "
+                     "boundary row");
+  }
+  SECTION("a park claimed by a scheduler record's subject") {
+    ReadyParityOptions options;
+    options.overlay_names_participant = true;
+    require_rejected(
+        MakeReadyParityBundle(options),
+        "scheduler ready-parity participant is named by a tape record");
+  }
+}
 
 TEST_CASE("session bundle admits a blocked export replay route",
           "[guest-execution-session-bundle]") {

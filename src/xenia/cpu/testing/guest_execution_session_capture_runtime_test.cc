@@ -2078,9 +2078,10 @@ TEST_CASE("session capture runtime admits a passive scheduler participant",
   thread.reset();
 }
 
-TEST_CASE(
-    "session capture runtime rejects a passive participant in a host call",
-    "[guest-execution-session-capture-runtime]") {
+// A fiber that yielded carries no wait at all, and the root guest entry it is
+// parked below is the only host call it will ever hold.
+TEST_CASE("session capture runtime parks a yielded fiber below its root call",
+          "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;
   auto thread = environment.MakeThread(1);
   RuntimeHarness harness(environment, *thread, 8);
@@ -2099,28 +2100,19 @@ TEST_CASE(
       [&]() { call_result = function.Call(thread.get(), 0x82003000); });
   const bool entered = function.WaitForEntry();
   const bool requested = entered && harness.runtime->RequestStart();
-  const bool terminal = requested && harness.runtime->WaitForTerminal(2s);
+  const bool recording =
+      requested && WaitForState(*harness.runtime, RuntimeState::kRecording);
   const auto status = harness.runtime->status();
   function.Release();
   source.join();
 
   REQUIRE(entered);
   REQUIRE(requested);
-  REQUIRE(terminal);
-  REQUIRE(status.state == RuntimeState::kRejected);
-  REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
-  REQUIRE(status.message.find("passive scheduler participant has an active "
-                              "outer host call") != std::string::npos);
-  // A rejection may append its own release diagnostics after the census.
-  const std::string census =
-      "capture runtime passive scheduler participant has an active outer host "
-      "call: tid=00000001 state=1 resume_kind=1 restorable=false pc=00000000 "
-      "hostcall=depth=1,fn=82002000,ret=82003000 export=none "
-      "wait=0/0/0/00000000/0; unsupported=1/1";
   INFO(status.message);
-  REQUIRE(status.message.compare(0, census.size(), census) == 0);
-  REQUIRE(status.message.find('\n') == std::string::npos);
-  REQUIRE(harness.provider.begin_count.load() == 0);
+  REQUIRE(recording);
+  REQUIRE(status.state == RuntimeState::kRecording);
+  REQUIRE(status.rejection == RuntimeRejection::kNone);
+  REQUIRE(harness.provider.begin_count.load() == 1);
   REQUIRE(call_result);
   harness.runtime->Shutdown();
   thread.reset();
@@ -2229,17 +2221,16 @@ TEST_CASE("session capture runtime censuses passive participants in host calls",
   INFO(status.message);
   REQUIRE(status.state == RuntimeState::kRejected);
   REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
+  // The ready row is parked below its own root dispatch and leaves the census;
+  // the suspended one has never run and no class admits it.
   const std::string census =
       "capture runtime passive scheduler participant has an active outer host "
-      "call: tid=00000001 state=1 resume_kind=1 restorable=false pc=00000000 "
-      "hostcall=depth=1,fn=82002000,ret=82003000 export=none "
-      "wait=1/1/5/00000000/0"
-      "; also: tid=00000002 state=3 resume_kind=3 restorable=false "
+      "call: tid=00000002 state=3 resume_kind=3 restorable=false "
       "pc=00000000 hostcall=depth=1,fn=82004000,ret=82005000 export=none "
       "wait=0/0/0/00000000/0"
-      "; unsupported=2/2";
+      "; unsupported=1/2";
   REQUIRE(status.message.compare(0, census.size(), census) == 0);
-  REQUIRE(status.message.find("; unsupported=2/2") != std::string::npos);
+  REQUIRE(status.message.find("tid=00000001") == std::string::npos);
   REQUIRE(status.message.find('\n') == std::string::npos);
   REQUIRE_FALSE(status.canonical_output_published);
   REQUIRE(harness.provider.begin_count.load() == 0);
@@ -2396,7 +2387,11 @@ TEST_CASE("session capture runtime admits a woken export participant",
   thread.reset();
 }
 
-TEST_CASE("session capture runtime censuses a woken waiter with no dispatch",
+// The root guest entry-point call is the only host call this thread will ever
+// hold, so no export dispatch can ever bind it and nothing modeled is open
+// beneath it. The parity route claims the park at both boundaries rather than
+// an outcome the interval has to contain.
+TEST_CASE("session capture runtime parks a woken waiter with no dispatch",
           "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;
   auto thread = environment.MakeThread(1);
@@ -2414,6 +2409,7 @@ TEST_CASE("session capture runtime censuses a woken waiter with no dispatch",
   participant.blocked_wait.flags =
       kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
   harness.checkpoint.start_guest_pc = 0;
+  harness.checkpoint.stop_guest_pc = 0;
 
   BlockingGuestFunction function(0x82002000, 0x82002100);
   bool call_result = false;
@@ -2421,28 +2417,31 @@ TEST_CASE("session capture runtime censuses a woken waiter with no dispatch",
       [&]() { call_result = function.Call(thread.get(), 0x82003000); });
   const bool entered = function.WaitForEntry();
   const bool requested = entered && harness.runtime->RequestStart();
-  const bool terminal = requested && harness.runtime->WaitForTerminal(2s);
+  const bool recording =
+      requested && WaitForState(*harness.runtime, RuntimeState::kRecording);
+  const bool dispatched =
+      recording && RecordCanonicalDispatch(*harness.runtime, *thread);
+  const bool stopped = dispatched && harness.runtime->RequestStop() &&
+                       harness.runtime->WaitForTerminal(2s);
   const auto status = harness.runtime->status();
   function.Release();
   source.join();
 
   REQUIRE(entered);
   REQUIRE(requested);
-  REQUIRE(terminal);
   INFO(status.message);
-  REQUIRE(status.state == RuntimeState::kRejected);
-  REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
-  // The root guest entry-point call is the only host call this thread will ever
-  // hold, so no export dispatch can ever bind it.
-  const std::string census =
-      "capture runtime passive scheduler participant has an active outer host "
-      "call: tid=00000001 state=1 resume_kind=1 restorable=false pc=00000000 "
-      "hostcall=depth=1,fn=82002000,ret=82003000 export=none "
-      "wait=1/1/4/00000000/0"
-      "; unsupported=1/1";
-  REQUIRE(status.message.compare(0, census.size(), census) == 0);
-  REQUIRE(status.message.find('\n') == std::string::npos);
-  REQUIRE(harness.provider.begin_count.load() == 0);
+  REQUIRE(recording);
+  REQUIRE(dispatched);
+  REQUIRE(stopped);
+  REQUIRE(harness.provider.begin_count.load() == 1);
+  // The stop reached the provider's seal, so the participant claimed the park
+  // at the final boundary too instead of an arrival it never made.
+  REQUIRE(harness.provider.seal_count.load() == 1);
+  REQUIRE(status.rejection != RuntimeRejection::kAssemblerFailure);
+  REQUIRE(status.message.find("cannot represent a non-safepoint active outer "
+                              "call") == std::string::npos);
+  REQUIRE(status.message.find("passive scheduler participant has an active "
+                              "outer host call") == std::string::npos);
   REQUIRE(call_result);
 
   harness.runtime->Shutdown();

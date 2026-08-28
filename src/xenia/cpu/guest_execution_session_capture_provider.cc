@@ -1020,6 +1020,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     std::map<uint64_t, PendingExportCheckpoint> pending_exports;
     std::map<std::pair<uint64_t, uint64_t>, uint64_t> execution_identities;
     std::map<uint64_t, uint32_t> outer_return_addresses;
+    std::map<uint64_t, uint64_t> root_host_call_tokens;
     std::set<uint64_t> outside_guest_participants;
     std::set<uint64_t> bound_dispatch_tokens;
     for (size_t ordinal = 0; ordinal < ordered.size(); ++ordinal) {
@@ -1112,14 +1113,48 @@ struct GuestExecutionSessionCaptureProvider::Impl {
               identity.capture_instance_id,
               PendingExportCheckpoint{state_blob, dispatch.token});
         } else if (IsPassiveOutsideGuestParticipant(*scheduler_participant)) {
-          if (std::any_of(host_calls.active_calls.cbegin(),
-                          host_calls.active_calls.cend(),
-                          [&](const auto& call) {
-                            return call.participant == identity;
-                          })) {
-            return RejectLocked(
-                "capture provider cannot encode a passive scheduler "
-                "participant with an active host call");
+          const GuestExecutionCaptureActiveHostCall* root_call = nullptr;
+          for (const GuestExecutionCaptureActiveHostCall& call :
+               host_calls.active_calls) {
+            if (call.participant == identity) {
+              root_call = &call;
+            }
+          }
+          if (root_call) {
+            // A fiber the barrier caught on a ready queue has already run, so
+            // it is parked below the dispatch that owns it. It is encoded in
+            // the passive shape and never resumed, which claims that it did
+            // not execute; the call is admitted only if every part of that
+            // claim holds. Whether anything modeled is open beneath it is a
+            // question only the export event log answers, so a log that cannot
+            // answer refuses the class rather than being read as an absence.
+            const std::shared_ptr<GuestExecutionCaptureExternalEventLog> log =
+                processor.guest_execution_capture_external_event_log();
+            std::vector<GuestExecutionCaptureExternalEventActiveCall>
+                open_dispatches;
+            if (!IsGuestExecutionSessionReadyParityCheckpointParticipant(
+                    *scheduler_participant) ||
+                !log ||
+                !log->CopyParticipantActiveCalls(identity, &open_dispatches)) {
+              return RejectLocked(
+                  "capture provider cannot encode a passive scheduler "
+                  "participant with an active host call: " +
+                  DescribeParticipant(*scheduler_participant));
+            }
+            if (!open_dispatches.empty()) {
+              return RejectLocked(
+                  "capture provider ready-parity participant is parked in an "
+                  "open modeled export dispatch: " +
+                  DescribeParticipant(*scheduler_participant));
+            }
+            if (!OwnsOnlyItsRootHostCall(identity, host_calls)) {
+              return RejectLocked(
+                  "capture provider ready-parity participant does not own "
+                  "exactly one root host call: " +
+                  DescribeParticipant(*scheduler_participant));
+            }
+            root_host_call_tokens.emplace(identity.capture_instance_id,
+                                          root_call->token.value);
           }
           state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
           outside_guest_participants.insert(identity.capture_instance_id);
@@ -1252,11 +1287,18 @@ struct GuestExecutionSessionCaptureProvider::Impl {
       initial_outside_guest_participants =
           std::move(outside_guest_participants);
       initial_pending_exports = std::move(pending_exports);
+      initial_root_host_call_tokens = std::move(root_host_call_tokens);
     } else if (execution_identities != active_invocation_identities ||
                outside_guest_participants !=
                    initial_outside_guest_participants) {
       return RejectLocked(
           "capture provider participant boundary class changed in-session");
+    } else if (root_host_call_tokens != initial_root_host_call_tokens) {
+      // The parity claim is that the fiber never left the call it was parked
+      // below, so a new token is a returned and re-entered dispatch.
+      return RejectLocked(
+          "capture provider ready-parity participant changed its outer host "
+          "call");
     }
     if (!establish_execution_identities) {
       for (uint64_t participant : outside_guest_participants) {
@@ -1629,6 +1671,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
   std::map<std::pair<uint64_t, uint64_t>, uint64_t>
       active_invocation_identities;
   std::map<uint64_t, uint32_t> initial_outer_return_addresses;
+  std::map<uint64_t, uint64_t> initial_root_host_call_tokens;
   std::set<uint64_t> initial_outside_guest_participants;
   std::map<uint64_t, std::vector<uint8_t>> initial_states;
   std::map<uint64_t, std::vector<uint8_t>> final_states;
