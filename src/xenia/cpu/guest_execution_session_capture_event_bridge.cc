@@ -1153,20 +1153,28 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::FinalizeBundle(
           final_scheduler_topology_.participants[checkpoint_subject.ordinal]
               .state ==
           GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned;
-      if (scheduler_unowned) {
-        if (boundary_checkpoint.resume_kind !=
-                ppc::GuestPPCThreadResumeKind::kOutsideGuest ||
+      const GuestExecutionSessionSchedulerTopologyParticipant&
+          topology_participant = final_scheduler_topology_
+                                     .participants[checkpoint_subject.ordinal];
+      if (boundary_checkpoint.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+        const bool passive_scheduler_owned =
+            !scheduler_unowned && !topology_participant.restorable &&
+            (topology_participant.resume_kind ==
+                 GuestExecutionSessionSchedulerResumeKind::
+                     kNativeContinuation ||
+             topology_participant.resume_kind ==
+                 GuestExecutionSessionSchedulerResumeKind::kNotYetRun);
+        if ((!scheduler_unowned && !passive_scheduler_owned) ||
             checkpoint_subject.boundary_arrival_kind !=
                 GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside) {
-          return Fail(error,
-                      "scheduler-unowned boundary has an executable route");
+          return Fail(error, "outside-guest boundary has an executable route");
         }
         continue;
       }
-      if (boundary_checkpoint.resume_kind ==
-          ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+      if (scheduler_unowned) {
         return Fail(error,
-                    "scheduler-owned boundary lacks an executable route");
+                    "scheduler-unowned boundary has an executable route");
       }
       const uint64_t arrival_index =
           checkpoint_subject.held_after_event_sequence -

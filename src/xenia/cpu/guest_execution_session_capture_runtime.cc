@@ -95,6 +95,25 @@ bool IsTerminal(RuntimeState state) {
          state == RuntimeState::kShutdown;
 }
 
+bool IsRestorableJitParticipant(const CheckpointParticipant& participant) {
+  return participant.restorable && participant.guest_pc &&
+         !(participant.guest_pc & 3) &&
+         participant.resume_kind == CheckpointResumeKind::kJitSafepoint;
+}
+
+bool IsPassiveOutsideGuestParticipant(
+    const CheckpointParticipant& participant) {
+  if (participant.restorable || participant.guest_pc ||
+      (participant.state !=
+           kernel::GuestSchedulerCheckpointParticipantState::kReady &&
+       participant.state !=
+           kernel::GuestSchedulerCheckpointParticipantState::kSuspended)) {
+    return false;
+  }
+  return participant.resume_kind == CheckpointResumeKind::kNativeContinuation ||
+         participant.resume_kind == CheckpointResumeKind::kNotYetRun;
+}
+
 bool CurrentTitleCaptureConfig(GuestExecutionSessionTitleCaptureConfig* output,
                                std::string* error) noexcept {
   if (!output) {
@@ -252,9 +271,15 @@ bool ValidateRuntimeCheckpointStateBindings(
       return Fail(error, std::string("capture runtime ") + boundary +
                              " scheduler and bundle identities differ");
     }
-    if (scheduler_participant->resume_kind !=
-            CheckpointResumeKind::kJitSafepoint ||
-        !scheduler_participant->restorable ||
+    if (IsPassiveOutsideGuestParticipant(*scheduler_participant)) {
+      if (decoded.resume_kind != ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+        return Fail(error, std::string("capture runtime ") + boundary +
+                               " passive scheduler participant has an "
+                               "executable PPC continuation");
+      }
+      continue;
+    }
+    if (!IsRestorableJitParticipant(*scheduler_participant) ||
         decoded.resume_kind != ppc::GuestPPCThreadResumeKind::kGuestBlockHead ||
         decoded.resume_pc != scheduler_participant->guest_pc) {
       return Fail(error, std::string("capture runtime ") + boundary +
@@ -365,9 +390,12 @@ bool ValidateRuntimePublicationBundle(
       bundle.manifest.participants.size(), false);
   for (const GuestExecutionSessionParticipant& participant :
        bundle.manifest.participants) {
-    participant_binding_required[participant.ordinal] =
+    const CheckpointParticipant* scheduler_participant =
         FindCheckpointParticipant(final_scheduler_checkpoint,
-                                  participant.guest_thread_id) != nullptr;
+                                  participant.guest_thread_id);
+    participant_binding_required[participant.ordinal] =
+        scheduler_participant &&
+        IsRestorableJitParticipant(*scheduler_participant);
   }
   GuestExecutionContinuousEventLimits continuous_limits;
   continuous_limits.maximum_encoded_bytes = limits.session.maximum_chunk_bytes;
@@ -1131,6 +1159,10 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
                   "capture runtime scheduler checkpoint exceeds the "
                   "Processor participant roster");
     }
+    if (host_calls.rejection !=
+        GuestExecutionCaptureHostCallRosterRejection::kNone) {
+      return Fail(error, "capture runtime host-call roster is rejected");
+    }
     size_t scheduler_owned_count = 0;
     for (size_t index = 0; index < registry.participants.size(); ++index) {
       const auto& lifecycle = registry.participants[index];
@@ -1171,6 +1203,15 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
             "capture runtime checkpoint intersects an in-flight scheduler "
             "preemption episode");
       }
+      if (IsPassiveOutsideGuestParticipant(*checkpoint_participant) &&
+          std::any_of(host_calls.active_calls.cbegin(),
+                      host_calls.active_calls.cend(), [&](const auto& call) {
+                        return call.participant == lifecycle.participant;
+                      })) {
+        return Fail(error,
+                    "capture runtime passive scheduler participant has an "
+                    "active outer host call");
+      }
       std::string capability_error;
       if (!dependencies.provider->SupportsCheckpointParticipant(
               *checkpoint_participant, &capability_error)) {
@@ -1185,10 +1226,6 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       return Fail(error,
                   "capture runtime checkpoint contains a non-Processor "
                   "participant");
-    }
-    if (host_calls.rejection !=
-        GuestExecutionCaptureHostCallRosterRejection::kNone) {
-      return Fail(error, "capture runtime host-call roster is rejected");
     }
     for (const auto& call : host_calls.active_calls) {
       const CheckpointParticipant* checkpoint_participant =

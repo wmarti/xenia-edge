@@ -491,6 +491,25 @@ bool ValidateSchedulerTopologyCheckpointBindings(
           bundle.chunks.back(), &final_checkpoint, error, limits.session)) {
     return false;
   }
+  std::set<uint32_t> guest_execution_actors;
+  for (size_t index = 0; index < bundle.chunks.size(); ++index) {
+    if (bundle.manifest.chunks[index].kind !=
+        GuestExecutionSessionChunkKind::kEvents) {
+      continue;
+    }
+    GuestExecutionSessionEventChunk events;
+    if (!GuestExecutionSessionCodec::DecodeEventChunk(
+            bundle.chunks[index], &events, error, limits.session)) {
+      return false;
+    }
+    for (const GuestExecutionSessionEvent& event : events.events) {
+      if (event.thread_ordinal != kGuestExecutionSessionNoThread &&
+          event.kind != GuestExecutionSessionEventKind::kThreadDispatch &&
+          event.kind != GuestExecutionSessionEventKind::kSynchronization) {
+        guest_execution_actors.insert(event.thread_ordinal);
+      }
+    }
+  }
   auto validate_boundary = [&](const auto& topology, const auto& checkpoint,
                                std::string_view boundary) {
     if (topology.participants.size() !=
@@ -527,11 +546,6 @@ bool ValidateSchedulerTopologyCheckpointBindings(
         }
         continue;
       }
-      if (decoded.resume_kind == ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
-        return Fail(error, std::string("scheduler ") + std::string(boundary) +
-                               " owned topology lacks an executable PPC "
-                               "route");
-      }
       switch (participant.resume_kind) {
         case GuestExecutionSessionSchedulerResumeKind::kJitSafepoint:
           if (decoded.resume_kind !=
@@ -543,16 +557,19 @@ bool ValidateSchedulerTopologyCheckpointBindings(
           }
           break;
         case GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport:
-          if (decoded.resume_kind != ppc::GuestPPCThreadResumeKind::
-                                         kPendingModeledBlockingExtern ||
-              decoded.resume_pc != participant.guest_pc) {
-            return Fail(error, std::string("scheduler ") +
-                                   std::string(boundary) +
-                                   " topology blocked route differs from PPC");
-          }
-          break;
+          return Fail(error, std::string("scheduler ") + std::string(boundary) +
+                                 " blocked export has no typed replay route");
         case GuestExecutionSessionSchedulerResumeKind::kNativeContinuation:
         case GuestExecutionSessionSchedulerResumeKind::kNotYetRun:
+          if (participant.restorable || participant.guest_pc ||
+              decoded.resume_kind !=
+                  ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+            return Fail(error, std::string("scheduler ") +
+                                   std::string(boundary) +
+                                   " passive topology has an executable PPC "
+                                   "route");
+          }
+          break;
         case GuestExecutionSessionSchedulerResumeKind::kNone:
         default:
           return Fail(error, std::string("scheduler ") + std::string(boundary) +
@@ -577,11 +594,39 @@ bool ValidateSchedulerTopologyCheckpointBindings(
       return Fail(error,
                   "scheduler ownership changed without a typed entry route");
     }
-    if (start_unowned &&
-        initial_checkpoint.checkpoint.thread_states[ordinal] !=
-            final_checkpoint.checkpoint.thread_states[ordinal]) {
+    const auto decode_boundary_state = [&](const auto& checkpoint,
+                                           ppc::GuestPPCThreadCheckpoint* out) {
+      const auto& reference = checkpoint.checkpoint.thread_states[ordinal];
+      const auto blob = validated.blobs.find(reference.sha256);
+      return blob != validated.blobs.end() &&
+             ppc::GuestPPCThreadCheckpointCodec::Decode(blob->second->bytes,
+                                                        out, error);
+    };
+    ppc::GuestPPCThreadCheckpoint initial_state;
+    ppc::GuestPPCThreadCheckpoint final_state;
+    if (!decode_boundary_state(initial_checkpoint, &initial_state) ||
+        !decode_boundary_state(final_checkpoint, &final_state)) {
+      return false;
+    }
+    const bool initial_outside = initial_state.resume_kind ==
+                                 ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+    const bool final_outside =
+        final_state.resume_kind == ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+    if (initial_outside != final_outside) {
       return Fail(error,
-                  "scheduler-unowned participant changed between boundaries");
+                  "scheduler continuation class changed without a typed "
+                  "entry route");
+    }
+    if (initial_outside &&
+        (initial_checkpoint.checkpoint.thread_states[ordinal] !=
+             final_checkpoint.checkpoint.thread_states[ordinal] ||
+         initial_state != final_state ||
+         start_topology.participants[ordinal].resume_kind !=
+             final_topology.participants[ordinal].resume_kind ||
+         guest_execution_actors.contains(static_cast<uint32_t>(ordinal)))) {
+      return Fail(error,
+                  "outside-guest participant changed or executed between "
+                  "boundaries");
     }
   }
   return true;

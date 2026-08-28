@@ -324,7 +324,13 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
 
   bool SupportsCheckpointParticipant(const CheckpointParticipant& participant,
                                      std::string*) noexcept override {
-    return participant.restorable;
+    return participant.restorable ||
+           (!participant.restorable && !participant.guest_pc &&
+            (participant.resume_kind ==
+                 kernel::GuestSchedulerCheckpointResumeKind::
+                     kNativeContinuation ||
+             participant.resume_kind ==
+                 kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun));
   }
 
   bool BeginCapture(
@@ -1711,6 +1717,71 @@ TEST_CASE("session capture runtime admits a scheduler-unowned participant",
   harness.runtime->Shutdown();
   scheduler_unowned.reset();
   scheduler_owned.reset();
+}
+
+TEST_CASE("session capture runtime admits a passive scheduler participant",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  auto& participant = harness.checkpoint.provisional.participants.front();
+  participant.state = kernel::GuestSchedulerCheckpointParticipantState::kReady;
+  participant.guest_pc = 0;
+  participant.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+  participant.restorable = false;
+  harness.checkpoint.start_guest_pc = 0;
+  harness.checkpoint.stop_guest_pc = 0;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRecording);
+  REQUIRE(status.rejection == RuntimeRejection::kNone);
+  REQUIRE(harness.provider.begin_count.load() == 1);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE(
+    "session capture runtime rejects a passive participant in a host call",
+    "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  auto& participant = harness.checkpoint.provisional.participants.front();
+  participant.state = kernel::GuestSchedulerCheckpointParticipantState::kReady;
+  participant.guest_pc = 0;
+  participant.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+  participant.restorable = false;
+  harness.checkpoint.start_guest_pc = 0;
+
+  BlockingGuestFunction function(0x82002000, 0x82002100);
+  bool call_result = false;
+  std::thread source(
+      [&]() { call_result = function.Call(thread.get(), 0x82003000); });
+  const bool entered = function.WaitForEntry();
+  const bool requested = entered && harness.runtime->RequestStart();
+  const bool terminal = requested && harness.runtime->WaitForTerminal(2s);
+  const auto status = harness.runtime->status();
+  function.Release();
+  source.join();
+
+  REQUIRE(entered);
+  REQUIRE(requested);
+  REQUIRE(terminal);
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
+  REQUIRE(status.message.find("passive scheduler participant has an active "
+                              "outer host call") != std::string::npos);
+  REQUIRE(harness.provider.begin_count.load() == 0);
+  REQUIRE(call_result);
+  harness.runtime->Shutdown();
+  thread.reset();
 }
 
 TEST_CASE("session capture runtime rejects a partial preemption episode",

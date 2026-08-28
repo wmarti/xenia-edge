@@ -92,6 +92,28 @@ bool IsExecutionPhase(ProviderState state) {
   return state == ProviderState::kRecording;
 }
 
+bool IsRestorableJitParticipant(const CheckpointParticipant& participant) {
+  return participant.restorable && participant.guest_pc &&
+         !(participant.guest_pc & 3) &&
+         participant.resume_kind ==
+             kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint;
+}
+
+bool IsPassiveOutsideGuestParticipant(
+    const CheckpointParticipant& participant) {
+  if (participant.restorable || participant.guest_pc ||
+      (participant.state !=
+           kernel::GuestSchedulerCheckpointParticipantState::kReady &&
+       participant.state !=
+           kernel::GuestSchedulerCheckpointParticipantState::kSuspended)) {
+    return false;
+  }
+  return participant.resume_kind ==
+             kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation ||
+         participant.resume_kind ==
+             kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun;
+}
+
 }  // namespace
 
 struct GuestExecutionSessionCaptureProvider::Impl {
@@ -808,36 +830,50 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           FindCheckpointParticipant(checkpoint, identity.guest_thread_id);
       if (scheduler_participant) {
         if (scheduler_participant->capture_instance_id !=
-                identity.capture_instance_id ||
-            !scheduler_participant->restorable ||
-            scheduler_participant->resume_kind !=
-                kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint ||
-            !scheduler_participant->guest_pc ||
-            (scheduler_participant->guest_pc & 3)) {
+            identity.capture_instance_id) {
           return RejectLocked(
-              "capture provider supports only exact-PC JIT safepoints");
+              "capture provider scheduler and ThreadState identities differ");
         }
-        uint32_t outer_return = 0;
-        if (!FindOuterReturn(identity, host_calls, &outer_return)) {
-          return false;
+        if (IsPassiveOutsideGuestParticipant(*scheduler_participant)) {
+          if (std::any_of(host_calls.active_calls.cbegin(),
+                          host_calls.active_calls.cend(),
+                          [&](const auto& call) {
+                            return call.participant == identity;
+                          })) {
+            return RejectLocked(
+                "capture provider cannot encode a passive scheduler "
+                "participant with an active host call");
+          }
+          state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+          outside_guest_participants.insert(identity.capture_instance_id);
+        } else if (!IsRestorableJitParticipant(*scheduler_participant)) {
+          return RejectLocked(
+              "capture provider supports only exact-PC JIT or passive "
+              "outside-guest scheduler participants");
+        } else {
+          uint32_t outer_return = 0;
+          if (!FindOuterReturn(identity, host_calls, &outer_return)) {
+            return false;
+          }
+          outer_return_addresses.emplace(identity.capture_instance_id,
+                                         outer_return);
+          const DefinitionRecord* owner =
+              FindOwningDefinitionLocked(scheduler_participant->guest_pc);
+          if (!owner) {
+            return false;
+          }
+          const uint32_t owner_address = FindDefinitionAddressLocked(owner);
+          if (!owner_address || !owner->code_pages_snapshotted ||
+              !AddClosureSeedLocked(owner_address, owner->end_address)) {
+            return false;
+          }
+          state_blob.resume_kind =
+              ppc::GuestPPCThreadResumeKind::kGuestBlockHead;
+          state_blob.resume_pc = scheduler_participant->guest_pc;
+          state_blob.owning_function_address = owner_address;
+          state_blob.owning_function_end_address = owner->end_address;
+          state_blob.outer_guest_return_address = outer_return;
         }
-        outer_return_addresses.emplace(identity.capture_instance_id,
-                                       outer_return);
-        const DefinitionRecord* owner =
-            FindOwningDefinitionLocked(scheduler_participant->guest_pc);
-        if (!owner) {
-          return false;
-        }
-        const uint32_t owner_address = FindDefinitionAddressLocked(owner);
-        if (!owner_address || !owner->code_pages_snapshotted ||
-            !AddClosureSeedLocked(owner_address, owner->end_address)) {
-          return false;
-        }
-        state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kGuestBlockHead;
-        state_blob.resume_pc = scheduler_participant->guest_pc;
-        state_blob.owning_function_address = owner_address;
-        state_blob.owning_function_end_address = owner->end_address;
-        state_blob.outer_guest_return_address = outer_return;
       } else {
         if (std::any_of(host_calls.active_calls.cbegin(),
                         host_calls.active_calls.cend(), [&](const auto& call) {
@@ -863,9 +899,13 @@ struct GuestExecutionSessionCaptureProvider::Impl {
                     thread->invocation_identity.thread_id),
           identity.capture_instance_id);
     }
+    const size_t executable_scheduler_participant_count = std::count_if(
+        checkpoint.participants.cbegin(), checkpoint.participants.cend(),
+        IsRestorableJitParticipant);
     if (encoded.size() != ordered.size() ||
         execution_identities.size() != ordered.size() ||
-        outer_return_addresses.size() != checkpoint.participants.size()) {
+        outer_return_addresses.size() !=
+            executable_scheduler_participant_count) {
       return RejectLocked(
           "capture provider checkpoint identity mapping is not one-to-one");
     }
@@ -1346,18 +1386,19 @@ bool GuestExecutionSessionCaptureProvider::SupportsCheckpointParticipant(
   if (error) {
     error->clear();
   }
-  if (!participant.restorable || !participant.thread_id ||
-      !participant.guest_pc || (participant.guest_pc & 3) ||
-      participant.resume_kind !=
-          kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint) {
-    return Fail(error,
-                fmt::format("capture provider supports only restorable "
-                            "exact-PC JIT safepoint participants: tid={:08X} "
-                            "state={} resume_kind={} restorable={} pc={:08X}",
-                            participant.thread_id,
-                            static_cast<uint32_t>(participant.state),
-                            static_cast<uint32_t>(participant.resume_kind),
-                            participant.restorable, participant.guest_pc));
+  if (!participant.thread_id ||
+      (!IsRestorableJitParticipant(participant) &&
+       !IsPassiveOutsideGuestParticipant(participant))) {
+    return Fail(
+        error,
+        fmt::format("capture provider supports only restorable exact-PC JIT "
+                    "or passive outside-guest scheduler participants: "
+                    "tid={:08X} state={} resume_kind={} restorable={} "
+                    "pc={:08X}",
+                    participant.thread_id,
+                    static_cast<uint32_t>(participant.state),
+                    static_cast<uint32_t>(participant.resume_kind),
+                    participant.restorable, participant.guest_pc));
   }
   return true;
 }

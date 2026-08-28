@@ -243,6 +243,23 @@ class ProviderHarness final {
     return checkpoint;
   }
 
+  kernel::GuestSchedulerCheckpointBarrierSnapshot PassiveSecondThreadCheckpoint(
+      kernel::GuestSchedulerCheckpointResumeKind resume_kind =
+          kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation)
+      const {
+    auto checkpoint = Checkpoint();
+    kernel::GuestSchedulerCheckpointParticipant checkpoint_participant;
+    checkpoint_participant.thread_id = kSecondThreadId;
+    checkpoint_participant.capture_instance_id =
+        second_participant.capture_instance_id;
+    checkpoint_participant.cpu = 1;
+    checkpoint_participant.state =
+        kernel::GuestSchedulerCheckpointParticipantState::kReady;
+    checkpoint_participant.resume_kind = resume_kind;
+    checkpoint.participants.push_back(checkpoint_participant);
+    return checkpoint;
+  }
+
   GuestExecutionCaptureHostCallRosterSnapshot TwoThreadHostCalls() const {
     auto roster = HostCalls();
     roster.active_calls.push_back({{2},
@@ -470,6 +487,79 @@ TEST_CASE("guest execution session provider checkpoints a dormant participant",
   REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(final_state_bytes,
                                                      &final_state, &error));
   REQUIRE(final_state == initial_state);
+}
+
+TEST_CASE(
+    "guest execution session provider checkpoints a passive scheduler "
+    "participant",
+    "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.second_thread->context()->r[3] = 0x8899AABBCCDDEEFFull;
+  std::string error;
+  const auto checkpoint = harness.PassiveSecondThreadCheckpoint();
+  REQUIRE(harness.provider->SupportsCheckpointParticipant(
+      checkpoint.participants.back(), &error));
+  REQUIRE(harness.provider->BeginCapture(checkpoint,
+                                         harness.TwoThreadParticipants(),
+                                         harness.HostCalls(), &error));
+
+  std::vector<uint8_t> initial_state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(
+      harness.second_participant, &initial_state_bytes, &error));
+  ppc::GuestPPCThreadCheckpoint initial_state;
+  REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(initial_state_bytes,
+                                                     &initial_state, &error));
+  REQUIRE(initial_state.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kOutsideGuest);
+  REQUIRE(initial_state.resume_pc == 0);
+  REQUIRE(initial_state.owning_function_address == 0);
+  REQUIRE(initial_state.owning_function_end_address == 0);
+  REQUIRE(initial_state.outer_guest_return_address == 0);
+  REQUIRE(initial_state.registers.gpr[3] == 0x8899AABBCCDDEEFFull);
+
+  REQUIRE(
+      harness.provider->SealCapture(checkpoint, harness.HostCalls(), &error));
+  std::vector<uint8_t> final_state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(harness.second_participant,
+                                                   &final_state_bytes, &error));
+  REQUIRE(final_state_bytes == initial_state_bytes);
+}
+
+TEST_CASE("guest execution session provider rejects passive boundary changes",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  std::string error;
+  const auto checkpoint = harness.PassiveSecondThreadCheckpoint();
+  REQUIRE(harness.provider->BeginCapture(checkpoint,
+                                         harness.TwoThreadParticipants(),
+                                         harness.HostCalls(), &error));
+
+  SECTION("raw checkpoint state") {
+    harness.second_thread->context()->r[3] = 1;
+    REQUIRE_FALSE(
+        harness.provider->SealCapture(checkpoint, harness.HostCalls(), &error));
+    REQUIRE(error.find("changed at the boundary") != std::string::npos);
+  }
+  SECTION("outside to executable") {
+    REQUIRE_FALSE(harness.provider->SealCapture(
+        harness.TwoThreadCheckpoint(), harness.TwoThreadHostCalls(), &error));
+    REQUIRE(error.find("boundary class changed") != std::string::npos);
+  }
+}
+
+TEST_CASE("guest execution session provider rejects an active passive call",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  std::string error;
+  REQUIRE_FALSE(harness.provider->BeginCapture(
+      harness.PassiveSecondThreadCheckpoint(), harness.TwoThreadParticipants(),
+      harness.TwoThreadHostCalls(), &error));
+  REQUIRE(
+      error.find("passive scheduler participant with an active host call") !=
+      std::string::npos);
 }
 
 TEST_CASE("guest execution session provider rejects an untyped dormant entry",
@@ -725,6 +815,21 @@ TEST_CASE("guest execution session provider rejects inexact production inputs",
     REQUIRE_FALSE(
         harness.provider->SupportsCheckpointParticipant(participant, &error));
     REQUIRE(error.find("exact-PC JIT") != std::string::npos);
+  }
+
+  SECTION("not-yet-run scheduler continuation") {
+    ProviderHarness harness;
+    auto participant = harness.Checkpoint().participants.front();
+    participant.state =
+        kernel::GuestSchedulerCheckpointParticipantState::kReady;
+    participant.guest_pc = 0;
+    participant.resume_kind =
+        kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun;
+    participant.restorable = false;
+    std::string error;
+    REQUIRE(
+        harness.provider->SupportsCheckpointParticipant(participant, &error));
+    REQUIRE(error.empty());
   }
 
   SECTION("checkpoint PC without a catalog owner") {

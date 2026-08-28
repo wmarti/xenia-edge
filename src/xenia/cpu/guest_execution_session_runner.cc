@@ -1002,9 +1002,6 @@ bool BuildGuestExecutionContinuousReplayPlan(
           "continuous participant scheduler ownership changes without a "
           "typed entry route");
     }
-    if (!final_scheduler_unowned && !final_routes[i]) {
-      return fail("continuous final checkpoint route is missing");
-    }
     const GuestExecutionSessionThreadStateReference& initial_state =
         plan.initial_session_checkpoint.thread_states[i];
     const GuestExecutionSessionThreadStateReference& final_state =
@@ -1060,26 +1057,54 @@ bool BuildGuestExecutionContinuousReplayPlan(
       *output = {};
       return false;
     }
-    if (final_scheduler_unowned) {
+    const bool initial_outside = planned.initial_checkpoint.resume_kind ==
+                                 ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+    const bool final_outside = planned.final_checkpoint.resume_kind ==
+                               ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+    if (initial_outside != final_outside) {
+      return fail(
+          "continuous participant continuation class changes without a "
+          "typed entry route");
+    }
+    if (initial_outside) {
+      const auto is_passive_resume = [](const auto& topology) {
+        return !topology.restorable && !topology.guest_pc &&
+               (topology.resume_kind ==
+                    GuestExecutionSessionSchedulerResumeKind::
+                        kNativeContinuation ||
+                topology.resume_kind ==
+                    GuestExecutionSessionSchedulerResumeKind::kNotYetRun);
+      };
+      const auto& initial_topology =
+          plan.initial_scheduler_topology.participants[i];
+      const auto& final_topology =
+          plan.final_scheduler_topology.participants[i];
+      const bool has_guest_execution_event = std::any_of(
+          plan.events.cbegin(), plan.events.cend(), [&](const auto& event) {
+            return event.canonical.thread_ordinal == participant.ordinal &&
+                   event.canonical.kind !=
+                       GuestExecutionSessionEventKind::kThreadDispatch &&
+                   event.canonical.kind !=
+                       GuestExecutionSessionEventKind::kSynchronization;
+          });
       if (final_routes[i] || initial_state != final_state ||
-          planned.initial_checkpoint.resume_kind !=
-              ppc::GuestPPCThreadResumeKind::kOutsideGuest ||
-          planned.final_checkpoint.resume_kind !=
-              ppc::GuestPPCThreadResumeKind::kOutsideGuest ||
           planned.initial_checkpoint != planned.final_checkpoint ||
           participant.initial_outer_call_state !=
               GuestExecutionSessionInitialOuterCallState::kOutside ||
           participant.boundary_arrival_kind !=
-              GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside) {
-        return fail("continuous scheduler-unowned participant is not dormant");
+              GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside ||
+          (!initial_scheduler_unowned &&
+           (!is_passive_resume(initial_topology) ||
+            !is_passive_resume(final_topology) ||
+            initial_topology.resume_kind != final_topology.resume_kind)) ||
+          has_guest_execution_event) {
+        return fail(
+            "continuous outside-guest participant is not passive and "
+            "byte-stable");
       }
     } else {
-      if (planned.initial_checkpoint.resume_kind ==
-              ppc::GuestPPCThreadResumeKind::kOutsideGuest ||
-          planned.final_checkpoint.resume_kind ==
-              ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
-        return fail(
-            "continuous scheduler-owned participant lacks a replay route");
+      if (final_scheduler_unowned || !final_routes[i]) {
+        return fail("continuous executable participant route is missing");
       }
       const ppc::GuestPPCThreadCheckpointBinding& final_binding =
           final_routes[i]->control.checkpoint.binding;
@@ -1089,7 +1114,7 @@ bool BuildGuestExecutionContinuousReplayPlan(
         return false;
       }
     }
-    if (!initial_scheduler_unowned &&
+    if (!initial_outside &&
         planned.initial_checkpoint.resume_pc !=
             planned.initial_checkpoint.owning_function_address) {
       const GuestExecutionContinuousReplayResumeEntry resume = {
