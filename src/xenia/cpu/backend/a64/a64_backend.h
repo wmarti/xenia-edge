@@ -130,6 +130,20 @@ struct A64BackendContext {
   // Same thunk without the vector save/restore, for transitions where
   // no HIR value can be live in q4-q31. See EmitGuestToHostThunkNoVec.
   uint64_t guest_to_host_thunk_no_vec_address;
+  // Entry points of the helpers Initialize emits into the code cache, for the
+  // same reason: the stack-repair tail and every frsqrte/vrsqrte sequence
+  // built the address inline at three instructions a site. Assigned once and
+  // never reassigned. The stack-repair entry stays null unless
+  // --a64_enable_host_guest_stack_synchronization, which also gates every site
+  // that reads it.
+  uint64_t synchronize_guest_and_host_stack_helper_address;
+  uint64_t vrsqrtefp_scalar_helper_address;
+  uint64_t vrsqrtefp_vector_helper_address;
+  uint64_t frsqrte_helper_address;
+  // The address of the yield handler pointer, not the handler itself: the
+  // scheduler installs the handler after guest threads exist and drops it on
+  // shutdown, so the preempt tail still loads through this.
+  uint64_t preempt_yield_handler_address;
   const A64StackpointNode* stackpoint_head;
   // address of the live reservation, and its granule generation when taken
   uint32_t reserve_address;
