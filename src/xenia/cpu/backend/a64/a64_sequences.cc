@@ -1851,11 +1851,83 @@ struct AND_I32 : Sequence<AND_I32, I<OPCODE_AND, I32Op, I32Op, I32Op>> {
   }
 };
 struct AND_I64 : Sequence<AND_I64, I<OPCODE_AND, I64Op, I64Op, I64Op>> {
+  // lvx/stvx and their 128-bit forms reach the backend as `and ea, ~0xF`
+  // feeding straight into the vector load or store. On a host that emulates
+  // the physical remap the access has to truncate that address to 32 bits
+  // anyway, and one W-form AND does the mask and the truncation together, so
+  // the mask costs no instruction and no allocated register at all. Clearing
+  // bits 3:0 cannot change the remap decision, which reads bits 31:29.
+  static bool TryFuseAddressMask(A64Emitter& e, const EmitArgType& i) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+    // Capture reads the address straight out of the register this fusion
+    // never writes, so it would record the wrong address for every access.
+    return false;
+#else
+    if (!NeedsPhysicalRemap()) {
+      // Without the remap the access indexes memory off the source register
+      // directly and never asks for a computed address, so the mask would be
+      // dropped and the access would run unmasked.
+      return false;
+    }
+    if (IsTracingData()) {
+      // The data tracers recompute the address after the access, and the
+      // fused value only ever materializes once.
+      return false;
+    }
+    if (!i.src2.is_constant || i.src1.is_constant) {
+      return false;
+    }
+    const uint64_t mask = static_cast<uint64_t>(i.src2.constant());
+    if ((mask >> 32) != 0xFFFFFFFFull) {
+      return false;
+    }
+    const uint32_t mask32 = static_cast<uint32_t>(mask);
+    if (!IsValidLogicalImm(mask32, 32)) {
+      return false;
+    }
+    const hir::Instr* next = i.instr->next;
+    if (!next || next->GetOpcodeNum() == hir::OPCODE_SOURCE_OFFSET) {
+      // A fused pair never spans a guest instruction boundary.
+      return false;
+    }
+    const bool is_load = next->GetOpcodeNum() == hir::OPCODE_LOAD;
+    const bool is_store = next->GetOpcodeNum() == hir::OPCODE_STORE;
+    if (!is_load && !is_store) {
+      return false;
+    }
+    // The masked value has to be the address, not a stored value.
+    if (next->src1.value != i.instr->dest) {
+      return false;
+    }
+    // Only the vector accesses reach their address solely through
+    // ComputeMemoryAddress; the 32-bit ones also read the address register
+    // directly on their MMIO paths.
+    const hir::Value* accessed = is_load ? next->dest : next->src2.value;
+    if (!accessed || accessed->type != hir::VEC128_TYPE) {
+      return false;
+    }
+    // The masked address must die at that access.
+    const hir::Value* masked = i.instr->dest;
+    if (!masked->use_head || masked->use_head->next != nullptr ||
+        masked->use_head->instr != next) {
+      return false;
+    }
+    e.MarkFusedAddressMask(i.dest.reg().getIdx(), i.src1.reg().getIdx(),
+                           mask32);
+    return true;
+#endif
+  }
+
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     if (e.ConsumeFusedSkip(i.instr)) {
       // SHL_I64 already produced this value with a W-form lsl. No ANDS ran,
       // so no flags are declared for the compare fusion; a later compare
       // simply re-tests.
+      return;
+    }
+    if (TryFuseAddressMask(e, i)) {
+      // Nothing was emitted, so there are no flags to declare either.
       return;
     }
     // See AND_I32: ANDS is free and feeds the compare-vs-zero fusion.

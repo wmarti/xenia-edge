@@ -162,11 +162,47 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     return false;
   }
 
+  // The same handoff run the other way: a producer that emits nothing at all
+  // hands the consumer the register it should have read and the 32-bit mask to
+  // fold into the address the consumer computes anyway. Keyed on the register
+  // the producer would have written, and cleared on read.
+  void MarkFusedAddressMask(int dest_reg, int src_reg, uint32_t mask) {
+    fused_addr_mask_stale_ = false;
+    fused_addr_mask_dest_reg_ = dest_reg;
+    fused_addr_mask_src_reg_ = src_reg;
+    fused_addr_mask_imm_ = mask;
+  }
+  bool ConsumeFusedAddressMask(int dest_reg, int* out_src_reg,
+                               uint32_t* out_mask) {
+    if (dest_reg < 0 || fused_addr_mask_dest_reg_ != dest_reg) {
+      return false;
+    }
+    *out_src_reg = fused_addr_mask_src_reg_;
+    *out_mask = fused_addr_mask_imm_;
+    fused_addr_mask_dest_reg_ = -1;
+    return true;
+  }
+
   void ResetFlagsZeroTest() {
     flags_zero_fresh_reg_ = flags_zero_armed_reg_ = -1;
     w16_holds_fresh_ = w16_holds_armed_ = nullptr;
+    fused_addr_mask_dest_reg_ = -1;
   }
   void ShiftFlagsZeroTest() {
+    // An armed mask that nothing read means the AND emitted nothing and the
+    // access it fed computed its address without it, which is a wrong guest
+    // address rather than a slower one. It can only survive the sequence that
+    // armed it.
+    if (fused_addr_mask_dest_reg_ >= 0) {
+      if (fused_addr_mask_stale_) {
+        XELOGE("A64Emitter: fused address mask for x{} was never read",
+               fused_addr_mask_dest_reg_);
+        assert_always();
+        fused_addr_mask_dest_reg_ = -1;
+      } else {
+        fused_addr_mask_stale_ = true;
+      }
+    }
     flags_zero_armed_reg_ = flags_zero_fresh_reg_;
     flags_zero_armed_is64_ = flags_zero_fresh_is64_;
     flags_zero_armed_cond_ = flags_zero_fresh_cond_;
@@ -428,6 +464,10 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   bool flags_zero_armed_is64_ = false;
   const hir::Value* w16_holds_fresh_ = nullptr;
   const hir::Value* w16_holds_armed_ = nullptr;
+  int fused_addr_mask_dest_reg_ = -1;
+  int fused_addr_mask_src_reg_ = -1;
+  uint32_t fused_addr_mask_imm_ = 0;
+  bool fused_addr_mask_stale_ = false;
 
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t vec_reg_map_[VEC_COUNT];
