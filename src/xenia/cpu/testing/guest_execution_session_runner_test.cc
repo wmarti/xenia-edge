@@ -1092,6 +1092,13 @@ GuestExecutionSessionBundle MakePassiveContinuousSessionBundle(
   for (auto* topology : {&start_topology, &final_topology}) {
     GuestExecutionSessionSchedulerTopologyParticipant& participant =
         topology->participants[1];
+    // An untouched passive row is invariant across both boundaries.
+    participant.state = GuestExecutionSessionSchedulerParticipantState::kReady;
+    participant.cpu = 0;
+    participant.effective_priority = 8;
+    participant.suspension_count = 0;
+    participant.ready_queue_level = 8;
+    participant.ready_queue_fifo_ordinal = 1;
     participant.resume_kind =
         GuestExecutionSessionSchedulerResumeKind::kNotYetRun;
     participant.restorable = false;
