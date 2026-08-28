@@ -1062,6 +1062,96 @@ TEST_CASE("guest execution session provider proves a blocked-parity park",
           GuestExecutionSessionCaptureProviderState::kRejected);
 }
 
+TEST_CASE("guest execution session provider checkpoints a blocked-parity park",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.second_thread->context()->r[3] = 0x0123456789ABCDEFull;
+  harness.InstallExternalEventLog();
+  std::string error;
+  // The live shape: a waiter below the root dispatch it has held since it
+  // started running, with nothing modeled beneath it to bind a route to.
+  const auto checkpoint = harness.BlockedSecondThreadCheckpoint();
+  REQUIRE(harness.provider->SupportsCheckpointParticipant(
+      checkpoint.participants.back(), &error));
+  REQUIRE(harness.provider->BeginCapture(checkpoint,
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+  // The class publishes no route, so nothing about it waits on the tape.
+  REQUIRE_FALSE(harness.provider->DefersInitialParticipantState(
+      harness.second_participant));
+
+  std::vector<uint8_t> initial_state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(
+      harness.second_participant, true, &initial_state_bytes, &error));
+  ppc::GuestPPCThreadCheckpoint initial_state;
+  REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(initial_state_bytes,
+                                                     &initial_state, &error));
+  REQUIRE(initial_state.participant_ordinal == 1);
+  REQUIRE(initial_state.guest_thread_id == kSecondThreadId);
+  REQUIRE(initial_state.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kOutsideGuest);
+  REQUIRE(initial_state.resume_pc == 0);
+  REQUIRE(initial_state.owning_function_address == 0);
+  REQUIRE(initial_state.outer_guest_return_address == 0);
+  REQUIRE(initial_state.pending_external_event_sequence == 0);
+  REQUIRE(initial_state.registers.gpr[3] == 0x0123456789ABCDEFull);
+
+  // The parity claim binds to the absence of an outcome, so unlike a modeled
+  // export it is still admissible where the interval ends.
+  REQUIRE(harness.provider->SealCapture(checkpoint,
+                                        harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+  std::vector<uint8_t> final_state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(
+      harness.second_participant, false, &final_state_bytes, &error));
+  REQUIRE(final_state_bytes == initial_state_bytes);
+}
+
+TEST_CASE("guest execution session provider rejects blocked-parity drift",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.InstallExternalEventLog();
+  const auto checkpoint = harness.BlockedSecondThreadCheckpoint();
+  std::string error;
+  REQUIRE(harness.provider->BeginCapture(checkpoint,
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+
+  SECTION("a different outer host call is a returned and re-entered dispatch") {
+    auto host_calls = harness.HostCalls();
+    host_calls.active_calls.push_back({{5},
+                                       harness.second_participant,
+                                       kFunctionAddress,
+                                       kFunctionEndAddress,
+                                       kOuterReturnAddress,
+                                       1});
+    REQUIRE_FALSE(
+        harness.provider->SealCapture(checkpoint, host_calls, &error));
+    REQUIRE(error.find("parity participant changed its outer host call") !=
+            std::string::npos);
+  }
+  SECTION("a register that moved is not parity") {
+    harness.second_thread->context()->r[3] = 9;
+    REQUIRE_FALSE(harness.provider->SealCapture(
+        checkpoint, harness.TwoThreadHostCalls(), &error));
+    REQUIRE(error.find("changed at the boundary") != std::string::npos);
+  }
+  SECTION("an export dispatch opened inside the interval is not parity") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    // The dispatch takes the participant off the parity arm and onto the
+    // blocked-export route, which the final boundary cannot carry.
+    REQUIRE_FALSE(harness.provider->SealCapture(
+        checkpoint, harness.TwoThreadHostCalls(), &error));
+    REQUIRE(error.find("blocked modeled export at the final boundary") !=
+            std::string::npos);
+  }
+}
+
 TEST_CASE(
     "guest execution session provider checkpoints a woken export participant",
     "[guest-execution-session-capture-provider]") {
@@ -1371,9 +1461,8 @@ TEST_CASE("guest execution session provider rejects ready-parity drift",
                                        1});
     REQUIRE_FALSE(
         harness.provider->SealCapture(checkpoint, host_calls, &error));
-    REQUIRE(
-        error.find("ready-parity participant changed its outer host call") !=
-        std::string::npos);
+    REQUIRE(error.find("parity participant changed its outer host call") !=
+            std::string::npos);
   }
   SECTION("a register that moved is not parity") {
     harness.second_thread->context()->r[3] = 9;

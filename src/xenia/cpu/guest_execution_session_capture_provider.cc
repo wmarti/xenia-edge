@@ -905,17 +905,26 @@ struct GuestExecutionSessionCaptureProvider::Impl {
   // fiber has been parked below since it started running.
   bool OwnsOnlyItsRootHostCall(
       const GuestExecutionCaptureParticipantIdentity& participant,
-      const GuestExecutionCaptureHostCallRosterSnapshot& host_calls) const {
+      const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
+      const GuestExecutionCaptureActiveHostCall** root_call = nullptr) const {
     size_t owned = 0;
     uint32_t depth = 0;
+    const GuestExecutionCaptureActiveHostCall* owned_call = nullptr;
     for (const GuestExecutionCaptureActiveHostCall& call :
          host_calls.active_calls) {
       if (call.participant == participant) {
         ++owned;
         depth = call.participant_depth;
+        owned_call = &call;
       }
     }
-    return owned == 1 && depth == 1;
+    if (owned != 1 || depth != 1) {
+      return false;
+    }
+    if (root_call) {
+      *root_call = owned_call;
+    }
+    return true;
   }
 
   bool CaptureThreadStates(size_t expected_count,
@@ -1196,23 +1205,11 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           // beneath it publishes no route. It is carried at both boundaries and
           // never resumed, which claims it did not run; the claim holds only if
           // it owns that one call and nothing else.
-          if (!OwnsOnlyItsRootHostCall(identity, host_calls)) {
+          const GuestExecutionCaptureActiveHostCall* root_call = nullptr;
+          if (!OwnsOnlyItsRootHostCall(identity, host_calls, &root_call)) {
             return RejectLocked(
                 "capture provider blocked-parity participant does not own "
                 "exactly one root host call: " +
-                DescribeParticipant(*scheduler_participant));
-          }
-          const GuestExecutionCaptureActiveHostCall* root_call = nullptr;
-          for (const GuestExecutionCaptureActiveHostCall& call :
-               host_calls.active_calls) {
-            if (call.participant == identity) {
-              root_call = &call;
-            }
-          }
-          if (!root_call) {
-            return RejectLocked(
-                "capture provider blocked-parity participant has no root host "
-                "call: " +
                 DescribeParticipant(*scheduler_participant));
           }
           root_host_call_tokens.emplace(identity.capture_instance_id,
@@ -1326,11 +1323,15 @@ struct GuestExecutionSessionCaptureProvider::Impl {
                     thread->invocation_identity.thread_id),
           identity.capture_instance_id);
     }
+    // Every arm that publishes an executable route records an outer return
+    // address, and only those. A parity park wears the blocked shape but
+    // publishes no route, so it is not one of them.
     const size_t executable_scheduler_participant_count = std::count_if(
         checkpoint.participants.cbegin(), checkpoint.participants.cend(),
         [&](const CheckpointParticipant& candidate) {
           return IsRestorableJitParticipant(candidate) ||
-                 IsBlockedExportParticipant(candidate) ||
+                 (IsBlockedExportParticipant(candidate) &&
+                  !IsBlockedParityParkParticipant(candidate)) ||
                  (IsWokenExportParticipant(candidate) &&
                   IsParkedInOpenExportDispatch(
                       {candidate.capture_instance_id, candidate.thread_id}));
@@ -1358,8 +1359,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
       // The parity claim is that the fiber never left the call it was parked
       // below, so a new token is a returned and re-entered dispatch.
       return RejectLocked(
-          "capture provider ready-parity participant changed its outer host "
-          "call");
+          "capture provider parity participant changed its outer host call");
     }
     if (!establish_execution_identities) {
       for (uint64_t participant : outside_guest_participants) {
