@@ -91,6 +91,9 @@ struct GuestExecutionSessionCaptureRuntimeConfig {
   // Failed release attempts retain the generation and are retried this many
   // times before the terminal status exposes the still-owned barrier.
   size_t checkpoint_release_attempts = 3;
+  // Arm attempts discarded before the session touches any of its own state may
+  // be retried at a later marker boundary this many times. Zero is single-shot.
+  size_t arm_retry_limit = 0;
 };
 
 struct GuestExecutionSessionInstructionCoverageDelta {
@@ -179,6 +182,9 @@ class GuestExecutionSessionCaptureRuntimeCheckpointController {
 // false must not change attachment state. AcknowledgeArmAndResumeAfterStart
 // must acknowledge the marker controller's arm boundary while the source is
 // still held, then resume using exactly that token. False leaves it held.
+// RearmAfterRejectedStart discards an unacknowledged arm boundary and resumes
+// under the same attachment, so a session that never armed can try the next
+// marker; false leaves the source held.
 // IsSourceHealthy covers dispatcher loss and marker-controller rejection after
 // attach. SealAndDetach validates the final hold token and atomically removes
 // the source before the runtime releases its stop checkpoint or publishes.
@@ -193,6 +199,8 @@ class GuestExecutionSessionCaptureRuntimeExternalSink {
                     std::string* error) noexcept = 0;
   virtual bool AcknowledgeArmAndResumeAfterStart(
       const gpu::Pm4MarkerHoldToken& token, std::string* error) noexcept = 0;
+  virtual bool RearmAfterRejectedStart(const gpu::Pm4MarkerHoldToken& token,
+                                       std::string* error) noexcept = 0;
   virtual bool IsSourceHealthy(std::string* error) const noexcept = 0;
   virtual bool SealAndDetach(const gpu::Pm4MarkerHoldToken& token,
                              std::string* error) noexcept = 0;
@@ -215,6 +223,8 @@ class GuestExecutionSessionCaptureRuntimePm4ExternalSink final
             std::string* error) noexcept override;
   bool AcknowledgeArmAndResumeAfterStart(const gpu::Pm4MarkerHoldToken& token,
                                          std::string* error) noexcept override;
+  bool RearmAfterRejectedStart(const gpu::Pm4MarkerHoldToken& token,
+                               std::string* error) noexcept override;
   bool IsSourceHealthy(std::string* error) const noexcept override;
   bool SealAndDetach(const gpu::Pm4MarkerHoldToken& token,
                      std::string* error) noexcept override;
@@ -253,6 +263,9 @@ struct GuestExecutionSessionCaptureRuntimeStatus {
   GuestExecutionSessionCaptureRuntimeRejection rejection =
       GuestExecutionSessionCaptureRuntimeRejection::kNone;
   uint64_t checkpoint_generation = 0;
+  // Arm attempts consumed, including the one that armed or rejected the
+  // session. Every attempt above the first discarded a retryable boundary.
+  uint64_t arm_attempt_count = 0;
   uint64_t queued_event_count = 0;
   uint64_t processed_event_count = 0;
   uint64_t scheduler_event_count = 0;
@@ -400,6 +413,7 @@ struct GuestExecutionSessionTitleCaptureConfig {
   uint64_t warmup_milliseconds = 100000;
   uint64_t stop_marker_count = 1;
   uint64_t maximum_bundle_bytes = 1ull << 30;
+  uint64_t arm_retry_limit = 8;
 };
 
 // Title-lifetime production composition. Provider attachment is deliberately

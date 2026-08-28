@@ -879,7 +879,9 @@ class FakeCheckpointController final
       held_snapshot.participants.front().guest_pc =
           current_pause == 1 ? start_guest_pc : stop_guest_pc;
     }
-    if (pause_result != CheckpointRejection::kNone) {
+    const uint32_t failure_limit = pause_failure_limit.load();
+    if (pause_result != CheckpointRejection::kNone &&
+        (!failure_limit || current_pause <= failure_limit)) {
       *snapshot = {};
       snapshot->rejection = pause_result;
       return pause_result;
@@ -950,6 +952,8 @@ class FakeCheckpointController final
 
   CheckpointSnapshot provisional;
   CheckpointRejection pause_result = CheckpointRejection::kNone;
+  // Zero fails every pause; otherwise only the leading pauses fail.
+  std::atomic<uint32_t> pause_failure_limit{0};
   CheckpointRejection finalize_result = CheckpointRejection::kNone;
   bool block_finalize = false;
   bool finalize_keeps_active = false;
@@ -975,6 +979,7 @@ class FakeCheckpointController final
 enum class ExternalSinkOperation : uint8_t {
   kHold,
   kResumeAfterStart,
+  kRearmAfterRejectedStart,
   kSealAndDetach,
   kAbortAndDetach,
 };
@@ -1022,6 +1027,23 @@ class FakeExternalSink final
     }
     if (fail_resume) {
       return Fail(error, "test PM4 external sink resume failed");
+    }
+    ++generation_;
+    held_ = false;
+    hold_token_ = {};
+    return true;
+  }
+
+  bool RearmAfterRejectedStart(const gpu::Pm4MarkerHoldToken& token,
+                               std::string* error) noexcept override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    RecordOperationLocked(ExternalSinkOperation::kRearmAfterRejectedStart);
+    ++rearm_count_;
+    if (!held_ || token != hold_token_) {
+      return Fail(error, "test PM4 external sink rearmed while unheld");
+    }
+    if (fail_rearm) {
+      return Fail(error, "test PM4 external sink rearm failed");
     }
     ++generation_;
     held_ = false;
@@ -1110,7 +1132,13 @@ class FakeExternalSink final
     return attached_;
   }
 
+  uint32_t rearm_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return rearm_count_;
+  }
+
   uint32_t fail_hold_call = 0;
+  bool fail_rearm = false;
   bool fail_resume = false;
   bool fail_abort_detach = false;
   bool produce_swap_during_seal = false;
@@ -1138,6 +1166,7 @@ class FakeExternalSink final
   std::vector<ExternalSinkOperation> operations_;
   std::vector<ExternalSinkObservation> observations_;
   uint32_t hold_count_ = 0;
+  uint32_t rearm_count_ = 0;
   uint64_t generation_ = 1;
   uint64_t hold_epoch_ = 0;
   uint64_t last_ordinal_ = 0;
@@ -1156,8 +1185,9 @@ struct RuntimeHarness {
                  uint64_t boundary_value = 0, bool enable_external_sink = false,
                  uint32_t external_sink_ordinal = 0,
                  uint32_t fail_external_hold_call = 0,
-                 bool fail_external_resume = false)
+                 bool fail_external_resume = false, size_t arm_retry_limit = 0)
       : checkpoint(thread), config(MakeConfig(queue_capacity)) {
+    config.arm_retry_limit = arm_retry_limit;
     config.assembler.coverage_mode = coverage_mode;
     config.assembler.boundary.kind = boundary_kind;
     if (boundary_kind == GuestExecutionSessionBoundaryKind::kGuestMarkerCount) {
@@ -1239,6 +1269,22 @@ bool WaitForShutdownPending(
   const auto deadline = std::chrono::steady_clock::now() + 2s;
   while (std::chrono::steady_clock::now() < deadline) {
     if (runtime.status().shutdown_pending) {
+      return true;
+    }
+    std::this_thread::yield();
+  }
+  return false;
+}
+
+// A discarded arm attempt is complete only once the source has been handed
+// back, which is the last step before the next boundary may arm.
+bool WaitForDiscardedArmAttempt(
+    const GuestExecutionSessionCaptureRuntime& runtime, uint64_t attempts) {
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto status = runtime.status();
+    if (status.arm_attempt_count >= attempts &&
+        status.state == RuntimeState::kIdle && !status.external_sink_held) {
       return true;
     }
     std::this_thread::yield();
@@ -2483,6 +2529,169 @@ TEST_CASE("session capture runtime rejects a stop PM4 sink hold failure",
               ExternalSinkOperation::kResumeAfterStart,
               ExternalSinkOperation::kHold, ExternalSinkOperation::kHold,
               ExternalSinkOperation::kAbortAndDetach});
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rearms a rejected checkpoint boundary",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 8,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kManual, 0, true, 0, 0, false, 2);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.pause_result = CheckpointRejection::kTopologyChanged;
+  harness.checkpoint.pause_failure_limit.store(1);
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForDiscardedArmAttempt(*harness.runtime, 1));
+  auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kIdle);
+  REQUIRE(status.rejection == RuntimeRejection::kNone);
+  REQUIRE(status.arm_attempt_count == 1);
+  REQUIRE(status.checkpoint_generation == 0);
+  REQUIRE_FALSE(status.provider_armed);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE_FALSE(status.external_sink_control_failed);
+  REQUIRE_FALSE(status.external_sink_terminally_detached);
+  REQUIRE(status.message.find(
+              "capture runtime start checkpoint barrier failed with code 12") !=
+          std::string::npos);
+  REQUIRE(harness.external_sink.attached());
+  REQUIRE(harness.external_sink.rearm_count() == 1);
+  REQUIRE(harness.external_sink.operations() ==
+          std::vector<ExternalSinkOperation>{
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kRearmAfterRejectedStart});
+  REQUIRE(harness.provider.begin_count.load() == 0);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  // The next matching marker arms an attempt that carries nothing forward.
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kComplete);
+  REQUIRE(status.arm_attempt_count == 2);
+  REQUIRE(status.canonical_output_published);
+  REQUIRE(harness.provider.begin_count.load() == 1);
+  REQUIRE(harness.checkpoint.finalize_count.load() == 2);
+  REQUIRE(harness.publisher.calls.load() == 1);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime never rearms a terminal checkpoint code",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 8,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kManual, 0, true, 0, 0, false, 8);
+  REQUIRE(harness.runtime);
+  // An invalid topology is a barrier state error, not a boundary condition.
+  harness.checkpoint.pause_result = CheckpointRejection::kInvalidTopology;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kCheckpointBarrier);
+  REQUIRE(status.arm_attempt_count == 1);
+  REQUIRE(status.message.find(
+              "capture runtime start checkpoint barrier failed with code 7") !=
+          std::string::npos);
+  REQUIRE(harness.external_sink.rearm_count() == 0);
+  REQUIRE(status.external_sink_terminally_detached);
+  REQUIRE(harness.external_sink.operations() ==
+          std::vector<ExternalSinkOperation>{
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kAbortAndDetach});
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime exhausts its bounded arm retries",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 8,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kManual, 0, true, 0, 0, false, 2);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.pause_result = CheckpointRejection::kTopologyChanged;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForDiscardedArmAttempt(*harness.runtime, 1));
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForDiscardedArmAttempt(*harness.runtime, 2));
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kCheckpointBarrier);
+  // Two retries above the first attempt, and the terminal status keeps the
+  // last attempt's own diagnostic rather than a retry summary.
+  REQUIRE(status.arm_attempt_count == 3);
+  REQUIRE(status.message.find(
+              "capture runtime start checkpoint barrier failed with code 12") !=
+          std::string::npos);
+  REQUIRE(harness.external_sink.rearm_count() == 2);
+  REQUIRE(status.external_sink_terminally_detached);
+  REQUIRE(harness.external_sink.operations() ==
+          std::vector<ExternalSinkOperation>{
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kRearmAfterRejectedStart,
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kRearmAfterRejectedStart,
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kAbortAndDetach});
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime arms once at a zero retry limit",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(
+      environment, *thread, 8,
+      GuestExecutionReelCoverageMode::kContinuousInstructions,
+      GuestExecutionSessionBoundaryKind::kManual, 0, true);
+  REQUIRE(harness.runtime);
+  REQUIRE(harness.config.arm_retry_limit == 0);
+  harness.checkpoint.pause_result = CheckpointRejection::kTopologyChanged;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kCheckpointBarrier);
+  REQUIRE(status.arm_attempt_count == 1);
+  REQUIRE(status.message.find(
+              "capture runtime start checkpoint barrier failed with code 12") !=
+          std::string::npos);
+  REQUIRE(harness.external_sink.rearm_count() == 0);
+  REQUIRE(status.external_sink_terminally_detached);
+  REQUIRE(harness.external_sink.operations() ==
+          std::vector<ExternalSinkOperation>{
+              ExternalSinkOperation::kHold,
+              ExternalSinkOperation::kAbortAndDetach});
+  REQUIRE_FALSE(harness.runtime->RequestStart());
   REQUIRE(harness.publisher.calls.load() == 0);
 
   harness.runtime->Shutdown();

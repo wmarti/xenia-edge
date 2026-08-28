@@ -65,6 +65,10 @@ DEFINE_CVar(guest_execution_capture_warmup_ms, 100000,
 DEFINE_CVar(guest_execution_capture_bundle_cap_bytes, 1ull << 30,
             "Maximum encoded session bundle size in bytes.",
             "Guest Execution Session Capture", true, uint64_t);
+DEFINE_CVar(guest_execution_capture_arm_retry_limit, 8,
+            "Arm attempts rejected by boundary conditions that are retried at "
+            "a later marker. Zero arms exactly once.",
+            "Guest Execution Session Capture", true, uint64_t);
 DEFINE_transient_path(
     guest_execution_capture_stop_file, "",
     "Reserved manual-stop path. Manual title capture is not implemented yet.",
@@ -137,6 +141,7 @@ bool CurrentTitleCaptureConfig(GuestExecutionSessionTitleCaptureConfig* output,
   config.output_directory = cvars::guest_execution_capture_output;
   config.warmup_milliseconds = cvars::guest_execution_capture_warmup_ms;
   config.maximum_bundle_bytes = cvars::guest_execution_capture_bundle_cap_bytes;
+  config.arm_retry_limit = cvars::guest_execution_capture_arm_retry_limit;
   if (config.output_directory.empty()) {
     return Fail(error, "session title capture output directory is missing");
   }
@@ -731,6 +736,80 @@ enum class AsyncFailure : uint8_t {
   kSourceAfterSeal,
 };
 
+enum class ArmAttemptDisposition : uint8_t {
+  kTerminal,
+  kRetryable,
+};
+
+// A barrier code describes the quiesce window it was raised in, so only the
+// two codes that report that window's own conditions can differ at the next
+// marker. Everything else names a deterministic barrier state error.
+ArmAttemptDisposition ClassifyCheckpointBarrierRejection(
+    CheckpointRejection rejection) {
+  switch (rejection) {
+    case CheckpointRejection::kTopologyChanged:
+    case CheckpointRejection::kTimedOut:
+      return ArmAttemptDisposition::kRetryable;
+    case CheckpointRejection::kNone:
+    case CheckpointRejection::kAlreadyActive:
+    case CheckpointRejection::kNotActive:
+    case CheckpointRejection::kStaleGeneration:
+    case CheckpointRejection::kReleasePending:
+    case CheckpointRejection::kNotStarted:
+    case CheckpointRejection::kCalledFromDispatchThread:
+    case CheckpointRejection::kInvalidTopology:
+    case CheckpointRejection::kUnexpectedSafepoint:
+    case CheckpointRejection::kDuplicateSafepoint:
+    case CheckpointRejection::kInvalidGuestPc:
+    case CheckpointRejection::kUnexpectedSwitchOut:
+    case CheckpointRejection::kShutdown:
+    case CheckpointRejection::kCancelled:
+      return ArmAttemptDisposition::kTerminal;
+  }
+  return ArmAttemptDisposition::kTerminal;
+}
+
+// Session arm policy. A rejection is retryable only when the guest state the
+// next marker boundary presents can differ; every configuration, attachment
+// and encoding failure is a property of this session and never changes. An
+// unlisted kind is terminal.
+ArmAttemptDisposition ClassifyArmRejection(RuntimeRejection rejection,
+                                           CheckpointRejection barrier) {
+  switch (rejection) {
+    case RuntimeRejection::kCheckpointBarrier:
+      return ClassifyCheckpointBarrierRejection(barrier);
+    case RuntimeRejection::kCheckpointRoster:
+    case RuntimeRejection::kMissingCheckpointCapability:
+      return ArmAttemptDisposition::kRetryable;
+    case RuntimeRejection::kNone:
+    case RuntimeRejection::kInvalidConfiguration:
+    case RuntimeRejection::kSourceAttachment:
+    case RuntimeRejection::kSourceRejected:
+    case RuntimeRejection::kQueueOverflow:
+    case RuntimeRejection::kSchedulerSequence:
+    case RuntimeRejection::kProviderFailure:
+    case RuntimeRejection::kAssemblerFailure:
+    case RuntimeRejection::kEventBridgeFailure:
+    case RuntimeRejection::kExternalSinkControl:
+    case RuntimeRejection::kBundleValidation:
+    case RuntimeRejection::kPublicationFailure:
+    case RuntimeRejection::kCancelled:
+      return ArmAttemptDisposition::kTerminal;
+  }
+  return ArmAttemptDisposition::kTerminal;
+}
+
+std::string JoinDiagnostics(std::string message, std::string appended) {
+  if (appended.empty()) {
+    return message;
+  }
+  if (!message.empty()) {
+    message += "; ";
+  }
+  message += appended;
+  return message;
+}
+
 RuntimeRejection MapAsyncFailure(AsyncFailure failure) {
   switch (failure) {
     case AsyncFailure::kQueueOverflow:
@@ -903,6 +982,31 @@ bool GuestExecutionSessionCaptureRuntimePm4ExternalSink::
   }
   if (!command_processor_.ResumePm4MarkerSink(marker_controller_, token)) {
     return Fail(error, "PM4 runtime external sink resume failed");
+  }
+  return true;
+}
+
+bool GuestExecutionSessionCaptureRuntimePm4ExternalSink::
+    RearmAfterRejectedStart(const gpu::Pm4MarkerHoldToken& token,
+                            std::string* error) noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!token || terminally_detached_ || !attached_ ||
+      !IsSourceHealthyLocked(error)) {
+    return false;
+  }
+  const GuestExecutionMarkerControllerStatus controller =
+      marker_controller_->status();
+  // Retract before admission reopens; a marker delivered against a retained
+  // unacknowledged arm boundary would fail the controller closed.
+  if (controller.state != GuestExecutionMarkerControllerState::kArmed ||
+      controller.emitted_boundary_count != 1 ||
+      controller.acknowledged_boundary_count != 0 ||
+      !marker_controller_->RetractArmBoundaryAndRearm()) {
+    return Fail(error,
+                "PM4 runtime external sink arm boundary is not retractable");
+  }
+  if (!command_processor_.ResumePm4MarkerSink(marker_controller_, token)) {
+    return Fail(error, "PM4 runtime external sink rearm resume failed");
   }
   return true;
 }
@@ -1148,7 +1252,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
                   "capture runtime PM4 external sink ordinal differs from "
                   "the assembler configuration");
     }
-    external_sink_registered = true;
+    external_sink_registered.store(true, std::memory_order_release);
     return true;
   }
 
@@ -1557,6 +1661,35 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     return true;
   }
 
+  bool RearmExternalSink(std::string* error) {
+    if (!dependencies.pm4_external_sink) {
+      return true;
+    }
+    if (!external_sink_hold_token) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      return Fail(error,
+                  "capture runtime cannot rearm an unheld PM4 external sink");
+    }
+    std::string source_error;
+    if (!dependencies.pm4_external_sink->RearmAfterRejectedStart(
+            *external_sink_hold_token, &source_error)) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      return Fail(error,
+                  source_error.empty()
+                      ? "capture runtime could not rearm its PM4 external sink"
+                      : std::move(source_error));
+    }
+    external_sink_hold_token.reset();
+    external_sink_held.store(false, std::memory_order_release);
+    if (!dependencies.pm4_external_sink->IsSourceHealthy(&source_error)) {
+      external_sink_control_failed.store(true, std::memory_order_release);
+      return Fail(error, source_error.empty()
+                             ? "capture runtime PM4 source failed after rearm"
+                             : std::move(source_error));
+    }
+    return true;
+  }
+
   bool CheckExternalSinkHealth(std::string* error) {
     if (!dependencies.pm4_external_sink ||
         external_sink_terminally_detached.load(std::memory_order_acquire)) {
@@ -1701,6 +1834,87 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     SetState(RuntimeState::kRejected);
   }
 
+  // A retry only exists where a later arm boundary can arrive, and only for an
+  // attempt that has not yet touched the assembler, provider or event bridge.
+  bool ShouldRearmArmAttempt(RuntimeRejection rejection_value,
+                             CheckpointRejection barrier_rejection) const {
+    return dependencies.pm4_external_sink && !arm_attempt_committed &&
+           arm_attempt_count.load(std::memory_order_relaxed) <=
+               config.arm_retry_limit &&
+           !shutdown_requested.load(std::memory_order_acquire) &&
+           !external_sink_control_failed.load(std::memory_order_acquire) &&
+           !external_sink_terminally_detached.load(std::memory_order_acquire) &&
+           async_failure.load(std::memory_order_acquire) ==
+               AsyncFailure::kNone &&
+           ClassifyArmRejection(rejection_value, barrier_rejection) ==
+               ArmAttemptDisposition::kRetryable;
+  }
+
+  // Tears the attempt down exactly as Reject does, minus the terminal source
+  // detach, and hands the source back so the next marker arms a clean attempt.
+  void DiscardArmAttemptAndRearm(RuntimeRejection rejection_value,
+                                 std::string message) {
+    std::string sink_error;
+    if (!HoldExternalSink(&sink_error)) {
+      Reject(RuntimeRejection::kExternalSinkControl,
+             JoinDiagnostics(std::move(message), std::move(sink_error)));
+      return;
+    }
+    capture_gate.store(false, std::memory_order_release);
+    session_active.store(false, std::memory_order_release);
+    WaitForCallbacks();
+    std::string barrier_error;
+    if (!CancelActiveBarrier(&barrier_error)) {
+      Reject(RuntimeRejection::kCheckpointBarrier,
+             JoinDiagnostics(std::move(message), std::move(barrier_error)));
+      return;
+    }
+    EndProvider(false);
+    deferred_publisher.Clear();
+    // The attempt never seeded this assembler, and replacing it rather than
+    // cancelling it makes the absence of carried state structural.
+    assembler.reset();
+    std::string assembler_error;
+    if (!InitializeAssembler(&assembler_error)) {
+      Reject(RuntimeRejection::kAssemblerFailure,
+             JoinDiagnostics(std::move(message), std::move(assembler_error)));
+      return;
+    }
+    initial_scheduler_checkpoint.reset();
+    instruction_coverage_deltas.clear();
+    XELOGW(
+        "Guest execution session capture discarded arm attempt {} at marker "
+        "ordinal {}: rejection={} diagnostic={}",
+        arm_attempt_count.load(std::memory_order_relaxed),
+        external_sink_last_ordinal.load(std::memory_order_relaxed),
+        static_cast<uint32_t>(rejection_value), message);
+    {
+      std::lock_guard<std::mutex> lock(status_mutex);
+      status_message = message;
+    }
+    {
+      std::lock_guard<std::mutex> lock(control_mutex);
+      start_requested = false;
+    }
+    SetState(RuntimeState::kIdle);
+    // Admission reopens last, so no marker can reach a half-discarded attempt.
+    std::string rearm_error;
+    if (!RearmExternalSink(&rearm_error)) {
+      Reject(RuntimeRejection::kExternalSinkControl,
+             JoinDiagnostics(std::move(message), std::move(rearm_error)));
+    }
+  }
+
+  void RejectArmAttempt(RuntimeRejection rejection_value,
+                        CheckpointRejection barrier_rejection,
+                        std::string message) {
+    if (ShouldRearmArmAttempt(rejection_value, barrier_rejection)) {
+      DiscardArmAttemptAndRearm(rejection_value, std::move(message));
+      return;
+    }
+    Reject(rejection_value, std::move(message));
+  }
+
   bool RejectAsyncFailureIfAny() {
     const AsyncFailure failure = async_failure.load(std::memory_order_acquire);
     if (failure == AsyncFailure::kNone) {
@@ -1717,6 +1931,8 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       return;
     }
     SetState(RuntimeState::kStarting);
+    arm_attempt_count.fetch_add(1, std::memory_order_relaxed);
+    arm_attempt_committed = false;
 
     CheckpointSnapshot provisional;
     const CheckpointRejection pause_result =
@@ -1726,9 +1942,10 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
         checkpoint_generation.store(provisional.generation,
                                     std::memory_order_release);
       }
-      Reject(RuntimeRejection::kCheckpointBarrier,
-             "capture runtime start checkpoint barrier failed with code " +
-                 std::to_string(static_cast<uint32_t>(pause_result)));
+      RejectArmAttempt(
+          RuntimeRejection::kCheckpointBarrier, pause_result,
+          "capture runtime start checkpoint barrier failed with code " +
+              std::to_string(static_cast<uint32_t>(pause_result)));
       return;
     }
     checkpoint_generation.store(provisional.generation,
@@ -1755,9 +1972,12 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     const auto registry = processor.QueryGuestExecutionCaptureParticipants();
     const auto host_calls = host_call_roster.snapshot();
     if (!ValidateCheckpoint(provisional, registry, host_calls, &error)) {
-      Reject(RuntimeRejection::kCheckpointRoster, std::move(error));
+      RejectArmAttempt(RuntimeRejection::kCheckpointRoster,
+                       CheckpointRejection::kNone, std::move(error));
       return;
     }
+    // Past this point the attempt owns session state that no retry may inherit.
+    arm_attempt_committed = true;
     if (!assembler->SeedParticipants(registry.participants, host_calls)) {
       Reject(RuntimeRejection::kAssemblerFailure,
              "capture runtime assembler rejected the initial roster");
@@ -2356,6 +2576,8 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   std::atomic<uint64_t> queued_event_count{0};
   std::atomic<uint64_t> processed_event_count{0};
   std::atomic<RuntimeState> state_atomic{RuntimeState::kIdle};
+  std::atomic<uint64_t> arm_attempt_count{0};
+  bool arm_attempt_committed = false;
   bool start_requested = false;
   bool stop_requested = false;
 
@@ -2371,7 +2593,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   bool external_event_log_attached = false;
   std::shared_ptr<GuestExecutionCaptureExternalEventLog> external_event_log;
   std::atomic<bool> provider_armed{false};
-  bool external_sink_registered = false;
+  // Rearming rebuilds the assembler on the worker, so this outlives one
+  // attachment and is read from every status caller.
+  std::atomic<bool> external_sink_registered{false};
   std::atomic<bool> external_sink_held{false};
   std::atomic<bool> external_sink_terminally_detached{false};
   std::atomic<bool> external_sink_control_failed{false};
@@ -2621,6 +2845,8 @@ GuestExecutionSessionCaptureRuntime::status() const {
   result.rejection = impl_->rejection;
   result.checkpoint_generation =
       impl_->checkpoint_generation.load(std::memory_order_relaxed);
+  result.arm_attempt_count =
+      impl_->arm_attempt_count.load(std::memory_order_relaxed);
   result.queued_event_count =
       impl_->queued_event_count.load(std::memory_order_relaxed);
   result.processed_event_count =
@@ -2633,7 +2859,8 @@ GuestExecutionSessionCaptureRuntime::status() const {
   result.external_event_log_attached = impl_->external_event_log_attached;
   result.scheduler_attached = impl_->scheduler_attached;
   result.provider_armed = impl_->provider_armed.load(std::memory_order_relaxed);
-  result.external_sink_registered = impl_->external_sink_registered;
+  result.external_sink_registered =
+      impl_->external_sink_registered.load(std::memory_order_relaxed);
   result.external_sink_held =
       impl_->external_sink_held.load(std::memory_order_relaxed);
   result.external_sink_terminally_detached =
@@ -2886,6 +3113,7 @@ struct GuestExecutionSessionTitleCaptureRuntime::Impl {
       return Fail(error, "session title capture identity allocation failed");
     }
     assembler.bundle_limits = bundle_limits;
+    prepared.arm_retry_limit = static_cast<size_t>(config.arm_retry_limit);
 
     GuestExecutionMarkerControllerConfig marker;
     marker.marker_source = GuestExecutionSessionMarkerSource::kPm4Swap;
@@ -3053,8 +3281,8 @@ void GuestExecutionSessionTitleCaptureRuntime::Shutdown() noexcept {
         "runtime_state={} runtime_rejection={} marker_state={} "
         "marker_rejection={} matching_markers={} warmup_markers={} "
         "ignored_markers={} arm_ordinal={} stop_ordinal={} "
-        "emitted_boundaries={} acknowledged_boundaries={} queued_events={} "
-        "processed_events={} published={} diagnostic={}",
+        "emitted_boundaries={} acknowledged_boundaries={} arm_attempts={} "
+        "queued_events={} processed_events={} published={} diagnostic={}",
         static_cast<uint32_t>(runtime_status.state),
         static_cast<uint32_t>(runtime_status.rejection),
         static_cast<uint32_t>(marker_status.state),
@@ -3063,7 +3291,8 @@ void GuestExecutionSessionTitleCaptureRuntime::Shutdown() noexcept {
         marker_status.ignored_marker_count, marker_status.arm_marker_ordinal,
         marker_status.stop_marker_ordinal, marker_status.emitted_boundary_count,
         marker_status.acknowledged_boundary_count,
-        runtime_status.queued_event_count, runtime_status.processed_event_count,
+        runtime_status.arm_attempt_count, runtime_status.queued_event_count,
+        runtime_status.processed_event_count,
         runtime_status.canonical_output_published,
         runtime_status.message.empty() ? "none" : runtime_status.message);
   }

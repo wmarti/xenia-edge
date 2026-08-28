@@ -190,6 +190,34 @@ bool GuestExecutionMarkerController::AcknowledgeBoundary(uint64_t sequence) {
   return true;
 }
 
+bool GuestExecutionMarkerController::RetractArmBoundaryAndRearm() {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  if (!EnterLocked()) {
+    return false;
+  }
+  if (IsTerminalLocked()) {
+    return false;
+  }
+  // Only the arm boundary itself is retractable, and only while the owner has
+  // not acknowledged it. Anything else is the caller's own state error.
+  if (status_.state != GuestExecutionMarkerControllerState::kArmed ||
+      status_.emitted_boundary_count != 1 ||
+      status_.acknowledged_boundary_count != 0) {
+    FailLocked(GuestExecutionMarkerControllerRejection::kInvalidTransition);
+    return false;
+  }
+  if (status_.stop_requested) {
+    status_.state = GuestExecutionMarkerControllerState::kAborted;
+    return false;
+  }
+  status_.emitted_boundary_count = 0;
+  status_.arm_marker_ordinal = 0;
+  status_.arm_tick = 0;
+  status_.markers_since_arm = 0;
+  status_.state = GuestExecutionMarkerControllerState::kRearming;
+  return true;
+}
+
 bool GuestExecutionMarkerController::OnPm4Marker(
     const gpu::Pm4MarkerEvent& event) noexcept {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -231,6 +259,25 @@ bool GuestExecutionMarkerController::OnPm4Marker(
       if (!status_.warmup_marker_count) {
         FailLocked(
             GuestExecutionMarkerControllerRejection::kMarkerCounterStalled);
+        return false;
+      }
+      status_.markers_since_arm = 0;
+      if (!EmitBoundaryLocked(
+              GuestExecutionMarkerBoundaryKind::kArm, event, now,
+              GuestExecutionSessionStopReason::kRequestedBoundary)) {
+        return false;
+      }
+      status_.arm_marker_ordinal = event.ordinal;
+      status_.arm_tick = now;
+      status_.state = GuestExecutionMarkerControllerState::kArmed;
+      return true;
+    }
+    case GuestExecutionMarkerControllerState::kRearming: {
+      // The warmup already elapsed and its marker evidence still stands, so a
+      // retry arms at the next matching marker without repeating it.
+      const uint64_t now = clock_.NowTicks();
+      if (now < status_.begin_tick) {
+        FailLocked(GuestExecutionMarkerControllerRejection::kClockRegressed);
         return false;
       }
       status_.markers_since_arm = 0;

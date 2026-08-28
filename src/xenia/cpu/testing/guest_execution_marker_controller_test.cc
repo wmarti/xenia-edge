@@ -502,6 +502,72 @@ TEST_CASE("Guest marker controller fails closed when the source shuts down",
           GuestExecutionMarkerControllerState::kStopped);
 }
 
+TEST_CASE("Guest marker controller rearms a retracted arm boundary",
+          "[guest-execution-marker]") {
+  Harness harness;
+  harness.ArmAtOrdinal(4);
+  REQUIRE(harness.controller->ShouldFenceAfterPm4Marker(SwapMarker(4)));
+
+  REQUIRE(harness.controller->RetractArmBoundaryAndRearm());
+  auto status = harness.controller->status();
+  REQUIRE(status.state == GuestExecutionMarkerControllerState::kRearming);
+  REQUIRE(status.emitted_boundary_count == 0);
+  REQUIRE(status.acknowledged_boundary_count == 0);
+  REQUIRE(status.arm_marker_ordinal == 0);
+  REQUIRE_FALSE(harness.controller->ShouldFenceAfterPm4Marker(SwapMarker(4)));
+
+  // The warmup is not repeated, and the retry keeps the canonical accounting.
+  harness.clock.now = 100 + kWarmupTicks + 5;
+  REQUIRE(harness.controller->OnPm4Marker(SwapMarker(5)));
+  status = harness.controller->status();
+  REQUIRE(status.state == GuestExecutionMarkerControllerState::kArmed);
+  REQUIRE(status.arm_marker_ordinal == 5);
+  REQUIRE(status.emitted_boundary_count == 1);
+  REQUIRE(harness.sink.boundaries.size() == 2);
+  REQUIRE(harness.sink.boundaries[1].kind ==
+          GuestExecutionMarkerBoundaryKind::kArm);
+  REQUIRE(harness.sink.boundaries[1].sequence == 1);
+  REQUIRE(harness.sink.boundaries[1].marker_ordinal == 5);
+  REQUIRE(harness.sink.armed_markers.empty());
+
+  REQUIRE(harness.controller->AcknowledgeBoundary(1));
+  REQUIRE(harness.controller->OnPm4Marker(SwapMarker(6)));
+  status = harness.controller->status();
+  REQUIRE(status.state == GuestExecutionMarkerControllerState::kStopped);
+  REQUIRE(status.stop_marker_ordinal == 6);
+  REQUIRE(harness.sink.armed_markers.size() == 1);
+}
+
+TEST_CASE("Guest marker controller refuses an unretractable arm boundary",
+          "[guest-execution-marker]") {
+  Harness acknowledged;
+  acknowledged.ArmAtOrdinal(4);
+  REQUIRE(acknowledged.controller->AcknowledgeBoundary(1));
+  REQUIRE_FALSE(acknowledged.controller->RetractArmBoundaryAndRearm());
+  auto status = acknowledged.controller->status();
+  REQUIRE(status.state == GuestExecutionMarkerControllerState::kFailed);
+  REQUIRE(status.rejection ==
+          GuestExecutionMarkerControllerRejection::kInvalidTransition);
+
+  Harness warming;
+  warming.clock.now = 100;
+  REQUIRE(warming.controller->Begin());
+  REQUIRE_FALSE(warming.controller->RetractArmBoundaryAndRearm());
+  status = warming.controller->status();
+  REQUIRE(status.state == GuestExecutionMarkerControllerState::kFailed);
+  REQUIRE(status.rejection ==
+          GuestExecutionMarkerControllerRejection::kInvalidTransition);
+
+  // A stop request outranks a retry: the window is over, not restarting.
+  Harness stopping;
+  stopping.ArmAtOrdinal(4);
+  REQUIRE(stopping.controller->RequestStop());
+  REQUIRE_FALSE(stopping.controller->RetractArmBoundaryAndRearm());
+  status = stopping.controller->status();
+  REQUIRE(status.state == GuestExecutionMarkerControllerState::kAborted);
+  REQUIRE(status.rejection == GuestExecutionMarkerControllerRejection::kNone);
+}
+
 }  // namespace testing
 }  // namespace cpu
 }  // namespace xe

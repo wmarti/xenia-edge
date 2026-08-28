@@ -41,6 +41,9 @@ enum class GuestExecutionMarkerControllerState : uint8_t {
   kAborted,
   // Terminal. See the rejection; nothing further is emitted.
   kFailed,
+  // The owner discarded an unacknowledged arm boundary. Appended so the
+  // existing numeric states keep their meaning in retained probe logs.
+  kRearming,
 };
 
 enum class GuestExecutionMarkerControllerRejection : uint8_t {
@@ -167,6 +170,10 @@ class GuestExecutionMarkerController final : public gpu::Pm4MarkerSink {
   bool RequestStop();
   // Owner-side completion of one handed-off boundary, in sequence order.
   bool AcknowledgeBoundary(uint64_t sequence);
+  // Owner-side discard of the sole unacknowledged arm boundary. The boundary
+  // is retracted from the sequence, so the retry arms at the next matching
+  // marker with the same canonical accounting the first attempt had.
+  bool RetractArmBoundaryAndRearm();
 
   bool OnPm4Marker(const gpu::Pm4MarkerEvent& event) noexcept override;
   bool ShouldFenceAfterPm4Marker(
