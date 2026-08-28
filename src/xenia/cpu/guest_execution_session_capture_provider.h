@@ -67,9 +67,8 @@ struct GuestExecutionSessionCaptureProviderStatus {
 // CreateAndAttach must run before title translation so the definition catalog
 // is complete. The Processor keeps a non-owning event-sink pointer, therefore
 // this object must be ended and destroyed before the Processor.
-// Dirty guest pages remain fail-closed until the runtime owns a lifetime-scoped
-// coverage lease for every non-JIT guest-memory writer. Final byte comparison
-// alone is not such an attestation.
+// A guest page written during the interval is carried at both boundaries; a
+// page nothing wrote that changed anyway is still fail-closed.
 class GuestExecutionSessionCaptureProvider final
     : public GuestExecutionSessionCaptureRuntimeProvider,
       public GuestInvocationCaptureEventSink {

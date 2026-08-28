@@ -45,8 +45,18 @@ constexpr uint32_t kMiddleFunctionAddress = kFunctionAddress + 0x40;
 constexpr uint32_t kMiddleFunctionEndAddress = kMiddleFunctionAddress + 0xC;
 constexpr uint32_t kLeafFunctionAddress = kFunctionAddress + 0x80;
 constexpr uint32_t kLeafFunctionEndAddress = kLeafFunctionAddress + 0xC;
+// Declared as a module but never demanded by the harness, so a test can drive
+// its dependencies before its definition the way the translator does.
+constexpr uint32_t kLateFunctionAddress = kLeafFunctionAddress + 0x4;
+constexpr uint32_t kLateFunctionEndAddress = kLeafFunctionEndAddress;
+constexpr uint32_t kUncataloguedFunctionAddress = kFunctionAddress + 0x200;
 constexpr uint32_t kAliasDataAddress = 0x82080000u;
 constexpr uint32_t kAliasDataMirrorAddress = 0x92080000u;
+// One 64 KiB physical allocation, reached through the 0xA0000000 view and
+// through the 0xE0000000 view of the same physical page.
+constexpr uint32_t kPhysicalDataAddress = 0xA0010000u;
+constexpr uint32_t kPhysicalDataViewAddress = kPhysicalDataAddress + 0x1000u;
+constexpr uint32_t kPhysicalDataAliasAddress = 0xE0010000u;
 constexpr uint32_t kOuterReturnAddress = 0xBCBCBCBCu;
 constexpr uint32_t kFinalOuterReturnAddress = 0xACACACACu;
 constexpr uint32_t kThreadId = 0x880u;
@@ -103,6 +113,9 @@ class ProviderHarness final {
     REQUIRE(processor->AddModule(
         CreateFunctionModule(processor.get(), "SessionCaptureProviderLeaf",
                              kLeafFunctionAddress, kLeafFunctionEndAddress)));
+    REQUIRE(processor->AddModule(
+        CreateFunctionModule(processor.get(), "SessionCaptureProviderLate",
+                             kLateFunctionAddress, kLateFunctionEndAddress)));
     processor->backend()->CommitExecutableRange(kFunctionAddress,
                                                 kFunctionAddress + 0x1000);
 
@@ -160,6 +173,10 @@ class ProviderHarness final {
       memory->LookupHeap(alias_allocation_address)
           ->Release(alias_allocation_address);
     }
+    if (physical_allocation_address) {
+      memory->LookupHeap(physical_allocation_address)
+          ->Release(physical_allocation_address);
+    }
     memory.reset();
   }
 
@@ -174,6 +191,18 @@ class ProviderHarness final {
     second_thread->context()->lr = kOuterReturnAddress;
     second_participant = {second_thread->guest_execution_capture_instance_id(),
                           kSecondThreadId};
+  }
+
+  void AllocatePhysicalData() {
+    REQUIRE_FALSE(physical_allocation_address);
+    BaseHeap* heap = memory->LookupHeap(kPhysicalDataAddress);
+    REQUIRE(heap);
+    REQUIRE(heap->AllocFixed(kPhysicalDataAddress, 0x10000, 0x10000,
+                             kMemoryAllocationReserve | kMemoryAllocationCommit,
+                             kMemoryProtectRead | kMemoryProtectWrite));
+    physical_allocation_address = kPhysicalDataAddress;
+    std::fill_n(memory->TranslateVirtual(kPhysicalDataAddress), 0x10000,
+                uint8_t{0x64});
   }
 
   void AllocateAliasData() {
@@ -380,6 +409,7 @@ class ProviderHarness final {
   uint32_t protection_granule_size = 0;
   uint32_t code_allocation_address = 0;
   uint32_t alias_allocation_address = 0;
+  uint32_t physical_allocation_address = 0;
   uint32_t stack_address = 0;
   uint32_t second_stack_address = 0;
   uint32_t data_address = 0;
@@ -927,6 +957,55 @@ TEST_CASE(
         harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
     REQUIRE(error.empty());
   }
+  // The scheduler stamps every blocked thread kAfterBlockingExport with the
+  // link register whatever it is waiting on, so a wait class the modeled
+  // dispatch cannot name a single return point for is parked, not refused.
+  SECTION("a delay inside an open dispatch") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE(harness.provider->SupportsCheckpointParticipant(
+        harness
+            .BlockedSecondThreadCheckpoint(
+                kernel::GuestSchedulerCaptureWaitKind::kDelay)
+            .participants.back(),
+        &error));
+    REQUIRE(error.empty());
+  }
+  SECTION("an alertable wait inside an open dispatch") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE(harness.provider->SupportsCheckpointParticipant(
+        harness
+            .BlockedSecondThreadCheckpoint(
+                kernel::GuestSchedulerCaptureWaitKind::kSingle,
+                kernel::kGuestSchedulerCaptureWaitFlagAlertable)
+            .participants.back(),
+        &error));
+    REQUIRE(error.empty());
+  }
+  SECTION("a pending user APC inside an open dispatch") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE(harness.provider->SupportsCheckpointParticipant(
+        harness
+            .BlockedSecondThreadCheckpoint(
+                kernel::GuestSchedulerCaptureWaitKind::kSingle,
+                kernel::kGuestSchedulerCaptureWaitFlagUserApcPending)
+            .participants.back(),
+        &error));
+    REQUIRE(error.empty());
+  }
+  SECTION("an I/O offload wait inside an open dispatch") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE(harness.provider->SupportsCheckpointParticipant(
+        harness
+            .BlockedSecondThreadCheckpoint(
+                kernel::GuestSchedulerCaptureWaitKind::kIoOffload)
+            .participants.back(),
+        &error));
+    REQUIRE(error.empty());
+  }
 }
 
 TEST_CASE("guest execution session provider binds one blocking export dispatch",
@@ -964,47 +1043,6 @@ TEST_CASE("guest execution session provider binds one blocking export dispatch",
     REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
         harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
     REQUIRE(error.find("more than one open modeled export dispatch") !=
-            std::string::npos);
-  }
-  SECTION("wait kind outside the allowlist") {
-    harness.InstallExternalEventLog();
-    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
-                                       kFunctionAddress, kExportThunkAddress));
-    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
-        harness
-            .BlockedSecondThreadCheckpoint(
-                kernel::GuestSchedulerCaptureWaitKind::kDelay)
-            .participants.back(),
-        &error));
-    REQUIRE(error.find("outside the modeled blocking-export wait allowlist") !=
-            std::string::npos);
-  }
-  SECTION("alertable wait") {
-    harness.InstallExternalEventLog();
-    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
-                                       kFunctionAddress, kExportThunkAddress));
-    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
-        harness
-            .BlockedSecondThreadCheckpoint(
-                kernel::GuestSchedulerCaptureWaitKind::kSingle,
-                kernel::kGuestSchedulerCaptureWaitFlagAlertable)
-            .participants.back(),
-        &error));
-    REQUIRE(error.find("outside the modeled blocking-export wait allowlist") !=
-            std::string::npos);
-  }
-  SECTION("pending user APC") {
-    harness.InstallExternalEventLog();
-    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
-                                       kFunctionAddress, kExportThunkAddress));
-    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
-        harness
-            .BlockedSecondThreadCheckpoint(
-                kernel::GuestSchedulerCaptureWaitKind::kSingle,
-                kernel::kGuestSchedulerCaptureWaitFlagUserApcPending)
-            .participants.back(),
-        &error));
-    REQUIRE(error.find("outside the modeled blocking-export wait allowlist") !=
             std::string::npos);
   }
   SECTION("dispatch return point differs from the checkpoint PC") {
@@ -1679,6 +1717,56 @@ TEST_CASE("guest execution session provider serializes seal and stop",
           GuestExecutionSessionCaptureProviderState::kStopped);
 }
 
+TEST_CASE(
+    "guest execution session provider resolves an overlapping catalog "
+    "owner",
+    "[guest-execution-session-capture-provider]") {
+  // The frontend finds a second entry point into code it already knows and
+  // scans both to the same terminating branch, so two definitions legitimately
+  // reach one address. The nearest entry at or below it is the extent.
+  ProviderHarness harness;
+  REQUIRE(harness.processor->ResolveFunction(kLateFunctionAddress));
+  std::string error;
+  REQUIRE(harness.provider->BeginCapture(
+      harness.Checkpoint(kLateFunctionAddress + 4), harness.Participants(),
+      harness.HostCalls(), &error));
+  REQUIRE(error.empty());
+  std::vector<uint8_t> state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(harness.participant, true,
+                                                   &state_bytes, &error));
+  ppc::GuestPPCThreadCheckpoint state;
+  REQUIRE(
+      ppc::GuestPPCThreadCheckpointCodec::Decode(state_bytes, &state, &error));
+  REQUIRE(state.resume_pc == kLateFunctionAddress + 4);
+  REQUIRE(state.owning_function_address == kLateFunctionAddress);
+  REQUIRE(state.owning_function_end_address == kLateFunctionEndAddress);
+}
+
+TEST_CASE(
+    "guest execution session provider seals over an undefined call "
+    "target",
+    "[guest-execution-session-capture-provider]") {
+  // A demand JIT declares far more call targets than it ever translates, and
+  // an extern thunk carries no emitted code, so neither belongs to the corpus.
+  ProviderHarness harness;
+  REQUIRE(harness.provider->OnFunctionDependency(kLateFunctionAddress,
+                                                 kUncataloguedFunctionAddress));
+  REQUIRE(harness.processor->ResolveFunction(kLateFunctionAddress));
+  std::string error;
+  const auto checkpoint = harness.Checkpoint(kLateFunctionAddress);
+  REQUIRE(harness.provider->BeginCapture(checkpoint, harness.Participants(),
+                                         harness.HostCalls(), &error));
+  REQUIRE(
+      harness.provider->SealCapture(checkpoint, harness.HostCalls(), &error));
+  REQUIRE(error.empty());
+  std::vector<uint8_t> corpus_bytes;
+  REQUIRE(harness.provider->CollectSessionCodeCorpus(&corpus_bytes, &error));
+  ExecutionJitCorpus corpus;
+  REQUIRE(ExecutionJitCorpus::Decode(corpus_bytes, &corpus, &error));
+  REQUIRE(corpus.functions().size() == 1);
+  REQUIRE(corpus.functions().front().address == kLateFunctionAddress);
+}
+
 TEST_CASE("guest execution session provider rejects inexact production inputs",
           "[guest-execution-session-capture-provider]") {
   SECTION("blocked scheduler continuation") {
@@ -1726,12 +1814,14 @@ TEST_CASE("guest execution session provider rejects inexact production inputs",
     REQUIRE(harness.provider->BeginCapture(
         harness.Checkpoint(kLeafFunctionAddress, kLeafFunctionAddress),
         harness.Participants(), harness.HostCalls(), &error));
-    REQUIRE_FALSE(harness.provider->OnFunctionExit(
+    // The return seeds the corpus and nothing else, so an address no
+    // catalogued extent reaches widens nothing rather than refusing.
+    REQUIRE(harness.provider->OnFunctionExit(
         harness.InvocationIdentity(), kLeafFunctionAddress,
         kFunctionAddress + 0x100,
         ppc::CaptureGuestPPCRegisterState(*harness.thread->context())));
     REQUIRE(harness.provider->status().state ==
-            GuestExecutionSessionCaptureProviderState::kRejected);
+            GuestExecutionSessionCaptureProviderState::kRecording);
   }
 
   SECTION("participant outer return may be ownerless") {
@@ -1778,7 +1868,7 @@ TEST_CASE("guest execution session provider rejects inexact production inputs",
     REQUIRE(status.message.find("unsupported dependency") != std::string::npos);
   }
 
-  SECTION("dirty page without complete external mutation coverage") {
+  SECTION("an observed write is carried at both boundaries") {
     ProviderHarness harness;
     std::string error;
     REQUIRE(harness.provider->BeginCapture(harness.Checkpoint(),
@@ -1789,13 +1879,28 @@ TEST_CASE("guest execution session provider rejects inexact production inputs",
         ppc::GuestInvocationRecorderMemoryAccess::kWrite));
     std::fill_n(harness.memory->TranslateVirtual(harness.data_address), 4,
                 uint8_t{0xA7});
-    REQUIRE_FALSE(harness.provider->SealCapture(harness.Checkpoint(),
-                                                harness.HostCalls(), &error));
-    REQUIRE(error.find("complete external-memory mutation coverage") !=
-            std::string::npos);
+    REQUIRE(harness.provider->SealCapture(harness.Checkpoint(),
+                                          harness.HostCalls(), &error));
+    REQUIRE(error.empty());
+    std::vector<GuestExecutionSessionAssemblerContent> initial_content;
+    std::vector<GuestExecutionSessionAssemblerContent> final_content;
+    REQUIRE(harness.provider->CollectCheckpointContent(true, &initial_content,
+                                                       &error));
+    REQUIRE(harness.provider->CollectCheckpointContent(false, &final_content,
+                                                       &error));
+    const auto* initial_page = FindContent(
+        initial_content, GuestExecutionSessionContentKind::kGuestPage,
+        harness.data_address);
+    const auto* final_page =
+        FindContent(final_content, GuestExecutionSessionContentKind::kGuestPage,
+                    harness.data_address);
+    REQUIRE(initial_page);
+    REQUIRE(final_page);
+    REQUIRE(initial_page->bytes[0] == 0x31);
+    REQUIRE(final_page->bytes[0] == 0xA7);
   }
 
-  SECTION("read-shared page later written by the original participant") {
+  SECTION("two participants sharing a written page") {
     ProviderHarness harness;
     harness.AddSecondParticipant();
     std::string error;
@@ -1807,52 +1912,26 @@ TEST_CASE("guest execution session provider rejects inexact production inputs",
         ppc::GuestInvocationRecorderMemoryAccess::kRead));
     REQUIRE(harness.provider->OnMemoryAccess(
         harness.SecondInvocationIdentity(), harness.data_address, 4,
-        ppc::GuestInvocationRecorderMemoryAccess::kRead));
-    REQUIRE_FALSE(harness.provider->OnMemoryAccess(
-        harness.InvocationIdentity(), harness.data_address, 4,
         ppc::GuestInvocationRecorderMemoryAccess::kWrite));
-    const auto status = harness.provider->status();
-    REQUIRE(status.state ==
-            GuestExecutionSessionCaptureProviderState::kRejected);
-    REQUIRE(status.message.find("cross-participant shared write") !=
-            std::string::npos);
-  }
-
-  SECTION("written page later read by another participant") {
-    ProviderHarness harness;
-    harness.AddSecondParticipant();
-    std::string error;
-    REQUIRE(harness.provider->BeginCapture(
-        harness.TwoThreadCheckpoint(), harness.TwoThreadParticipants(),
-        harness.TwoThreadHostCalls(), &error));
     REQUIRE(harness.provider->OnMemoryAccess(
         harness.InvocationIdentity(), harness.data_address, 4,
         ppc::GuestInvocationRecorderMemoryAccess::kWrite));
-    REQUIRE_FALSE(harness.provider->OnMemoryAccess(
-        harness.SecondInvocationIdentity(), harness.data_address, 4,
-        ppc::GuestInvocationRecorderMemoryAccess::kRead));
-    REQUIRE(harness.provider->status().message.find(
-                "cross-participant shared write") != std::string::npos);
+    std::fill_n(harness.memory->TranslateVirtual(harness.data_address), 4,
+                uint8_t{0xC3});
+    REQUIRE(harness.provider->SealCapture(
+        harness.TwoThreadCheckpoint(), harness.TwoThreadHostCalls(), &error));
+    REQUIRE(error.empty());
+    std::vector<GuestExecutionSessionAssemblerContent> final_content;
+    REQUIRE(harness.provider->CollectCheckpointContent(false, &final_content,
+                                                       &error));
+    const auto* final_page =
+        FindContent(final_content, GuestExecutionSessionContentKind::kGuestPage,
+                    harness.data_address);
+    REQUIRE(final_page);
+    REQUIRE(final_page->bytes[0] == 0xC3);
   }
 
-  SECTION("read page later written by another participant") {
-    ProviderHarness harness;
-    harness.AddSecondParticipant();
-    std::string error;
-    REQUIRE(harness.provider->BeginCapture(
-        harness.TwoThreadCheckpoint(), harness.TwoThreadParticipants(),
-        harness.TwoThreadHostCalls(), &error));
-    REQUIRE(harness.provider->OnMemoryAccess(
-        harness.InvocationIdentity(), harness.data_address, 4,
-        ppc::GuestInvocationRecorderMemoryAccess::kRead));
-    REQUIRE_FALSE(harness.provider->OnMemoryAccess(
-        harness.SecondInvocationIdentity(), harness.data_address, 4,
-        ppc::GuestInvocationRecorderMemoryAccess::kWrite));
-    REQUIRE(harness.provider->status().message.find(
-                "cross-participant shared write") != std::string::npos);
-  }
-
-  SECTION("physical alias views cannot bypass shared-page ordering") {
+  SECTION("the xex views of one backing page") {
     ProviderHarness harness;
     harness.AddSecondParticipant();
     harness.AllocateAliasData();
@@ -1866,8 +1945,54 @@ TEST_CASE("guest execution session provider rejects inexact production inputs",
     REQUIRE_FALSE(harness.provider->OnMemoryAccess(
         harness.SecondInvocationIdentity(), kAliasDataMirrorAddress, 4,
         ppc::GuestInvocationRecorderMemoryAccess::kWrite));
+    REQUIRE(harness.provider->status().message.find(
+                "both physical alias views") != std::string::npos);
+  }
+
+  SECTION("physical memory is guest memory") {
+    ProviderHarness harness;
+    harness.AllocatePhysicalData();
+    std::string error;
+    REQUIRE(harness.provider->BeginCapture(harness.Checkpoint(),
+                                           harness.Participants(),
+                                           harness.HostCalls(), &error));
+    // MmAllocatePhysicalMemory hands a title the 0xA0000000, 0xC0000000 and
+    // 0xE0000000 views for its command, vertex, index and texture buffers.
+    REQUIRE(harness.provider->OnMemoryAccess(
+        harness.InvocationIdentity(), kPhysicalDataViewAddress, 4,
+        ppc::GuestInvocationRecorderMemoryAccess::kRead));
+    // The 0xE0000000 view of that same physical page, which the heap places
+    // 4 KiB further into physical memory than the 0xA0000000 view.
+    REQUIRE_FALSE(harness.provider->OnMemoryAccess(
+        harness.InvocationIdentity(), kPhysicalDataAliasAddress, 4,
+        ppc::GuestInvocationRecorderMemoryAccess::kRead));
     REQUIRE(harness.provider->status().state ==
             GuestExecutionSessionCaptureProviderState::kRejected);
+  }
+
+  SECTION("a tail call reported before its target is translated") {
+    ProviderHarness harness;
+    std::string error;
+    REQUIRE(harness.provider->BeginCapture(harness.Checkpoint(),
+                                           harness.Participants(),
+                                           harness.HostCalls(), &error));
+    REQUIRE(harness.provider->OnTailCall(harness.InvocationIdentity(),
+                                         kFunctionAddress,
+                                         kUncataloguedFunctionAddress));
+    REQUIRE(harness.provider->status().state ==
+            GuestExecutionSessionCaptureProviderState::kRecording);
+  }
+
+  SECTION("a nested host-to-guest entry") {
+    ProviderHarness harness;
+    std::string error;
+    REQUIRE(harness.provider->BeginCapture(harness.Checkpoint(),
+                                           harness.Participants(),
+                                           harness.HostCalls(), &error));
+    // The kernel delivers APCs, DPCs and object callbacks this way.
+    REQUIRE(harness.provider->OnAsyncReentry(harness.InvocationIdentity()));
+    REQUIRE(harness.provider->status().state ==
+            GuestExecutionSessionCaptureProviderState::kRecording);
   }
 }
 
@@ -2312,15 +2437,14 @@ TEST_CASE("guest execution session provider admits blocked parity",
   REQUIRE(error.empty());
 
   // An alertable wait can run guest code on the waiting thread's stack, so it
-  // states nothing about whether the participant ran and cannot claim parity.
+  // publishes no resume route. It is still admitted and parked: the encode arm
+  // proves it executed nothing rather than the roster gate guessing.
   participant.blocked_wait.flags |=
       kernel::kGuestSchedulerCaptureWaitFlagAlertable;
   REQUIRE_FALSE(
       IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
-  REQUIRE_FALSE(
-      harness.provider->SupportsCheckpointParticipant(participant, &error));
-  REQUIRE(error.find("outside the modeled blocking-export wait allowlist") !=
-          std::string::npos);
+  REQUIRE(harness.provider->SupportsCheckpointParticipant(participant, &error));
+  REQUIRE(error.empty());
 }
 
 }  // namespace testing

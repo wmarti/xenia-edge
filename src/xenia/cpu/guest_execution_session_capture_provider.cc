@@ -52,14 +52,25 @@ bool Fail(std::string* error, std::string_view message) {
 
 bool IsPowerOfTwo(uint32_t value) { return value && !(value & (value - 1)); }
 
-bool IsSupportedPageAddress(uint32_t address) {
-  return (address >= 0x00001000u && address <= 0x7EFFF000u) ||
-         (address >= 0x80000000u && address <= 0x9FFFF000u);
+bool IsSupportedPageAddress(Memory& memory, uint32_t address) {
+  return memory.LookupHeap(address) != nullptr;
 }
 
+// Physical memory is reachable through the 0xA0000000, 0xC0000000 and
+// 0xE0000000 views and the XEX range through 0x80000000 and 0x90000000, so a
+// page is keyed by the lowest view that reaches it. PhysicalHeap places the
+// 0xE0000000 view 4 KiB further into physical memory than the others.
 uint32_t BackingPageAddress(uint32_t address) {
-  return address >= 0x90000000u && address < 0xA0000000u ? address - 0x10000000u
-                                                         : address;
+  if (address >= 0xE0000000u && address < 0xFFD00000u) {
+    return address - 0xE0000000u + 0xA0001000u;
+  }
+  if (address >= 0xC0000000u && address < 0xE0000000u) {
+    return address - 0x20000000u;
+  }
+  if (address >= 0x90000000u && address < 0xA0000000u) {
+    return address - 0x10000000u;
+  }
+  return address;
 }
 
 bool HasWriteAccess(ppc::GuestInvocationRecorderMemoryAccess access) {
@@ -131,7 +142,8 @@ bool IsBlockedExportParticipant(const CheckpointParticipant& participant) {
 // matching the modeled export dispatch adapter's own allowlist. A delay, a
 // fence or spin poll and the I/O classes reach that link register once per poll
 // rather than once per export, and an alertable or APC-pending wait can run
-// guest code on the waiting thread's stack before the export returns.
+// guest code on the waiting thread's stack before the export returns. Those
+// waits carry no resume route, so they are parked rather than refused.
 bool IsBlockedExportWaitInAllowlist(const CheckpointParticipant& participant) {
   const bool modeled_kind =
       participant.blocked_wait_kind ==
@@ -225,12 +237,6 @@ struct GuestExecutionSessionCaptureProvider::Impl {
 
   struct InstructionCounter {
     GuestExecutionCaptureParticipantIdentity participant;
-  };
-
-  struct DataPageUse {
-    uint64_t first_participant = 0;
-    bool shared = false;
-    bool written = false;
   };
 
   enum class CodeReadResult {
@@ -442,7 +448,8 @@ struct GuestExecutionSessionCaptureProvider::Impl {
 
   Impl(Memory& memory_value, Processor& processor_value,
        GuestExecutionSessionCaptureProviderConfig config_value)
-      : processor(processor_value),
+      : memory(memory_value),
+        processor(processor_value),
         config(config_value),
         page_reader(memory_value) {}
 
@@ -509,7 +516,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     }
     for (uint64_t page = first_granule; page < end; page += kGuestPageSize) {
       const uint32_t address = static_cast<uint32_t>(page);
-      if (!IsSupportedPageAddress(address)) {
+      if (!IsSupportedPageAddress(memory, address)) {
         return RejectLocked(
             "capture provider protection granule uses unsupported memory");
       }
@@ -736,38 +743,37 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     return &definition->second;
   }
 
-  const DefinitionRecord* FindOwningDefinitionLocked(uint32_t guest_pc) {
+  // More than one catalogued definition can reach an address: the frontend
+  // scans a second entry point into code it already knows to the same
+  // terminating branch, and both definitions are real. The emulator never
+  // answers which of them contains an address -- Module::ContainsAddress is
+  // unconditional and lookup is by entry address -- so the nearest entry at or
+  // below the address is the extent the checkpoint format is given.
+  const DefinitionRecord* FindContainingDefinitionLocked(
+      uint32_t guest_pc, uint32_t* owner_address) const {
     const DefinitionRecord* owner = nullptr;
+    uint32_t owner_entry = 0;
     for (const auto& [address, definition] : definitions) {
       if (!definition.defined || guest_pc < address ||
           guest_pc > definition.end_address) {
         continue;
       }
-      if (owner) {
-        RejectLocked(fmt::format(
-            "capture provider checkpoint PC has overlapping catalog owners: "
-            "pc={:08X} first={:08X}-{:08X} second={:08X}-{:08X} order={}/{}",
-            guest_pc, FindDefinitionAddressLocked(owner), owner->end_address,
-            address, definition.end_address, owner->definition_order,
-            definition.definition_order));
-        return nullptr;
-      }
       owner = &definition;
+      owner_entry = address;
     }
+    *owner_address = owner_entry;
+    return owner;
+  }
+
+  const DefinitionRecord* FindOwningDefinitionLocked(uint32_t guest_pc,
+                                                     uint32_t* owner_address) {
+    const DefinitionRecord* owner =
+        FindContainingDefinitionLocked(guest_pc, owner_address);
     if (!owner) {
       RejectLocked(
           "capture provider checkpoint PC has no successful definition");
     }
     return owner;
-  }
-
-  uint32_t FindDefinitionAddressLocked(const DefinitionRecord* target) const {
-    for (const auto& [address, definition] : definitions) {
-      if (&definition == target) {
-        return address;
-      }
-    }
-    return 0;
   }
 
   const CheckpointParticipant* FindCheckpointParticipant(
@@ -816,7 +822,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
   bool BindModeledExportDispatch(
       const CheckpointParticipant& participant,
       std::string_view participant_class, std::string_view resume_point,
-      bool wait_in_allowlist, uint32_t return_point,
+      uint32_t return_point,
       GuestExecutionCaptureExternalEventActiveCall* output,
       std::string* reason) const {
     // Queried before the first refusal so every refusal names the wait it
@@ -842,12 +848,6 @@ struct GuestExecutionSessionCaptureProvider::Impl {
       }
       return false;
     };
-    if (!wait_in_allowlist) {
-      return refuse(fmt::format(
-          "capture provider {} is outside the modeled blocking-export wait "
-          "allowlist",
-          participant_class));
-    }
     if (!log) {
       return refuse(
           "capture provider has no installed modeled export event log");
@@ -1136,7 +1136,6 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           std::string reason;
           if (!BindModeledExportDispatch(
                   *scheduler_participant, "woken waiter", "link register",
-                  IsBlockedExportWaitInAllowlist(*scheduler_participant),
                   static_cast<uint32_t>(thread->registers.link_register),
                   &dispatch, &reason)) {
             return RejectLocked(reason);
@@ -1158,12 +1157,12 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           }
           outer_return_addresses.emplace(identity.capture_instance_id,
                                          outer_return);
-          const DefinitionRecord* owner =
-              FindOwningDefinitionLocked(dispatch.call_site_address);
+          uint32_t owner_address = 0;
+          const DefinitionRecord* owner = FindOwningDefinitionLocked(
+              dispatch.call_site_address, &owner_address);
           if (!owner) {
             return false;
           }
-          const uint32_t owner_address = FindDefinitionAddressLocked(owner);
           if (!owner_address || !owner->code_pages_snapshotted ||
               !AddClosureSeedLocked(owner_address, owner->end_address)) {
             return false;
@@ -1228,11 +1227,14 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           }
           state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
           outside_guest_participants.insert(identity.capture_instance_id);
-        } else if (IsBlockedParityParkParticipant(*scheduler_participant)) {
-          // A waiter parked below its root dispatch with nothing modeled
-          // beneath it publishes no route. It is carried at both boundaries and
-          // never resumed, which claims it did not run; the claim holds only if
-          // it owns that one call and nothing else.
+        } else if (IsBlockedParityParkParticipant(*scheduler_participant) ||
+                   (IsBlockedExportParticipant(*scheduler_participant) &&
+                    !IsBlockedExportWaitInAllowlist(*scheduler_participant))) {
+          // A waiter whose wait names no single export return point, or that is
+          // parked below its root dispatch with nothing modeled beneath it,
+          // publishes no route. It is carried at both boundaries and never
+          // resumed, which claims it did not run; the claim holds only if it
+          // owns that one call and nothing else.
           const GuestExecutionCaptureActiveHostCall* root_call = nullptr;
           if (!OwnsOnlyItsRootHostCall(identity, host_calls, &root_call)) {
             return RejectLocked(
@@ -1258,7 +1260,6 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           std::string reason;
           if (!BindModeledExportDispatch(
                   *scheduler_participant, "blocked participant", "PC",
-                  IsBlockedExportWaitInAllowlist(*scheduler_participant),
                   scheduler_participant->guest_pc, &dispatch, &reason)) {
             return RejectLocked(reason);
           }
@@ -1273,12 +1274,12 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           }
           outer_return_addresses.emplace(identity.capture_instance_id,
                                          outer_return);
-          const DefinitionRecord* owner =
-              FindOwningDefinitionLocked(scheduler_participant->guest_pc);
+          uint32_t owner_address = 0;
+          const DefinitionRecord* owner = FindOwningDefinitionLocked(
+              scheduler_participant->guest_pc, &owner_address);
           if (!owner) {
             return false;
           }
-          const uint32_t owner_address = FindDefinitionAddressLocked(owner);
           if (!owner_address || !owner->code_pages_snapshotted ||
               !AddClosureSeedLocked(owner_address, owner->end_address)) {
             return false;
@@ -1360,6 +1361,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
         [&](const CheckpointParticipant& candidate) {
           return IsRestorableJitParticipant(candidate) ||
                  (IsBlockedExportParticipant(candidate) &&
+                  IsBlockedExportWaitInAllowlist(candidate) &&
                   !IsBlockedParityParkParticipant(candidate)) ||
                  (IsWokenExportParticipant(candidate) &&
                   IsParkedInOpenExportDispatch(
@@ -1453,7 +1455,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
         static_cast<uint32_t>(last_byte) & ~(kGuestPageSize - 1);
     for (uint64_t page = first_page; page <= last_page;
          page += kGuestPageSize) {
-      if (!IsSupportedPageAddress(static_cast<uint32_t>(page))) {
+      if (!IsSupportedPageAddress(memory, static_cast<uint32_t>(page))) {
         return RejectLocked(
             "capture provider memory access uses unsupported memory");
       }
@@ -1501,27 +1503,14 @@ struct GuestExecutionSessionCaptureProvider::Impl {
       data_backing_views.emplace(backing, view);
     }
 
-    const bool writes = HasWriteAccess(access);
+    if (!HasWriteAccess(access)) {
+      return true;
+    }
     for (uint64_t page = first_page; page <= last_page;
          page += kGuestPageSize) {
       const uint32_t page_address = static_cast<uint32_t>(page);
-      const uint32_t backing = BackingPageAddress(page_address);
-      DataPageUse& use = data_page_uses[backing];
-      if (use.first_participant && use.first_participant != participant) {
-        use.shared = true;
-      }
-      if (use.shared && (use.written || writes)) {
-        return RejectLocked(
-            "capture provider cannot order a cross-participant shared write");
-      }
-      if (!use.first_participant) {
-        use.first_participant = participant;
-      }
-      if (writes) {
-        use.written = true;
-        dirty_data_pages.insert(page_address);
-        written_backing_pages.insert(backing);
-      }
+      dirty_data_pages.insert(page_address);
+      written_backing_pages.insert(BackingPageAddress(page_address));
     }
     return true;
   }
@@ -1544,14 +1533,15 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     while (!pending.empty()) {
       const uint32_t address = pending.back();
       pending.pop_back();
-      if (!closure->insert(address).second) {
-        continue;
-      }
       const auto definition = definitions.find(address);
+      // A declared call target the JIT never demanded, and an extern thunk that
+      // carries no emitted code, have nothing to replay and no code pages.
       if (definition == definitions.cend() || !definition->second.defined ||
           !definition->second.code_pages_snapshotted) {
-        return RejectLocked(
-            "capture provider translation closure is incomplete");
+        continue;
+      }
+      if (!closure->insert(address).second) {
+        continue;
       }
       pending.insert(pending.end(), definition->second.dependencies.cbegin(),
                      definition->second.dependencies.cend());
@@ -1567,12 +1557,6 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     if (!BuildClosureLocked(&closure)) {
       return false;
     }
-    if (!dirty_data_pages.empty()) {
-      return RejectLocked(
-          "capture provider cannot seal dirty guest pages without complete "
-          "external-memory mutation coverage");
-    }
-
     std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> code_pages;
     std::map<uint32_t, uint32_t> code_backing_views;
     for (uint32_t function_address : closure) {
@@ -1736,6 +1720,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     return true;
   }
 
+  Memory& memory;
   Processor& processor;
   GuestExecutionSessionCaptureProviderConfig config;
   GuestInvocationCapturePageReader page_reader;
@@ -1779,7 +1764,6 @@ struct GuestExecutionSessionCaptureProvider::Impl {
 
   std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> initial_data_pages;
   std::map<uint32_t, uint32_t> data_backing_views;
-  std::map<uint32_t, DataPageUse> data_page_uses;
   std::set<uint32_t> dirty_data_pages;
   std::set<uint32_t> written_backing_pages;
   uint64_t memory_access_count = 0;
@@ -1872,11 +1856,16 @@ bool GuestExecutionSessionCaptureProvider::SupportsCheckpointParticipant(
       return true;
     }
     if (participant.thread_id && IsBlockedExportParticipant(participant)) {
+      // The scheduler stamps every blocked thread the same way whatever it is
+      // waiting on, so a wait class the modeled dispatch cannot name a single
+      // return point for publishes no route and is carried unchanged.
+      if (!IsBlockedExportWaitInAllowlist(participant)) {
+        return true;
+      }
       std::string reason;
-      if (impl_->BindModeledExportDispatch(
-              participant, "blocked participant", "PC",
-              IsBlockedExportWaitInAllowlist(participant), participant.guest_pc,
-              nullptr, &reason)) {
+      if (impl_->BindModeledExportDispatch(participant, "blocked participant",
+                                           "PC", participant.guest_pc, nullptr,
+                                           &reason)) {
         return true;
       }
       // A waiter no modeled dispatch owns cannot be resumed from the tape, but
@@ -2350,14 +2339,15 @@ bool GuestExecutionSessionCaptureProvider::OnFunctionExit(
     if (return_address == outer_return->second) {
       return true;
     }
+    // The seed only widens the code corpus, so a return address no catalogued
+    // extent reaches is not a reason to refuse the interval.
+    uint32_t owner_address = 0;
     const Impl::DefinitionRecord* owner =
-        impl_->FindOwningDefinitionLocked(return_address);
-    if (!owner) {
-      return false;
+        impl_->FindContainingDefinitionLocked(return_address, &owner_address);
+    if (!owner || !owner_address) {
+      return true;
     }
-    const uint32_t owner_address = impl_->FindDefinitionAddressLocked(owner);
-    return owner_address &&
-           impl_->AddClosureSeedLocked(owner_address, owner->end_address);
+    return impl_->AddClosureSeedLocked(owner_address, owner->end_address);
   });
 }
 
@@ -2403,12 +2393,16 @@ bool GuestExecutionSessionCaptureProvider::OnTailCall(
     }
     uint64_t participant = 0;
     const auto source = impl_->definitions.find(from_address);
-    const auto target = impl_->definitions.find(target_address);
     if (!impl_->IsKnownExecutionIdentityLocked(identity, &participant) ||
-        source == impl_->definitions.cend() || !source->second.defined ||
-        target == impl_->definitions.cend() || !target->second.defined) {
+        source == impl_->definitions.cend() || !source->second.defined) {
       return impl_->RejectLocked(
           "capture provider tail call is outside the exact catalog");
+    }
+    // The branch is reported before the backend resolves its target, so a
+    // target the JIT has not defined yet is seeded by its own entry instead.
+    const auto target = impl_->definitions.find(target_address);
+    if (target == impl_->definitions.cend() || !target->second.defined) {
+      return true;
     }
     return impl_->AddClosureSeedLocked(target_address,
                                        target->second.end_address);
@@ -2443,9 +2437,11 @@ bool GuestExecutionSessionCaptureProvider::OnAsyncReentry(
       return true;
     }
     uint64_t participant = 0;
-    return impl_->IsKnownExecutionIdentityLocked(identity, &participant) &&
-           impl_->RejectLocked(
-               "capture provider cannot replay asynchronous reentry");
+    // A nested host-to-guest entry is how the kernel delivers APCs, DPCs,
+    // object callbacks and module entry points. The session tracks
+    // participants rather than one balanced invocation, so the reentry only
+    // has to come from the held roster.
+    return impl_->IsKnownExecutionIdentityLocked(identity, &participant);
   });
 }
 
