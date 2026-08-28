@@ -1098,12 +1098,15 @@ GuestExecutionSessionBundle MakePassiveContinuousSessionBundle(
     participant.effective_priority = 8;
     participant.suspension_count = 0;
     participant.ready_queue_level = 8;
-    participant.ready_queue_fifo_ordinal = 1;
+    participant.ready_queue_fifo_ordinal = 0;
     participant.resume_kind =
         GuestExecutionSessionSchedulerResumeKind::kNotYetRun;
     participant.restorable = false;
     participant.guest_pc = 0;
   }
+  // The executable row runs at the final boundary and leaves the queue, so the
+  // passive row holds ordinal 0 and the start queue stays dense behind it.
+  start_topology.participants[0].ready_queue_fifo_ordinal = 1;
 
   bundle.chunks.resize(7);
   REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
