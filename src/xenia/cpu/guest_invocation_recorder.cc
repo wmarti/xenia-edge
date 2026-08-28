@@ -551,9 +551,10 @@ struct GuestInvocationRecorder::Impl {
       }
       const auto definition = definitions.find(function_address);
       if (definition == definitions.cend() || !definition->second.defined) {
-        return Reject(
-            GuestInvocationRecorderRejection::kIncompleteTranslationClosure,
-            "capture dependency lacks a successful definition/extent/order");
+        // Translation declares every call target but only defines the ones the
+        // title actually demands, and a declared target has no emitted code.
+        // Entering one later reseeds the closure from its own definition.
+        continue;
       }
       for (const AddressRange& write : owner_writes) {
         if (RangeSharesPages(write, definition->second.code_page_addresses)) {

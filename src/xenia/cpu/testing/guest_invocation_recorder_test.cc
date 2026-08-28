@@ -773,16 +773,24 @@ TEST_CASE("guest invocation recorder claims owner and validates registry order",
         *recorder,
         GuestInvocationRecorderRejection::kIncompleteTranslationClosure);
   }
-  SECTION("every dependency in the selected closure must be defined") {
+  SECTION("a declared-only dependency stays out of the selected closure") {
+    reader.AddPage(kDataPageA, 1);
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock, MakeLimits(), MakeSelection(), false);
     REQUIRE(recorder->OnFunctionDependency(kRootAddress, kDeclaredOnlyAddress));
     Define(*recorder, kRootAddress, kRootEndAddress);
-    REQUIRE_FALSE(recorder->OnFunctionEntry(kOwner, kRootAddress,
-                                            kRootEndAddress, MakeState(1)));
-    RequireRejected(
-        *recorder,
-        GuestInvocationRecorderRejection::kIncompleteTranslationClosure);
+    ConvergeOnPage(*recorder);
+    EnterRoot(*recorder, MakeState(3));
+    Access(*recorder, kDataPageA);
+    ExitRoot(*recorder, MakeState(4));
+    REQUIRE(recorder->state() == GuestInvocationRecorderState::kComplete);
+    const GuestInvocationRecorderResult* result = recorder->result();
+    REQUIRE(result);
+    REQUIRE((result->translation_dependencies ==
+             std::vector<GuestInvocationRecorderFunction>{
+                 {kRootAddress, kRootEndAddress}}));
+    REQUIRE(result->code_pages.size() == 1);
+    REQUIRE(result->code_pages[0].guest_address == kRootAddress);
   }
   SECTION("dependency edges must precede their source definition") {
     std::unique_ptr<GuestInvocationRecorder> recorder =

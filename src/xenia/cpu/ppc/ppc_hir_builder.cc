@@ -267,8 +267,6 @@ Function* PPCHIRBuilder::LookupFunction(uint32_t address) {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   // The dependency must precede the source's successful-definition event.
-  // Report the lookup even if declaration fails so the recorder rejects an
-  // incomplete closure rather than silently producing an unsafe artifact.
   processor->NotifyGuestInvocationCaptureFunctionDependency(
       function_->address(), address);
 #endif

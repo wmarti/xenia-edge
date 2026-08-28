@@ -126,10 +126,12 @@ struct GuestInvocationRecorderResult {
   GuestFunctionInvocation invocation;
   GuestInvocationRecorderIdentity owner;
 
-  // The transitive translation/declaration closure in the exact successful
-  // definition order reported to the registry. It may include functions that
-  // were never entered and remains separate from the runtime call tree so an
-  // exact-corpus builder can reproduce code placement.
+  // The transitive closure of successfully defined functions in the exact
+  // definition order reported to the registry. A demand JIT declares call
+  // targets it never translates; those carry no emitted code and are excluded.
+  // It may include functions that were never entered and remains separate from
+  // the runtime call tree so an exact-corpus builder can reproduce code
+  // placement.
   std::vector<GuestInvocationRecorderFunction> translation_dependencies;
   // Immutable guest code pages sampled immediately after successful
   // translation and before backend publication. Only pages required by the
