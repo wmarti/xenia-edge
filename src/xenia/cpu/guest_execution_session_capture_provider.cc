@@ -173,6 +173,11 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     ppc::GuestPPCRegisterState registers;
   };
 
+  struct PendingExportCheckpoint {
+    ppc::GuestPPCThreadCheckpoint state;
+    GuestExecutionCaptureExternalEventToken token;
+  };
+
   struct InstructionCounter {
     GuestExecutionCaptureParticipantIdentity participant;
   };
@@ -916,6 +921,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     }
 
     std::map<uint64_t, std::vector<uint8_t>> encoded;
+    std::map<uint64_t, PendingExportCheckpoint> pending_exports;
     std::map<std::pair<uint64_t, uint64_t>, uint64_t> execution_identities;
     std::map<uint64_t, uint32_t> outer_return_addresses;
     std::set<uint64_t> outside_guest_participants;
@@ -957,6 +963,15 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
           outside_guest_participants.insert(identity.capture_instance_id);
         } else if (IsBlockedExportParticipant(*scheduler_participant)) {
+          // Only the start boundary can carry this route. A participant still
+          // parked at the final boundary waits for an export that returns after
+          // the interval, so no captured event can ever witness it.
+          if (!establish_execution_identities) {
+            return RejectLocked(
+                "capture provider cannot encode a blocked modeled export at "
+                "the final boundary: " +
+                DescribeParticipant(*scheduler_participant));
+          }
           GuestExecutionCaptureExternalEventActiveCall dispatch;
           std::string reason;
           if (!BindBlockedExportDispatch(*scheduler_participant, &dispatch,
@@ -986,11 +1001,13 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           state_blob.owning_function_end_address = owner->end_address;
           state_blob.outer_guest_return_address = outer_return;
           state_blob.pending_export_guest_address = dispatch.guest_address;
-          // The dispatch's log identity, not the tape sequence the bundle
-          // cross-check compares: nothing canonicalizes a kKernelExport record
-          // into the session envelope yet, so no durable sequence exists to
-          // name here.
+          // Provisional, and never published: the dispatch is still open, so
+          // its canonical event has no sequence yet. EncodeParticipantState
+          // resolves the token and serves the only durable form.
           state_blob.pending_external_event_sequence = dispatch.token.value;
+          pending_exports.emplace(
+              identity.capture_instance_id,
+              PendingExportCheckpoint{state_blob, dispatch.token});
         } else if (!IsRestorableJitParticipant(*scheduler_participant)) {
           return RejectLocked(
               "capture provider supports only exact-PC JIT, passive "
@@ -1063,6 +1080,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
       initial_outer_return_addresses = std::move(outer_return_addresses);
       initial_outside_guest_participants =
           std::move(outside_guest_participants);
+      initial_pending_exports = std::move(pending_exports);
     } else if (execution_identities != active_invocation_identities ||
                outside_guest_participants !=
                    initial_outside_guest_participants) {
@@ -1443,6 +1461,12 @@ struct GuestExecutionSessionCaptureProvider::Impl {
   std::set<uint64_t> initial_outside_guest_participants;
   std::map<uint64_t, std::vector<uint8_t>> initial_states;
   std::map<uint64_t, std::vector<uint8_t>> final_states;
+  // Start-boundary participants whose encoded route names an export event that
+  // was still open at the barrier. The pairing token stays here and never
+  // reaches a durable byte.
+  std::map<uint64_t, PendingExportCheckpoint> initial_pending_exports;
+  const GuestExecutionSessionCaptureExportSequenceResolver*
+      export_sequence_resolver = nullptr;
   std::vector<InstructionCounter> instruction_counters;
   std::vector<ppc::PPCContext*> instruction_counter_context_scratch;
   std::map<uint32_t, uint32_t> closure_seeds;
@@ -1774,7 +1798,8 @@ void GuestExecutionSessionCaptureProvider::EndCapture(bool accepted) noexcept {
 
 bool GuestExecutionSessionCaptureProvider::EncodeParticipantState(
     const GuestExecutionCaptureParticipantIdentity& participant,
-    std::vector<uint8_t>* output, std::string* error) noexcept {
+    bool initial_checkpoint, std::vector<uint8_t>* output,
+    std::string* error) noexcept {
   if (error) {
     error->clear();
   }
@@ -1784,18 +1809,50 @@ bool GuestExecutionSessionCaptureProvider::EncodeParticipantState(
   try {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const ProviderState current = impl_->state.load(std::memory_order_relaxed);
-    const auto& states = current == ProviderState::kRecording
-                             ? impl_->initial_states
-                             : impl_->final_states;
+    const auto& states =
+        initial_checkpoint ? impl_->initial_states : impl_->final_states;
     if (current != ProviderState::kRecording &&
         current != ProviderState::kSealed) {
       output->clear();
       return impl_->SetErrorFromRejection(error);
     }
+    if (!initial_checkpoint && current != ProviderState::kSealed) {
+      output->clear();
+      return Fail(error, "capture provider has no final state before the seal");
+    }
     const auto state = states.find(participant.capture_instance_id);
     if (state == states.cend() || participant.guest_thread_id == 0) {
       output->clear();
       return Fail(error, "capture provider has no state for the participant");
+    }
+    const auto pending =
+        impl_->initial_pending_exports.find(participant.capture_instance_id);
+    if (initial_checkpoint &&
+        pending != impl_->initial_pending_exports.cend()) {
+      // The provisional encoding in initial_states named the dispatch's
+      // pairing token; only the resolved sequence may leave this method.
+      uint64_t global_sequence = 0;
+      if (!impl_->export_sequence_resolver ||
+          !impl_->export_sequence_resolver->ResolveModeledExportSequence(
+              pending->second.token, participant, &global_sequence) ||
+          !global_sequence) {
+        output->clear();
+        return Fail(error,
+                    "capture provider modeled export dispatch never reached "
+                    "the session tape");
+      }
+      ppc::GuestPPCThreadCheckpoint resolved = pending->second.state;
+      resolved.pending_external_event_sequence = global_sequence;
+      std::string encode_error;
+      if (!ppc::GuestPPCThreadCheckpointCodec::Encode(resolved, output,
+                                                      &encode_error)) {
+        output->clear();
+        return Fail(error,
+                    "capture provider could not encode a resolved pending "
+                    "export checkpoint: " +
+                        encode_error);
+      }
+      return true;
     }
     *output = state->second;
     return true;
@@ -1804,6 +1861,13 @@ bool GuestExecutionSessionCaptureProvider::EncodeParticipantState(
     impl_->RejectException();
     return Fail(error, "capture provider state copy failed");
   }
+}
+
+void GuestExecutionSessionCaptureProvider::SetModeledExportSequenceResolver(
+    const GuestExecutionSessionCaptureExportSequenceResolver*
+        resolver) noexcept {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->export_sequence_resolver = resolver;
 }
 
 bool GuestExecutionSessionCaptureProvider::CollectCheckpointContent(

@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "xenia/cpu/guest_execution_session_capture_export_event_bridge.h"
 #include "xenia/cpu/guest_execution_session_capture_runtime.h"
 #include "xenia/cpu/guest_invocation_capture.h"
 #include "xenia/cpu/jit_corpus.h"
@@ -87,6 +88,13 @@ class GuestExecutionSessionCaptureProvider final
   bool SupportsCheckpointParticipant(
       const kernel::GuestSchedulerCheckpointParticipant& participant,
       std::string* error) noexcept override;
+
+  // Installed before capture begins. A participant parked inside a modeled
+  // blocking export cannot be encoded without it, because its checkpoint names
+  // an export event that is still open when the checkpoint is taken.
+  void SetModeledExportSequenceResolver(
+      const GuestExecutionSessionCaptureExportSequenceResolver*
+          resolver) noexcept override;
   bool BeginCapture(
       const kernel::GuestSchedulerCheckpointBarrierSnapshot& checkpoint,
       std::span<const GuestExecutionCaptureThreadStateLifecycleEvent>
@@ -104,7 +112,8 @@ class GuestExecutionSessionCaptureProvider final
 
   bool EncodeParticipantState(
       const GuestExecutionCaptureParticipantIdentity& participant,
-      std::vector<uint8_t>* output, std::string* error) noexcept override;
+      bool initial_checkpoint, std::vector<uint8_t>* output,
+      std::string* error) noexcept override;
   bool CollectCheckpointContent(
       bool initial_checkpoint,
       std::vector<GuestExecutionSessionAssemblerContent>* output,

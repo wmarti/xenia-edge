@@ -696,6 +696,7 @@ enum class RuntimeEventKind : uint8_t {
   kHostCallEnd,
   kScheduler,
   kGuestMarker,
+  kModeledExport,
 };
 
 struct RuntimeEvent {
@@ -713,6 +714,8 @@ struct RuntimeEvent {
   GuestExecutionSessionMarkerSource marker_source =
       GuestExecutionSessionMarkerSource::kNone;
   uint64_t marker_identity = 0;
+  GuestExecutionCaptureExternalEventToken modeled_export_token;
+  uint64_t modeled_export_sequence = 0;
 };
 
 // Dmitry Vyukov's bounded sequence-cell queue. There is one consumer and any
@@ -1455,14 +1458,18 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   // The modeled export dispatches this session's provider binds blocked
   // participants to are recorded on the Processor-owned log installed here, so
   // there is exactly one log and both sides read the same open calls.
-  bool AttachExternalEventLog() {
+  bool AttachExternalEventLog(
+      GuestExecutionCaptureExternalEventObserver* observer) {
     std::shared_ptr<GuestExecutionCaptureExternalEventLog> log;
     try {
       log = std::make_shared<GuestExecutionCaptureExternalEventLog>();
     } catch (...) {
       return false;
     }
-    if (!processor.AttachGuestExecutionCaptureExternalEventLog(log)) {
+    // Installed before the Processor can route a dispatch here, so no record
+    // can land before the session can canonicalize it.
+    if (!log->SetObserver(observer) ||
+        !processor.AttachGuestExecutionCaptureExternalEventLog(log)) {
       return false;
     }
     external_event_log = std::move(log);
@@ -1481,6 +1488,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
             external_event_log)) {
       return false;
     }
+    external_event_log->SetObserver(nullptr);
     external_event_log.reset();
     {
       std::lock_guard<std::mutex> lock(status_mutex);
@@ -1857,6 +1865,12 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     provider_armed.store(false, std::memory_order_release);
   }
 
+  // The provider outlives this runtime, so the resolver it borrows is cleared
+  // before this object can go away.
+  void ReleaseExportSequenceResolver() noexcept {
+    dependencies.provider->SetModeledExportSequenceResolver(nullptr);
+  }
+
   bool CancelActiveBarrier(std::string* error = nullptr) noexcept {
     const uint64_t generation =
         checkpoint_generation.load(std::memory_order_acquire);
@@ -2209,6 +2223,22 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       case RuntimeEventKind::kGuestMarker:
         return assembler->OnGuestMarker(std::nullopt, event.marker_source,
                                         event.marker_identity);
+      case RuntimeEventKind::kModeledExport: {
+        GuestExecutionCaptureExternalEventRecord record;
+        if (!external_event_log ||
+            !external_event_log->CopyRecord(event.modeled_export_sequence,
+                                            &record) ||
+            record.participant != event.participant) {
+          if (error) {
+            *error =
+                "capture runtime could not read a recorded modeled export "
+                "dispatch";
+          }
+          return AssemblerAction::kReject;
+        }
+        return export_event_bridge.OnModeledExportRecord(
+            *assembler, event.modeled_export_token, record, error);
+      }
       case RuntimeEventKind::kStart:
       case RuntimeEventKind::kStop:
         break;
@@ -2658,6 +2688,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   GuestExecutionSessionCaptureRuntimeCheckpointController*
       checkpoint_controller = nullptr;
   std::unique_ptr<GuestExecutionSessionAssembler> assembler;
+  GuestExecutionSessionCaptureExportEventBridge export_event_bridge;
   std::optional<CheckpointSnapshot> initial_scheduler_checkpoint;
   std::vector<GuestExecutionSessionInstructionCoverageDelta>
       instruction_coverage_deltas;
@@ -2802,11 +2833,13 @@ bool GuestExecutionSessionCaptureRuntime::Attach(std::string* error) {
       std::static_pointer_cast<GuestExecutionCaptureHostCallObserver>(owner);
   // Installed before the observers so no dispatch a checkpoint may have to bind
   // to can open outside this session's log.
-  if (!impl_->AttachExternalEventLog()) {
+  if (!impl_->AttachExternalEventLog(this)) {
     return Fail(error,
                 "capture runtime could not install its modeled export event "
                 "log");
   }
+  impl_->dependencies.provider->SetModeledExportSequenceResolver(
+      &impl_->export_event_bridge);
   if (!impl_->scheduler.AttachCaptureObserverTransactionally(
           scheduler_observer, [this, &processor_observer]() {
             return impl_->processor.AttachGuestExecutionCaptureHostCallObserver(
@@ -2897,6 +2930,7 @@ void GuestExecutionSessionCaptureRuntime::Shutdown() noexcept {
   // Released first so no later dispatch can open a call this session would
   // have to account for.
   const bool log_released = impl_->DetachExternalEventLog();
+  impl_->ReleaseExportSequenceResolver();
   const auto owner = impl_->owner.lock();
   if (!owner) {
     if (!log_released) {
@@ -3102,6 +3136,19 @@ bool GuestExecutionSessionCaptureRuntime::OnHostGuestCallEnd(
   const bool forwarded = impl_->ForwardInsideCallback(event, active, accepting);
   impl_->callback_count.fetch_sub(1, std::memory_order_acq_rel);
   return forwarded;
+}
+
+void GuestExecutionSessionCaptureRuntime::OnExternalEventRecorded(
+    GuestExecutionCaptureExternalEventToken token, uint64_t sequence,
+    const GuestExecutionCaptureParticipantIdentity& participant) noexcept {
+  // Queued at the dispatch boundary rather than drained later, so the reready
+  // that released the wait is always on the tape before its export event.
+  RuntimeEvent event;
+  event.kind = RuntimeEventKind::kModeledExport;
+  event.participant = participant;
+  event.modeled_export_token = token;
+  event.modeled_export_sequence = sequence;
+  impl_->ForwardIfActive(event);
 }
 
 bool GuestExecutionSessionCaptureRuntime::OnSchedulerEvent(

@@ -206,6 +206,20 @@ struct GuestExecutionCaptureExternalEventActiveCall {
       default;
 };
 
+// Notified on the recording thread once a record is durable in the log, so a
+// session owner can canonicalize it in dispatch order instead of polling. The
+// token is the one that opened the dispatch, which is how a checkpoint bound to
+// a still-open call finds the event that closed it. Implementations must not
+// call back into the log.
+class GuestExecutionCaptureExternalEventObserver {
+ public:
+  virtual ~GuestExecutionCaptureExternalEventObserver() = default;
+
+  virtual void OnExternalEventRecorded(
+      GuestExecutionCaptureExternalEventToken token, uint64_t sequence,
+      const GuestExecutionCaptureParticipantIdentity& participant) noexcept = 0;
+};
+
 struct GuestExecutionCaptureExternalEventSnapshot {
   uint64_t recorded_event_count = 0;
   uint64_t total_payload_bytes = 0;
@@ -264,6 +278,18 @@ class GuestExecutionCaptureExternalEventLog final {
   // True when no event is still open, or once any rejection has latched so a
   // failed log never pins its owner.
   bool CanDetach() const noexcept;
+
+  // Installs or clears the recording observer. Legal only while no call is
+  // open, so an observer can never see the second half of a dispatch it did not
+  // see the first half of.
+  bool SetObserver(
+      GuestExecutionCaptureExternalEventObserver* observer) noexcept;
+
+  // Copies one recorded event by its log sequence. snapshot() copies every
+  // payload, which a per-event consumer draining in order cannot afford.
+  bool CopyRecord(
+      uint64_t sequence,
+      GuestExecutionCaptureExternalEventRecord* output) const noexcept;
 
   // Copies the still-open calls owned by one participant. snapshot() copies
   // every recorded payload as well, which a per-participant checkpoint query

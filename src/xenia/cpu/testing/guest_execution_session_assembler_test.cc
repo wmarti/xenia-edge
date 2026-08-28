@@ -29,6 +29,7 @@
 #include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/guest_execution_continuous_event.h"
 #include "xenia/cpu/guest_execution_session_capture_event_bridge.h"
+#include "xenia/cpu/guest_execution_session_capture_export_event_bridge.h"
 
 namespace xe {
 namespace cpu {
@@ -111,8 +112,10 @@ class FakeStateProvider final
  public:
   bool EncodeParticipantState(
       const GuestExecutionCaptureParticipantIdentity& participant,
-      std::vector<uint8_t>* output, std::string* error) noexcept override {
+      bool initial_checkpoint, std::vector<uint8_t>* output,
+      std::string* error) noexcept override {
     ++calls;
+    initial_calls += initial_checkpoint ? 1 : 0;
     if (fail) {
       *error = "state provider failed";
       return false;
@@ -139,18 +142,23 @@ class FakeStateProvider final
       return ppc::GuestPPCThreadCheckpointCodec::Encode(checkpoint, output,
                                                         error);
     }
+    // Both boundaries are serialized in one publication pass, so the
+    // boundary itself, not the call order, selects the state.
     output->assign(
-        state_size,
-        static_cast<uint8_t>(participant.capture_instance_id + generation));
+        initial_checkpoint || !final_state_size ? state_size : final_state_size,
+        static_cast<uint8_t>(participant.capture_instance_id +
+                             (initial_checkpoint ? 0 : generation)));
     return true;
   }
 
   size_t state_size = 64;
+  size_t final_state_size = 0;
   uint8_t generation = 0;
   bool fail = false;
   bool encode_thread_checkpoint = false;
   std::vector<GuestExecutionCaptureParticipantIdentity> checkpoint_participants;
   uint32_t calls = 0;
+  uint32_t initial_calls = 0;
   GuestExecutionSessionAssembler* reenter_target = nullptr;
 };
 
@@ -869,8 +877,9 @@ TEST_CASE("session assembler records one manual window with nested calls",
   harness.StartOutside({kA});
   REQUIRE(harness.status().encoded_chunk_count == 0);
   REQUIRE(harness.status().capture_start_tick == kStartTick);
-  // Only participant state is captured at start; pages wait for the stop.
-  REQUIRE(harness.states.calls == 1);
+  // Participant state is frozen by the provider at the start barrier but
+  // serialized at publication, so nothing has been encoded yet.
+  REQUIRE(harness.states.calls == 0);
   REQUIRE(harness.content.calls == 0);
 
   REQUIRE(harness.Enter(kA) == Action::kContinue);
@@ -922,7 +931,7 @@ TEST_CASE("session assembler records one manual window with nested calls",
   // Nothing is encoded and no provider runs on the arriving thread.
   REQUIRE(harness.status().staged_event_count == 11);
   REQUIRE(harness.status().encoded_chunk_count == 0);
-  REQUIRE(harness.states.calls == 1);
+  REQUIRE(harness.states.calls == 0);
   REQUIRE(harness.content.calls == 0);
   REQUIRE(harness.publisher.calls == 0);
   // Held participants may not resume before publication completes.
@@ -932,6 +941,7 @@ TEST_CASE("session assembler records one manual window with nested calls",
 
   const GuestExecutionSessionBundle& bundle = harness.PublishedBundle();
   REQUIRE(harness.states.calls == 2);
+  REQUIRE(harness.states.initial_calls == 1);
   REQUIRE(harness.content.calls == 2);
   REQUIRE(harness.content.corpus_calls == 1);
   const GuestExecutionSessionManifest& manifest = bundle.manifest;
@@ -1302,7 +1312,7 @@ TEST_CASE("session assembler holds three participants through mixed arrivals",
   REQUIRE(harness.states.calls == 0);
   REQUIRE(harness.assembler->OnExternalSinkHeld(gpu) == Action::kContinue);
   REQUIRE(harness.state() == State::kRecording);
-  REQUIRE(harness.states.calls == 3);
+  REQUIRE(harness.states.calls == 0);
   REQUIRE_FALSE(harness.status().external_sinks[0].held);
 
   REQUIRE(harness.Enter(kA) == Action::kContinue);
@@ -1982,7 +1992,7 @@ TEST_CASE("session assembler rejects timeouts, limits and overflow",
     REQUIRE(harness.Enter(kA) == Action::kContinue);
     ++harness.clock.now;
     harness.RecordSegment(kA);
-    harness.states.state_size = 65;
+    harness.states.final_state_size = 65;
     REQUIRE(harness.assembler->RequestStop() == Action::kHold);
     REQUIRE(harness.Leave(kA) == Action::kHold);
     REQUIRE_FALSE(harness.assembler->Publish(&harness.error));
@@ -3231,6 +3241,151 @@ TEST_CASE("scheduler event bridge authenticates every cooperative wait kind",
       GuestExecutionSessionCaptureSchedulerEventBridge::
           DecodeSchedulerEventPayload(high_bit_kind, &ignored, &harness.error));
   REQUIRE(harness.error.find("kind is out of range") != std::string::npos);
+}
+
+namespace {
+
+GuestExecutionCaptureExternalEventRecord MakeExportRecord(
+    const GuestExecutionCaptureParticipantIdentity& identity,
+    uint64_t sequence = 1) {
+  GuestExecutionCaptureExternalEventRecord record;
+  record.sequence = sequence;
+  record.participant = identity;
+  record.kind = GuestExecutionSessionEventKind::kKernelExport;
+  record.disposition = GuestExecutionSessionEventDisposition::kReplayCaptured;
+  record.mutation_source =
+      GuestExecutionSessionMutationSource::kActiveGuestThread;
+  record.export_ordinal = 5;
+  record.guest_address = 0x8270D724;
+  record.call_site_address = 0x82000040;
+  record.has_returned_value = true;
+  record.returned_value_le = {1, 0, 0, 0, 0, 0, 0, 0};
+  record.effect_ranges = {{0x2000, 4}, {0x3000, 2}};
+  record.effect_byte_count = 6;
+  record.preimage = {0, 0, 0, 0, 0, 0};
+  record.postimage = {1, 2, 3, 4, 5, 6};
+  return record;
+}
+
+}  // namespace
+
+TEST_CASE("modeled export bridge canonicalizes one dispatch",
+          "[guest-execution-session-assembler]") {
+  Harness harness;
+  harness.StartOutside({kA});
+  REQUIRE(harness.Enter(kA) == Action::kContinue);
+  GuestExecutionSessionCaptureExportEventBridge bridge;
+  const GuestExecutionCaptureExternalEventToken token = {0x4242};
+  const GuestExecutionCaptureExternalEventRecord record = MakeExportRecord(kA);
+  REQUIRE(bridge.OnModeledExportRecord(*harness.assembler, token, record,
+                                       &harness.error) == Action::kContinue);
+  REQUIRE(harness.error.empty());
+  REQUIRE(bridge.canonicalized_export_count() == 1);
+
+  uint64_t resolved = 0;
+  REQUIRE(bridge.ResolveModeledExportSequence(token, kA, &resolved));
+  // The outer host-call begin owns sequence one.
+  REQUIRE(resolved == 2);
+  // The token is the only key; another participant's checkpoint may not claim
+  // this dispatch's event.
+  REQUIRE_FALSE(bridge.ResolveModeledExportSequence(token, kB, &resolved));
+  REQUIRE(resolved == 0);
+  REQUIRE_FALSE(bridge.ResolveModeledExportSequence({0x4243}, kA, &resolved));
+
+  // The export event, then one mutation per declared effect range.
+  REQUIRE(harness.status().last_event_sequence == 4);
+  ++harness.clock.now;
+  harness.RecordSegment(kA);
+  REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+  REQUIRE(harness.Leave(kA) == Action::kHold);
+  const GuestExecutionSessionBundle& bundle = harness.PublishedBundle();
+  std::vector<GuestExecutionSessionEvent> events;
+  for (size_t index = 0; index < bundle.chunks.size(); ++index) {
+    if (bundle.manifest.chunks[index].kind !=
+        GuestExecutionSessionChunkKind::kEvents) {
+      continue;
+    }
+    GuestExecutionSessionEventChunk chunk;
+    REQUIRE(GuestExecutionSessionCodec::DecodeEventChunk(
+        bundle.chunks[index], &chunk, &harness.error));
+    events.insert(events.end(), chunk.events.begin(), chunk.events.end());
+  }
+  REQUIRE(events.size() >= 4);
+  REQUIRE(events[1].kind == GuestExecutionSessionEventKind::kKernelExport);
+  REQUIRE(events[1].global_sequence == 2);
+  REQUIRE(events[1].thread_ordinal == 0);
+  REQUIRE(events[1].guest_address == record.guest_address);
+  REQUIRE(events[1].byte_count == 0);
+  REQUIRE(events[1].disposition ==
+          GuestExecutionSessionEventDisposition::kReplayCaptured);
+  REQUIRE(events[1].payload_kind ==
+          GuestExecutionSessionPayloadKind::kLittleEndianUnsignedInteger);
+  REQUIRE(events[1].payload_size == 8);
+  REQUIRE(events[2].kind == GuestExecutionSessionEventKind::kMemoryMutation);
+  REQUIRE(events[2].guest_address == 0x2000);
+  REQUIRE(events[2].byte_count == 4);
+  REQUIRE(events[2].mutation_source ==
+          GuestExecutionSessionMutationSource::kActiveGuestThread);
+  REQUIRE(events[3].kind == GuestExecutionSessionEventKind::kMemoryMutation);
+  REQUIRE(events[3].guest_address == 0x3000);
+  REQUIRE(events[3].byte_count == 2);
+}
+
+TEST_CASE("modeled export bridge fails closed",
+          "[guest-execution-session-assembler]") {
+  const GuestExecutionCaptureExternalEventToken token = {0x11};
+
+  SECTION("a dispatch is canonicalized at most once") {
+    Harness harness;
+    harness.StartOutside({kA});
+    REQUIRE(harness.Enter(kA) == Action::kContinue);
+    GuestExecutionSessionCaptureExportEventBridge bridge;
+    const GuestExecutionCaptureExternalEventRecord record =
+        MakeExportRecord(kA);
+    REQUIRE(bridge.OnModeledExportRecord(*harness.assembler, token, record,
+                                         &harness.error) == Action::kContinue);
+    REQUIRE(bridge.OnModeledExportRecord(*harness.assembler, token, record,
+                                         &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("canonicalized twice") != std::string::npos);
+    uint64_t resolved = 0;
+    REQUIRE_FALSE(bridge.ResolveModeledExportSequence(token, kA, &resolved));
+  }
+  SECTION("a record with no export identity never reaches the tape") {
+    Harness harness;
+    harness.StartOutside({kA});
+    REQUIRE(harness.Enter(kA) == Action::kContinue);
+    GuestExecutionSessionCaptureExportEventBridge bridge;
+    GuestExecutionCaptureExternalEventRecord record = MakeExportRecord(kA);
+    record.guest_address = 0;
+    REQUIRE(bridge.OnModeledExportRecord(*harness.assembler, token, record,
+                                         &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("no canonical session identity") !=
+            std::string::npos);
+    // Nothing after the outer host-call begin reached the tape.
+    REQUIRE(harness.status().last_event_sequence == 1);
+  }
+  SECTION("a postimage shorter than the declared ranges rejects") {
+    Harness harness;
+    harness.StartOutside({kA});
+    REQUIRE(harness.Enter(kA) == Action::kContinue);
+    GuestExecutionSessionCaptureExportEventBridge bridge;
+    GuestExecutionCaptureExternalEventRecord record = MakeExportRecord(kA);
+    record.postimage.pop_back();
+    REQUIRE(bridge.OnModeledExportRecord(*harness.assembler, token, record,
+                                         &harness.error) == Action::kReject);
+    REQUIRE(harness.error.find("no canonical session identity") !=
+            std::string::npos);
+  }
+  SECTION("a dispatch outside guest code rejects the session") {
+    Harness harness;
+    harness.StartOutside({kA});
+    GuestExecutionSessionCaptureExportEventBridge bridge;
+    REQUIRE(bridge.OnModeledExportRecord(*harness.assembler, token,
+                                         MakeExportRecord(kA),
+                                         &harness.error) == Action::kReject);
+    REQUIRE(bridge.rejected());
+    harness.RequireRejected(Rejection::kInvalidCall);
+  }
 }
 
 }  // namespace test

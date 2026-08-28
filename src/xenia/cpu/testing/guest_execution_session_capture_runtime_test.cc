@@ -380,9 +380,20 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
     ended_accepted.store(accepted, std::memory_order_release);
   }
 
+  const GuestExecutionSessionCaptureExportSequenceResolver*
+      export_sequence_resolver = nullptr;
+
+  void SetModeledExportSequenceResolver(
+      const GuestExecutionSessionCaptureExportSequenceResolver*
+          resolver) noexcept override {
+    export_sequence_resolver = resolver;
+  }
+
   bool EncodeParticipantState(
       const GuestExecutionCaptureParticipantIdentity& participant,
-      std::vector<uint8_t>* output, std::string* error) noexcept override {
+      bool initial_checkpoint, std::vector<uint8_t>* output,
+      std::string* error) noexcept override {
+    (void)initial_checkpoint;
     {
       std::unique_lock<std::mutex> lock(state_mutex);
       state_encode_entered = true;

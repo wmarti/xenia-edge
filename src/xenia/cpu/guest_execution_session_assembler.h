@@ -110,6 +110,9 @@ struct GuestExecutionSessionAssemblerContent {
 
 // Serializes one participant's pointer-free PPC state. Called only while every
 // participant is held; the byte size must be identical for every checkpoint.
+// Both boundaries are serialized at publication, because a continuation route
+// that names a captured event cannot be encoded before that event exists; the
+// provider still froze both states at their own barrier.
 // A production provider visits ThreadStates under Processor's capture
 // registry lock while the session lock is held, so OnParticipantLifecycle must
 // never run under that registry lock: the adapter answers Processor lifecycle
@@ -120,7 +123,8 @@ class GuestExecutionSessionAssemblerStateProvider {
 
   virtual bool EncodeParticipantState(
       const GuestExecutionCaptureParticipantIdentity& participant,
-      std::vector<uint8_t>* output, std::string* error) noexcept = 0;
+      bool initial_checkpoint, std::vector<uint8_t>* output,
+      std::string* error) noexcept = 0;
 };
 
 // Supplies checkpoint content and the session code corpus, all collected at
@@ -345,10 +349,14 @@ class GuestExecutionSessionAssembler final {
       const std::optional<GuestExecutionCaptureParticipantIdentity>&
           participant,
       GuestExecutionSessionMarkerSource source, uint64_t marker_identity);
+  // global_sequence receives the sequence assigned to the accepted event, and
+  // zero on any rejection, so a producer that must name its own event durably
+  // never has to guess it.
   GuestExecutionSessionAssemblerAction OnExternalEvent(
       const std::optional<GuestExecutionCaptureParticipantIdentity>&
           participant,
-      GuestExecutionSessionAssemblerExternalEvent event);
+      GuestExecutionSessionAssemblerExternalEvent event,
+      uint64_t* global_sequence = nullptr);
   GuestExecutionSessionAssemblerAction OnMemoryMutation(
       const std::optional<GuestExecutionCaptureParticipantIdentity>&
           participant,

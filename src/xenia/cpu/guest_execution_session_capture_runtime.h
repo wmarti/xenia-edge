@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "xenia/cpu/guest_execution_capture.h"
+#include "xenia/cpu/guest_execution_external_event.h"
 #include "xenia/cpu/guest_execution_session_assembler.h"
+#include "xenia/cpu/guest_execution_session_capture_export_event_bridge.h"
 #include "xenia/gpu/pm4_marker_sink.h"
 #include "xenia/kernel/guest_scheduler_capture_observer.h"
 #include "xenia/kernel/guest_scheduler_checkpoint.h"
@@ -146,6 +148,12 @@ class GuestExecutionSessionCaptureRuntimeProvider
   // Disarms every writer after the staged bundle no longer needs the source.
   // accepted is true only after the scheduler generation was revalidated.
   virtual void EndCapture(bool accepted) noexcept = 0;
+  // Installed before the session arms. A checkpoint taken while a modeled
+  // export dispatch is still open cannot name that dispatch's durable event
+  // sequence, so the provider asks this resolver when it serializes.
+  virtual void SetModeledExportSequenceResolver(
+      const GuestExecutionSessionCaptureExportSequenceResolver*
+          resolver) noexcept = 0;
 };
 
 // Translates the scheduler's pointer-free observation stream into the session
@@ -318,6 +326,7 @@ struct GuestExecutionSessionCaptureRuntimeStatus {
 class GuestExecutionSessionCaptureRuntime final
     : public GuestExecutionCaptureHostCallObserver,
       public kernel::GuestSchedulerCaptureObserver,
+      public GuestExecutionCaptureExternalEventObserver,
       public std::enable_shared_from_this<GuestExecutionSessionCaptureRuntime> {
  public:
   static std::shared_ptr<GuestExecutionSessionCaptureRuntime> CreateAndAttach(
@@ -366,6 +375,10 @@ class GuestExecutionSessionCaptureRuntime final
       GuestExecutionCaptureHostCallOutcome outcome) noexcept override;
   bool OnSchedulerEvent(
       const kernel::GuestSchedulerCaptureEvent& event) noexcept override;
+  void OnExternalEventRecorded(GuestExecutionCaptureExternalEventToken token,
+                               uint64_t sequence,
+                               const GuestExecutionCaptureParticipantIdentity&
+                                   participant) noexcept override;
   bool CanDetach() const noexcept override;
 
  private:

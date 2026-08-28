@@ -708,8 +708,15 @@ struct GuestExecutionSessionAssembler::Impl {
 
   RecordResult RecordEventLocked(const GuestExecutionSessionEvent& event,
                                  uint64_t tick, uint64_t instruction_delta,
-                                 bool matching_marker,
-                                 Participant* participant) {
+                                 bool matching_marker, Participant* participant,
+                                 uint64_t* appended_sequence = nullptr) {
+    // Reported before any boundary event the same call may append after it, so
+    // a caller always learns the sequence of its own event.
+    const auto report = [&]() {
+      if (appended_sequence) {
+        *appended_sequence = next_event_sequence;
+      }
+    };
     if (state == State::kRecording) {
       GuestExecutionReelEventRange range;
       const GuestExecutionReelAction action = reel->RecordEvents(
@@ -726,6 +733,7 @@ struct GuestExecutionSessionAssembler::Impl {
                        "capture session sequence accounting diverged");
           return RecordResult::kRejected;
         }
+        report();
         if (!AppendEventLocked(event, participant)) {
           return RecordResult::kRejected;
         }
@@ -769,6 +777,7 @@ struct GuestExecutionSessionAssembler::Impl {
                    "capture session stop tail exceeds a configured maximum");
       return RecordResult::kRejected;
     }
+    report();
     if (!AppendEventLocked(event, participant)) {
       return RecordResult::kRejected;
     }
@@ -849,7 +858,7 @@ struct GuestExecutionSessionAssembler::Impl {
       std::vector<uint8_t> bytes;
       std::string error;
       if (!dependencies.state_provider->EncodeParticipantState(
-              participant.identity, &bytes, &error)) {
+              participant.identity, initial_checkpoint, &bytes, &error)) {
         RejectLocked(Rejection::kCheckpointFailure, error);
         return false;
       }
@@ -881,11 +890,6 @@ struct GuestExecutionSessionAssembler::Impl {
     if (state != State::kStartRendezvous ||
         arrived_participant_count != participants.size() ||
         held_sink_count != external_sinks.size()) {
-      return;
-    }
-    // Only participant state is captured now; the initial checkpoint's page
-    // preimages accumulate over the session and are encoded at stop.
-    if (!EncodeParticipantStatesLocked(true, &initial_thread_states)) {
       return;
     }
     std::string error;
@@ -949,11 +953,13 @@ struct GuestExecutionSessionAssembler::Impl {
     }
     GuestExecutionSessionCheckpoint initial;
     initial.global_sequence = 0;
-    initial.thread_states = initial_thread_states;
     GuestExecutionSessionCheckpoint final_checkpoint;
     final_checkpoint.global_sequence = last_event_sequence;
     GuestExecutionSessionSha256 corpus_digest = {};
-    if (!EncodeParticipantStatesLocked(false,
+    // Both boundaries serialize here, with the whole tape closed, so a route
+    // naming one of its events can be encoded with that event's sequence.
+    if (!EncodeParticipantStatesLocked(true, &initial.thread_states) ||
+        !EncodeParticipantStatesLocked(false,
                                        &final_checkpoint.thread_states) ||
         !CollectContentLocked(true, &initial.content) ||
         !CollectContentLocked(false, &final_checkpoint.content) ||
@@ -1097,7 +1103,6 @@ struct GuestExecutionSessionAssembler::Impl {
   uint64_t stop_tail_guest_instruction_count = 0;
 
   std::vector<GuestExecutionSessionEvent> pending_events;
-  std::vector<GuestExecutionSessionThreadStateReference> initial_thread_states;
   std::vector<std::vector<uint8_t>> encoded_chunks;
   std::vector<GuestExecutionSessionChunkReference> chunk_references;
   uint64_t encoded_chunk_bytes = 0;
@@ -2161,7 +2166,11 @@ Action GuestExecutionSessionAssembler::OnGuestMarker(
 
 Action GuestExecutionSessionAssembler::OnExternalEvent(
     const std::optional<GuestExecutionCaptureParticipantIdentity>& identity,
-    GuestExecutionSessionAssemblerExternalEvent input) {
+    GuestExecutionSessionAssemblerExternalEvent input,
+    uint64_t* global_sequence) {
+  if (global_sequence) {
+    *global_sequence = 0;
+  }
   Impl::Scope scope(*impl_);
   uint64_t now = 0;
   if (!impl_->BeginCallLocked(scope, &now)) {
@@ -2260,8 +2269,12 @@ Action GuestExecutionSessionAssembler::OnExternalEvent(
                             &event.payload_size)) {
     return Action::kReject;
   }
-  if (impl_->RecordEventLocked(event, now, 0, false, participant) ==
+  if (impl_->RecordEventLocked(event, now, 0, false, participant,
+                               global_sequence) ==
       Impl::RecordResult::kRejected) {
+    if (global_sequence) {
+      *global_sequence = 0;
+    }
     return Action::kReject;
   }
   if (input.disposition ==

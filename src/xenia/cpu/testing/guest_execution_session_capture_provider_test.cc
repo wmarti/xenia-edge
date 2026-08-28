@@ -530,7 +530,7 @@ TEST_CASE(
 
   std::vector<uint8_t> initial_state_bytes;
   REQUIRE(harness.provider->EncodeParticipantState(
-      harness.participant, &initial_state_bytes, &error));
+      harness.participant, true, &initial_state_bytes, &error));
   ppc::GuestPPCThreadCheckpoint initial_state;
   REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(initial_state_bytes,
                                                      &initial_state, &error));
@@ -556,7 +556,7 @@ TEST_CASE(
   REQUIRE(harness.processor->guest_invocation_capture_sink() == nullptr);
 
   std::vector<uint8_t> final_state_bytes;
-  REQUIRE(harness.provider->EncodeParticipantState(harness.participant,
+  REQUIRE(harness.provider->EncodeParticipantState(harness.participant, false,
                                                    &final_state_bytes, &error));
   ppc::GuestPPCThreadCheckpoint final_state;
   REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(final_state_bytes,
@@ -619,7 +619,7 @@ TEST_CASE("guest execution session provider checkpoints a dormant participant",
 
   std::vector<uint8_t> initial_state_bytes;
   REQUIRE(harness.provider->EncodeParticipantState(
-      harness.second_participant, &initial_state_bytes, &error));
+      harness.second_participant, true, &initial_state_bytes, &error));
   ppc::GuestPPCThreadCheckpoint initial_state;
   REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(initial_state_bytes,
                                                      &initial_state, &error));
@@ -637,8 +637,8 @@ TEST_CASE("guest execution session provider checkpoints a dormant participant",
                                         harness.HostCalls(), &error));
   REQUIRE(error.empty());
   std::vector<uint8_t> final_state_bytes;
-  REQUIRE(harness.provider->EncodeParticipantState(harness.second_participant,
-                                                   &final_state_bytes, &error));
+  REQUIRE(harness.provider->EncodeParticipantState(
+      harness.second_participant, false, &final_state_bytes, &error));
   ppc::GuestPPCThreadCheckpoint final_state;
   REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(final_state_bytes,
                                                      &final_state, &error));
@@ -662,7 +662,7 @@ TEST_CASE(
 
   std::vector<uint8_t> initial_state_bytes;
   REQUIRE(harness.provider->EncodeParticipantState(
-      harness.second_participant, &initial_state_bytes, &error));
+      harness.second_participant, true, &initial_state_bytes, &error));
   ppc::GuestPPCThreadCheckpoint initial_state;
   REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(initial_state_bytes,
                                                      &initial_state, &error));
@@ -677,8 +677,8 @@ TEST_CASE(
   REQUIRE(
       harness.provider->SealCapture(checkpoint, harness.HostCalls(), &error));
   std::vector<uint8_t> final_state_bytes;
-  REQUIRE(harness.provider->EncodeParticipantState(harness.second_participant,
-                                                   &final_state_bytes, &error));
+  REQUIRE(harness.provider->EncodeParticipantState(
+      harness.second_participant, false, &final_state_bytes, &error));
   REQUIRE(final_state_bytes == initial_state_bytes);
 }
 
@@ -763,6 +763,37 @@ TEST_CASE("guest execution session provider rejects an active dormant call",
   REQUIRE(error.find("active host call as outside guest") != std::string::npos);
 }
 
+// Stands in for the session's export event bridge: the durable sequence a
+// dispatch's canonical event was assigned.
+class FakeExportSequenceResolver final
+    : public GuestExecutionSessionCaptureExportSequenceResolver {
+ public:
+  bool ResolveModeledExportSequence(
+      GuestExecutionCaptureExternalEventToken token,
+      const GuestExecutionCaptureParticipantIdentity& participant,
+      uint64_t* global_sequence) const noexcept override {
+    *global_sequence = 0;
+    if (token != token_ || participant != participant_) {
+      return false;
+    }
+    *global_sequence = sequence_;
+    return true;
+  }
+
+  void Bind(GuestExecutionCaptureExternalEventToken token,
+            const GuestExecutionCaptureParticipantIdentity& participant,
+            uint64_t sequence) {
+    token_ = token;
+    participant_ = participant;
+    sequence_ = sequence;
+  }
+
+ private:
+  GuestExecutionCaptureExternalEventToken token_;
+  GuestExecutionCaptureParticipantIdentity participant_;
+  uint64_t sequence_ = 0;
+};
+
 TEST_CASE(
     "guest execution session provider checkpoints a blocked export "
     "participant",
@@ -786,22 +817,68 @@ TEST_CASE(
   REQUIRE(error.empty());
 
   std::vector<uint8_t> state_bytes;
-  REQUIRE(harness.provider->EncodeParticipantState(harness.second_participant,
-                                                   &state_bytes, &error));
-  ppc::GuestPPCThreadCheckpoint state;
-  REQUIRE(
-      ppc::GuestPPCThreadCheckpointCodec::Decode(state_bytes, &state, &error));
-  REQUIRE(state.participant_ordinal == 1);
-  REQUIRE(state.guest_thread_id == kSecondThreadId);
-  REQUIRE(state.resume_kind ==
-          ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
-  REQUIRE(state.resume_pc == kFunctionAddress);
-  REQUIRE(state.owning_function_address == kFunctionAddress);
-  REQUIRE(state.owning_function_end_address == kFunctionEndAddress);
-  REQUIRE(state.outer_guest_return_address == kOuterReturnAddress);
-  REQUIRE(state.pending_export_guest_address == kExportThunkAddress);
-  REQUIRE(state.pending_external_event_sequence == dispatch.value);
-  REQUIRE(state.registers.gpr[3] == 0x0102030405060708ull);
+  SECTION("an unresolved dispatch never encodes a route") {
+    REQUIRE_FALSE(harness.provider->EncodeParticipantState(
+        harness.second_participant, true, &state_bytes, &error));
+    REQUIRE(error.find("never reached the session tape") != std::string::npos);
+    REQUIRE(state_bytes.empty());
+  }
+  SECTION("a resolver bound to another participant never encodes a route") {
+    FakeExportSequenceResolver resolver;
+    resolver.Bind(dispatch, harness.participant, 41);
+    harness.provider->SetModeledExportSequenceResolver(&resolver);
+    REQUIRE_FALSE(harness.provider->EncodeParticipantState(
+        harness.second_participant, true, &state_bytes, &error));
+    REQUIRE(error.find("never reached the session tape") != std::string::npos);
+    harness.provider->SetModeledExportSequenceResolver(nullptr);
+  }
+  SECTION("the resolved sequence is the only value that is encoded") {
+    FakeExportSequenceResolver resolver;
+    resolver.Bind(dispatch, harness.second_participant, 41);
+    harness.provider->SetModeledExportSequenceResolver(&resolver);
+    REQUIRE(harness.provider->EncodeParticipantState(
+        harness.second_participant, true, &state_bytes, &error));
+    ppc::GuestPPCThreadCheckpoint state;
+    REQUIRE(ppc::GuestPPCThreadCheckpointCodec::Decode(state_bytes, &state,
+                                                       &error));
+    REQUIRE(state.participant_ordinal == 1);
+    REQUIRE(state.guest_thread_id == kSecondThreadId);
+    REQUIRE(state.resume_kind ==
+            ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+    REQUIRE(state.resume_pc == kFunctionAddress);
+    REQUIRE(state.owning_function_address == kFunctionAddress);
+    REQUIRE(state.owning_function_end_address == kFunctionEndAddress);
+    REQUIRE(state.outer_guest_return_address == kOuterReturnAddress);
+    REQUIRE(state.pending_export_guest_address == kExportThunkAddress);
+    REQUIRE(state.pending_external_event_sequence == 41);
+    REQUIRE(state.pending_external_event_sequence != dispatch.value);
+    REQUIRE(state.registers.gpr[3] == 0x0102030405060708ull);
+    harness.provider->SetModeledExportSequenceResolver(nullptr);
+  }
+}
+
+TEST_CASE(
+    "guest execution session provider refuses a final blocked export "
+    "participant",
+    "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.InstallExternalEventLog();
+  REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                     kFunctionAddress, kExportThunkAddress));
+
+  std::string error;
+  const auto blocked = harness.BlockedSecondThreadCheckpoint();
+  REQUIRE(harness.provider->BeginCapture(harness.Checkpoint(),
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+  // The export completes after the interval, so nothing on the tape can
+  // witness the route this participant would need.
+  REQUIRE_FALSE(harness.provider->SealCapture(
+      blocked, harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.find("blocked modeled export at the final boundary") !=
+          std::string::npos);
 }
 
 TEST_CASE("guest execution session provider binds one blocking export dispatch",

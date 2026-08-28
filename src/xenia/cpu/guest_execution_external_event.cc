@@ -111,6 +111,7 @@ struct GuestExecutionCaptureExternalEventLog::Impl {
   uint64_t first_reject_session_sequence = 0;
   GuestExecutionCaptureExternalEventRejection rejection =
       GuestExecutionCaptureExternalEventRejection::kNone;
+  GuestExecutionCaptureExternalEventObserver* observer = nullptr;
   std::vector<GuestExecutionCaptureExternalEventActiveCall> active_calls;
   std::vector<std::vector<uint8_t>> active_preimages;
   std::vector<GuestExecutionCaptureExternalEventRecord> events;
@@ -205,7 +206,7 @@ bool GuestExecutionCaptureExternalEventLog::OnExternalEventEnd(
     GuestExecutionCaptureExternalEventToken token,
     const GuestExecutionCaptureExternalEventEnd& end,
     std::span<const uint8_t> effect_postimage) noexcept {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::unique_lock<std::mutex> lock(impl_->mutex);
   if (impl_->rejection != GuestExecutionCaptureExternalEventRejection::kNone) {
     return false;
   }
@@ -298,6 +299,8 @@ bool GuestExecutionCaptureExternalEventLog::OnExternalEventEnd(
     return false;
   }
 
+  const GuestExecutionCaptureParticipantIdentity active_call_participant =
+      active_call.participant;
   impl_->active_calls.erase(active_it);
   impl_->active_preimages.erase(impl_->active_preimages.begin() + active_index);
   impl_->total_payload_bytes += payload_bytes;
@@ -309,7 +312,52 @@ bool GuestExecutionCaptureExternalEventLog::OnExternalEventEnd(
     }
     ++impl_->reject_session_count;
   }
+  const uint64_t recorded_sequence = impl_->next_sequence;
   ++impl_->next_sequence;
+  GuestExecutionCaptureExternalEventObserver* const observer = impl_->observer;
+  const GuestExecutionCaptureParticipantIdentity participant =
+      active_call_participant;
+  lock.unlock();
+  if (observer) {
+    observer->OnExternalEventRecorded(token, recorded_sequence, participant);
+  }
+  return true;
+}
+
+bool GuestExecutionCaptureExternalEventLog::SetObserver(
+    GuestExecutionCaptureExternalEventObserver* observer) noexcept {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->active_calls.empty()) {
+    return false;
+  }
+  impl_->observer = observer;
+  return true;
+}
+
+bool GuestExecutionCaptureExternalEventLog::CopyRecord(
+    uint64_t sequence,
+    GuestExecutionCaptureExternalEventRecord* output) const noexcept {
+  if (!output) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->rejection != GuestExecutionCaptureExternalEventRejection::kNone) {
+    return false;
+  }
+  const auto record = std::find_if(
+      impl_->events.cbegin(), impl_->events.cend(),
+      [sequence](const GuestExecutionCaptureExternalEventRecord& candidate) {
+        return candidate.sequence == sequence;
+      });
+  if (record == impl_->events.cend()) {
+    return false;
+  }
+  try {
+    *output = *record;
+  } catch (...) {
+    *output = {};
+    return false;
+  }
   return true;
 }
 
