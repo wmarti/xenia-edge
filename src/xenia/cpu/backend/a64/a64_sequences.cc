@@ -1103,30 +1103,20 @@ EMITTER_OPCODE_TABLE(OPCODE_SIGN_EXTEND, SIGN_EXTEND_I16_I8, SIGN_EXTEND_I32_I8,
 // ============================================================================
 // OPCODE_TRUNCATE
 // ============================================================================
-// True when every reader of this instruction's result takes it as a 32-bit
-// operand, so the upper half of the register it lands in cannot be observed.
-// Compares are the only readers listed here because they are the only ones
-// this has been shown to hold for; widen it with measurement, not by guessing.
+// True when no reader of this instruction's result depends on the upper half of
+// the register it lands in. Every sequence that reads a source through its X
+// form takes an I64 operand, or an I8 shift amount where only the low bits are
+// architecturally read, so a 32-bit result never reaches one. The widening
+// sequence is the exception: it elides its own move precisely because an I32
+// value's upper half is already clear.
 inline bool TruncationOnlyReadAsWord(const hir::Instr* instr) {
   const hir::Value* result = instr->dest;
   if (!result || !result->use_head) {
     return false;
   }
   for (const hir::Value::Use* use = result->use_head; use; use = use->next) {
-    switch (use->instr->GetOpcodeNum()) {
-      case hir::OPCODE_COMPARE_EQ:
-      case hir::OPCODE_COMPARE_NE:
-      case hir::OPCODE_COMPARE_SLT:
-      case hir::OPCODE_COMPARE_SLE:
-      case hir::OPCODE_COMPARE_SGT:
-      case hir::OPCODE_COMPARE_SGE:
-      case hir::OPCODE_COMPARE_ULT:
-      case hir::OPCODE_COMPARE_ULE:
-      case hir::OPCODE_COMPARE_UGT:
-      case hir::OPCODE_COMPARE_UGE:
-        break;
-      default:
-        return false;
+    if (use->instr->GetOpcodeNum() == hir::OPCODE_ZERO_EXTEND) {
+      return false;
     }
   }
   return true;
