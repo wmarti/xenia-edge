@@ -1103,6 +1103,35 @@ EMITTER_OPCODE_TABLE(OPCODE_SIGN_EXTEND, SIGN_EXTEND_I16_I8, SIGN_EXTEND_I32_I8,
 // ============================================================================
 // OPCODE_TRUNCATE
 // ============================================================================
+// True when every reader of this instruction's result takes it as a 32-bit
+// operand, so the upper half of the register it lands in cannot be observed.
+// Compares are the only readers listed here because they are the only ones
+// this has been shown to hold for; widen it with measurement, not by guessing.
+inline bool TruncationOnlyReadAsWord(const hir::Instr* instr) {
+  const hir::Value* result = instr->dest;
+  if (!result || !result->use_head) {
+    return false;
+  }
+  for (const hir::Value::Use* use = result->use_head; use; use = use->next) {
+    switch (use->instr->GetOpcodeNum()) {
+      case hir::OPCODE_COMPARE_EQ:
+      case hir::OPCODE_COMPARE_NE:
+      case hir::OPCODE_COMPARE_SLT:
+      case hir::OPCODE_COMPARE_SLE:
+      case hir::OPCODE_COMPARE_SGT:
+      case hir::OPCODE_COMPARE_SGE:
+      case hir::OPCODE_COMPARE_ULT:
+      case hir::OPCODE_COMPARE_ULE:
+      case hir::OPCODE_COMPARE_UGT:
+      case hir::OPCODE_COMPARE_UGE:
+        break;
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+
 struct TRUNCATE_I8_I16
     : Sequence<TRUNCATE_I8_I16, I<OPCODE_TRUNCATE, I8Op, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
@@ -1141,6 +1170,14 @@ struct TRUNCATE_I32_I64
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     // mov wD, wS — implicitly truncates (upper 32 bits zeroed).
     auto w_src = WReg(i.src1.reg().getIdx());
+    if (i.dest.reg().getIdx() == w_src.getIdx() &&
+        TruncationOnlyReadAsWord(i.instr)) {
+      // Same register, and nothing reads the result any wider than the low
+      // half, so there is nothing for the move to do. It cannot be dropped in
+      // general: an I32 value's upper half being zero is what lets
+      // ZERO_EXTEND_I64_I32 elide its own move.
+      return;
+    }
     e.mov(i.dest, w_src);
   }
 };
