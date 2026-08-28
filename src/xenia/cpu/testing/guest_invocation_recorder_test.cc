@@ -461,19 +461,29 @@ TEST_CASE("guest invocation recorder fails closed on granule hazards",
                     kGuestInvocationDependencyUnsupportedMappingOrProtection);
   }
 
-  SECTION("data access enters a closure-only code sibling") {
+  SECTION("a read inside the code granule is served by the corpus") {
     FakePageReader reader;
     GuestInvocationRecorderLimits limits = MakeLimits();
     limits.host_protection_page_size = 16 * 1024;
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock, limits);
     EnterRoot(*recorder);
-    REQUIRE_FALSE(
+    // The page holds no code. It is in the closure only because the root's
+    // definition claims the whole granule, and the corpus already carries it,
+    // so a read of it needs no data page of its own.
+    REQUIRE(
         recorder->OnMemoryAccess(kOwner, kRootAddress + kGuestPageSize, 4,
                                  GuestInvocationRecorderMemoryAccess::kRead));
+    REQUIRE(recorder->rejection() == GuestInvocationRecorderRejection::kNone);
+    // A write to it is a different matter: those bytes decide what replay
+    // compiles.
+    REQUIRE_FALSE(
+        recorder->OnMemoryAccess(kOther, kRootAddress + kGuestPageSize, 4,
+                                 GuestInvocationRecorderMemoryAccess::kWrite));
     RequireRejected(*recorder,
-                    GuestInvocationRecorderRejection::kUnsupportedDependency,
-                    kGuestInvocationDependencyUnsupportedMappingOrProtection);
+                    GuestInvocationRecorderRejection::kSelfModifyingCode,
+                    kGuestInvocationDependencySelfModifyingCode |
+                        kGuestInvocationDependencyCrossThreadMutation);
   }
 
   SECTION("write enters a closure-only code sibling") {
@@ -505,32 +515,43 @@ TEST_CASE("guest invocation recorder fails closed on granule hazards",
                     kGuestInvocationDependencyPhysicalAlias);
   }
 
-  SECTION("cross-thread write touches a data closure sibling") {
+  SECTION("a granule neighbour is not watched inside the final attempt") {
     FakePageReader reader;
+    reader.AddPages(kDataPageA, 4, 1);
     GuestInvocationRecorderLimits limits = MakeLimits();
     limits.host_protection_page_size = 16 * 1024;
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock, limits);
+    ConvergeOnPage(*recorder);
     EnterRoot(*recorder);
     Access(*recorder, kDataPageA);
-    REQUIRE_FALSE(recorder->OnMemoryAccess(
-        kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
-    RequireRejected(*recorder,
-                    GuestInvocationRecorderRejection::kCrossThreadMutation,
-                    kGuestInvocationDependencyCrossThreadMutation);
-  }
-
-  SECTION("data closure discovers a prior cross-thread sibling write") {
-    FakePageReader reader;
-    GuestInvocationRecorderLimits limits = MakeLimits();
-    limits.host_protection_page_size = 16 * 1024;
-    std::unique_ptr<GuestInvocationRecorder> recorder =
-        MakeRecorder(reader, clock, limits);
-    EnterRoot(*recorder);
+    // kDataPageB only closes kDataPageA's protection granule. The invocation
+    // never reads it, so what another thread does to it cannot reach replay --
+    // and that stays true once the snapshot the watch protects exists.
     REQUIRE(recorder->OnMemoryAccess(
         kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
+    REQUIRE(recorder->rejection() == GuestInvocationRecorderRejection::kNone);
+    REQUIRE(recorder->state() ==
+            GuestInvocationRecorderState::kRecordingFinalAttempt);
+  }
+
+  SECTION("the final attempt reads a page another thread already wrote") {
+    FakePageReader reader;
+    reader.AddPages(kDataPageA, 4, 1);
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.host_protection_page_size = 16 * 1024;
+    limits.max_attempts = 3;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    ConvergeOnPage(*recorder);
+    EnterRoot(*recorder);
+    // Tracked rather than refused: nothing has read it yet.
+    REQUIRE(recorder->OnMemoryAccess(
+        kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
+    // Reading the page that was written is what makes the write matter, and
+    // no attempt is left to retake.
     REQUIRE_FALSE(recorder->OnMemoryAccess(
-        kOwner, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kRead));
+        kOwner, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kRead));
     RequireRejected(*recorder,
                     GuestInvocationRecorderRejection::kCrossThreadMutation,
                     kGuestInvocationDependencyCrossThreadMutation);
@@ -556,17 +577,19 @@ TEST_CASE("guest invocation recorder fails closed on granule hazards",
 
   SECTION("cross-thread watches share the data closure bound") {
     FakePageReader reader;
+    reader.AddPages(kDataPageA, 4, 1);
     GuestInvocationRecorderLimits limits = MakeLimits();
     limits.host_protection_page_size = 16 * 1024;
     limits.max_page_count = 4;
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock, limits);
+    // The granule closure already spends the whole page budget, so the watch
+    // has nothing left to spend on a page outside it.
+    ConvergeOnPage(*recorder);
     EnterRoot(*recorder);
-    REQUIRE(
+    REQUIRE_FALSE(
         recorder->OnMemoryAccess(kOther, kDataPageA + 0x10000, 4,
                                  GuestInvocationRecorderMemoryAccess::kWrite));
-    REQUIRE_FALSE(recorder->OnMemoryAccess(
-        kOwner, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kRead));
     RequireRejected(*recorder, GuestInvocationRecorderRejection::kPageLimit,
                     kGuestInvocationDependencyPageDiscoveryOverflow);
   }
@@ -1387,21 +1410,29 @@ TEST_CASE("guest invocation recorder rejects cross-thread closure writes",
   }
   SECTION("cross-thread pages share the total page budget") {
     GuestInvocationRecorderLimits limits = MakeLimits();
-    limits.max_page_count = 1;
+    limits.max_page_count = 2;
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock, limits);
+    ConvergeOnPage(*recorder);
     EnterRoot(*recorder);
+    // The watch fits inside the budget the invocation's own page left.
     REQUIRE(recorder->OnMemoryAccess(
-        kOther, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kWrite));
+        kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
+    // A third page does not, and it is the read that asks for it.
     REQUIRE_FALSE(recorder->OnMemoryAccess(
-        kOwner, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kRead));
+        kOwner, kDataPageC, 4, GuestInvocationRecorderMemoryAccess::kRead));
     RequireRejected(*recorder, GuestInvocationRecorderRejection::kPageLimit,
                     kGuestInvocationDependencyPageDiscoveryOverflow);
   }
   SECTION("cross-thread physical aliases intersect the closure") {
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.max_attempts = 3;
     std::unique_ptr<GuestInvocationRecorder> recorder =
-        MakeRecorder(reader, clock);
+        MakeRecorder(reader, clock, limits);
+    ConvergeOnPage(*recorder);
     EnterRoot(*recorder);
+    // 0x92000000 and 0x82000000 are the same backing page seen through two
+    // views, so the write reaches the page the read is about.
     REQUIRE(recorder->OnMemoryAccess(
         kOther, 0x92000000u, 4, GuestInvocationRecorderMemoryAccess::kWrite));
     REQUIRE_FALSE(recorder->OnMemoryAccess(

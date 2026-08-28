@@ -677,8 +677,10 @@ GuestExecutionSessionBundle MakeContinuousSessionBundle(
             initial_chunk.checkpoint.content.end(),
             [](const GuestExecutionSessionContentReference& left,
                const GuestExecutionSessionContentReference& right) {
-              return std::tie(left.kind, left.guest_address) <
-                     std::tie(right.kind, right.guest_address);
+              // The encoder requires content ordered by address and
+              // non-overlapping, not grouped by kind.
+              return std::tie(left.guest_address, left.kind) <
+                     std::tie(right.guest_address, right.kind);
             });
 
   GuestExecutionSessionCodeCorpusChunk corpus_chunk;
@@ -1062,8 +1064,10 @@ GuestExecutionSessionBundle MakePassiveContinuousSessionBundle(
             initial_chunk.checkpoint.content.end(),
             [](const GuestExecutionSessionContentReference& left,
                const GuestExecutionSessionContentReference& right) {
-              return std::tie(left.kind, left.guest_address) <
-                     std::tie(right.kind, right.guest_address);
+              // The encoder requires content ordered by address and
+              // non-overlapping, not grouped by kind.
+              return std::tie(left.guest_address, left.kind) <
+                     std::tie(right.guest_address, right.kind);
             });
 
   GuestExecutionSessionCodeCorpusChunk corpus_chunk;
