@@ -326,7 +326,16 @@ class FakeProvider final : public GuestExecutionSessionCaptureRuntimeProvider {
 
   bool SupportsCheckpointParticipant(const CheckpointParticipant& participant,
                                      std::string* error) noexcept override {
-    if (participant.restorable ||
+    // The production provider admits a thread parked inside a modeled blocking
+    // export; the wait allowlist and the dispatch binding it also checks are
+    // the provider's own concern, so publication is what proves the route here.
+    const bool blocked_in_export =
+        !participant.restorable && participant.guest_pc &&
+        participant.state ==
+            kernel::GuestSchedulerCheckpointParticipantState::kBlocked &&
+        participant.resume_kind ==
+            kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+    if (participant.restorable || blocked_in_export ||
         (!participant.guest_pc &&
          (participant.resume_kind ==
               kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation ||

@@ -849,12 +849,30 @@ struct GuestExecutionSessionAssembler::Impl {
     return true;
   }
 
+  // deferred_only selects which half of the initial roster to serialize: false
+  // at the start barrier for every participant the provider can encode there,
+  // true at publication for the ones whose route names an event the tape had
+  // not yet recorded. The final checkpoint is always the whole roster.
   bool EncodeParticipantStatesLocked(
-      bool initial_checkpoint,
+      bool initial_checkpoint, bool deferred_only,
       std::vector<GuestExecutionSessionThreadStateReference>* output) {
     const State expected_state = state;
-    output->clear();
-    for (Participant& participant : participants) {
+    if (!deferred_only) {
+      output->assign(participants.size(),
+                     GuestExecutionSessionThreadStateReference{});
+    }
+    for (size_t index = 0; index < participants.size(); ++index) {
+      Participant& participant = participants[index];
+      const bool defers =
+          initial_checkpoint &&
+          dependencies.state_provider->DefersInitialParticipantState(
+              participant.identity);
+      if (state != expected_state) {
+        return false;
+      }
+      if (defers != deferred_only) {
+        continue;
+      }
       std::vector<uint8_t> bytes;
       std::string error;
       if (!dependencies.state_provider->EncodeParticipantState(
@@ -881,7 +899,7 @@ struct GuestExecutionSessionAssembler::Impl {
         participant.initial_state_size = reference.byte_size;
         participant.initial_state_sha256 = reference.sha256;
       }
-      output->push_back(reference);
+      (*output)[index] = reference;
     }
     return true;
   }
@@ -890,6 +908,13 @@ struct GuestExecutionSessionAssembler::Impl {
     if (state != State::kStartRendezvous ||
         arrived_participant_count != participants.size() ||
         held_sink_count != external_sinks.size()) {
+      return;
+    }
+    // Only participant state is captured now; the initial checkpoint's page
+    // preimages accumulate over the session and are encoded at stop. A
+    // participant whose route names an event that has not happened yet is
+    // deferred to publication instead.
+    if (!EncodeParticipantStatesLocked(true, false, &initial_thread_states)) {
       return;
     }
     std::string error;
@@ -956,10 +981,13 @@ struct GuestExecutionSessionAssembler::Impl {
     GuestExecutionSessionCheckpoint final_checkpoint;
     final_checkpoint.global_sequence = last_event_sequence;
     GuestExecutionSessionSha256 corpus_digest = {};
-    // Both boundaries serialize here, with the whole tape closed, so a route
-    // naming one of its events can be encoded with that event's sequence.
-    if (!EncodeParticipantStatesLocked(true, &initial.thread_states) ||
-        !EncodeParticipantStatesLocked(false,
+    // The tape is closed here, so a deferred route can finally be encoded with
+    // the sequence of the event it names.
+    if (!EncodeParticipantStatesLocked(true, true, &initial_thread_states)) {
+      return false;
+    }
+    initial.thread_states = initial_thread_states;
+    if (!EncodeParticipantStatesLocked(false, false,
                                        &final_checkpoint.thread_states) ||
         !CollectContentLocked(true, &initial.content) ||
         !CollectContentLocked(false, &final_checkpoint.content) ||
@@ -1110,6 +1138,7 @@ struct GuestExecutionSessionAssembler::Impl {
   std::map<GuestExecutionSessionSha256, std::vector<uint8_t>> blobs;
   uint64_t blob_count = 0;
   uint64_t blob_bytes = 0;
+  std::vector<GuestExecutionSessionThreadStateReference> initial_thread_states;
   std::vector<GuestExecutionSessionSegmentReference> segments;
   std::optional<OpenSegment> open_segment;
   bool publish_in_progress = false;

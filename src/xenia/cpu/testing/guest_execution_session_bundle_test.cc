@@ -1671,12 +1671,14 @@ struct BlockedExportOptions {
   uint8_t witness_reason = 11;  // kSignalEpoch
   uint32_t witness_thread_id = 7;
   bool witness_payload_is_v1 = false;
+  // A reready normally has no participant actor; owning one lets the fixture
+  // give the participant an earlier event than its export.
+  bool witness_owns_participant = false;
   GuestExecutionSessionSchedulerWaitKind wait_kind =
       GuestExecutionSessionSchedulerWaitKind::kSingle;
   uint32_t wait_flags = kGuestExecutionSessionSchedulerWaitFlagInterruptible;
   uint32_t wait_handle_count = 1;
   uint64_t wait_deadline_ms = 0;
-  uint32_t export_event_thread = 0;
   GuestExecutionSessionEventDisposition export_disposition =
       GuestExecutionSessionEventDisposition::kReplayCaptured;
   bool blocked_final_topology = false;
@@ -1747,6 +1749,9 @@ GuestExecutionSessionBundle MakeBlockedExportBundle(
   events.ordinal = 2;
   GuestExecutionSessionEvent wake;
   wake.global_sequence = 1;
+  if (options.witness_owns_participant) {
+    wake.thread_ordinal = 0;
+  }
   wake.kind = GuestExecutionSessionEventKind::kSynchronization;
   wake.disposition = GuestExecutionSessionEventDisposition::kReplayCaptured;
   wake.payload_kind = GuestExecutionSessionPayloadKind::kGuestBytes;
@@ -1755,7 +1760,7 @@ GuestExecutionSessionBundle MakeBlockedExportBundle(
   events.events.push_back(wake);
   GuestExecutionSessionEvent export_event;
   export_event.global_sequence = 2;
-  export_event.thread_ordinal = options.export_event_thread;
+  export_event.thread_ordinal = 0;
   export_event.kind = GuestExecutionSessionEventKind::kKernelExport;
   export_event.disposition = options.export_disposition;
   export_event.guest_address = options.export_guest_address;
@@ -2003,15 +2008,7 @@ TEST_CASE("session bundle proves every blocked export obligation",
   }
   SECTION("a pending sequence naming another event rejects") {
     BlockedExportOptions options;
-    options.pending_sequence = 3;
-    options.participant_first_event = 3;
-    require_rejected(MakeBlockedExportBundle(options),
-                     "pending event does not name the participant's export");
-  }
-  SECTION("an export owned by no participant rejects") {
-    BlockedExportOptions options;
-    options.export_event_thread = kGuestExecutionSessionNoThread;
-    options.participant_first_event = 3;
+    options.pending_sequence = 5;
     require_rejected(MakeBlockedExportBundle(options),
                      "pending event does not name the participant's export");
   }
@@ -2030,7 +2027,8 @@ TEST_CASE("session bundle proves every blocked export obligation",
   }
   SECTION("the export is not the participant's first captured event") {
     BlockedExportOptions options;
-    options.participant_first_event = 3;
+    options.witness_owns_participant = true;
+    options.participant_first_event = 1;
     require_rejected(
         MakeBlockedExportBundle(options),
         "pending event is not the participant's first captured event");

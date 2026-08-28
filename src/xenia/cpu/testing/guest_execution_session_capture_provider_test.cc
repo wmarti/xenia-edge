@@ -869,12 +869,14 @@ TEST_CASE(
 
   std::string error;
   const auto blocked = harness.BlockedSecondThreadCheckpoint();
-  REQUIRE(harness.provider->BeginCapture(harness.Checkpoint(),
+  // The same participant is admissible at the start boundary, where its export
+  // still returns inside the interval.
+  REQUIRE(harness.provider->BeginCapture(blocked,
                                          harness.TwoThreadParticipants(),
                                          harness.TwoThreadHostCalls(), &error));
   REQUIRE(error.empty());
-  // The export completes after the interval, so nothing on the tape can
-  // witness the route this participant would need.
+  // At the final boundary the export completes after the interval, so nothing
+  // on the tape can witness the route this participant would need.
   REQUIRE_FALSE(harness.provider->SealCapture(
       blocked, harness.TwoThreadHostCalls(), &error));
   REQUIRE(error.find("blocked modeled export at the final boundary") !=

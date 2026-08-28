@@ -142,17 +142,13 @@ class FakeStateProvider final
       return ppc::GuestPPCThreadCheckpointCodec::Encode(checkpoint, output,
                                                         error);
     }
-    // Both boundaries are serialized in one publication pass, so the
-    // boundary itself, not the call order, selects the state.
     output->assign(
-        initial_checkpoint || !final_state_size ? state_size : final_state_size,
-        static_cast<uint8_t>(participant.capture_instance_id +
-                             (initial_checkpoint ? 0 : generation)));
+        state_size,
+        static_cast<uint8_t>(participant.capture_instance_id + generation));
     return true;
   }
 
   size_t state_size = 64;
-  size_t final_state_size = 0;
   uint8_t generation = 0;
   bool fail = false;
   bool encode_thread_checkpoint = false;
@@ -877,9 +873,8 @@ TEST_CASE("session assembler records one manual window with nested calls",
   harness.StartOutside({kA});
   REQUIRE(harness.status().encoded_chunk_count == 0);
   REQUIRE(harness.status().capture_start_tick == kStartTick);
-  // Participant state is frozen by the provider at the start barrier but
-  // serialized at publication, so nothing has been encoded yet.
-  REQUIRE(harness.states.calls == 0);
+  // Only participant state is captured at start; pages wait for the stop.
+  REQUIRE(harness.states.calls == 1);
   REQUIRE(harness.content.calls == 0);
 
   REQUIRE(harness.Enter(kA) == Action::kContinue);
@@ -931,7 +926,7 @@ TEST_CASE("session assembler records one manual window with nested calls",
   // Nothing is encoded and no provider runs on the arriving thread.
   REQUIRE(harness.status().staged_event_count == 11);
   REQUIRE(harness.status().encoded_chunk_count == 0);
-  REQUIRE(harness.states.calls == 0);
+  REQUIRE(harness.states.calls == 1);
   REQUIRE(harness.content.calls == 0);
   REQUIRE(harness.publisher.calls == 0);
   // Held participants may not resume before publication completes.
@@ -1312,7 +1307,7 @@ TEST_CASE("session assembler holds three participants through mixed arrivals",
   REQUIRE(harness.states.calls == 0);
   REQUIRE(harness.assembler->OnExternalSinkHeld(gpu) == Action::kContinue);
   REQUIRE(harness.state() == State::kRecording);
-  REQUIRE(harness.states.calls == 0);
+  REQUIRE(harness.states.calls == 3);
   REQUIRE_FALSE(harness.status().external_sinks[0].held);
 
   REQUIRE(harness.Enter(kA) == Action::kContinue);
@@ -1992,7 +1987,7 @@ TEST_CASE("session assembler rejects timeouts, limits and overflow",
     REQUIRE(harness.Enter(kA) == Action::kContinue);
     ++harness.clock.now;
     harness.RecordSegment(kA);
-    harness.states.final_state_size = 65;
+    harness.states.state_size = 65;
     REQUIRE(harness.assembler->RequestStop() == Action::kHold);
     REQUIRE(harness.Leave(kA) == Action::kHold);
     REQUIRE_FALSE(harness.assembler->Publish(&harness.error));

@@ -1863,6 +1863,22 @@ bool GuestExecutionSessionCaptureProvider::EncodeParticipantState(
   }
 }
 
+bool GuestExecutionSessionCaptureProvider::DefersInitialParticipantState(
+    const GuestExecutionCaptureParticipantIdentity& participant) noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    // A participant bound to a still-open modeled export names an event the
+    // tape has not recorded yet, so its route cannot be encoded until the
+    // session publishes.
+    return impl_->initial_pending_exports.find(
+               participant.capture_instance_id) !=
+           impl_->initial_pending_exports.cend();
+  } catch (...) {
+    impl_->RejectException();
+    return false;
+  }
+}
+
 void GuestExecutionSessionCaptureProvider::SetModeledExportSequenceResolver(
     const GuestExecutionSessionCaptureExportSequenceResolver*
         resolver) noexcept {

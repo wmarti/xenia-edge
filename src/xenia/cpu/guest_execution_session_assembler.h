@@ -110,9 +110,6 @@ struct GuestExecutionSessionAssemblerContent {
 
 // Serializes one participant's pointer-free PPC state. Called only while every
 // participant is held; the byte size must be identical for every checkpoint.
-// Both boundaries are serialized at publication, because a continuation route
-// that names a captured event cannot be encoded before that event exists; the
-// provider still froze both states at their own barrier.
 // A production provider visits ThreadStates under Processor's capture
 // registry lock while the session lock is held, so OnParticipantLifecycle must
 // never run under that registry lock: the adapter answers Processor lifecycle
@@ -121,10 +118,22 @@ class GuestExecutionSessionAssemblerStateProvider {
  public:
   virtual ~GuestExecutionSessionAssemblerStateProvider() = default;
 
+  // initial_checkpoint selects the boundary rather than the provider's own
+  // phase, because a deferred initial state is asked for after the seal.
   virtual bool EncodeParticipantState(
       const GuestExecutionCaptureParticipantIdentity& participant,
       bool initial_checkpoint, std::vector<uint8_t>* output,
       std::string* error) noexcept = 0;
+
+  // True when this participant's initial state cannot be serialized at the
+  // start rendezvous because its continuation route names a captured event
+  // that has not happened yet. Such a participant is serialized at
+  // publication, with the tape closed; every other one is serialized at the
+  // start barrier as before, so a failing provider still rejects early.
+  virtual bool DefersInitialParticipantState(
+      const GuestExecutionCaptureParticipantIdentity& participant) noexcept {
+    return false;
+  }
 };
 
 // Supplies checkpoint content and the session code corpus, all collected at

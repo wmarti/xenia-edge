@@ -114,6 +114,9 @@ class GuestExecutionSessionCaptureProvider final
       const GuestExecutionCaptureParticipantIdentity& participant,
       bool initial_checkpoint, std::vector<uint8_t>* output,
       std::string* error) noexcept override;
+  bool DefersInitialParticipantState(
+      const GuestExecutionCaptureParticipantIdentity& participant) noexcept
+      override;
   bool CollectCheckpointContent(
       bool initial_checkpoint,
       std::vector<GuestExecutionSessionAssemblerContent>* output,
