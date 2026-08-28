@@ -14,6 +14,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -893,12 +894,23 @@ struct GuestInvocationRecorder::Impl {
     }
   }
 
+  // Distinguishes the three cross-thread refusal sites and reports whether the
+  // page was directly accessed or only pulled in by its protection granule.
+  std::string CrossThreadDetail(std::string_view site, uint32_t page) const {
+    return fmt::format(
+        "another thread wrote a page in the capture closure: {} page {:08X} "
+        "backing {:08X} known {} attempt {} state {} granule {}",
+        site, page, BackingPageAddress(page),
+        known_pages.contains(page) ? 1 : 0, attempt_count,
+        static_cast<uint32_t>(state), limits.host_protection_page_size);
+  }
+
   bool AddOwnerPages(const std::vector<uint32_t>& pages) {
     for (uint32_t page : pages) {
       if (cross_thread_written_backing_pages.contains(
               BackingPageAddress(page))) {
         return Reject(GuestInvocationRecorderRejection::kCrossThreadMutation,
-                      "another thread wrote a page in the capture closure",
+                      CrossThreadDetail("owner-access", page),
                       kGuestInvocationDependencyCrossThreadMutation);
       }
       if (state == GuestInvocationRecorderState::kRecordingFinalAttempt &&
@@ -924,7 +936,7 @@ struct GuestInvocationRecorder::Impl {
       const uint32_t backing = BackingPageAddress(page);
       if (cross_thread_written_backing_pages.contains(backing)) {
         return Reject(GuestInvocationRecorderRejection::kCrossThreadMutation,
-                      "another thread wrote a page in the capture closure",
+                      CrossThreadDetail("owner-granule", page),
                       kGuestInvocationDependencyCrossThreadMutation);
       }
       const auto code_backing = closure_code_backing_views.find(backing);
@@ -971,9 +983,13 @@ struct GuestInvocationRecorder::Impl {
       const uint32_t backing = BackingPageAddress(page);
       if (supplied_data_backing_views.contains(backing) ||
           closure_code_backing_views.contains(backing)) {
-        return Reject(GuestInvocationRecorderRejection::kCrossThreadMutation,
-                      "another thread wrote a page in the capture closure",
-                      kGuestInvocationDependencyCrossThreadMutation);
+        return Reject(
+            GuestInvocationRecorderRejection::kCrossThreadMutation,
+            CrossThreadDetail(closure_code_backing_views.contains(backing)
+                                  ? "foreign-write-code"
+                                  : "foreign-write-data",
+                              page),
+            kGuestInvocationDependencyCrossThreadMutation);
       }
     }
     std::set<uint32_t> new_backing_pages;
