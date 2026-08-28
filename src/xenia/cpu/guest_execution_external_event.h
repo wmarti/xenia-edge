@@ -265,6 +265,15 @@ class GuestExecutionCaptureExternalEventLog final {
   // failed log never pins its owner.
   bool CanDetach() const noexcept;
 
+  // Copies the still-open calls owned by one participant. snapshot() copies
+  // every recorded payload as well, which a per-participant checkpoint query
+  // cannot afford. False once any rejection or reject-session event has
+  // latched, so no consumer can bind a checkpoint to an unusable log.
+  bool CopyParticipantActiveCalls(
+      const GuestExecutionCaptureParticipantIdentity& participant,
+      std::vector<GuestExecutionCaptureExternalEventActiveCall>* output)
+      const noexcept;
+
   GuestExecutionCaptureExternalEventSnapshot snapshot() const;
 
  private:

@@ -13,11 +13,13 @@
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -25,6 +27,7 @@
 #include "xenia/base/byte_order.h"
 #include "xenia/base/memory.h"
 #include "xenia/cpu/execution_jit_corpus.h"
+#include "xenia/cpu/guest_execution_external_event.h"
 #include "xenia/cpu/guest_execution_session_capture_provider.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/test_module.h"
@@ -48,6 +51,8 @@ constexpr uint32_t kFinalOuterReturnAddress = 0xACACACACu;
 constexpr uint32_t kThreadId = 0x880u;
 constexpr uint32_t kSecondThreadId = 0x881u;
 constexpr uint32_t kBranchToLinkRegister = 0x4E800020u;
+constexpr uint32_t kExportThunkAddress = 0x8270D724u;
+constexpr uint32_t kExportOrdinal = 0x1DBu;
 
 std::unique_ptr<TestModule> CreateFunctionModule(Processor* processor,
                                                  std::string_view name,
@@ -279,6 +284,59 @@ class ProviderHarness final {
          GuestExecutionCaptureThreadStateLifecycleState::kReady}};
   }
 
+  void InstallExternalEventLog() {
+    REQUIRE_FALSE(external_event_log);
+    external_event_log =
+        std::make_shared<GuestExecutionCaptureExternalEventLog>();
+    REQUIRE(processor->AttachGuestExecutionCaptureExternalEventLog(
+        external_event_log));
+  }
+
+  GuestExecutionCaptureExternalEventToken OpenExportDispatch(
+      const GuestExecutionCaptureParticipantIdentity& dispatch_participant,
+      uint32_t call_site_address, uint32_t guest_address,
+      GuestExecutionSessionEventKind kind =
+          GuestExecutionSessionEventKind::kKernelExport,
+      bool declare_effect = true) const {
+    const GuestExecutionCaptureExternalEventEffectRange range = {data_address,
+                                                                 4};
+    const std::array<uint8_t, 4> preimage = {};
+    GuestExecutionCaptureExternalEventBegin begin;
+    begin.participant = dispatch_participant;
+    begin.kind = kind;
+    begin.export_ordinal = kExportOrdinal;
+    begin.guest_address = guest_address;
+    begin.call_site_address = call_site_address;
+    if (declare_effect) {
+      begin.effect_ranges = std::span(&range, 1);
+      return external_event_log->OnExternalEventBegin(begin, preimage);
+    }
+    return external_event_log->OnExternalEventBegin(begin, {});
+  }
+
+  kernel::GuestSchedulerCheckpointBarrierSnapshot BlockedSecondThreadCheckpoint(
+      kernel::GuestSchedulerCaptureWaitKind wait_kind =
+          kernel::GuestSchedulerCaptureWaitKind::kSingle,
+      uint8_t wait_flags = 0, uint32_t guest_pc = kFunctionAddress) const {
+    auto checkpoint = Checkpoint();
+    kernel::GuestSchedulerCheckpointParticipant checkpoint_participant;
+    checkpoint_participant.thread_id = kSecondThreadId;
+    checkpoint_participant.capture_instance_id =
+        second_participant.capture_instance_id;
+    checkpoint_participant.guest_pc = guest_pc;
+    checkpoint_participant.cpu = 1;
+    checkpoint_participant.state =
+        kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
+    checkpoint_participant.resume_kind =
+        kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+    checkpoint_participant.blocked_wait_kind = wait_kind;
+    checkpoint_participant.blocked_wait.handle_count = 1;
+    checkpoint_participant.blocked_wait.flags = wait_flags;
+    checkpoint_participant.blocked_wait.handles[0] = 0x00110001u;
+    checkpoint.participants.push_back(checkpoint_participant);
+    return checkpoint;
+  }
+
   ppc::GuestInvocationRecorderIdentity InvocationIdentity() const {
     return {reinterpret_cast<uintptr_t>(thread->context()), kThreadId};
   }
@@ -293,6 +351,7 @@ class ProviderHarness final {
   std::unique_ptr<GuestExecutionSessionCaptureProvider> provider;
   std::unique_ptr<ThreadState> thread;
   std::unique_ptr<ThreadState> second_thread;
+  std::shared_ptr<GuestExecutionCaptureExternalEventLog> external_event_log;
   Function* function = nullptr;
   GuestExecutionCaptureParticipantIdentity participant;
   GuestExecutionCaptureParticipantIdentity second_participant;
@@ -605,6 +664,172 @@ TEST_CASE("guest execution session provider rejects an active dormant call",
       harness.Checkpoint(), harness.TwoThreadParticipants(),
       harness.TwoThreadHostCalls(), &error));
   REQUIRE(error.find("active host call as outside guest") != std::string::npos);
+}
+
+TEST_CASE(
+    "guest execution session provider checkpoints a blocked export "
+    "participant",
+    "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.second_thread->context()->r[3] = 0x0102030405060708ull;
+  harness.InstallExternalEventLog();
+  const auto dispatch = harness.OpenExportDispatch(
+      harness.second_participant, kFunctionAddress, kExportThunkAddress);
+  REQUIRE(dispatch);
+
+  std::string error;
+  const auto checkpoint = harness.BlockedSecondThreadCheckpoint();
+  REQUIRE(harness.provider->SupportsCheckpointParticipant(
+      checkpoint.participants.back(), &error));
+  REQUIRE(error.empty());
+  REQUIRE(harness.provider->BeginCapture(checkpoint,
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+
+  std::vector<uint8_t> state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(harness.second_participant,
+                                                   &state_bytes, &error));
+  ppc::GuestPPCThreadCheckpoint state;
+  REQUIRE(
+      ppc::GuestPPCThreadCheckpointCodec::Decode(state_bytes, &state, &error));
+  REQUIRE(state.participant_ordinal == 1);
+  REQUIRE(state.guest_thread_id == kSecondThreadId);
+  REQUIRE(state.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  REQUIRE(state.resume_pc == kFunctionAddress);
+  REQUIRE(state.owning_function_address == kFunctionAddress);
+  REQUIRE(state.owning_function_end_address == kFunctionEndAddress);
+  REQUIRE(state.outer_guest_return_address == kOuterReturnAddress);
+  REQUIRE(state.pending_export_guest_address == kExportThunkAddress);
+  REQUIRE(state.pending_external_event_sequence == dispatch.value);
+  REQUIRE(state.registers.gpr[3] == 0x0102030405060708ull);
+}
+
+TEST_CASE("guest execution session provider binds one blocking export dispatch",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  std::string error;
+
+  SECTION("no installed log") {
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
+    REQUIRE(error.find("no installed modeled export event log") !=
+            std::string::npos);
+  }
+  SECTION("no open dispatch") {
+    harness.InstallExternalEventLog();
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
+    REQUIRE(error.find("no open modeled export dispatch") != std::string::npos);
+  }
+  SECTION("dispatch belongs to another participant") {
+    harness.InstallExternalEventLog();
+    REQUIRE(harness.OpenExportDispatch(harness.participant, kFunctionAddress,
+                                       kExportThunkAddress));
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
+    REQUIRE(error.find("no open modeled export dispatch") != std::string::npos);
+  }
+  SECTION("two open dispatches") {
+    harness.InstallExternalEventLog();
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
+    REQUIRE(error.find("more than one open modeled export dispatch") !=
+            std::string::npos);
+  }
+  SECTION("wait kind outside the allowlist") {
+    harness.InstallExternalEventLog();
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness
+            .BlockedSecondThreadCheckpoint(
+                kernel::GuestSchedulerCaptureWaitKind::kDelay)
+            .participants.back(),
+        &error));
+    REQUIRE(error.find("outside the modeled blocking-export wait allowlist") !=
+            std::string::npos);
+  }
+  SECTION("alertable wait") {
+    harness.InstallExternalEventLog();
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness
+            .BlockedSecondThreadCheckpoint(
+                kernel::GuestSchedulerCaptureWaitKind::kSingle,
+                kernel::kGuestSchedulerCaptureWaitFlagAlertable)
+            .participants.back(),
+        &error));
+    REQUIRE(error.find("outside the modeled blocking-export wait allowlist") !=
+            std::string::npos);
+  }
+  SECTION("pending user APC") {
+    harness.InstallExternalEventLog();
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness
+            .BlockedSecondThreadCheckpoint(
+                kernel::GuestSchedulerCaptureWaitKind::kSingle,
+                kernel::kGuestSchedulerCaptureWaitFlagUserApcPending)
+            .participants.back(),
+        &error));
+    REQUIRE(error.find("outside the modeled blocking-export wait allowlist") !=
+            std::string::npos);
+  }
+  SECTION("dispatch return point differs from the checkpoint PC") {
+    harness.InstallExternalEventLog();
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kMiddleFunctionAddress,
+                                       kExportThunkAddress));
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
+    REQUIRE(error.find("differs from its modeled export return point") !=
+            std::string::npos);
+  }
+  SECTION("dispatch declares no guest-memory effect") {
+    harness.InstallExternalEventLog();
+    REQUIRE(harness.OpenExportDispatch(
+        harness.second_participant, kFunctionAddress, kExportThunkAddress,
+        GuestExecutionSessionEventKind::kKernelExport, false));
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
+    REQUIRE(error.find("no bindable export identity") != std::string::npos);
+  }
+  SECTION("dispatch is not a kernel export") {
+    harness.InstallExternalEventLog();
+    REQUIRE(harness.OpenExportDispatch(
+        harness.second_participant, kFunctionAddress, kExportThunkAddress,
+        GuestExecutionSessionEventKind::kExternOrBuiltin));
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
+    REQUIRE(error.find("outermost modeled kernel export") != std::string::npos);
+  }
+  REQUIRE(error.find("tid=00000881") != std::string::npos);
+  REQUIRE(error.find("resume_kind=2") != std::string::npos);
+}
+
+TEST_CASE(
+    "guest execution session provider rejects an unbindable blocked export",
+    "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.InstallExternalEventLog();
+  std::string error;
+  REQUIRE_FALSE(harness.provider->BeginCapture(
+      harness.BlockedSecondThreadCheckpoint(), harness.TwoThreadParticipants(),
+      harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.find("no open modeled export dispatch") != std::string::npos);
+  REQUIRE(harness.provider->status().state ==
+          GuestExecutionSessionCaptureProviderState::kRejected);
 }
 
 TEST_CASE("guest execution session provider owns instruction counters",

@@ -259,6 +259,7 @@ struct GuestExecutionSessionCaptureRuntimeStatus {
   uint64_t last_scheduler_sequence = 0;
   bool processor_attached = false;
   bool scheduler_attached = false;
+  bool external_event_log_attached = false;
   bool provider_armed = false;
   bool external_sink_registered = false;
   bool external_sink_held = false;

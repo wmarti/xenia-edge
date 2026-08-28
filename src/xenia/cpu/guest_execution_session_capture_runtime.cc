@@ -31,6 +31,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/guest_execution_continuous_event.h"
+#include "xenia/cpu/guest_execution_external_event.h"
 #include "xenia/cpu/guest_execution_marker_controller.h"
 #include "xenia/cpu/guest_execution_session_capture_event_bridge.h"
 #include "xenia/cpu/guest_execution_session_capture_provider.h"
@@ -1133,6 +1134,63 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
     scheduler_attached = scheduler_value;
   }
 
+  // The modeled export dispatches this session's provider binds blocked
+  // participants to are recorded on the Processor-owned log installed here, so
+  // there is exactly one log and both sides read the same open calls.
+  bool AttachExternalEventLog() {
+    std::shared_ptr<GuestExecutionCaptureExternalEventLog> log;
+    try {
+      log = std::make_shared<GuestExecutionCaptureExternalEventLog>();
+    } catch (...) {
+      return false;
+    }
+    if (!processor.AttachGuestExecutionCaptureExternalEventLog(log)) {
+      return false;
+    }
+    external_event_log = std::move(log);
+    {
+      std::lock_guard<std::mutex> lock(status_mutex);
+      external_event_log_attached = true;
+    }
+    return true;
+  }
+
+  bool DetachExternalEventLog() {
+    if (!external_event_log) {
+      return true;
+    }
+    if (!processor.DetachGuestExecutionCaptureExternalEventLog(
+            external_event_log)) {
+      return false;
+    }
+    external_event_log.reset();
+    {
+      std::lock_guard<std::mutex> lock(status_mutex);
+      external_event_log_attached = false;
+    }
+    return true;
+  }
+
+  // A refused detach means a guest thread is still parked inside an export the
+  // log promised to record. The log stays installed rather than dropping that
+  // promise, and the session is terminally rejected instead of reporting a
+  // result whose tape is missing an event that is still being produced.
+  void RejectRetainedExternalEventLog() {
+    {
+      std::lock_guard<std::mutex> lock(status_mutex);
+      if (rejection == RuntimeRejection::kNone) {
+        rejection = RuntimeRejection::kSourceAttachment;
+      }
+      if (!status_message.empty()) {
+        status_message += "; ";
+      }
+      status_message +=
+          "capture runtime retained its modeled export event log because a "
+          "dispatch is still open";
+    }
+    SetState(RuntimeState::kRejected);
+  }
+
   bool ValidateCheckpoint(
       const CheckpointSnapshot& checkpoint,
       const GuestExecutionCaptureThreadStateRegistrySnapshot& registry,
@@ -1231,13 +1289,27 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       const CheckpointParticipant* checkpoint_participant =
           FindCheckpointParticipant(checkpoint,
                                     call.participant.guest_thread_id);
-      if (!checkpoint_participant ||
-          checkpoint_participant->resume_kind !=
-              CheckpointResumeKind::kJitSafepoint ||
-          !checkpoint_participant->restorable) {
+      // A thread parked inside a blocking export is always below the host-call
+      // dispatch token its GuestFunction::Call opened, so its outer call is
+      // expected exactly like a safepoint's. The provider has already refused
+      // any blocked participant it could not bind to a modeled export
+      // dispatch, so reaching here means this one carries a typed route.
+      const bool restorable_safepoint =
+          checkpoint_participant &&
+          checkpoint_participant->resume_kind ==
+              CheckpointResumeKind::kJitSafepoint &&
+          checkpoint_participant->restorable;
+      const bool blocked_in_export =
+          checkpoint_participant &&
+          checkpoint_participant->resume_kind ==
+              CheckpointResumeKind::kAfterBlockingExport &&
+          !checkpoint_participant->restorable &&
+          checkpoint_participant->state ==
+              kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
+      if (!restorable_safepoint && !blocked_in_export) {
         return Fail(error,
                     "capture runtime active outer call lacks an exact-PC JIT "
-                    "safepoint continuation");
+                    "safepoint or modeled blocking-export continuation");
       }
     }
     return true;
@@ -2181,6 +2253,8 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   std::atomic<uint64_t> scheduler_event_count{0};
   bool processor_attached = false;
   bool scheduler_attached = false;
+  bool external_event_log_attached = false;
+  std::shared_ptr<GuestExecutionCaptureExternalEventLog> external_event_log;
   std::atomic<bool> provider_armed{false};
   bool external_sink_registered = false;
   std::atomic<bool> external_sink_held{false};
@@ -2285,11 +2359,19 @@ bool GuestExecutionSessionCaptureRuntime::Attach(std::string* error) {
       std::static_pointer_cast<kernel::GuestSchedulerCaptureObserver>(owner);
   const auto processor_observer =
       std::static_pointer_cast<GuestExecutionCaptureHostCallObserver>(owner);
+  // Installed before the observers so no dispatch a checkpoint may have to bind
+  // to can open outside this session's log.
+  if (!impl_->AttachExternalEventLog()) {
+    return Fail(error,
+                "capture runtime could not install its modeled export event "
+                "log");
+  }
   if (!impl_->scheduler.AttachCaptureObserverTransactionally(
           scheduler_observer, [this, &processor_observer]() {
             return impl_->processor.AttachGuestExecutionCaptureHostCallObserver(
                 processor_observer);
           })) {
+    impl_->DetachExternalEventLog();
     return Fail(error, "capture runtime observer transaction was rejected");
   }
   impl_->SetAttachmentStatus(true, true);
@@ -2371,8 +2453,14 @@ void GuestExecutionSessionCaptureRuntime::Shutdown() noexcept {
   }
   std::lock_guard<std::mutex> shutdown_lock(impl_->shutdown_operation_mutex);
   impl_->StopWorker();
+  // Released first so no later dispatch can open a call this session would
+  // have to account for.
+  const bool log_released = impl_->DetachExternalEventLog();
   const auto owner = impl_->owner.lock();
   if (!owner) {
+    if (!log_released) {
+      impl_->RejectRetainedExternalEventLog();
+    }
     return;
   }
   bool scheduler_attached = false;
@@ -2398,6 +2486,9 @@ void GuestExecutionSessionCaptureRuntime::Shutdown() noexcept {
     }
   }
   impl_->SetAttachmentStatus(processor_attached, scheduler_attached);
+  if (!log_released) {
+    impl_->RejectRetainedExternalEventLog();
+  }
 }
 
 bool GuestExecutionSessionCaptureRuntime::WaitForTerminal(
@@ -2424,6 +2515,7 @@ GuestExecutionSessionCaptureRuntime::status() const {
   result.last_scheduler_sequence =
       impl_->last_scheduler_sequence.load(std::memory_order_relaxed);
   result.processor_attached = impl_->processor_attached;
+  result.external_event_log_attached = impl_->external_event_log_attached;
   result.scheduler_attached = impl_->scheduler_attached;
   result.provider_armed = impl_->provider_armed.load(std::memory_order_relaxed);
   result.external_sink_registered = impl_->external_sink_registered;

@@ -29,6 +29,7 @@
 #include "xenia/base/memory.h"
 #include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/function.h"
+#include "xenia/cpu/guest_execution_external_event.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/guest_invocation_capture_page_reader.h"
 #include "xenia/cpu/processor.h"
@@ -112,6 +113,46 @@ bool IsPassiveOutsideGuestParticipant(
              kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation ||
          participant.resume_kind ==
              kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun;
+}
+
+// The shape ValidateSchedulerTopology already accepts for a blocked-in-export
+// route: a non-restorable participant parked at the link register of the
+// branch that entered the export thunk.
+bool IsBlockedExportParticipant(const CheckpointParticipant& participant) {
+  return !participant.restorable && participant.guest_pc &&
+         !(participant.guest_pc & 3) &&
+         participant.state ==
+             kernel::GuestSchedulerCheckpointParticipantState::kBlocked &&
+         participant.resume_kind ==
+             kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+}
+
+// The wait classes whose link register is the export's single return point,
+// matching the modeled export dispatch adapter's own allowlist. A delay, a
+// fence or spin poll and the I/O classes reach that link register once per poll
+// rather than once per export, and an alertable or APC-pending wait can run
+// guest code on the waiting thread's stack before the export returns.
+bool IsBlockedExportWaitInAllowlist(const CheckpointParticipant& participant) {
+  const bool modeled_kind =
+      participant.blocked_wait_kind ==
+          kernel::GuestSchedulerCaptureWaitKind::kSingle ||
+      participant.blocked_wait_kind ==
+          kernel::GuestSchedulerCaptureWaitKind::kMultiAny ||
+      participant.blocked_wait_kind ==
+          kernel::GuestSchedulerCaptureWaitKind::kMultiAll;
+  const uint8_t refused_flags =
+      kernel::kGuestSchedulerCaptureWaitFlagAlertable |
+      kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
+  return modeled_kind && participant.blocked_wait.handle_count &&
+         !(participant.blocked_wait.flags & refused_flags);
+}
+
+std::string DescribeParticipant(const CheckpointParticipant& participant) {
+  return fmt::format(
+      "tid={:08X} state={} resume_kind={} restorable={} pc={:08X}",
+      participant.thread_id, static_cast<uint32_t>(participant.state),
+      static_cast<uint32_t>(participant.resume_kind), participant.restorable,
+      participant.guest_pc);
 }
 
 }  // namespace
@@ -667,10 +708,79 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     }
     if (outer_count != 1 || !outer_return || (outer_return & 3)) {
       return RejectLocked(
-          "capture provider JIT checkpoint lacks one outer host-call "
-          "boundary");
+          "capture provider checkpoint lacks one outer host-call boundary");
     }
     *output = outer_return;
+    return true;
+  }
+
+  // Binds a blocked participant to the single open modeled export dispatch it
+  // is parked inside. The log is the one the capture runtime installed on this
+  // Processor, so the provider and the export shims always see the same open
+  // calls. Every refusal is a first-failure diagnostic in the census style; the
+  // participant stays rejected exactly as it is today unless all of it holds.
+  bool BindBlockedExportDispatch(
+      const CheckpointParticipant& participant,
+      GuestExecutionCaptureExternalEventActiveCall* output,
+      std::string* reason) const {
+    const auto refuse = [&](std::string_view text) {
+      if (reason) {
+        reason->assign(text);
+        reason->append(": ");
+        reason->append(DescribeParticipant(participant));
+      }
+      return false;
+    };
+    if (!IsBlockedExportWaitInAllowlist(participant)) {
+      return refuse(
+          "capture provider blocked participant is outside the modeled "
+          "blocking-export wait allowlist");
+    }
+    const std::shared_ptr<GuestExecutionCaptureExternalEventLog> log =
+        processor.guest_execution_capture_external_event_log();
+    if (!log) {
+      return refuse(
+          "capture provider has no installed modeled export event log");
+    }
+    std::vector<GuestExecutionCaptureExternalEventActiveCall> calls;
+    if (!log->CopyParticipantActiveCalls(
+            {participant.capture_instance_id, participant.thread_id}, &calls)) {
+      return refuse(
+          "capture provider modeled export event log is not replayable");
+    }
+    if (calls.empty()) {
+      return refuse(
+          "capture provider blocked participant has no open modeled export "
+          "dispatch");
+    }
+    if (calls.size() != 1) {
+      return refuse(
+          "capture provider blocked participant has more than one open "
+          "modeled export dispatch");
+    }
+    const GuestExecutionCaptureExternalEventActiveCall& call = calls.front();
+    if (call.kind != GuestExecutionSessionEventKind::kKernelExport ||
+        !call.is_outermost()) {
+      return refuse(
+          "capture provider blocked participant is not parked in an outermost "
+          "modeled kernel export");
+    }
+    // A modeled blocking wait always declares the guest thread fields it
+    // writes, so a dispatch with no declared effect cannot be one.
+    if (!call.guest_address || (call.guest_address & 3) ||
+        !call.effect_byte_count) {
+      return refuse(
+          "capture provider modeled export dispatch has no bindable export "
+          "identity");
+    }
+    if (call.call_site_address != participant.guest_pc) {
+      return refuse(
+          "capture provider blocked participant PC differs from its modeled "
+          "export return point");
+    }
+    if (output) {
+      *output = call;
+    }
     return true;
   }
 
@@ -846,10 +956,46 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           }
           state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
           outside_guest_participants.insert(identity.capture_instance_id);
+        } else if (IsBlockedExportParticipant(*scheduler_participant)) {
+          GuestExecutionCaptureExternalEventActiveCall dispatch;
+          std::string reason;
+          if (!BindBlockedExportDispatch(*scheduler_participant, &dispatch,
+                                         &reason)) {
+            return RejectLocked(reason);
+          }
+          uint32_t outer_return = 0;
+          if (!FindOuterReturn(identity, host_calls, &outer_return)) {
+            return false;
+          }
+          outer_return_addresses.emplace(identity.capture_instance_id,
+                                         outer_return);
+          const DefinitionRecord* owner =
+              FindOwningDefinitionLocked(scheduler_participant->guest_pc);
+          if (!owner) {
+            return false;
+          }
+          const uint32_t owner_address = FindDefinitionAddressLocked(owner);
+          if (!owner_address || !owner->code_pages_snapshotted ||
+              !AddClosureSeedLocked(owner_address, owner->end_address)) {
+            return false;
+          }
+          state_blob.resume_kind =
+              ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern;
+          state_blob.resume_pc = scheduler_participant->guest_pc;
+          state_blob.owning_function_address = owner_address;
+          state_blob.owning_function_end_address = owner->end_address;
+          state_blob.outer_guest_return_address = outer_return;
+          state_blob.pending_export_guest_address = dispatch.guest_address;
+          // The dispatch's log identity, not the tape sequence the bundle
+          // cross-check compares: nothing canonicalizes a kKernelExport record
+          // into the session envelope yet, so no durable sequence exists to
+          // name here.
+          state_blob.pending_external_event_sequence = dispatch.token.value;
         } else if (!IsRestorableJitParticipant(*scheduler_participant)) {
           return RejectLocked(
-              "capture provider supports only exact-PC JIT or passive "
-              "outside-guest scheduler participants");
+              "capture provider supports only exact-PC JIT, passive "
+              "outside-guest or modeled blocking-export scheduler "
+              "participants");
         } else {
           uint32_t outer_return = 0;
           if (!FindOuterReturn(identity, host_calls, &outer_return)) {
@@ -901,7 +1047,10 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     }
     const size_t executable_scheduler_participant_count = std::count_if(
         checkpoint.participants.cbegin(), checkpoint.participants.cend(),
-        IsRestorableJitParticipant);
+        [](const CheckpointParticipant& candidate) {
+          return IsRestorableJitParticipant(candidate) ||
+                 IsBlockedExportParticipant(candidate);
+        });
     if (encoded.size() != ordered.size() ||
         execution_identities.size() != ordered.size() ||
         outer_return_addresses.size() !=
@@ -1386,21 +1535,29 @@ bool GuestExecutionSessionCaptureProvider::SupportsCheckpointParticipant(
   if (error) {
     error->clear();
   }
-  if (!participant.thread_id ||
-      (!IsRestorableJitParticipant(participant) &&
-       !IsPassiveOutsideGuestParticipant(participant))) {
+  try {
+    if (participant.thread_id &&
+        (IsRestorableJitParticipant(participant) ||
+         IsPassiveOutsideGuestParticipant(participant))) {
+      return true;
+    }
+    if (participant.thread_id && IsBlockedExportParticipant(participant)) {
+      std::string reason;
+      if (impl_->BindBlockedExportDispatch(participant, nullptr, &reason)) {
+        return true;
+      }
+      return Fail(error, reason);
+    }
     return Fail(
         error,
-        fmt::format("capture provider supports only restorable exact-PC JIT "
-                    "or passive outside-guest scheduler participants: "
-                    "tid={:08X} state={} resume_kind={} restorable={} "
-                    "pc={:08X}",
-                    participant.thread_id,
-                    static_cast<uint32_t>(participant.state),
-                    static_cast<uint32_t>(participant.resume_kind),
-                    participant.restorable, participant.guest_pc));
+        fmt::format("capture provider supports only restorable exact-PC JIT, "
+                    "passive outside-guest or modeled blocking-export "
+                    "scheduler participants: {}",
+                    DescribeParticipant(participant)));
+  } catch (...) {
+    return Fail(error,
+                "capture provider could not evaluate a checkpoint participant");
   }
-  return true;
 }
 
 bool GuestExecutionSessionCaptureProvider::BeginCapture(

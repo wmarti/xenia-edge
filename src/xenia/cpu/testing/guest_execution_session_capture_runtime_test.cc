@@ -30,6 +30,7 @@
 #include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/guest_execution_continuous_event.h"
+#include "xenia/cpu/guest_execution_external_event.h"
 #include "xenia/cpu/guest_execution_session_capture_runtime.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/processor.h"
@@ -1302,6 +1303,59 @@ TEST_CASE("session capture runtime pre-arm path only observes sources",
 
   harness.runtime->Shutdown();
   pending.reset();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime owns the modeled export event log",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  REQUIRE(harness.runtime->status().external_event_log_attached);
+  const auto log =
+      environment.processor->guest_execution_capture_external_event_log();
+  REQUIRE(log);
+  REQUIRE(environment.processor
+              ->guest_execution_capture_external_event_log_installed());
+
+  harness.runtime->Shutdown();
+  REQUIRE_FALSE(harness.runtime->status().external_event_log_attached);
+  REQUIRE_FALSE(environment.processor
+                    ->guest_execution_capture_external_event_log_installed());
+  REQUIRE_FALSE(
+      environment.processor->guest_execution_capture_external_event_log());
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime rejects a retained export event log",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  const auto log =
+      environment.processor->guest_execution_capture_external_event_log();
+  REQUIRE(log);
+
+  GuestExecutionCaptureExternalEventBegin begin;
+  begin.participant = {thread->guest_execution_capture_instance_id(),
+                       thread->thread_id()};
+  begin.guest_address = 0x8270D724u;
+  begin.call_site_address = 0x82081740u;
+  const auto dispatch = log->OnExternalEventBegin(begin, {});
+  REQUIRE(dispatch);
+
+  harness.runtime->Shutdown();
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kSourceAttachment);
+  REQUIRE(status.message.find("retained its modeled export event log") !=
+          std::string::npos);
+  // The log stays installed rather than dropping an event it already promised.
+  REQUIRE(status.external_event_log_attached);
+  REQUIRE(environment.processor->guest_execution_capture_external_event_log() ==
+          log);
   thread.reset();
 }
 

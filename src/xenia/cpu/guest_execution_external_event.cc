@@ -321,6 +321,33 @@ bool GuestExecutionCaptureExternalEventLog::CanDetach() const noexcept {
          impl_->active_calls.empty();
 }
 
+bool GuestExecutionCaptureExternalEventLog::CopyParticipantActiveCalls(
+    const GuestExecutionCaptureParticipantIdentity& participant,
+    std::vector<GuestExecutionCaptureExternalEventActiveCall>* output)
+    const noexcept {
+  if (!output) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->rejection != GuestExecutionCaptureExternalEventRejection::kNone ||
+      impl_->reject_session_count) {
+    return false;
+  }
+  try {
+    output->clear();
+    for (const GuestExecutionCaptureExternalEventActiveCall& active_call :
+         impl_->active_calls) {
+      if (active_call.participant == participant) {
+        output->push_back(active_call);
+      }
+    }
+  } catch (...) {
+    output->clear();
+    return false;
+  }
+  return true;
+}
+
 GuestExecutionCaptureExternalEventSnapshot
 GuestExecutionCaptureExternalEventLog::snapshot() const {
   std::lock_guard<std::mutex> lock(impl_->mutex);
