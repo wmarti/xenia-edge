@@ -18,6 +18,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1627,6 +1628,450 @@ TEST_CASE("session bundle no-replace publication cleans racing staging",
   CHECK_FALSE(succeeded);
   CHECK(ReadText(sentinel) == "keep-racing-output");
   CHECK_FALSE(std::filesystem::exists(staging));
+}
+
+namespace {
+
+// One canonical XEGSCE1 version-2 scheduler payload. The capture-side encoder
+// owns this layout and the validator decodes it without the kernel
+// enumerations, so the fixture writes the durable bytes directly.
+std::vector<uint8_t> SchedulerPayload(uint32_t raw_kind, uint64_t sequence,
+                                      uint64_t capture_instance_id,
+                                      uint32_t guest_thread_id,
+                                      uint8_t raw_reason) {
+  std::vector<uint8_t> payload(192, 0);
+  static constexpr char kMagic[8] = {'X', 'E', 'G', 'S', 'C', 'E', '1', '\0'};
+  std::copy(std::begin(kMagic), std::end(kMagic), payload.begin());
+  const auto write_u32 = [&payload](size_t offset, uint32_t value) {
+    for (size_t index = 0; index < 4; ++index) {
+      payload[offset + index] = static_cast<uint8_t>(value >> (index * 8));
+    }
+  };
+  const auto write_u64 = [&payload](size_t offset, uint64_t value) {
+    for (size_t index = 0; index < 8; ++index) {
+      payload[offset + index] = static_cast<uint8_t>(value >> (index * 8));
+    }
+  };
+  write_u32(8, 2);
+  write_u32(12, raw_kind);
+  write_u64(16, sequence);
+  write_u64(24, capture_instance_id);
+  write_u32(32, guest_thread_id);
+  payload[42] = raw_reason;
+  return payload;
+}
+
+struct BlockedExportOptions {
+  uint32_t export_guest_address = 0x82000080;
+  // Zero means the checkpoint names the same thunk the tape's event does.
+  uint32_t checkpoint_export_address = 0;
+  uint64_t pending_sequence = 2;
+  uint64_t participant_first_event = 2;
+  uint32_t witness_kind = 9;    // kReready
+  uint8_t witness_reason = 11;  // kSignalEpoch
+  uint32_t witness_thread_id = 7;
+  bool witness_payload_is_v1 = false;
+  GuestExecutionSessionSchedulerWaitKind wait_kind =
+      GuestExecutionSessionSchedulerWaitKind::kSingle;
+  uint32_t wait_flags = kGuestExecutionSessionSchedulerWaitFlagInterruptible;
+  uint32_t wait_handle_count = 1;
+  uint64_t wait_deadline_ms = 0;
+  uint32_t export_event_thread = 0;
+  GuestExecutionSessionEventDisposition export_disposition =
+      GuestExecutionSessionEventDisposition::kReplayCaptured;
+  bool blocked_final_topology = false;
+};
+
+// A zero-segment continuous bundle whose only participant begins the interval
+// parked inside a modeled blocking export and wakes inside it.
+GuestExecutionSessionBundle MakeBlockedExportBundle(
+    BlockedExportOptions options = {}) {
+  constexpr uint64_t kEpoch = 0x123456789ABCDEF0ull;
+  constexpr uint32_t kThreadId = 7;
+  constexpr uint64_t kInstanceId = 0x100;
+  constexpr uint32_t kResumePc = 0x82000040;
+
+  GuestExecutionSessionBundle bundle;
+  const std::vector<uint8_t> initial_state_bytes = ThreadCheckpointBytes(
+      0, kThreadId, kResumePc, 1,
+      ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern,
+      options.pending_sequence,
+      options.checkpoint_export_address ? options.checkpoint_export_address
+                                        : options.export_guest_address);
+  const std::vector<uint8_t> final_state_bytes =
+      ThreadCheckpointBytes(0, kThreadId, 0x82000044, 2);
+  const GuestExecutionSessionSha256 initial_state =
+      AddBlob(&bundle, initial_state_bytes);
+  const GuestExecutionSessionSha256 final_state =
+      AddBlob(&bundle, final_state_bytes);
+  const std::vector<uint8_t> corpus_page = Bytes(JitCorpus::kPageSize, 0x30);
+  const GuestExecutionSessionSha256 code = AddBlob(&bundle, corpus_page);
+  std::vector<uint8_t> witness_payload =
+      SchedulerPayload(options.witness_kind, 1, kInstanceId,
+                       options.witness_thread_id, options.witness_reason);
+  if (options.witness_payload_is_v1) {
+    witness_payload.resize(48);
+  }
+  const uint64_t witness_payload_size = witness_payload.size();
+  const GuestExecutionSessionSha256 witness =
+      AddBlob(&bundle, std::move(witness_payload));
+
+  ExecutionJitCorpusBuilder builder(JitCorpus::kConfigGuestScheduler);
+  const ExecutionJitCorpus::FunctionRecord function = {0x82000000, 0x820000FC,
+                                                       64, 0};
+  std::vector<uint8_t> corpus_bytes;
+  std::string error;
+  REQUIRE(builder.AddCodePage(0x82000000, corpus_page.data(),
+                              corpus_page.size(), &error));
+  REQUIRE(builder.AddFunction(function, &error));
+  REQUIRE(builder.Encode(&corpus_bytes, &error));
+  const GuestExecutionSessionSha256 corpus =
+      AddBlob(&bundle, std::move(corpus_bytes));
+
+  GuestExecutionSessionCheckpointChunk initial;
+  initial.session_epoch = kEpoch;
+  initial.ordinal = 0;
+  initial.checkpoint.thread_states.push_back(
+      {0, initial_state_bytes.size(), initial_state});
+  initial.checkpoint.content.push_back(
+      {GuestExecutionSessionContentKind::kGuestCode, 0x82000000,
+       JitCorpus::kPageSize, code});
+
+  GuestExecutionSessionCodeCorpusChunk code_corpus;
+  code_corpus.session_epoch = kEpoch;
+  code_corpus.ordinal = 1;
+  code_corpus.code_corpus_sha256 = corpus;
+
+  GuestExecutionSessionEventChunk events;
+  events.session_epoch = kEpoch;
+  events.ordinal = 2;
+  GuestExecutionSessionEvent wake;
+  wake.global_sequence = 1;
+  wake.kind = GuestExecutionSessionEventKind::kSynchronization;
+  wake.disposition = GuestExecutionSessionEventDisposition::kReplayCaptured;
+  wake.payload_kind = GuestExecutionSessionPayloadKind::kGuestBytes;
+  wake.payload_size = witness_payload_size;
+  wake.payload_sha256 = witness;
+  events.events.push_back(wake);
+  GuestExecutionSessionEvent export_event;
+  export_event.global_sequence = 2;
+  export_event.thread_ordinal = options.export_event_thread;
+  export_event.kind = GuestExecutionSessionEventKind::kKernelExport;
+  export_event.disposition = options.export_disposition;
+  export_event.guest_address = options.export_guest_address;
+  events.events.push_back(export_event);
+  GuestExecutionSessionEvent coverage;
+  coverage.global_sequence = 3;
+  coverage.thread_ordinal = 0;
+  coverage.kind = GuestExecutionSessionEventKind::kInstructionCoverage;
+  coverage.disposition =
+      GuestExecutionSessionEventDisposition::kValidateDeterministic;
+  coverage.guest_instruction_delta = 10;
+  events.events.push_back(coverage);
+  GuestExecutionSessionEvent request;
+  request.global_sequence = 4;
+  request.kind = GuestExecutionSessionEventKind::kBoundaryRequest;
+  events.events.push_back(request);
+  GuestExecutionSessionEvent arrival;
+  arrival.global_sequence = 5;
+  arrival.thread_ordinal = 0;
+  arrival.kind = GuestExecutionSessionEventKind::kJitSafepointArrival;
+  arrival.disposition =
+      GuestExecutionSessionEventDisposition::kValidateDeterministic;
+  events.events.push_back(arrival);
+  GuestExecutionSessionEvent held;
+  held.global_sequence = 6;
+  held.kind = GuestExecutionSessionEventKind::kBoundaryHeld;
+  events.events.push_back(held);
+
+  GuestExecutionSessionCheckpointChunk final_checkpoint;
+  final_checkpoint.session_epoch = kEpoch;
+  final_checkpoint.ordinal = 6;
+  final_checkpoint.checkpoint.global_sequence = 6;
+  final_checkpoint.checkpoint.thread_states.push_back(
+      {0, final_state_bytes.size(), final_state});
+  final_checkpoint.checkpoint.content = initial.checkpoint.content;
+
+  std::vector<GuestExecutionContinuousEvent> continuous_events;
+  for (const GuestExecutionSessionEvent& event : events.events) {
+    GuestExecutionContinuousEvent continuous;
+    continuous.global_sequence = event.global_sequence;
+    continuous.kind = event.kind;
+    if (event.thread_ordinal != kGuestExecutionSessionNoThread) {
+      continuous.actor = {event.thread_ordinal, kThreadId};
+    }
+    continuous_events.push_back(continuous);
+  }
+  GuestExecutionContinuousEvent& held_continuous = continuous_events.back();
+  held_continuous.subject = {0, kThreadId};
+  held_continuous.checkpoint.kind =
+      GuestExecutionContinuousCheckpointReferenceKind::kThreadState;
+  held_continuous.checkpoint.checkpoint_global_sequence = 6;
+  held_continuous.checkpoint.state_size = final_state_bytes.size();
+  held_continuous.checkpoint.state_sha256 = final_state;
+  const std::optional<ppc::GuestPPCThreadCheckpointBinding> final_binding =
+      DecodeCheckpointBinding(final_state_bytes);
+  REQUIRE(final_binding.has_value());
+  held_continuous.checkpoint.binding = *final_binding;
+
+  GuestExecutionSessionSchedulerTopologyChunk start_topology;
+  start_topology.session_epoch = kEpoch;
+  start_topology.ordinal = 4;
+  start_topology.boundary =
+      GuestExecutionSessionSchedulerTopologyBoundary::kStart;
+  GuestExecutionSessionSchedulerTopologyParticipant row;
+  row.guest_thread_id = kThreadId;
+  row.capture_instance_id = kInstanceId;
+  row.state = GuestExecutionSessionSchedulerParticipantState::kBlocked;
+  row.cpu = 0;
+  row.effective_priority = 8;
+  row.base_priority = 6;
+  row.suspension_count = 0;
+  row.quantum_remaining_us = 500;
+  row.resume_kind =
+      GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport;
+  row.guest_pc = kResumePc;
+  row.restorable = false;
+  row.blocked_wait.kind = options.wait_kind;
+  row.blocked_wait.handle_count = options.wait_handle_count;
+  row.blocked_wait.flags = options.wait_flags;
+  row.blocked_wait.deadline_ms = options.wait_deadline_ms;
+  for (uint32_t index = 0; index < options.wait_handle_count; ++index) {
+    row.blocked_wait.handles[index] = 0x40 + index;
+  }
+  start_topology.participants.push_back(row);
+
+  GuestExecutionSessionSchedulerTopologyChunk final_topology = start_topology;
+  final_topology.ordinal = 5;
+  final_topology.boundary =
+      GuestExecutionSessionSchedulerTopologyBoundary::kFinal;
+  final_topology.global_sequence = 6;
+  if (!options.blocked_final_topology) {
+    final_topology.participants[0].state =
+        GuestExecutionSessionSchedulerParticipantState::kRunning;
+    final_topology.participants[0].resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kJitSafepoint;
+    final_topology.participants[0].restorable = true;
+    final_topology.participants[0].guest_pc = 0x82000044;
+    final_topology.participants[0].blocked_wait = {};
+    final_topology.participants[0].ready_queue_level =
+        kGuestExecutionSessionSchedulerNoValue;
+  }
+
+  bundle.chunks.resize(7);
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      initial, &bundle.chunks[0], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCodeCorpusChunk(
+      code_corpus, &bundle.chunks[1], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
+      events, &bundle.chunks[2], &error));
+  REQUIRE(GuestExecutionContinuousEventCodec::Encode(
+      continuous_events, &bundle.chunks[3], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      start_topology, &bundle.chunks[4], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      final_topology, &bundle.chunks[5], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_checkpoint, &bundle.chunks[6], &error));
+
+  GuestExecutionSessionManifest& manifest = bundle.manifest;
+  manifest.session_epoch = kEpoch;
+  manifest.first_event_sequence = 1;
+  manifest.last_event_sequence = 6;
+  manifest.capture_start_tick = 100;
+  manifest.capture_end_tick = 500;
+  manifest.capture_tick_frequency = 1000000000;
+  manifest.capture_build_sha256 = IdentityDigest(0x10);
+  manifest.replay_config_sha256 = IdentityDigest(0x20);
+  manifest.title_identity_sha256 = IdentityDigest(0x30);
+  manifest.module_identity_sha256 = IdentityDigest(0x40);
+  manifest.accepted_event_count = 6;
+  manifest.stop_reason = GuestExecutionSessionStopReason::kManualRequest;
+  manifest.stop_request_event_sequence = 4;
+  manifest.stop_request_tick = 300;
+  manifest.stop_request_guest_instruction_count = 10;
+  manifest.maximum_stop_tail_event_count = 16;
+  manifest.maximum_stop_tail_guest_instruction_count = 64;
+  manifest.maximum_stop_tail_ticks = 1000;
+  GuestExecutionSessionParticipant participant;
+  participant.guest_thread_id = kThreadId;
+  participant.capture_instance_id = kInstanceId;
+  participant.initial_outer_call_state =
+      GuestExecutionSessionInitialOuterCallState::kActive;
+  participant.boundary_arrival_kind =
+      GuestExecutionSessionBoundaryArrivalKind::kJitSafepoint;
+  participant.first_event_sequence = options.participant_first_event;
+  participant.last_event_sequence = 5;
+  participant.held_after_event_sequence = 5;
+  participant.initial_state_size = initial_state_bytes.size();
+  participant.initial_state_sha256 = initial_state;
+  manifest.participants.push_back(participant);
+  manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                   bundle.chunks[0]));
+  manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCodeCorpus, 1, 0, 0, 1,
+                   bundle.chunks[1]));
+  manifest.chunks.push_back(ReferenceFor(
+      GuestExecutionSessionChunkKind::kEvents, 2, 1, 6, 6, bundle.chunks[2]));
+  manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kContinuousEvents, 3, 1, 6,
+                   6, bundle.chunks[3]));
+  manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kSchedulerTopology, 4, 0, 0,
+                   1, bundle.chunks[4]));
+  manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kSchedulerTopology, 5, 6, 6,
+                   1, bundle.chunks[5]));
+  manifest.chunks.push_back(
+      ReferenceFor(GuestExecutionSessionChunkKind::kCheckpoint, 6, 6, 6, 1,
+                   bundle.chunks[6]));
+  std::reverse(bundle.content_blobs.begin(), bundle.content_blobs.end());
+  return bundle;
+}
+
+}  // namespace
+
+TEST_CASE("session bundle admits a blocked export replay route",
+          "[guest-execution-session-bundle]") {
+  const GuestExecutionSessionBundle bundle = MakeBlockedExportBundle();
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                      bundle.chunks, &error));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  REQUIRE(error.empty());
+}
+
+TEST_CASE("session bundle proves every blocked export obligation",
+          "[guest-execution-session-bundle]") {
+  std::string error;
+  const auto require_rejected = [&error](
+                                    const GuestExecutionSessionBundle& bundle,
+                                    std::string_view text) {
+    error.clear();
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(error.find(text) != std::string::npos);
+  };
+
+  SECTION("a final-boundary blocked participant has no route") {
+    BlockedExportOptions options;
+    options.blocked_final_topology = true;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "final blocked export has no durable replay route");
+  }
+  SECTION("an alertable wait is outside the modeled allowlist") {
+    BlockedExportOptions options;
+    options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagAlertable;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "blocked-export wait is outside the modeled allowlist");
+  }
+  SECTION("an APC-pending wait is outside the modeled allowlist") {
+    BlockedExportOptions options;
+    options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagAlertable |
+                          kGuestExecutionSessionSchedulerWaitFlagUserApcPending;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "blocked-export wait is outside the modeled allowlist");
+  }
+  SECTION("a delay wait is outside the modeled allowlist") {
+    BlockedExportOptions options;
+    options.wait_kind = GuestExecutionSessionSchedulerWaitKind::kDelay;
+    options.wait_handle_count = 0;
+    options.wait_deadline_ms = 1000;
+    options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagGated;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "blocked-export wait is outside the modeled allowlist");
+  }
+  SECTION("a multi-object wait stays inside the modeled allowlist") {
+    BlockedExportOptions options;
+    options.wait_kind = GuestExecutionSessionSchedulerWaitKind::kMultiAny;
+    options.wait_handle_count = 2;
+    error.clear();
+    REQUIRE(ValidateGuestExecutionSessionBundle(
+        MakeBlockedExportBundle(options), &error));
+  }
+  SECTION("a pending sequence past the interval rejects") {
+    BlockedExportOptions options;
+    options.pending_sequence = 9;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "pending event is outside the captured interval");
+  }
+  SECTION("the boundary-held sequence is not inside the interval") {
+    BlockedExportOptions options;
+    options.pending_sequence = 6;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "pending event is outside the captured interval");
+  }
+  SECTION("a pending sequence naming another event rejects") {
+    BlockedExportOptions options;
+    options.pending_sequence = 3;
+    options.participant_first_event = 3;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "pending event does not name the participant's export");
+  }
+  SECTION("an export owned by no participant rejects") {
+    BlockedExportOptions options;
+    options.export_event_thread = kGuestExecutionSessionNoThread;
+    options.participant_first_event = 3;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "pending event does not name the participant's export");
+  }
+  SECTION("a deterministic export disposition rejects") {
+    BlockedExportOptions options;
+    options.export_disposition =
+        GuestExecutionSessionEventDisposition::kValidateDeterministic;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "pending event does not name the participant's export");
+  }
+  SECTION("an export at a different thunk rejects") {
+    BlockedExportOptions options;
+    options.checkpoint_export_address = 0x820000C0;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "pending event does not name the participant's export");
+  }
+  SECTION("the export is not the participant's first captured event") {
+    BlockedExportOptions options;
+    options.participant_first_event = 3;
+    require_rejected(
+        MakeBlockedExportBundle(options),
+        "pending event is not the participant's first captured event");
+  }
+  SECTION("a wake witnessed by a block rather than a reready rejects") {
+    BlockedExportOptions options;
+    options.witness_kind = 8;  // kBlock
+    require_rejected(MakeBlockedExportBundle(options),
+                     "wake has no kReready witness before its export event");
+  }
+  SECTION("a wake witnessing another participant rejects") {
+    BlockedExportOptions options;
+    options.witness_thread_id = 9;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "wake has no kReready witness before its export event");
+  }
+  SECTION("a polled wake reason is not modeled") {
+    BlockedExportOptions options;
+    options.witness_reason = 10;  // kPolled
+    require_rejected(MakeBlockedExportBundle(options),
+                     "wake reason is not modeled");
+  }
+  SECTION("a user-APC wake reason is not modeled") {
+    BlockedExportOptions options;
+    options.witness_reason = 13;  // kUserApc
+    require_rejected(MakeBlockedExportBundle(options),
+                     "wake reason is not modeled");
+  }
+  SECTION("a version-1 witness payload is unreadable") {
+    BlockedExportOptions options;
+    options.witness_payload_is_v1 = true;
+    require_rejected(MakeBlockedExportBundle(options),
+                     "witness payload is unreadable");
+  }
+  SECTION("a deadline wake is modeled") {
+    BlockedExportOptions options;
+    options.witness_reason = 12;  // kDeadline
+    error.clear();
+    REQUIRE(ValidateGuestExecutionSessionBundle(
+        MakeBlockedExportBundle(options), &error));
+  }
 }
 
 }  // namespace test

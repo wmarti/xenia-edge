@@ -889,6 +889,16 @@ class FakeCheckpointController final
       held_snapshot = provisional;
       held_snapshot.participants.front().guest_pc =
           current_pause == 1 ? start_guest_pc : stop_guest_pc;
+      if (current_pause == 1 ? blocked_at_start : blocked_at_stop) {
+        auto& row = held_snapshot.participants.front();
+        row.state = kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
+        row.resume_kind =
+            kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+        row.restorable = false;
+        row.blocked_wait_kind = blocked_wait_kind;
+        row.blocked_wait.handle_count = blocked_wait_handle_count;
+        row.blocked_wait.flags = blocked_wait_flags;
+      }
     }
     const uint32_t failure_limit = pause_failure_limit.load();
     if (pause_result != CheckpointRejection::kNone &&
@@ -971,6 +981,12 @@ class FakeCheckpointController final
   bool cancel_always_keeps_active = false;
   uint32_t start_guest_pc = kResumePc;
   uint32_t stop_guest_pc = kResumePc;
+  bool blocked_at_start = false;
+  bool blocked_at_stop = false;
+  kernel::GuestSchedulerCaptureWaitKind blocked_wait_kind =
+      kernel::GuestSchedulerCaptureWaitKind::kSingle;
+  uint8_t blocked_wait_handle_count = 1;
+  uint8_t blocked_wait_flags = 0;
   std::atomic<uint32_t> block_pause_number{0};
   uint32_t cancel_failures = 0;
   std::atomic<uint32_t> pause_count{0};
@@ -1428,6 +1444,86 @@ TEST_CASE("session capture runtime rejects a retained export event log",
   REQUIRE(status.external_event_log_attached);
   REQUIRE(environment.processor->guest_execution_capture_external_event_log() ==
           log);
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime binds initial state to a blocked export",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.blocked_at_start = true;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kBundleValidation);
+  // A block-head route is not the pending-extern route this class needs.
+  REQUIRE(status.message.find(
+              "initial PPC continuation differs from the held scheduler "
+              "blocked export") != std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime refuses an unmodeled blocked export wait",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.blocked_at_start = true;
+  harness.checkpoint.blocked_wait_kind =
+      kernel::GuestSchedulerCaptureWaitKind::kDelay;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kBundleValidation);
+  REQUIRE(status.message.find(
+              "blocked-export wait is outside the modeled allowlist") !=
+          std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime refuses a final blocked export",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.blocked_at_stop = true;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  // The export this participant waits on returns after the interval, so no
+  // captured event can witness its route.
+  REQUIRE(status.message.find("final blocked-export participant has no "
+                              "durable replay route") != std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
   thread.reset();
 }
 

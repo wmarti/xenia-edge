@@ -57,6 +57,40 @@ static_assert(static_cast<uint32_t>(CaptureKind::kEnqueueReady) == 1 &&
               static_cast<uint32_t>(CaptureKind::kResume) == 11 &&
               static_cast<uint32_t>(CaptureKind::kPriorityChange) == 12 &&
               static_cast<uint32_t>(CaptureKind::kMigrate) == 13);
+
+// The session validator decodes these durable identifiers without the kernel
+// enumerations, so the two spellings are pinned to each other here.
+static_assert(
+    static_cast<uint32_t>(CaptureKind::kBlock) ==
+        static_cast<uint32_t>(GuestExecutionSessionSchedulerEventKind::kBlock),
+    "durable scheduler block identifier drifted");
+static_assert(static_cast<uint32_t>(CaptureKind::kReready) ==
+                  static_cast<uint32_t>(
+                      GuestExecutionSessionSchedulerEventKind::kReready),
+              "durable scheduler reready identifier drifted");
+static_assert(static_cast<uint32_t>(CaptureReason::kPolled) ==
+                  static_cast<uint32_t>(
+                      GuestExecutionSessionSchedulerEventReason::kPolled),
+              "durable scheduler polled reason drifted");
+static_assert(static_cast<uint32_t>(CaptureReason::kSignalEpoch) ==
+                  static_cast<uint32_t>(
+                      GuestExecutionSessionSchedulerEventReason::kSignalEpoch),
+              "durable scheduler signal-epoch reason drifted");
+static_assert(static_cast<uint32_t>(CaptureReason::kDeadline) ==
+                  static_cast<uint32_t>(
+                      GuestExecutionSessionSchedulerEventReason::kDeadline),
+              "durable scheduler deadline reason drifted");
+static_assert(static_cast<uint32_t>(CaptureReason::kUserApc) ==
+                  static_cast<uint32_t>(
+                      GuestExecutionSessionSchedulerEventReason::kUserApc),
+              "durable scheduler user-APC reason drifted");
+static_assert(static_cast<uint32_t>(CaptureReason::kBackstop) ==
+                  static_cast<uint32_t>(
+                      GuestExecutionSessionSchedulerEventReason::kBackstop),
+              "durable scheduler backstop reason drifted");
+static_assert(GuestExecutionSessionCaptureSchedulerEventBridge::
+                      kSchedulerPayloadVersion == 2,
+              "durable scheduler payload version drifted");
 constexpr uint16_t kKnownCaptureFlags =
     kernel::kGuestSchedulerCaptureFlagAtHead |
     kernel::kGuestSchedulerCaptureFlagYieldToOther |

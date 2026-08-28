@@ -190,6 +190,31 @@ bool IsBlockedParityWait(kernel::GuestSchedulerCaptureWaitKind kind,
   return !wait.deadline_ms || wait.deadline_ms > wait.observed_uptime_ms;
 }
 
+bool IsBlockedExportParticipant(const CheckpointParticipant& participant) {
+  return !participant.restorable && participant.guest_pc &&
+         !(participant.guest_pc & 3) &&
+         participant.state ==
+             kernel::GuestSchedulerCheckpointParticipantState::kBlocked &&
+         participant.resume_kind == CheckpointResumeKind::kAfterBlockingExport;
+}
+
+// The provider's admission allowlist, re-derived here so publication does not
+// take the encoded route's word for what kind of wait it came from.
+bool IsBlockedExportWaitInAllowlist(const CheckpointParticipant& participant) {
+  const bool modeled_kind =
+      participant.blocked_wait_kind ==
+          kernel::GuestSchedulerCaptureWaitKind::kSingle ||
+      participant.blocked_wait_kind ==
+          kernel::GuestSchedulerCaptureWaitKind::kMultiAny ||
+      participant.blocked_wait_kind ==
+          kernel::GuestSchedulerCaptureWaitKind::kMultiAll;
+  const uint8_t refused_flags =
+      kernel::kGuestSchedulerCaptureWaitFlagAlertable |
+      kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
+  return modeled_kind && participant.blocked_wait.handle_count &&
+         !(participant.blocked_wait.flags & refused_flags);
+}
+
 bool CurrentTitleCaptureConfig(GuestExecutionSessionTitleCaptureConfig* output,
                                std::string* error) noexcept {
   if (!output) {
@@ -289,7 +314,7 @@ bool ValidateRuntimeCheckpointStateBindings(
     const GuestExecutionSessionBundle& bundle,
     const GuestExecutionSessionCheckpointChunk& checkpoint,
     const CheckpointSnapshot& scheduler_checkpoint, const char* boundary,
-    std::string* error) {
+    bool initial_boundary, std::string* error) {
   if (checkpoint.checkpoint.thread_states.size() !=
           bundle.manifest.participants.size() ||
       scheduler_checkpoint.participants.size() >
@@ -353,6 +378,30 @@ bool ValidateRuntimeCheckpointStateBindings(
         return Fail(error, std::string("capture runtime ") + boundary +
                                " passive scheduler participant has an "
                                "executable PPC continuation");
+      }
+      continue;
+    }
+    if (IsBlockedExportParticipant(*scheduler_participant)) {
+      // The route names an export event that completes the wait. Only the
+      // start boundary can have one on the tape.
+      if (!initial_boundary) {
+        return Fail(error,
+                    "capture runtime final blocked-export participant has no "
+                    "durable replay route");
+      }
+      if (!IsBlockedExportWaitInAllowlist(*scheduler_participant)) {
+        return Fail(error,
+                    "capture runtime blocked-export wait is outside the "
+                    "modeled allowlist");
+      }
+      if (decoded.resume_kind !=
+              ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern ||
+          decoded.resume_pc != scheduler_participant->guest_pc ||
+          !decoded.pending_external_event_sequence ||
+          !decoded.pending_export_guest_address) {
+        return Fail(error,
+                    "capture runtime initial PPC continuation differs from the "
+                    "held scheduler blocked export");
       }
       continue;
     }
@@ -451,10 +500,10 @@ bool ValidateRuntimePublicationBundle(
           bundle.manifest.last_event_sequence ||
       !ValidateRuntimeCheckpointStateBindings(bundle, initial_checkpoint,
                                               initial_scheduler_checkpoint,
-                                              "initial", error) ||
+                                              "initial", true, error) ||
       !ValidateRuntimeCheckpointStateBindings(bundle, final_checkpoint,
                                               final_scheduler_checkpoint,
-                                              "final", error)) {
+                                              "final", false, error)) {
     if (error && !error->empty()) {
       return false;
     }
@@ -470,6 +519,9 @@ bool ValidateRuntimePublicationBundle(
     const CheckpointParticipant* scheduler_participant =
         FindCheckpointParticipant(final_scheduler_checkpoint,
                                   participant.guest_thread_id);
+    // A pending modeled blocking-export route cannot be a final-boundary route
+    // at all, so it never carries a final overlay binding of its own; the
+    // requirement stays keyed to the final boundary's restorable JIT class.
     participant_binding_required[participant.ordinal] =
         scheduler_participant &&
         IsRestorableJitParticipant(*scheduler_participant);
@@ -1678,7 +1730,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
   }
 
   bool ArriveActiveParticipants(const CheckpointSnapshot& checkpoint,
-                                std::string* error) {
+                                bool start_rendezvous, std::string* error) {
     for (const auto& participant : assembler->status().participants) {
       if (!participant.host_call_depth || participant.arrived ||
           participant.held) {
@@ -1687,10 +1739,19 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       const CheckpointParticipant* checkpoint_participant =
           FindCheckpointParticipant(checkpoint,
                                     participant.identity.guest_thread_id);
-      if (!checkpoint_participant ||
-          checkpoint_participant->resume_kind !=
-              CheckpointResumeKind::kJitSafepoint ||
-          !checkpoint_participant->restorable) {
+      // At the start rendezvous the arrival records only that the outer call
+      // is active, which is true of a thread parked inside a modeled export.
+      // At the stop it would emit a JIT safepoint arrival for a thread that
+      // never reached one, and a participant still blocked there has no
+      // durable route either way.
+      const bool blocked_in_export =
+          start_rendezvous && checkpoint_participant &&
+          IsBlockedExportParticipant(*checkpoint_participant) &&
+          IsBlockedExportWaitInAllowlist(*checkpoint_participant);
+      if (!blocked_in_export && (!checkpoint_participant ||
+                                 checkpoint_participant->resume_kind !=
+                                     CheckpointResumeKind::kJitSafepoint ||
+                                 !checkpoint_participant->restorable)) {
         return Fail(error,
                     "capture runtime cannot represent a non-safepoint active "
                     "outer call");
@@ -2132,7 +2193,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       Reject(RuntimeRejection::kAssemblerFailure, assembler->status().message);
       return;
     }
-    if (!ArriveActiveParticipants(provisional, &error) ||
+    if (!ArriveActiveParticipants(provisional, true, &error) ||
         assembler->status().state != AssemblerState::kRecording) {
       Reject(RuntimeRejection::kAssemblerFailure,
              error.empty() ? assembler->status().message : std::move(error));
@@ -2385,7 +2446,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       Reject(RuntimeRejection::kCheckpointRoster, std::move(error));
       return;
     }
-    if (!ArriveActiveParticipants(provisional, &error)) {
+    if (!ArriveActiveParticipants(provisional, false, &error)) {
       Reject(RuntimeRejection::kAssemblerFailure, std::move(error));
       return;
     }

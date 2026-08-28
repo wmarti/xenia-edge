@@ -472,6 +472,26 @@ struct GuestExecutionSessionSchedulerTopologyChunk {
 bool IsGuestExecutionSessionBlockedParityParticipant(
     const GuestExecutionSessionSchedulerTopologyParticipant& participant);
 
+// Durable scheduler tape identifiers carried inside a canonical
+// kThreadDispatch/kSynchronization payload. Only the values a validator has to
+// recognize are named here; the capture-side encoder static-asserts them
+// against kernel::GuestSchedulerCaptureEventKind and
+// kernel::GuestSchedulerCaptureReason so the two cannot drift.
+enum class GuestExecutionSessionSchedulerEventKind : uint32_t {
+  kNone = 0,
+  kBlock = 8,
+  kReready = 9,
+};
+
+enum class GuestExecutionSessionSchedulerEventReason : uint32_t {
+  kNone = 0,
+  kPolled = 10,
+  kSignalEpoch = 11,
+  kDeadline = 12,
+  kUserApc = 13,
+  kBackstop = 14,
+};
+
 // Decoder limits are caller-selectable so capture policy can be stricter than
 // the format maxima and tests can prove that limits reject rather than slice.
 struct GuestExecutionSessionLimits {
@@ -610,13 +630,16 @@ class GuestExecutionSessionCodec {
       GuestExecutionSessionEventKind kind, const uint8_t* data,
       size_t data_size,
       const std::vector<GuestExecutionSessionParticipant>& participants,
-      uint32_t* subject_ordinal, std::string* error = nullptr);
+      uint32_t* subject_ordinal, std::string* error = nullptr,
+      uint32_t* record_kind = nullptr, uint32_t* record_reason = nullptr);
   static bool ResolveSchedulerEventSubject(
       GuestExecutionSessionEventKind kind, const std::vector<uint8_t>& data,
       const std::vector<GuestExecutionSessionParticipant>& participants,
-      uint32_t* subject_ordinal, std::string* error = nullptr) {
+      uint32_t* subject_ordinal, std::string* error = nullptr,
+      uint32_t* record_kind = nullptr, uint32_t* record_reason = nullptr) {
     return ResolveSchedulerEventSubject(kind, data.data(), data.size(),
-                                        participants, subject_ordinal, error);
+                                        participants, subject_ordinal, error,
+                                        record_kind, record_reason);
   }
 
   // Fully decodes and binds each supplied chunk to the corresponding manifest

@@ -401,6 +401,22 @@ bool CollectRequiredBlobs(
   return true;
 }
 
+// The wait classes whose link register is the export's single return point.
+// A delay, a fence or spin poll and the I/O classes reach it once per poll
+// rather than once per export, and an alertable or APC-pending wait can run
+// guest code on the waiting thread's stack before the export returns.
+bool IsModeledBlockingExportWait(
+    const GuestExecutionSessionSchedulerBlockedWaitBinding& wait) {
+  const bool modeled_kind =
+      wait.kind == GuestExecutionSessionSchedulerWaitKind::kSingle ||
+      wait.kind == GuestExecutionSessionSchedulerWaitKind::kMultiAny ||
+      wait.kind == GuestExecutionSessionSchedulerWaitKind::kMultiAll;
+  const uint32_t refused_flags =
+      kGuestExecutionSessionSchedulerWaitFlagAlertable |
+      kGuestExecutionSessionSchedulerWaitFlagUserApcPending;
+  return modeled_kind && wait.handle_count && !(wait.flags & refused_flags);
+}
+
 struct ValidatedBundle {
   std::vector<uint8_t> manifest_bytes;
   std::map<GuestExecutionSessionSha256, RequiredBlob> requirements;
@@ -444,6 +460,120 @@ bool ValidateContinuousCheckpointBlobs(
                     "continuous event checkpoint blob or subject is invalid: " +
                         checkpoint_error);
       }
+    }
+  }
+  return true;
+}
+
+// A blocked-export route claims that a recorded export completed the
+// participant's wait inside this interval. Prove every part of that claim from
+// the tape: the named event exists, it is that participant's export, it is the
+// first thing the participant did, and a modeled reready released the wait
+// before it.
+bool ValidateBlockedExportRoutes(
+    const GuestExecutionSessionBundle& bundle, const ValidatedBundle& validated,
+    const GuestExecutionSessionSchedulerTopologyChunk& start_topology,
+    const GuestExecutionSessionCheckpointChunk& initial_checkpoint,
+    const std::vector<GuestExecutionSessionEvent>& canonical_events,
+    std::string* error) {
+  for (const GuestExecutionSessionSchedulerTopologyParticipant& participant :
+       start_topology.participants) {
+    if (participant.resume_kind !=
+        GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport) {
+      continue;
+    }
+    if (participant.ordinal >= bundle.manifest.participants.size() ||
+        participant.ordinal >=
+            initial_checkpoint.checkpoint.thread_states.size()) {
+      return Fail(error, "scheduler blocked-export participant is unknown");
+    }
+    const GuestExecutionSessionParticipant& durable =
+        bundle.manifest.participants[participant.ordinal];
+    const GuestExecutionSessionThreadStateReference& reference =
+        initial_checkpoint.checkpoint.thread_states[participant.ordinal];
+    const auto blob = validated.blobs.find(reference.sha256);
+    ppc::GuestPPCThreadCheckpoint decoded;
+    if (blob == validated.blobs.end() ||
+        !ppc::GuestPPCThreadCheckpointCodec::Decode(blob->second->bytes,
+                                                    &decoded, error)) {
+      return Fail(error, "scheduler blocked-export start state is unreadable");
+    }
+    const uint64_t pending = decoded.pending_external_event_sequence;
+    if (pending < bundle.manifest.first_event_sequence ||
+        pending >= bundle.manifest.last_event_sequence ||
+        pending - bundle.manifest.first_event_sequence >=
+            canonical_events.size()) {
+      return Fail(error,
+                  "scheduler blocked-export pending event is outside the "
+                  "captured interval");
+    }
+    const GuestExecutionSessionEvent& pending_event =
+        canonical_events[static_cast<size_t>(
+            pending - bundle.manifest.first_event_sequence)];
+    const bool modeled_extern =
+        pending_event.kind == GuestExecutionSessionEventKind::kKernelExport ||
+        pending_event.kind == GuestExecutionSessionEventKind::kExternOrBuiltin;
+    if (pending_event.global_sequence != pending || !modeled_extern ||
+        pending_event.disposition !=
+            GuestExecutionSessionEventDisposition::kReplayCaptured ||
+        pending_event.thread_ordinal != participant.ordinal ||
+        pending_event.guest_address != decoded.pending_export_guest_address) {
+      return Fail(error,
+                  "scheduler blocked-export pending event does not name the "
+                  "participant's export");
+    }
+    if (durable.first_event_sequence != pending) {
+      return Fail(error,
+                  "scheduler blocked-export pending event is not the "
+                  "participant's first captured event");
+    }
+    // The last scheduler transition this participant was the subject of before
+    // its export returned is the wake that released the wait.
+    bool has_witness = false;
+    uint32_t witness_kind = 0;
+    uint32_t witness_reason = 0;
+    for (size_t index = 0;
+         index <
+         static_cast<size_t>(pending - bundle.manifest.first_event_sequence);
+         ++index) {
+      const GuestExecutionSessionEvent& event = canonical_events[index];
+      if (event.kind != GuestExecutionSessionEventKind::kThreadDispatch &&
+          event.kind != GuestExecutionSessionEventKind::kSynchronization) {
+        continue;
+      }
+      const auto payload = validated.blobs.find(event.payload_sha256);
+      uint32_t subject_ordinal = kGuestExecutionSessionNoThread;
+      uint32_t raw_kind = 0;
+      uint32_t raw_reason = 0;
+      if (payload == validated.blobs.end() ||
+          !GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
+              event.kind, payload->second->bytes, bundle.manifest.participants,
+              &subject_ordinal, nullptr, &raw_kind, &raw_reason)) {
+        return Fail(error,
+                    "scheduler blocked-export witness payload is unreadable");
+      }
+      if (subject_ordinal != participant.ordinal) {
+        continue;
+      }
+      witness_kind = raw_kind;
+      witness_reason = raw_reason;
+      has_witness = true;
+    }
+    if (!has_witness ||
+        witness_kind !=
+            static_cast<uint32_t>(
+                GuestExecutionSessionSchedulerEventKind::kReready)) {
+      return Fail(error,
+                  "scheduler blocked-export wake has no kReready witness "
+                  "before its export event");
+    }
+    if (witness_reason !=
+            static_cast<uint32_t>(
+                GuestExecutionSessionSchedulerEventReason::kSignalEpoch) &&
+        witness_reason !=
+            static_cast<uint32_t>(
+                GuestExecutionSessionSchedulerEventReason::kDeadline)) {
+      return Fail(error, "scheduler blocked-export wake reason is not modeled");
     }
   }
   return true;
@@ -493,6 +623,7 @@ bool ValidateSchedulerTopologyCheckpointBindings(
   }
   std::set<uint32_t> guest_execution_actors;
   std::set<uint32_t> scheduler_event_subjects;
+  std::vector<GuestExecutionSessionEvent> canonical_events;
   for (size_t index = 0; index < bundle.chunks.size(); ++index) {
     if (bundle.manifest.chunks[index].kind !=
         GuestExecutionSessionChunkKind::kEvents) {
@@ -523,9 +654,12 @@ bool ValidateSchedulerTopologyCheckpointBindings(
         guest_execution_actors.insert(event.thread_ordinal);
       }
     }
+    canonical_events.insert(canonical_events.end(), events.events.cbegin(),
+                            events.events.cend());
   }
   auto validate_boundary = [&](const auto& topology, const auto& checkpoint,
                                std::string_view boundary) {
+    const bool start_boundary = boundary == "start";
     if (topology.participants.size() !=
         checkpoint.checkpoint.thread_states.size()) {
       return Fail(error,
@@ -571,8 +705,36 @@ bool ValidateSchedulerTopologyCheckpointBindings(
           }
           break;
         case GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport:
-          return Fail(error, std::string("scheduler ") + std::string(boundary) +
-                                 " blocked export has no typed replay route");
+          // Start boundary only. A participant still parked at the final
+          // boundary waits for an export that returns after the interval, so
+          // no captured event can witness its route.
+          if (!start_boundary) {
+            return Fail(error,
+                        "scheduler final blocked export has no durable replay "
+                        "route");
+          }
+          if (decoded.resume_kind != ppc::GuestPPCThreadResumeKind::
+                                         kPendingModeledBlockingExtern ||
+              decoded.resume_pc != participant.guest_pc) {
+            return Fail(error,
+                        "scheduler start topology blocked-export route differs "
+                        "from PPC");
+          }
+          // Session validation already refuses this shape; repeated here so
+          // the route arm does not depend on the order it runs in.
+          if (participant.restorable ||
+              participant.state !=
+                  GuestExecutionSessionSchedulerParticipantState::kBlocked) {
+            return Fail(error,
+                        "scheduler start blocked-export topology row is not a "
+                        "blocked participant");
+          }
+          if (!IsModeledBlockingExportWait(participant.blocked_wait)) {
+            return Fail(error,
+                        "scheduler start blocked-export wait is outside the "
+                        "modeled allowlist");
+          }
+          break;
         case GuestExecutionSessionSchedulerResumeKind::kNativeContinuation:
         case GuestExecutionSessionSchedulerResumeKind::kNotYetRun:
           if (participant.restorable || participant.guest_pc ||
@@ -594,6 +756,11 @@ bool ValidateSchedulerTopologyCheckpointBindings(
   };
   if (!validate_boundary(start_topology, initial_checkpoint, "start") ||
       !validate_boundary(final_topology, final_checkpoint, "final")) {
+    return false;
+  }
+  if (!ValidateBlockedExportRoutes(bundle, validated, start_topology,
+                                   initial_checkpoint, canonical_events,
+                                   error)) {
     return false;
   }
   for (size_t ordinal = 0; ordinal < start_topology.participants.size();

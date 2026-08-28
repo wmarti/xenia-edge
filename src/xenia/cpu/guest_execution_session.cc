@@ -2595,11 +2595,18 @@ bool GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
 bool GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
     GuestExecutionSessionEventKind kind, const uint8_t* data, size_t data_size,
     const std::vector<GuestExecutionSessionParticipant>& participants,
-    uint32_t* subject_ordinal, std::string* error) {
+    uint32_t* subject_ordinal, std::string* error, uint32_t* record_kind,
+    uint32_t* record_reason) {
   if (!subject_ordinal) {
     return Fail(error, "scheduler event subject output is null");
   }
   *subject_ordinal = kGuestExecutionSessionNoThread;
+  if (record_kind) {
+    *record_kind = 0;
+  }
+  if (record_reason) {
+    *record_reason = 0;
+  }
   if (error) {
     error->clear();
   }
@@ -2616,14 +2623,14 @@ bool GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
   Reader reader(data, data_size);
   std::array<uint8_t, 8> magic = {};
   uint32_t version = 0;
-  uint32_t record_kind = 0;
+  uint32_t record_kind_value = 0;
   uint64_t sequence = 0;
   uint64_t capture_instance_id = 0;
   uint32_t guest_thread_id = 0;
   if (!reader.ReadBytes(magic.data(), magic.size()) ||
       magic != kSchedulerEventPayloadMagic || !reader.ReadU32(&version) ||
       version != kSchedulerEventPayloadVersion ||
-      !reader.ReadU32(&record_kind) || !reader.ReadU64(&sequence) ||
+      !reader.ReadU32(&record_kind_value) || !reader.ReadU64(&sequence) ||
       !reader.ReadU64(&capture_instance_id) ||
       !reader.ReadU32(&guest_thread_id) || !sequence || !capture_instance_id ||
       !guest_thread_id) {
@@ -2632,7 +2639,7 @@ bool GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
   // Durable kernel::GuestSchedulerCaptureEventKind tape identifiers; the
   // declaring header is compiled out of capture-disabled builds.
   GuestExecutionSessionEventKind canonical_kind;
-  switch (record_kind) {
+  switch (record_kind_value) {
     case 7:   // kSafepoint
     case 8:   // kBlock
     case 9:   // kReready
@@ -2657,10 +2664,19 @@ bool GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
     return Fail(
         error, "scheduler event payload kind differs from its canonical event");
   }
+  // The reason byte the capture bridge writes beside the record kind; the
+  // event-bridge static_asserts pin both spellings.
+  constexpr size_t kRecordReasonOffset = 42;
   for (const GuestExecutionSessionParticipant& participant : participants) {
     if (participant.capture_instance_id == capture_instance_id &&
         participant.guest_thread_id == guest_thread_id) {
       *subject_ordinal = participant.ordinal;
+      if (record_kind) {
+        *record_kind = record_kind_value;
+      }
+      if (record_reason) {
+        *record_reason = data[kRecordReasonOffset];
+      }
       return true;
     }
   }
