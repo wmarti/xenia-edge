@@ -397,7 +397,8 @@ bool BuildSyntheticGuestInvocationFixture(
   GuestInvocationReplayPlan plan;
   if (!BuildGuestInvocationReplayPlan(fixture.valid_invocation, fixture.corpus,
                                       host_page_size, &plan, error) ||
-      plan.reset_page_addresses.size() != closure_page_count) {
+      plan.reset_page_addresses.size() !=
+          fixture.valid_invocation.expected_dirty_pages.size()) {
     return Fail(error, "synthetic valid invocation has an invalid reset plan");
   }
   if (!BuildGuestInvocationReplayPlan(fixture.omitted_page_fault_invocation,

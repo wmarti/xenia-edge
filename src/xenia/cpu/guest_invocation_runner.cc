@@ -370,7 +370,6 @@ struct SuppliedPageFlags {
 
 struct GranuleFlags {
   bool writable = false;
-  bool dirty = false;
 };
 
 #if XE_PLATFORM_MAC
@@ -617,7 +616,6 @@ bool BuildGuestInvocationReplayPlan(
     const uint32_t granule_address = address & ~(host_page_size - 1);
     GranuleFlags& granule = granules[granule_address];
     granule.writable |= flags.data;
-    granule.dirty |= flags.dirty;
   }
 
   for (const auto& granule_entry : granules) {
@@ -650,13 +648,13 @@ bool BuildGuestInvocationReplayPlan(
   for (const auto& [address, flags] : granules) {
     plan.protection_granules.push_back(GuestInvocationReplayProtectionGranule{
         address, host_page_size, flags.writable});
+  }
+  // Protection is granule-wide but the capture records what the invocation
+  // writes a page at a time, and a page it writes without saying so fails
+  // verification whether or not the reset restored it.
+  for (const auto& [address, flags] : supplied_pages) {
     if (flags.dirty) {
-      const uint64_t granule_end = uint64_t(address) + host_page_size;
-      for (uint64_t page_address = address; page_address < granule_end;
-           page_address += kGuestPageSize) {
-        plan.reset_page_addresses.push_back(
-            static_cast<uint32_t>(page_address));
-      }
+      plan.reset_page_addresses.push_back(address);
     }
   }
   *output = std::move(plan);

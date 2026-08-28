@@ -341,9 +341,9 @@ TEST_CASE("guest invocation planner derives closed reset and access sets",
   REQUIRE(plan.eager_guest_code_bytes == 16);
   REQUIRE(plan.captured_host_code_bytes == 64);
   REQUIRE(plan.supplied_page_addresses.size() == 8);
-  REQUIRE(plan.reset_page_addresses ==
-          std::vector<uint32_t>{kDataAddress, kDataAddress + 0x1000,
-                                kDataAddress + 0x2000, kDataAddress + 0x3000});
+  // The granule is protected whole because that is the only granularity the
+  // host offers; the reset covers only the page the capture recorded.
+  REQUIRE(plan.reset_page_addresses == std::vector<uint32_t>{kDataAddress});
   REQUIRE(
       plan.protection_granules ==
       std::vector<GuestInvocationReplayProtectionGranule>{
@@ -362,7 +362,7 @@ TEST_CASE("guest invocation planner accepts known corpus configuration",
                                          &error));
   REQUIRE(error.empty());
   REQUIRE(plan.supplied_page_addresses.size() == 8);
-  REQUIRE(plan.reset_page_addresses.size() == 4);
+  REQUIRE(plan.reset_page_addresses.size() == 1);
   REQUIRE(plan.protection_granules.size() == 2);
 
 #if XE_PLATFORM_MAC && XE_ARCH_ARM64
@@ -568,9 +568,8 @@ TEST_CASE("guest invocation runner executes and verifies a real backend",
   REQUIRE(metrics.reset_only_uptime_raw_nanoseconds > 0);
   REQUIRE(metrics.placement_generation_before ==
           metrics.placement_generation_after);
-  REQUIRE(metrics.reset_page_count_per_invocation ==
-          xe::memory::page_size() / JitCorpus::kPageSize);
-  REQUIRE(metrics.reset_bytes_per_invocation == xe::memory::page_size());
+  REQUIRE(metrics.reset_page_count_per_invocation == 1);
+  REQUIRE(metrics.reset_bytes_per_invocation == JitCorpus::kPageSize);
   REQUIRE(metrics.code_shape.function_count == 1);
   REQUIRE(metrics.code_shape.host_instruction_count > 0);
 #endif  // !XE_PLATFORM_MAC || !XE_ARCH_ARM64

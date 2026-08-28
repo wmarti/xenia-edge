@@ -55,7 +55,8 @@ TEST_CASE("synthetic invocation fixture closes each supported host granule",
                                            fixture.corpus, host_page_size,
                                            &plan, &error));
     REQUIRE(plan.supplied_page_addresses.size() == closure_page_count * 2);
-    REQUIRE(plan.reset_page_addresses.size() == closure_page_count);
+    REQUIRE(plan.reset_page_addresses.size() ==
+            fixture.valid_invocation.expected_dirty_pages.size());
     REQUIRE(plan.protection_granules.size() == 2);
 
     REQUIRE(fixture.omitted_page_fault_invocation.input_data_pages.empty());

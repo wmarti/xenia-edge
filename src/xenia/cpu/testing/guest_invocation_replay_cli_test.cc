@@ -79,6 +79,7 @@ TEST_CASE("Guest invocation benchmark marker is canonical",
 
   GuestInvocationReplayMetrics metrics;
   metrics.timed_invocation_count = 17;
+  metrics.timed_batch_count = 3;
   metrics.reset_page_count_per_invocation = 2;
   metrics.reset_bytes_per_invocation = 8192;
   metrics.thread_cpu_nanoseconds = 123456;
@@ -108,6 +109,7 @@ TEST_CASE("Guest invocation benchmark marker is canonical",
               "\twide_materialization_sites=7"
               "\tpc_relative_sites=11"
               "\titerations=17"
+              "\tbatches=3"
               "\treset_pages=2"
               "\treset_bytes_per_iteration=8192"
               "\tthread_cpu_ns=123456"
