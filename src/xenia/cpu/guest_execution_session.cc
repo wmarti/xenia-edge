@@ -429,7 +429,7 @@ bool IsKnownInitialOuterCallState(
   switch (state) {
     case GuestExecutionSessionInitialOuterCallState::kOutside:
     case GuestExecutionSessionInitialOuterCallState::kActive:
-    case GuestExecutionSessionInitialOuterCallState::kBlockedInExport:
+    case GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall:
       return true;
     default:
       return false;

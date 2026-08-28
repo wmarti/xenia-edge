@@ -1765,9 +1765,9 @@ TEST_CASE("Guest execution asynchronous rendezvous is fail closed", "[cpu]") {
                                                            &output, &error));
   }
 
-  SECTION("blocked-in-export outer-call state round trips unadmitted") {
+  SECTION("parked-below-outer-call state round trips unadmitted") {
     fixture.manifest.participants[0].initial_outer_call_state =
-        GuestExecutionSessionInitialOuterCallState::kBlockedInExport;
+        GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
     REQUIRE(GuestExecutionSessionCodec::EncodeManifest(fixture.manifest,
                                                        &output, &error));
     // The record is fixed width, so admitting the value cannot move the wire.
@@ -1777,9 +1777,9 @@ TEST_CASE("Guest execution asynchronous rendezvous is fail closed", "[cpu]") {
         GuestExecutionSessionCodec::DecodeManifest(output, &decoded, &error));
     CHECK(decoded == fixture.manifest);
     CHECK(decoded.participants[0].initial_outer_call_state ==
-          GuestExecutionSessionInitialOuterCallState::kBlockedInExport);
-    // The class sits below an outer host call it never arrived at, so the
-    // request reconciliation still refuses it.
+          GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall);
+    // The class holds an outer host call it never arrived at, so the request
+    // reconciliation still refuses it.
     CHECK_FALSE(GuestExecutionSessionCodec::ValidateSession(
         decoded, fixture.chunks, &error));
   }
