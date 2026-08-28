@@ -462,6 +462,12 @@ struct GuestExecutionSessionSchedulerTopologyChunk {
       default;
 };
 
+// A thread parked in a blocking export whose wait this row alone witnesses as
+// unsatisfied. Holding at both boundaries of an interval is a separate
+// obligation and is not decided here.
+bool IsGuestExecutionSessionBlockedParityParticipant(
+    const GuestExecutionSessionSchedulerTopologyParticipant& participant);
+
 // Decoder limits are caller-selectable so capture policy can be stricter than
 // the format maxima and tests can prove that limits reject rather than slice.
 struct GuestExecutionSessionLimits {

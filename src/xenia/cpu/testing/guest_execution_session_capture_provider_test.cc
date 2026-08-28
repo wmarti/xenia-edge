@@ -461,6 +461,59 @@ GuestExecutionSessionSchedulerTopologyParticipant WokenInWaitRow() {
   return participant;
 }
 
+constexpr uint32_t kWaitEpoch = 7;
+constexpr uint64_t kWaitUptimeMs = 1000;
+
+kernel::GuestSchedulerCheckpointParticipant BlockedParityParticipant() {
+  kernel::GuestSchedulerCheckpointParticipant participant;
+  participant.thread_id = kSecondThreadId;
+  participant.capture_instance_id = 2;
+  participant.guest_pc = kFunctionAddress;
+  participant.cpu = 1;
+  participant.state =
+      kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
+  participant.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+  participant.blocked_wait_kind =
+      kernel::GuestSchedulerCaptureWaitKind::kSingle;
+  participant.blocked_wait.handle_count = 1;
+  participant.blocked_wait.flags =
+      kernel::kGuestSchedulerCaptureWaitFlagGated |
+      kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
+  participant.blocked_wait.handles[0] = kWaitHandle;
+  participant.blocked_wait.wait_epoch = kWaitEpoch;
+  participant.blocked_wait.observed_wait_epoch = kWaitEpoch;
+  participant.blocked_wait.signal_epochs_before[0] = kWaitEpoch;
+  participant.blocked_wait.signal_epochs_observed[0] = kWaitEpoch;
+  participant.blocked_wait.observed_uptime_ms = kWaitUptimeMs;
+  return participant;
+}
+
+GuestExecutionSessionSchedulerTopologyParticipant BlockedParityRow() {
+  GuestExecutionSessionSchedulerTopologyParticipant participant;
+  participant.ordinal = 1;
+  participant.guest_thread_id = kSecondThreadId;
+  participant.capture_instance_id = 2;
+  participant.state = GuestExecutionSessionSchedulerParticipantState::kBlocked;
+  participant.cpu = 1;
+  participant.resume_kind =
+      GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport;
+  participant.guest_pc = kFunctionAddress;
+  participant.blocked_wait.kind =
+      GuestExecutionSessionSchedulerWaitKind::kSingle;
+  participant.blocked_wait.handle_count = 1;
+  participant.blocked_wait.flags =
+      kGuestExecutionSessionSchedulerWaitFlagGated |
+      kGuestExecutionSessionSchedulerWaitFlagInterruptible;
+  participant.blocked_wait.handles[0] = kWaitHandle;
+  participant.blocked_wait.wait_epoch = kWaitEpoch;
+  participant.blocked_wait.observed_wait_epoch = kWaitEpoch;
+  participant.blocked_wait.signal_epochs_before[0] = kWaitEpoch;
+  participant.blocked_wait.signal_epochs_observed[0] = kWaitEpoch;
+  participant.blocked_wait.observed_uptime_ms = kWaitUptimeMs;
+  return participant;
+}
+
 }  // namespace
 
 TEST_CASE(
@@ -1483,6 +1536,226 @@ TEST_CASE("guest execution session provider still gates a woken waiter",
   REQUIRE_FALSE(
       IsGuestExecutionSessionWokenInWaitCheckpointParticipant(dormant));
   REQUIRE(harness.provider->SupportsCheckpointParticipant(dormant, &error));
+}
+
+TEST_CASE("guest execution session classifies a blocked-parity checkpoint",
+          "[guest-execution-session-capture-provider]") {
+  auto participant = BlockedParityParticipant();
+  REQUIRE(
+      IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+
+  SECTION("a participant that is not blocked") {
+    participant.state =
+        kernel::GuestSchedulerCheckpointParticipantState::kReady;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("a resume kind other than after-blocking-export") {
+    participant.resume_kind =
+        kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("a restorable participant") {
+    participant.restorable = true;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("no link register") {
+    participant.guest_pc = 0;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("an unaligned link register") {
+    participant.guest_pc = kFunctionAddress + 2;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("no wait kind") {
+    participant.blocked_wait_kind =
+        kernel::GuestSchedulerCaptureWaitKind::kNone;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("more handles than the binding holds") {
+    participant.blocked_wait.handle_count = static_cast<uint8_t>(
+        kernel::kGuestSchedulerCaptureMaximumWaitHandles + 1);
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("an in-flight IRQL preemption episode") {
+    participant.preempt_defers_irql = 1;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("an in-flight lock preemption episode") {
+    participant.preempt_defers_lock = 1;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("a declined safepoint") {
+    participant.capture_declined_safepoints = 1;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("a handle-free untimed wait") {
+    participant.blocked_wait_kind =
+        kernel::GuestSchedulerCaptureWaitKind::kFence;
+    participant.blocked_wait = {};
+    participant.blocked_wait.observed_uptime_ms = kWaitUptimeMs;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("an alertable wait") {
+    participant.blocked_wait.flags |=
+        kernel::kGuestSchedulerCaptureWaitFlagAlertable;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("a pending user APC") {
+    participant.blocked_wait.flags |=
+        kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("a signal epoch that moved") {
+    participant.blocked_wait.signal_epochs_observed[0] = kWaitEpoch + 1;
+    participant.blocked_wait.observed_wait_epoch = kWaitEpoch + 1;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("a deadline the boundary has reached") {
+    participant.blocked_wait.deadline_ms = kWaitUptimeMs;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("a deadline the boundary has not reached") {
+    participant.blocked_wait.deadline_ms = kWaitUptimeMs + 1;
+    REQUIRE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+  SECTION("a timed external wait") {
+    participant.blocked_wait_kind =
+        kernel::GuestSchedulerCaptureWaitKind::kIoCompletion;
+    participant.blocked_wait = {};
+    participant.blocked_wait.handle_count = 1;
+    participant.blocked_wait.handles[0] = kWaitHandle;
+    participant.blocked_wait.flags =
+        kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
+    participant.blocked_wait.observed_uptime_ms = kWaitUptimeMs;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+    participant.blocked_wait.deadline_ms = kWaitUptimeMs + 1;
+    REQUIRE(
+        IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  }
+}
+
+TEST_CASE("guest execution session classifies a blocked-parity topology row",
+          "[guest-execution-session-capture-provider]") {
+  auto participant = BlockedParityRow();
+  REQUIRE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+
+  SECTION("a participant that is not blocked") {
+    participant.state = GuestExecutionSessionSchedulerParticipantState::kReady;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("a resume kind other than after-blocking-export") {
+    participant.resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kNativeContinuation;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("a restorable participant") {
+    participant.restorable = true;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("no link register") {
+    participant.guest_pc = 0;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("an unaligned link register") {
+    participant.guest_pc = kFunctionAddress + 2;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("no wait kind") {
+    participant.blocked_wait.kind =
+        GuestExecutionSessionSchedulerWaitKind::kNone;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("a malformed wait binding") {
+    participant.blocked_wait.handle_count = 2;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("a handle-free untimed wait") {
+    participant.blocked_wait = {};
+    participant.blocked_wait.kind =
+        GuestExecutionSessionSchedulerWaitKind::kFence;
+    participant.blocked_wait.observed_uptime_ms = kWaitUptimeMs;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("an alertable wait") {
+    participant.blocked_wait.flags |=
+        kGuestExecutionSessionSchedulerWaitFlagAlertable;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("an alertable wait with a pending user APC") {
+    participant.blocked_wait.flags |=
+        kGuestExecutionSessionSchedulerWaitFlagAlertable |
+        kGuestExecutionSessionSchedulerWaitFlagUserApcPending;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("a signal epoch that moved") {
+    participant.blocked_wait.signal_epochs_observed[0] = kWaitEpoch + 1;
+    participant.blocked_wait.observed_wait_epoch = kWaitEpoch + 1;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("a deadline the boundary has reached") {
+    participant.blocked_wait.deadline_ms = kWaitUptimeMs;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("a deadline the boundary has not reached") {
+    participant.blocked_wait.deadline_ms = kWaitUptimeMs + 1;
+    REQUIRE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("a timed delay") {
+    participant.blocked_wait = {};
+    participant.blocked_wait.kind =
+        GuestExecutionSessionSchedulerWaitKind::kDelay;
+    participant.blocked_wait.flags =
+        kGuestExecutionSessionSchedulerWaitFlagGated |
+        kGuestExecutionSessionSchedulerWaitFlagInterruptible;
+    participant.blocked_wait.observed_uptime_ms = kWaitUptimeMs;
+    participant.blocked_wait.deadline_ms = kWaitUptimeMs + 1;
+    REQUIRE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+  SECTION("a timed external wait") {
+    participant.blocked_wait = {};
+    participant.blocked_wait.kind =
+        GuestExecutionSessionSchedulerWaitKind::kIoCompletion;
+    participant.blocked_wait.handle_count = 1;
+    participant.blocked_wait.handles[0] = kWaitHandle;
+    participant.blocked_wait.flags =
+        kGuestExecutionSessionSchedulerWaitFlagInterruptible;
+    participant.blocked_wait.observed_uptime_ms = kWaitUptimeMs;
+    REQUIRE_FALSE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+    participant.blocked_wait.deadline_ms = kWaitUptimeMs + 1;
+    REQUIRE(IsGuestExecutionSessionBlockedParityParticipant(participant));
+  }
+}
+
+TEST_CASE("guest execution session provider still gates blocked parity",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.InstallExternalEventLog();
+  const auto participant =
+      harness.BlockedSecondThreadCheckpoint().participants.back();
+  REQUIRE(
+      IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
+  std::string error;
+  REQUIRE_FALSE(
+      harness.provider->SupportsCheckpointParticipant(participant, &error));
+  REQUIRE(error.find("no open modeled export dispatch") != std::string::npos);
 }
 
 }  // namespace testing

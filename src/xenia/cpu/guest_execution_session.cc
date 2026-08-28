@@ -655,6 +655,34 @@ bool ValidateSchedulerBlockedWait(
   return true;
 }
 
+bool IsBlockedParityWait(
+    const GuestExecutionSessionSchedulerBlockedWaitBinding& wait) {
+  // A wait is witnessed as unsatisfied by a signalable object's frozen epochs
+  // or by a deadline the boundary has not reached; a kind carrying neither
+  // states nothing about whether it woke.
+  const bool object_wait =
+      wait.kind == GuestExecutionSessionSchedulerWaitKind::kSingle ||
+      wait.kind == GuestExecutionSessionSchedulerWaitKind::kMultiAny ||
+      wait.kind == GuestExecutionSessionSchedulerWaitKind::kMultiAll;
+  if (!(object_wait && wait.handle_count) && !wait.deadline_ms) {
+    return false;
+  }
+  constexpr uint32_t kRefusedWaitFlags =
+      kGuestExecutionSessionSchedulerWaitFlagAlertable |
+      kGuestExecutionSessionSchedulerWaitFlagUserApcPending;
+  if (wait.flags & kRefusedWaitFlags) {
+    return false;
+  }
+  if (wait.observed_wait_epoch != wait.wait_epoch ||
+      wait.signal_epochs_observed != wait.signal_epochs_before) {
+    return false;
+  }
+  // observed_uptime_ms is a per-snapshot host clock read rather than thread
+  // state, so the deadline is the only durable statement of how near this wait
+  // is to its own timeout.
+  return !wait.deadline_ms || wait.deadline_ms > wait.observed_uptime_ms;
+}
+
 bool ValidateSchedulerTopology(
     const GuestExecutionSessionSchedulerTopologyChunk& chunk,
     const GuestExecutionSessionLimits& limits, std::string* error) {
@@ -1829,6 +1857,20 @@ bool IsGuestExecutionSessionWokenInWaitParticipant(
   // self-contained.
   return participant.blocked_wait ==
          GuestExecutionSessionSchedulerBlockedWaitBinding{};
+}
+
+bool IsGuestExecutionSessionBlockedParityParticipant(
+    const GuestExecutionSessionSchedulerTopologyParticipant& participant) {
+  if (participant.state !=
+          GuestExecutionSessionSchedulerParticipantState::kBlocked ||
+      participant.resume_kind !=
+          GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport ||
+      participant.restorable || !participant.guest_pc ||
+      (participant.guest_pc & 3)) {
+    return false;
+  }
+  return ValidateSchedulerBlockedWait(participant.blocked_wait, nullptr) &&
+         IsBlockedParityWait(participant.blocked_wait);
 }
 
 GuestExecutionSessionSha256 GuestExecutionSessionCodec::HashBytes(

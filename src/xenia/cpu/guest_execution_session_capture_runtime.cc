@@ -155,6 +155,41 @@ std::string DescribeCheckpointParticipant(
       participant.guest_pc);
 }
 
+bool IsBlockedParityWait(kernel::GuestSchedulerCaptureWaitKind kind,
+                         const kernel::GuestSchedulerCaptureWaitState& wait) {
+  // The durable shape of the binding is ValidateSchedulerBlockedWait's to
+  // enforce once the row exists; only the bound its parity reasoning depends on
+  // is restated here.
+  if (kind == kernel::GuestSchedulerCaptureWaitKind::kNone ||
+      wait.handle_count > kernel::kGuestSchedulerCaptureMaximumWaitHandles) {
+    return false;
+  }
+  // A wait is witnessed as unsatisfied by a signalable object's frozen epochs
+  // or by a deadline the boundary has not reached; a kind carrying neither
+  // states nothing about whether it woke.
+  const bool object_wait =
+      kind == kernel::GuestSchedulerCaptureWaitKind::kSingle ||
+      kind == kernel::GuestSchedulerCaptureWaitKind::kMultiAny ||
+      kind == kernel::GuestSchedulerCaptureWaitKind::kMultiAll;
+  if (!(object_wait && wait.handle_count) && !wait.deadline_ms) {
+    return false;
+  }
+  constexpr uint8_t kRefusedWaitFlags =
+      kernel::kGuestSchedulerCaptureWaitFlagAlertable |
+      kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
+  if (wait.flags & kRefusedWaitFlags) {
+    return false;
+  }
+  if (wait.observed_wait_epoch != wait.wait_epoch ||
+      wait.signal_epochs_observed != wait.signal_epochs_before) {
+    return false;
+  }
+  // observed_uptime_ms is a per-snapshot host clock read rather than thread
+  // state, so the deadline is the only durable statement of how near this wait
+  // is to its own timeout.
+  return !wait.deadline_ms || wait.deadline_ms > wait.observed_uptime_ms;
+}
+
 bool CurrentTitleCaptureConfig(GuestExecutionSessionTitleCaptureConfig* output,
                                std::string* error) noexcept {
   if (!output) {
@@ -898,6 +933,24 @@ bool IsGuestExecutionSessionWokenInWaitCheckpointParticipant(
   }
   return IsWokenInWaitAllowlist(participant.blocked_wait_kind,
                                 participant.blocked_wait);
+}
+
+bool IsGuestExecutionSessionBlockedParityCheckpointParticipant(
+    const kernel::GuestSchedulerCheckpointParticipant& participant) {
+  if (participant.state !=
+          kernel::GuestSchedulerCheckpointParticipantState::kBlocked ||
+      participant.resume_kind !=
+          kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport ||
+      participant.restorable || !participant.guest_pc ||
+      (participant.guest_pc & 3)) {
+    return false;
+  }
+  if (participant.preempt_defers_irql || participant.preempt_defers_lock ||
+      participant.capture_declined_safepoints) {
+    return false;
+  }
+  return IsBlockedParityWait(participant.blocked_wait_kind,
+                             participant.blocked_wait);
 }
 
 struct GuestExecutionSessionCaptureRuntimePm4Wiring::MarkerBridge final

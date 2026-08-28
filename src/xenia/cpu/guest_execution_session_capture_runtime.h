@@ -110,6 +110,12 @@ struct GuestExecutionSessionInstructionCoverageDelta {
 bool IsGuestExecutionSessionWokenInWaitCheckpointParticipant(
     const kernel::GuestSchedulerCheckpointParticipant& participant);
 
+// The checkpoint-side twin of IsGuestExecutionSessionBlockedParityParticipant,
+// decided before a durable topology row exists. The extra clauses are the
+// preemption-episode counters, which no durable row carries.
+bool IsGuestExecutionSessionBlockedParityCheckpointParticipant(
+    const kernel::GuestSchedulerCheckpointParticipant& participant);
+
 // Owns the exact-PC checkpoint encoding and sparse memory/code observation.
 // BeginCapture runs while the provisional start barrier is held and must arm
 // every writer before returning. SealCapture runs while the stop barrier is
