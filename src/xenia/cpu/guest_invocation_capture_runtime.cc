@@ -237,18 +237,11 @@ bool GuestInvocationCapturePageReader::ReadPage(
       last_read_failure_site_ = 5;
       return false;
     }
-    const uint32_t alias_address = page_address ^ 0x10000000u;
-    BaseHeap* const alias_heap = memory_.LookupHeap(alias_address);
-    HeapAllocationInfo alias_info = {};
-    if (!alias_heap || alias_heap == first_heap ||
-        memory_.LookupHeap(alias_address + JitCorpus::kPageSize - 1) !=
-            alias_heap ||
-        !alias_heap->QueryRegionInfo(alias_address, &alias_info) ||
-        !(alias_info.state & kMemoryAllocationCommit) ||
-        !(alias_info.protect & kMemoryProtectRead)) {
-      last_read_failure_site_ = 6;
-      return false;
-    }
+    // Neither state nor protection is not a statement that nothing is mapped
+    // here: loading a module resets the whole page table of the heap it lands
+    // in, so a title that loads several into one heap leaves earlier images
+    // executing behind zeroed entries. The host mapping is what the guest
+    // reads, so it is what decides.
     size_t readable_length = 0;
     xe::memory::PageAccess host_access = xe::memory::PageAccess::kNoAccess;
     if (!xe::memory::QueryProtect(const_cast<void*>(translated_page),
