@@ -183,10 +183,28 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     return true;
   }
 
+  // A guest call sets its return address twice: once into the host stack slot
+  // and once into the guest link register, from the same immediate. The first
+  // leaves it in x0, so the second only has to store. One-shot, like the
+  // handoffs above.
+  void MarkX0HoldsConstant(uint64_t value) {
+    x0_constant_ = value;
+    x0_constant_valid_ = true;
+    x0_constant_stale_ = false;
+  }
+  bool ConsumeX0Constant(uint64_t value) {
+    if (!x0_constant_valid_ || x0_constant_ != value) {
+      return false;
+    }
+    x0_constant_valid_ = false;
+    return true;
+  }
+
   void ResetFlagsZeroTest() {
     flags_zero_fresh_reg_ = flags_zero_armed_reg_ = -1;
     w16_holds_fresh_ = w16_holds_armed_ = nullptr;
     fused_addr_mask_dest_reg_ = -1;
+    x0_constant_valid_ = false;
   }
   void ShiftFlagsZeroTest() {
     // An armed mask that nothing read means the AND emitted nothing and the
@@ -201,6 +219,13 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
         fused_addr_mask_dest_reg_ = -1;
       } else {
         fused_addr_mask_stale_ = true;
+      }
+    }
+    if (x0_constant_valid_) {
+      if (x0_constant_stale_) {
+        x0_constant_valid_ = false;
+      } else {
+        x0_constant_stale_ = true;
       }
     }
     flags_zero_armed_reg_ = flags_zero_fresh_reg_;
@@ -468,6 +493,9 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   int fused_addr_mask_src_reg_ = -1;
   uint32_t fused_addr_mask_imm_ = 0;
   bool fused_addr_mask_stale_ = false;
+  uint64_t x0_constant_ = 0;
+  bool x0_constant_valid_ = false;
+  bool x0_constant_stale_ = false;
 
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t vec_reg_map_[VEC_COUNT];

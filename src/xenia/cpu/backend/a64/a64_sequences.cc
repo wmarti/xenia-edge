@@ -349,7 +349,10 @@ struct STORE_CONTEXT_I64
       if (i.src2.constant() == 0) {
         e.str(e.xzr, ptr(e.GetContextReg(), offset));
       } else {
-        e.mov(e.x0, static_cast<uint64_t>(i.src2.constant()));
+        const uint64_t value = static_cast<uint64_t>(i.src2.constant());
+        if (!e.ConsumeX0Constant(value)) {
+          e.mov(e.x0, value);
+        }
         e.str(e.x0, ptr(e.GetContextReg(), offset));
       }
     } else {

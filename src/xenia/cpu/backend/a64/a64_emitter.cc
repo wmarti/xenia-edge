@@ -1417,6 +1417,7 @@ void A64Emitter::CallNativeSafe(void* fn) {
 void A64Emitter::SetReturnAddress(uint64_t value) {
   mov(x0, value);
   str(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
+  MarkX0HoldsConstant(value);
 }
 
 void A64Emitter::ReloadMembase() {
