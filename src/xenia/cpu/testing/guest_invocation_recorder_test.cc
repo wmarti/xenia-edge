@@ -990,11 +990,16 @@ TEST_CASE("guest invocation recorder rejects abnormal control flow",
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
     Define(*recorder, kNestedAddress, kNestedEndAddress);
+    // A non-linking branch leaves LR holding whatever the caller last put
+    // there, so the target's entry reports a link register that is not a
+    // return boundary at all and may point into the target itself.
+    GuestPPCRegisterState tail_entry = MakeState(2);
+    tail_entry.link_register = kNestedAddress;
     for (int attempt = 0; attempt < 2; ++attempt) {
       EnterRoot(*recorder);
       REQUIRE(recorder->OnTailCall(kOwner, kRootAddress, kNestedAddress));
       REQUIRE(recorder->OnFunctionEntry(kOwner, kNestedAddress,
-                                        kNestedEndAddress, MakeState(2)));
+                                        kNestedEndAddress, tail_entry));
       Access(*recorder, kDataPageA);
       REQUIRE(recorder->OnFunctionExit(kOwner, kNestedAddress, kReturnAddress,
                                        MakeState(3)));
@@ -1004,7 +1009,7 @@ TEST_CASE("guest invocation recorder rejects abnormal control flow",
     EnterRoot(*recorder);
     REQUIRE(recorder->OnTailCall(kOwner, kRootAddress, kNestedAddress));
     REQUIRE(recorder->OnFunctionEntry(kOwner, kNestedAddress, kNestedEndAddress,
-                                      MakeState(2)));
+                                      tail_entry));
     Access(*recorder, kDataPageA);
     REQUIRE(recorder->OnFunctionExit(kOwner, kNestedAddress, kReturnAddress,
                                      MakeState(3)));

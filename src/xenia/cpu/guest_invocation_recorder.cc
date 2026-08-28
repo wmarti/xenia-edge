@@ -111,6 +111,7 @@ struct GuestInvocationRecorder::Impl {
       rejection_message.assign(message);
       result.reset();
       call_stack.clear();
+      inherited_return_address.reset();
       initial_pages.clear();
     }
     return false;
@@ -646,6 +647,7 @@ struct GuestInvocationRecorder::Impl {
     }
     ++attempt_count;
     attempt_pages.clear();
+    inherited_return_address.reset();
     call_stack.clear();
     call_stack.push_back({selection.root_address, return_address});
     entered_functions.insert(selection.root_address);
@@ -677,6 +679,9 @@ struct GuestInvocationRecorder::Impl {
                     "tail call does not match the recorded call stack",
                     kGuestInvocationDependencyUnbalancedReturn);
     }
+    // A non-linking branch never writes LR, so the target does not establish a
+    // return boundary of its own and inherits this frame's instead.
+    inherited_return_address = call_stack.back().return_address;
     call_stack.pop_back();
     return true;
   }
@@ -1075,6 +1080,7 @@ struct GuestInvocationRecorder::Impl {
   GuestPPCRegisterState attempt_entry_state = {};
 
   std::vector<CallFrame> call_stack;
+  std::optional<uint32_t> inherited_return_address;
   std::map<uint32_t, DefinitionRecord> definitions;
   std::vector<uint32_t> definition_order;
   std::map<uint32_t, uint64_t> definition_page_write_generations;
@@ -1278,8 +1284,11 @@ bool GuestInvocationRecorder::OnFunctionEntry(
     return false;
   }
   uint32_t return_address = 0;
-  if (!impl_->ValidateReturnBoundary(address, end_address, entry_state, false,
-                                     &return_address)) {
+  if (impl_->inherited_return_address.has_value()) {
+    return_address = *impl_->inherited_return_address;
+    impl_->inherited_return_address.reset();
+  } else if (!impl_->ValidateReturnBoundary(address, end_address, entry_state,
+                                            false, &return_address)) {
     return false;
   }
   impl_->call_stack.push_back({address, return_address});
@@ -1322,6 +1331,7 @@ bool GuestInvocationRecorder::OnFunctionExit(
                          kGuestInvocationDependencyUnbalancedReturn);
   }
   impl_->call_stack.pop_back();
+  impl_->inherited_return_address.reset();
   if (!impl_->call_stack.empty()) {
     return true;
   }
