@@ -32,6 +32,7 @@ def metric_values(**overrides):
         "wide_materialization_sites": 7,
         "pc_relative_sites": 11,
         "iterations": 100,
+        "batches": 1,
         "reset_pages": 2,
         "reset_bytes_per_iteration": 8192,
         "thread_cpu_ns": 100000,
@@ -63,6 +64,7 @@ def expected(**overrides):
         "candidate_build_sha256": SHA_D,
         "config_sha256": SHA_E,
         "iterations": 100,
+        "batches": 1,
         "reset_pages": 2,
     }
     values.update(overrides)
@@ -448,10 +450,11 @@ class RunnerTest(unittest.TestCase):
         ):
             with self.subTest(fixed=fixed):
                 self.assertGreater(command.index(fixed), command.index(user))
-        self.assertEqual(command[-3:], [
+        self.assertEqual(command[-4:], [
             "--guest_invocation_in=/tmp/input.xinv",
             "--jit_corpus_in=/tmp/input.jcorpus",
             "--guest_invocation_iterations=100",
+            "--guest_invocation_batches=1",
         ])
         self.assertEqual(result["thread_cpu_ns_per_invocation"], 1000.0)
 

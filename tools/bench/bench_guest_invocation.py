@@ -58,6 +58,7 @@ METRIC_FIELDS = (
     "wide_materialization_sites",
     "pc_relative_sites",
     "iterations",
+    "batches",
     "reset_pages",
     "reset_bytes_per_iteration",
     "thread_cpu_ns",
@@ -82,6 +83,7 @@ POSITIVE_FIELDS = frozenset((
     "code_shape_functions",
     "host_instructions",
     "iterations",
+    "batches",
     "thread_cpu_ns",
     "uptime_raw_ns",
     "reset_only_uptime_raw_ns",
@@ -254,7 +256,7 @@ def validate_metric(metric, expected, min_thread_cpu_ns):
     return metric
 
 
-def build_command(exe, extra, artifact, corpus, iterations):
+def build_command(exe, extra, artifact, corpus, iterations, batches):
     return [
         str(exe),
         *extra,
@@ -263,6 +265,7 @@ def build_command(exe, extra, artifact, corpus, iterations):
         f"--guest_invocation_in={artifact}",
         f"--jit_corpus_in={corpus}",
         f"--guest_invocation_iterations={iterations}",
+        f"--guest_invocation_batches={batches}",
     ]
 
 
@@ -289,7 +292,8 @@ def pin_role_code_shape(metric, role, pinned_shapes):
 def run_once(exe, extra, artifact, corpus, expected, timeout,
              min_thread_cpu_ns):
     command = build_command(
-        exe, extra, artifact, corpus, expected["iterations"])
+        exe, extra, artifact, corpus, expected["iterations"],
+        expected["batches"])
     try:
         process = subprocess.run(
             command,
@@ -552,6 +556,16 @@ def main(argv=None):
     parser.add_argument("--capture-build-sha256", required=True)
     parser.add_argument("--config-sha256", required=True)
     parser.add_argument("--iterations", required=True, type=int)
+    parser.add_argument(
+        "--batches", type=int, default=1,
+        help=("alternating timed batches per leg inside one process; each leg "
+              "keeps its cheapest batch, which suppresses disturbance within "
+              "a sample but not core placement across samples"))
+    parser.add_argument(
+        "--repeats", type=int, default=1,
+        help=("process launches per measurement, keeping the cheapest; each "
+              "launch redraws core placement, so this is the leg that "
+              "suppresses placement variance across samples"))
     parser.add_argument("--reset-pages", required=True, type=int)
     parser.add_argument(
         "--same-build-tree-toolchain-attested", action="store_true",
@@ -595,6 +609,8 @@ def main(argv=None):
         if args.iterations <= 0 or args.reset_pages < 0:
             raise BenchmarkError(
                 "iterations must be positive and reset pages nonnegative")
+        if args.batches <= 0 or args.repeats <= 0:
+            raise BenchmarkError("batches and repeats must be positive")
         if args.pairs < 4 or args.pairs > MAX_PAIRS or args.pairs % 4:
             raise BenchmarkError(
                 "--pairs must be a multiple of 4 between 4 and "
@@ -629,6 +645,7 @@ def main(argv=None):
             "capture_build_sha256": capture_build_sha256,
             "config_sha256": config_sha256,
             "iterations": args.iterations,
+            "batches": args.batches,
             "reset_pages": args.reset_pages,
         }
         minimum_cpu_ns = int(args.min_thread_cpu_seconds * 1e9)
@@ -642,11 +659,18 @@ def main(argv=None):
         def run_role(role):
             expected = expected_for_role(
                 expected_common, executable_sha256, role)
-            metric = run_once(
-                exes[role], extras[role], args.artifact, args.corpus,
-                expected, args.timeout, minimum_cpu_ns)
-            pin_role_code_shape(metric, role, pinned_code_shapes)
-            return metric
+            # The host can add cost to a launch but never remove work from it,
+            # so the cheapest launch is the least placement-disturbed one.
+            best = None
+            for _ in range(args.repeats):
+                metric = run_once(
+                    exes[role], extras[role], args.artifact, args.corpus,
+                    expected, args.timeout, minimum_cpu_ns)
+                pin_role_code_shape(metric, role, pinned_code_shapes)
+                if best is None or (metric["thread_cpu_ns"] <
+                                    best["thread_cpu_ns"]):
+                    best = metric
+            return best
 
         samples = collect_phases(run_role, args.pairs)
         analysis = analyze(samples, args.max_control_noise_pct)

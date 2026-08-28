@@ -974,6 +974,7 @@ const uint8_t* GuestInvocationRunner::InitialPageData(
 }
 
 bool GuestInvocationRunner::RunTimed(uint64_t invocation_count,
+                                     uint64_t batch_count,
                                      GuestInvocationReplayMetrics* metrics,
                                      std::string* error) {
   if (error) {
@@ -989,6 +990,9 @@ bool GuestInvocationRunner::RunTimed(uint64_t invocation_count,
   if (!invocation_count || invocation_count > kMaxTimedInvocationCount) {
     return Fail(error, "timed invocation count is outside the bounded range");
   }
+  if (!batch_count || batch_count > kMaxTimedBatchCount) {
+    return Fail(error, "timed batch count is outside the bounded range");
+  }
 
 #if !XE_PLATFORM_MAC
   return Fail(error, "timed guest invocation replay is macOS-only");
@@ -1000,102 +1004,128 @@ bool GuestInvocationRunner::RunTimed(uint64_t invocation_count,
   const uint64_t placement_generation_before =
       code_cache->placement_generation();
 
-  const thread_t current_thread = mach_thread_self();
-  if (current_thread == MACH_PORT_NULL) {
-    return Fail(error, "failed to read current-thread CPU time before replay");
+  // The host can add cost to a batch but never remove work from it, so each
+  // leg keeps its cheapest batch. The legs alternate rather than running as
+  // one batch each: measuring all of one leg before the other charges any
+  // drift over the run to whichever leg came second.
+  uint64_t best_thread_cpu = std::numeric_limits<uint64_t>::max();
+  uint64_t best_uptime_raw = std::numeric_limits<uint64_t>::max();
+  uint64_t best_reset_thread_cpu = std::numeric_limits<uint64_t>::max();
+  uint64_t best_reset_uptime_raw = std::numeric_limits<uint64_t>::max();
+
+  for (uint64_t batch = 0; batch < batch_count; ++batch) {
+    const thread_t current_thread = mach_thread_self();
+    if (current_thread == MACH_PORT_NULL) {
+      return Fail(error,
+                  "failed to read current-thread CPU time before replay");
+    }
+
+    // Nest the primary CPU interval inside the diagnostic wall interval so the
+    // primary metric does not include either wall-clock query. The wall metric
+    // intentionally includes both THREAD_BASIC_INFO queries and is diagnostic.
+    bool timed_calls_succeeded = true;
+    const uint64_t wall_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t thread_cpu_start = 0;
+    if (!ReadCurrentThreadCpuNanoseconds(current_thread, &thread_cpu_start)) {
+      mach_port_deallocate(mach_task_self(), current_thread);
+      return Fail(error,
+                  "failed to read current-thread CPU time before replay");
+    }
+    for (uint64_t i = 0; i < invocation_count; ++i) {
+      if (!ResetInvocation(error) || !Invoke(error)) {
+        timed_calls_succeeded = false;
+        break;
+      }
+    }
+    uint64_t thread_cpu_end = 0;
+    const bool cpu_read_succeeded =
+        ReadCurrentThreadCpuNanoseconds(current_thread, &thread_cpu_end);
+    const uint64_t wall_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    mach_port_deallocate(mach_task_self(), current_thread);
+
+    if (!timed_calls_succeeded) {
+      return false;
+    }
+    if (!VerifyCurrentState(error)) {
+      return false;
+    }
+    if (!cpu_read_succeeded || thread_cpu_end <= thread_cpu_start) {
+      return Fail(error, "current-thread CPU interval is missing or zero");
+    }
+    if (wall_end <= wall_start) {
+      return Fail(error, "uptime raw interval is missing or zero");
+    }
+    if (code_cache->placement_generation() != placement_generation_before) {
+      return Fail(error, "code placement changed inside the timed interval");
+    }
+    best_thread_cpu =
+        std::min(best_thread_cpu, thread_cpu_end - thread_cpu_start);
+    best_uptime_raw = std::min(best_uptime_raw, wall_end - wall_start);
+
+    if (!ResetInvocation(error) || !Invoke(error) ||
+        !VerifyCurrentState(error)) {
+      return false;
+    }
+    if (code_cache->placement_generation() != placement_generation_before) {
+      return Fail(error, "code placement changed during final verification");
+    }
+
+    // Reset is measured on its own as a raw diagnostic, never as a value to
+    // subtract from the primary reset-plus-call metric: the two intervals have
+    // different cache and execution histories.
+    const thread_t reset_thread = mach_thread_self();
+    if (reset_thread == MACH_PORT_NULL) {
+      return Fail(error,
+                  "failed to read current-thread CPU time before reset replay");
+    }
+    bool reset_calls_succeeded = true;
+    const uint64_t reset_wall_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t reset_thread_cpu_start = 0;
+    if (!ReadCurrentThreadCpuNanoseconds(reset_thread,
+                                         &reset_thread_cpu_start)) {
+      mach_port_deallocate(mach_task_self(), reset_thread);
+      return Fail(error,
+                  "failed to read current-thread CPU time before reset replay");
+    }
+    for (uint64_t i = 0; i < invocation_count; ++i) {
+      if (!ResetInvocation(error)) {
+        reset_calls_succeeded = false;
+        break;
+      }
+    }
+    uint64_t reset_thread_cpu_end = 0;
+    const bool reset_cpu_read_succeeded =
+        ReadCurrentThreadCpuNanoseconds(reset_thread, &reset_thread_cpu_end);
+    const uint64_t reset_wall_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    mach_port_deallocate(mach_task_self(), reset_thread);
+
+    if (!reset_calls_succeeded) {
+      return false;
+    }
+    if (!reset_cpu_read_succeeded ||
+        reset_thread_cpu_end < reset_thread_cpu_start) {
+      return Fail(error, "current-thread reset CPU interval is invalid");
+    }
+    if (reset_wall_end <= reset_wall_start) {
+      return Fail(error, "reset uptime raw interval is missing or zero");
+    }
+    if (!Invoke(error) || !VerifyCurrentState(error)) {
+      return false;
+    }
+    if (code_cache->placement_generation() != placement_generation_before) {
+      return Fail(
+          error, "code placement changed during reset diagnostic verification");
+    }
+    best_reset_thread_cpu = std::min(
+        best_reset_thread_cpu, reset_thread_cpu_end - reset_thread_cpu_start);
+    best_reset_uptime_raw =
+        std::min(best_reset_uptime_raw, reset_wall_end - reset_wall_start);
   }
 
-  // Nest the primary CPU interval inside the diagnostic wall interval so the
-  // primary metric does not include either wall-clock query. The wall metric
-  // intentionally includes both THREAD_BASIC_INFO queries and is diagnostic.
-  bool timed_calls_succeeded = true;
-  const uint64_t wall_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-  uint64_t thread_cpu_start = 0;
-  if (!ReadCurrentThreadCpuNanoseconds(current_thread, &thread_cpu_start)) {
-    mach_port_deallocate(mach_task_self(), current_thread);
-    return Fail(error, "failed to read current-thread CPU time before replay");
-  }
-  for (uint64_t i = 0; i < invocation_count; ++i) {
-    if (!ResetInvocation(error) || !Invoke(error)) {
-      timed_calls_succeeded = false;
-      break;
-    }
-  }
-  uint64_t thread_cpu_end = 0;
-  const bool cpu_read_succeeded =
-      ReadCurrentThreadCpuNanoseconds(current_thread, &thread_cpu_end);
-  const uint64_t wall_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-  mach_port_deallocate(mach_task_self(), current_thread);
   const uint64_t placement_generation_after =
       code_cache->placement_generation();
-
-  if (!timed_calls_succeeded) {
-    return false;
-  }
-  if (!VerifyCurrentState(error)) {
-    return false;
-  }
-  if (!cpu_read_succeeded || thread_cpu_end <= thread_cpu_start) {
-    return Fail(error, "current-thread CPU interval is missing or zero");
-  }
-  if (wall_end <= wall_start) {
-    return Fail(error, "uptime raw interval is missing or zero");
-  }
   if (placement_generation_after != placement_generation_before) {
-    return Fail(error, "code placement changed inside the timed interval");
-  }
-
-  if (!ResetInvocation(error) || !Invoke(error) || !VerifyCurrentState(error)) {
-    return false;
-  }
-  if (code_cache->placement_generation() != placement_generation_after) {
-    return Fail(error, "code placement changed during final verification");
-  }
-
-  // Measure reset in a separate post-primary batch. This is a raw diagnostic,
-  // not a value that may be subtracted from the primary reset-plus-call metric:
-  // the two intervals have different cache and execution histories.
-  const thread_t reset_thread = mach_thread_self();
-  if (reset_thread == MACH_PORT_NULL) {
-    return Fail(error,
-                "failed to read current-thread CPU time before reset replay");
-  }
-  bool reset_calls_succeeded = true;
-  const uint64_t reset_wall_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-  uint64_t reset_thread_cpu_start = 0;
-  if (!ReadCurrentThreadCpuNanoseconds(reset_thread, &reset_thread_cpu_start)) {
-    mach_port_deallocate(mach_task_self(), reset_thread);
-    return Fail(error,
-                "failed to read current-thread CPU time before reset replay");
-  }
-  for (uint64_t i = 0; i < invocation_count; ++i) {
-    if (!ResetInvocation(error)) {
-      reset_calls_succeeded = false;
-      break;
-    }
-  }
-  uint64_t reset_thread_cpu_end = 0;
-  const bool reset_cpu_read_succeeded =
-      ReadCurrentThreadCpuNanoseconds(reset_thread, &reset_thread_cpu_end);
-  const uint64_t reset_wall_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-  mach_port_deallocate(mach_task_self(), reset_thread);
-
-  if (!reset_calls_succeeded) {
-    return false;
-  }
-  if (!reset_cpu_read_succeeded ||
-      reset_thread_cpu_end < reset_thread_cpu_start) {
-    return Fail(error, "current-thread reset CPU interval is invalid");
-  }
-  if (reset_wall_end <= reset_wall_start) {
-    return Fail(error, "reset uptime raw interval is missing or zero");
-  }
-  if (!Invoke(error) || !VerifyCurrentState(error)) {
-    return false;
-  }
-  if (code_cache->placement_generation() != placement_generation_after) {
-    return Fail(error,
-                "code placement changed during reset diagnostic verification");
+    return Fail(error, "code placement changed during timed replay");
   }
 
   GuestInvocationReplayCodeShape final_code_shape;
@@ -1108,12 +1138,11 @@ bool GuestInvocationRunner::RunTimed(uint64_t invocation_count,
 
   GuestInvocationReplayMetrics accepted_metrics;
   accepted_metrics.timed_invocation_count = invocation_count;
-  accepted_metrics.thread_cpu_nanoseconds = thread_cpu_end - thread_cpu_start;
-  accepted_metrics.uptime_raw_nanoseconds = wall_end - wall_start;
-  accepted_metrics.reset_only_thread_cpu_nanoseconds =
-      reset_thread_cpu_end - reset_thread_cpu_start;
-  accepted_metrics.reset_only_uptime_raw_nanoseconds =
-      reset_wall_end - reset_wall_start;
+  accepted_metrics.timed_batch_count = batch_count;
+  accepted_metrics.thread_cpu_nanoseconds = best_thread_cpu;
+  accepted_metrics.uptime_raw_nanoseconds = best_uptime_raw;
+  accepted_metrics.reset_only_thread_cpu_nanoseconds = best_reset_thread_cpu;
+  accepted_metrics.reset_only_uptime_raw_nanoseconds = best_reset_uptime_raw;
   accepted_metrics.placement_generation_before = placement_generation_before;
   accepted_metrics.placement_generation_after = placement_generation_after;
   accepted_metrics.reset_page_count_per_invocation =

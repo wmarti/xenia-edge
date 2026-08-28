@@ -245,6 +245,7 @@ std::string FormatGuestInvocationReplayBenchmarkMarker(
   AppendUint64Field(&marker, "pc_relative_sites",
                     metrics.code_shape.pc_relative_site_count);
   AppendUint64Field(&marker, "iterations", metrics.timed_invocation_count);
+  AppendUint64Field(&marker, "batches", metrics.timed_batch_count);
   AppendUint64Field(&marker, "reset_pages",
                     metrics.reset_page_count_per_invocation);
   AppendUint64Field(&marker, "reset_bytes_per_iteration",

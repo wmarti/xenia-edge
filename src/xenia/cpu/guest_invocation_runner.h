@@ -125,6 +125,8 @@ bool HashGuestInvocationReplayA64CodeShape(
 
 struct GuestInvocationReplayMetrics {
   uint64_t timed_invocation_count = 0;
+  // Batches per leg. Every reported interval is the cheapest of them.
+  uint64_t timed_batch_count = 0;
   uint64_t thread_cpu_nanoseconds = 0;
   uint64_t uptime_raw_nanoseconds = 0;
   uint64_t reset_only_thread_cpu_nanoseconds = 0;
@@ -147,6 +149,7 @@ struct GuestInvocationReplayMetrics {
 class GuestInvocationRunner {
  public:
   static constexpr uint64_t kMaxTimedInvocationCount = 10'000'000;
+  static constexpr uint64_t kMaxTimedBatchCount = 1024;
 
   static std::unique_ptr<GuestInvocationRunner> Create(
       const ppc::GuestFunctionInvocation& invocation,
@@ -162,15 +165,21 @@ class GuestInvocationRunner {
   // invokes the selected function once, and verifies its complete exit state.
   bool WarmAndVerify(std::string* error = nullptr);
 
-  // Measures exactly invocation_count reset-plus-call iterations on macOS.
-  // The primary current-thread CPU interval excludes the diagnostic wall-clock
-  // reads; the wall interval encloses the CPU clock reads. A separate
-  // reset-only diagnostic is measured after the primary interval and is never
-  // subtracted. Both intervals are followed by untimed invocation verification
-  // before metrics are accepted.
-  bool RunTimed(uint64_t invocation_count,
+  // Measures batch_count alternating pairs of an invocation_count
+  // reset-plus-call batch and an invocation_count reset-only batch on macOS,
+  // reporting each leg's cheapest batch. The primary current-thread CPU
+  // interval excludes the diagnostic wall-clock reads; the wall interval
+  // encloses the CPU clock reads. The reset-only leg is never subtracted from
+  // the primary one. Every interval is followed by untimed invocation
+  // verification before metrics are accepted.
+  bool RunTimed(uint64_t invocation_count, uint64_t batch_count,
                 GuestInvocationReplayMetrics* metrics,
                 std::string* error = nullptr);
+  bool RunTimed(uint64_t invocation_count,
+                GuestInvocationReplayMetrics* metrics,
+                std::string* error = nullptr) {
+    return RunTimed(invocation_count, 1, metrics, error);
+  }
 
   const GuestInvocationReplayPlan& plan() const { return plan_; }
   const backend::Backend& backend() const;

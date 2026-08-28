@@ -83,6 +83,10 @@ DEFINE_path(guest_invocation_in, "",
             "Execute one strictly verified guest invocation artifact against "
             "the exact code corpus supplied by --jit_corpus_in.",
             "CPU");
+DEFINE_uint64(
+    guest_invocation_batches, 1,
+    "Alternating timed batches per leg; each leg reports its cheapest batch.",
+    "CPU");
 DEFINE_uint64(guest_invocation_iterations, 0,
               "Fixed number of reset-plus-call iterations for "
               "--guest_invocation_in (1 through 10000000).",
@@ -1111,6 +1115,12 @@ bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
         "input validation",
         "--guest_invocation_iterations must be between 1 and 10000000");
   }
+  if (!cvars::guest_invocation_batches ||
+      cvars::guest_invocation_batches >
+          GuestInvocationRunner::kMaxTimedBatchCount) {
+    return Reject("input validation",
+                  "--guest_invocation_batches must be between 1 and 1024");
+  }
 
   GuestInvocationReplayFile artifact_file;
   std::string error;
@@ -1209,7 +1219,8 @@ bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
     return Reject("warm verification", error);
   }
   GuestInvocationReplayMetrics metrics;
-  if (!runner->RunTimed(cvars::guest_invocation_iterations, &metrics, &error)) {
+  if (!runner->RunTimed(cvars::guest_invocation_iterations,
+                        cvars::guest_invocation_batches, &metrics, &error)) {
     return Reject("timed or final verification", error);
   }
 
