@@ -299,7 +299,8 @@ struct GuestInvocationRecorder::Impl {
   }
 
   bool RequireStableCodePage(uint32_t page_address,
-                             std::array<uint8_t, kGuestPageSize>* stable_page) {
+                             std::array<uint8_t, kGuestPageSize>* stable_page,
+                             std::string_view site) {
     const CodePageReadResult read =
         ReadStableCodePage(page_address, stable_page);
     if (read == CodePageReadResult::kSuccess) {
@@ -308,7 +309,10 @@ struct GuestInvocationRecorder::Impl {
     if (read == CodePageReadResult::kRetry) {
       return Reject(
           GuestInvocationRecorderRejection::kPageReadFailure,
-          "global memory snapshot remained contended at capture boundary",
+          fmt::format("global memory snapshot was contended at capture "
+                      "boundary: {} page {:08X} closure {} attempt {} state {}",
+                      site, page_address, closure_code_pages.size(),
+                      attempt_count, static_cast<uint32_t>(state)),
           kGuestInvocationDependencyUnsupportedMappingOrProtection);
     }
     return false;
@@ -487,7 +491,7 @@ struct GuestInvocationRecorder::Impl {
     return true;
   }
 
-  bool ValidateClosureCodePages() {
+  bool ValidateClosureCodePages(std::string_view site) {
     for (const auto& [page_address, snapshot] : closure_code_pages) {
       const auto generation =
           definition_page_write_generations.find(page_address);
@@ -498,7 +502,7 @@ struct GuestInvocationRecorder::Impl {
                       kGuestInvocationDependencySelfModifyingCode);
       }
       std::array<uint8_t, kGuestPageSize> current = {};
-      if (!RequireStableCodePage(page_address, &current)) {
+      if (!RequireStableCodePage(page_address, &current, site)) {
         return false;
       }
       if (current != snapshot.data) {
@@ -583,7 +587,8 @@ struct GuestInvocationRecorder::Impl {
         closure_code_pages.size() == closure_code_page_count) {
       return true;
     }
-    return ValidateClosureCodePages();
+    return ValidateClosureCodePages(revalidate_closure_code ? "attempt-boundary"
+                                                            : "closure-growth");
   }
 
   bool ValidateReturnBoundary(uint32_t function_address,
@@ -695,7 +700,7 @@ struct GuestInvocationRecorder::Impl {
   }
 
   bool CompleteFinalAttempt(const GuestPPCRegisterState& exit_state) {
-    if (!ValidateClosureCodePages()) {
+    if (!ValidateClosureCodePages("final-exit")) {
       return false;
     }
     std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> final_pages;
@@ -938,12 +943,21 @@ struct GuestInvocationRecorder::Impl {
       const uint32_t backing = BackingPageAddress(page);
       const auto code_backing = closure_code_backing_views.find(backing);
       if (code_backing != closure_code_backing_views.cend()) {
+        const bool same_page = code_backing->second == page;
         const uint32_t dependency =
-            code_backing->second == page
-                ? kGuestInvocationDependencyUnsupportedMappingOrProtection
-                : kGuestInvocationDependencyPhysicalAlias;
-        return Reject(GuestInvocationRecorderRejection::kUnsupportedDependency,
-                      "invocation data overlaps the code closure", dependency);
+            same_page ? kGuestInvocationDependencyUnsupportedMappingOrProtection
+                      : kGuestInvocationDependencyPhysicalAlias;
+        const bool directly_read =
+            std::find(pages.cbegin(), pages.cend(), page) != pages.cend();
+        return Reject(
+            GuestInvocationRecorderRejection::kUnsupportedDependency,
+            fmt::format("invocation data overlaps the code closure: page "
+                        "{:08X} backing {:08X} read {} samepage {} access "
+                        "{:08X}-{:08X} granule {}",
+                        page, backing, directly_read ? 1 : 0, same_page ? 1 : 0,
+                        pages.front(), pages.back(),
+                        limits.host_protection_page_size),
+            dependency);
       }
       const auto known = supplied_data_backing_views.find(backing);
       const uint32_t* added = FindBackingView(new_backing_views, backing);
