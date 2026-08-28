@@ -122,6 +122,19 @@ static uint32_t SaturatingAdd(std::atomic<uint32_t>& counter,
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
+static uint8_t CaptureWaitFlags(XThread* thread) {
+  auto& links = thread->scheduler_links();
+  return static_cast<uint8_t>(
+      (links.wait_gated ? kGuestSchedulerCaptureWaitFlagGated : 0) |
+      (links.wait_alertable ? kGuestSchedulerCaptureWaitFlagAlertable : 0) |
+      (links.capture_wait_interruptible
+           ? kGuestSchedulerCaptureWaitFlagInterruptible
+           : 0) |
+      (links.wait_alertable && thread->HasPendingUserApc()
+           ? kGuestSchedulerCaptureWaitFlagUserApcPending
+           : 0));
+}
+
 static GuestSchedulerCaptureWaitState CaptureWaitState(XThread* thread,
                                                        uint64_t now_ms) {
   GuestSchedulerCaptureWaitState state;
@@ -130,15 +143,7 @@ static GuestSchedulerCaptureWaitState CaptureWaitState(XThread* thread,
   state.observed_uptime_ms = now_ms;
   state.wait_epoch = links.wait_epoch;
   state.handle_count = links.wait_handle_count;
-  state.flags =
-      (links.wait_gated ? kGuestSchedulerCaptureWaitFlagGated : 0) |
-      (links.wait_alertable ? kGuestSchedulerCaptureWaitFlagAlertable : 0) |
-      (links.capture_wait_interruptible
-           ? kGuestSchedulerCaptureWaitFlagInterruptible
-           : 0) |
-      (links.wait_alertable && thread->HasPendingUserApc()
-           ? kGuestSchedulerCaptureWaitFlagUserApcPending
-           : 0);
+  state.flags = CaptureWaitFlags(thread);
   const size_t handle_count = std::min<size_t>(
       state.handle_count, kGuestSchedulerCaptureMaximumWaitHandles);
   for (size_t i = 0; i < handle_count; ++i) {
@@ -469,6 +474,18 @@ void GuestScheduler::PopulateCheckpointParticipantStateLocked(
     participant->blocked_wait_kind = static_cast<GuestSchedulerCaptureWaitKind>(
         thread->scheduler_links().wait_kind);
     participant->blocked_wait = CaptureWaitState(thread, snapshot_uptime_ms);
+  } else if (state == GuestSchedulerCheckpointParticipantState::kReady ||
+             state == GuestSchedulerCheckpointParticipantState::kSuspended) {
+    // A re-readied waiter still carries the wait it has not returned from, and
+    // naming it is the only way a diagnostic tells that from a plain yield.
+    // The topology bridge copies blocked_wait under kBlocked alone, so this
+    // reaches no durable byte, and the scalars avoid CaptureWaitState's gate
+    // objects, which are readable only while the fiber is parked.
+    const auto& links = thread->scheduler_links();
+    participant->blocked_wait_kind =
+        static_cast<GuestSchedulerCaptureWaitKind>(links.wait_kind);
+    participant->blocked_wait.handle_count = links.wait_handle_count;
+    participant->blocked_wait.flags = CaptureWaitFlags(thread);
   }
 }
 

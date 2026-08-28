@@ -610,11 +610,52 @@ std::string DescribeActiveHostCall(
                      call.return_address);
 }
 
+// A host call names the dispatch a fiber is parked below; these two name why it
+// parked. Together they separate a waiter woken inside a modeled export from
+// one woken out of an unmodeled wait and from a plain yield, which the state
+// and resume kind alone report identically.
+std::string DescribeParticipantExportDispatch(
+    const GuestExecutionCaptureExternalEventLog* log,
+    const GuestExecutionCaptureParticipantIdentity& participant) {
+  if (!log) {
+    return "export=nolog";
+  }
+  std::vector<GuestExecutionCaptureExternalEventActiveCall> calls;
+  if (!log->CopyParticipantActiveCalls(participant, &calls)) {
+    return "export=rejected";
+  }
+  const GuestExecutionCaptureExternalEventActiveCall* outermost = nullptr;
+  for (const GuestExecutionCaptureExternalEventActiveCall& call : calls) {
+    if (!outermost || call.participant_depth < outermost->participant_depth) {
+      outermost = &call;
+    }
+  }
+  if (!outermost) {
+    return "export=none";
+  }
+  return fmt::format("export={}/{:08X}/{:08X}", outermost->export_ordinal,
+                     outermost->guest_address, outermost->call_site_address);
+}
+
+// kind/handles/flags/handle0/deadline. A ready or suspended participant carries
+// only the first three; the rest are a blocked participant's full wait state.
+std::string DescribeCheckpointWaitShape(
+    const CheckpointParticipant& participant) {
+  return fmt::format(
+      "wait={}/{}/{}/{:08X}/{}",
+      static_cast<uint32_t>(participant.blocked_wait_kind),
+      static_cast<uint32_t>(participant.blocked_wait.handle_count),
+      static_cast<uint32_t>(participant.blocked_wait.flags),
+      participant.blocked_wait.handles[0],
+      participant.blocked_wait.deadline_ms);
+}
+
 // The census names every offender, not only the one that stopped the loop.
 std::string CensusPassiveParticipantHostCalls(
     const CheckpointSnapshot& checkpoint,
     const GuestExecutionCaptureThreadStateRegistrySnapshot& registry,
-    const GuestExecutionCaptureHostCallRosterSnapshot& host_calls) {
+    const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
+    const GuestExecutionCaptureExternalEventLog* external_event_log) {
   std::string message =
       "capture runtime passive scheduler participant has an active outer "
       "host call";
@@ -635,6 +676,11 @@ std::string CensusPassiveParticipantHostCalls(
       message.append(DescribeCheckpointParticipant(*participant));
       message.push_back(' ');
       message.append(DescribeActiveHostCall(*call));
+      message.push_back(' ');
+      message.append(DescribeParticipantExportDispatch(external_event_log,
+                                                       lifecycle.participant));
+      message.push_back(' ');
+      message.append(DescribeCheckpointWaitShape(*participant));
     }
     ++unsupported_count;
   }
@@ -660,7 +706,8 @@ bool ActiveHostCallHasDurableContinuation(
 
 std::string CensusUnrepresentableActiveHostCalls(
     const CheckpointSnapshot& checkpoint,
-    const GuestExecutionCaptureHostCallRosterSnapshot& host_calls) {
+    const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
+    const GuestExecutionCaptureExternalEventLog* external_event_log) {
   std::string message =
       "capture runtime active outer call lacks an exact-PC JIT safepoint or "
       "modeled blocking-export continuation";
@@ -681,6 +728,15 @@ std::string CensusUnrepresentableActiveHostCalls(
                                        call.participant.guest_thread_id));
       message.push_back(' ');
       message.append(DescribeActiveHostCall(call));
+      message.push_back(' ');
+      message.append(DescribeParticipantExportDispatch(external_event_log,
+                                                       call.participant));
+      message.push_back(' ');
+      if (participant) {
+        message.append(DescribeCheckpointWaitShape(*participant));
+      } else {
+        message.append("wait=none");
+      }
     }
     ++unsupported_count;
   }
@@ -1652,7 +1708,8 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       if (IsPassiveOutsideGuestParticipant(*checkpoint_participant) &&
           FindOutermostActiveHostCall(host_calls, lifecycle.participant)) {
         return fail_participant(CensusPassiveParticipantHostCalls(
-            checkpoint, registry, host_calls));
+            checkpoint, registry, host_calls,
+            processor.guest_execution_capture_external_event_log().get()));
       }
       std::string capability_error;
       if (!dependencies.provider->SupportsCheckpointParticipant(
@@ -1689,8 +1746,11 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       // any blocked participant it could not bind to a modeled export
       // dispatch, so reaching here means this one carries a typed route.
       if (!ActiveHostCallHasDurableContinuation(checkpoint_participant)) {
-        return Fail(error, CensusUnrepresentableActiveHostCalls(checkpoint,
-                                                                host_calls));
+        return Fail(
+            error,
+            CensusUnrepresentableActiveHostCalls(
+                checkpoint, host_calls,
+                processor.guest_execution_capture_external_event_log().get()));
       }
     }
     return true;

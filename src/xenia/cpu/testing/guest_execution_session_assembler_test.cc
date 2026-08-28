@@ -2582,8 +2582,26 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
   MakeSeeds({{kB, 1}, {kA, 1}}, &seeds, &roster);
   REQUIRE(harness.assembler->SeedParticipants(seeds, roster));
 
+  // The scheduler publishes the scalar wait shape of a ready participant for
+  // the live census; the durable topology must still carry none of it.
+  const auto ready_with_wait_shape = [](uint64_t generation) {
+    kernel::GuestSchedulerCheckpointBarrierSnapshot checkpoint =
+        BridgeCheckpoint(generation, {kA, kB});
+    for (kernel::GuestSchedulerCheckpointParticipant& participant :
+         checkpoint.participants) {
+      participant.blocked_wait_kind =
+          kernel::GuestSchedulerCaptureWaitKind::kSingle;
+      participant.blocked_wait.handle_count = 1;
+      participant.blocked_wait.flags =
+          kernel::kGuestSchedulerCaptureWaitFlagGated;
+      participant.blocked_wait.handles[0] = 0x24;
+      participant.blocked_wait.wait_epoch = 7;
+    }
+    return checkpoint;
+  };
+
   GuestExecutionSessionCaptureSchedulerEventBridge bridge;
-  REQUIRE(bridge.BeginSession(*harness.assembler, BridgeCheckpoint(1, {kA, kB}),
+  REQUIRE(bridge.BeginSession(*harness.assembler, ready_with_wait_shape(1),
                               seeds, &harness.error));
   REQUIRE(harness.assembler->Arm(&harness.error));
   REQUIRE(harness.assembler->RequestStart(&harness.error));
@@ -2625,7 +2643,7 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
   REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kHold);
   REQUIRE(harness.assembler->ArriveAtSafepoint(kB) == Action::kHold);
   REQUIRE(harness.state() == State::kPublishing);
-  REQUIRE(bridge.SealSession(*harness.assembler, BridgeCheckpoint(2, {kA, kB}),
+  REQUIRE(bridge.SealSession(*harness.assembler, ready_with_wait_shape(2),
                              &harness.error));
   const bool published = harness.assembler->Publish(&harness.error);
   INFO(harness.error);
@@ -2679,6 +2697,16 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
           0);
   REQUIRE(scheduler_topologies[1].participants[1].ready_queue_fifo_ordinal ==
           1);
+  // The topology copies blocked_wait under kBlocked alone, so the ready
+  // participants' populated wait shape reached no durable byte.
+  for (const GuestExecutionSessionSchedulerTopologyChunk& topology :
+       scheduler_topologies) {
+    for (const GuestExecutionSessionSchedulerTopologyParticipant& durable :
+         topology.participants) {
+      REQUIRE(durable.blocked_wait ==
+              GuestExecutionSessionSchedulerBlockedWaitBinding{});
+    }
+  }
   const std::vector<GuestExecutionContinuousEvent> overlay =
       DecodeBridgeOverlay(bundle);
   REQUIRE(overlay.size() == bundle.manifest.accepted_event_count);

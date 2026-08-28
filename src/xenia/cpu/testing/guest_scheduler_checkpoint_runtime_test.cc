@@ -2550,6 +2550,83 @@ TEST_CASE("Guest scheduler checkpoint authenticates a blocked wait topology",
   event.reset();
 }
 
+TEST_CASE("Guest scheduler checkpoint names a re-readied waiter's wait shape",
+          "[guest_scheduler_checkpoint][guest_scheduler_capture_wait]"
+          "[runtime]") {
+  SchedulerEnvironment environment;
+  REQUIRE(environment.ready());
+  GuestScheduler& scheduler = *environment.scheduler();
+  auto event =
+      object_ref<XEvent>(new XEvent(environment.emulator()->kernel_state()));
+  event->Initialize(false, false);
+  RereadyWaitControl control;
+  auto waiter =
+      object_ref<RereadyWaitRuntimeThread>(new RereadyWaitRuntimeThread(
+          environment.emulator()->kernel_state(), &control, event.get()));
+  waiter->set_name("Scheduler re-readied waiter census test");
+  REQUIRE(waiter->Create() == X_STATUS_SUCCESS);
+
+  const auto blocked_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!GuestSchedulerCaptureWaitRuntimeTestAccess::IsBlocked(scheduler,
+                                                                waiter.get()) &&
+         std::chrono::steady_clock::now() < blocked_deadline) {
+    std::this_thread::yield();
+  }
+  REQUIRE(GuestSchedulerCaptureWaitRuntimeTestAccess::IsBlocked(scheduler,
+                                                                waiter.get()));
+
+  // A higher-priority fiber holds the woken waiter on the ready queue, which is
+  // the state whose wait source a checkpoint could not name before.
+  FiberControl higher_priority_control;
+  CreatedThread higher_priority =
+      CreateRuntimeThread(environment, higher_priority_control,
+                          kCpu0CreationFlags | X_CREATE_SUSPENDED);
+  REQUIRE(XSUCCEEDED(higher_priority.status));
+  higher_priority.thread->SetPriority(31);
+  REQUIRE(XSUCCEEDED(higher_priority.thread->Resume()));
+  REQUIRE(higher_priority_control.WaitForStart(2s));
+
+  event->Set(0, false);
+  REQUIRE(WaitUntilQueued(scheduler, waiter.get(), 2s));
+
+  GuestSchedulerCheckpointBarrierSnapshot snapshot;
+  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
+          Rejection::kNone);
+  const auto* participant = FindThread(snapshot, waiter->thread_id());
+  REQUIRE(participant);
+  REQUIRE(participant->state ==
+          GuestSchedulerCheckpointParticipantState::kReady);
+  REQUIRE(participant->resume_kind == ResumeKind::kNativeContinuation);
+  REQUIRE(participant->guest_pc == 0);
+  REQUIRE_FALSE(participant->restorable);
+  REQUIRE(participant->blocked_wait_kind ==
+          GuestSchedulerCaptureWaitKind::kSingle);
+  REQUIRE(participant->blocked_wait.handle_count == 1);
+  REQUIRE(participant->blocked_wait.flags ==
+          (kGuestSchedulerCaptureWaitFlagGated |
+           kGuestSchedulerCaptureWaitFlagInterruptible));
+  // Scalars only: the handle and epoch arrays read wait_gate_objects, which is
+  // valid only while the fiber is parked.
+  REQUIRE(participant->blocked_wait.handles[0] == 0);
+  REQUIRE(participant->blocked_wait.wait_epoch == 0);
+  REQUIRE(participant->blocked_wait.observed_wait_epoch == 0);
+  REQUIRE(participant->blocked_wait.deadline_ms == 0);
+  REQUIRE(participant->blocked_wait.observed_uptime_ms == 0);
+  REQUIRE(participant->blocked_wait.signal_epochs_before[0] == 0);
+  REQUIRE(participant->blocked_wait.signal_epochs_observed[0] == 0);
+  REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
+              snapshot.generation, nullptr) == Rejection::kNone);
+
+  REQUIRE(StopRuntimeThread(higher_priority, higher_priority_control));
+  REQUIRE(control.WaitForCompletion(2s));
+  scheduler.Shutdown();
+  waiter->ReclaimExited();
+  waiter->ReleaseHandle();
+  waiter.reset();
+  event->ReleaseHandle();
+  event.reset();
+}
+
 TEST_CASE("Guest scheduler discards a suspended exact JIT route",
           "[guest_scheduler_checkpoint][runtime][continuous_replay]") {
   FiberControl control;

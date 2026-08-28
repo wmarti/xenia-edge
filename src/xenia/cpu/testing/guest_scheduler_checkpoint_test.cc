@@ -59,7 +59,7 @@ const Participant& FindParticipant(
 TEST_CASE("Scheduler checkpoint barrier holds running and preserves passive",
           "[guest_scheduler_checkpoint]") {
   GuestSchedulerCheckpointBarrier barrier;
-  const std::array participants = {
+  std::array participants = {
       MakeParticipant(0x101, 0, ParticipantState::kRunning),
       MakeParticipant(0x202, 1, ParticipantState::kRunning),
       MakeParticipant(0x303, 0, ParticipantState::kReady),
@@ -67,6 +67,10 @@ TEST_CASE("Scheduler checkpoint barrier holds running and preserves passive",
                       ResumeKind::kAfterBlockingExport),
       MakeParticipant(0x505, 1, ParticipantState::kSuspended),
   };
+  // The scalar wait shape a re-readied waiter carries into the roster.
+  participants[2].blocked_wait_kind = GuestSchedulerCaptureWaitKind::kSingle;
+  participants[2].blocked_wait.handle_count = 1;
+  participants[2].blocked_wait.flags = kGuestSchedulerCaptureWaitFlagGated;
 
   REQUIRE(barrier.Begin(0b11, participants));
   REQUIRE(barrier.ArriveAtSafepoint(0x101, 0, 0x82002000, 3, 5, 8));
@@ -104,6 +108,11 @@ TEST_CASE("Scheduler checkpoint barrier holds running and preserves passive",
   REQUIRE(ready.guest_pc == 0);
   REQUIRE(ready.resume_kind == ResumeKind::kNativeContinuation);
   REQUIRE_FALSE(ready.restorable);
+  REQUIRE(ready.blocked_wait_kind == GuestSchedulerCaptureWaitKind::kSingle);
+  REQUIRE(ready.blocked_wait.handle_count == 1);
+  REQUIRE(ready.blocked_wait.flags == kGuestSchedulerCaptureWaitFlagGated);
+  REQUIRE(ready.blocked_wait.handles[0] == 0);
+  REQUIRE(ready.blocked_wait.wait_epoch == 0);
   const auto& blocked = FindParticipant(snapshot, 0x404);
   REQUIRE(blocked.state == ParticipantState::kBlocked);
   REQUIRE(blocked.guest_pc == 0x82001000);

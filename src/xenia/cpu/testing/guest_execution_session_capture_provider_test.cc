@@ -894,12 +894,30 @@ TEST_CASE("guest execution session provider binds one blocking export dispatch",
         harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
     REQUIRE(error.find("no installed modeled export event log") !=
             std::string::npos);
+    REQUIRE(error.find(" export=nolog wait=1/1/0/00110001/0") !=
+            std::string::npos);
   }
   SECTION("no open dispatch") {
     harness.InstallExternalEventLog();
     REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
         harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
     REQUIRE(error.find("no open modeled export dispatch") != std::string::npos);
+    // The refusal that dominates the live roster names the wait it refused, so
+    // an unwired wait is separable from a wired one that failed a later check.
+    REQUIRE(error.find(" export=none wait=1/1/0/00110001/0") !=
+            std::string::npos);
+  }
+  SECTION("refusal after an open dispatch still names it") {
+    harness.InstallExternalEventLog();
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kMiddleFunctionAddress,
+                                       kExportThunkAddress));
+    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
+        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
+    REQUIRE(error.find("differs from its modeled export return point") !=
+            std::string::npos);
+    REQUIRE(error.find(" export=475/8270D724/82040040 "
+                       "wait=1/1/0/00110001/0") != std::string::npos);
   }
   SECTION("dispatch belongs to another participant") {
     harness.InstallExternalEventLog();

@@ -155,6 +155,41 @@ std::string DescribeParticipant(const CheckpointParticipant& participant) {
       participant.guest_pc);
 }
 
+// kind/handles/flags/handle0/deadline, the same shape the capture runtime's
+// rejection census prints, so one reader parses both diagnostics.
+std::string DescribeParticipantWaitShape(
+    const CheckpointParticipant& participant) {
+  return fmt::format(
+      "wait={}/{}/{}/{:08X}/{}",
+      static_cast<uint32_t>(participant.blocked_wait_kind),
+      static_cast<uint32_t>(participant.blocked_wait.handle_count),
+      static_cast<uint32_t>(participant.blocked_wait.flags),
+      participant.blocked_wait.handles[0],
+      participant.blocked_wait.deadline_ms);
+}
+
+std::string DescribeOpenExportDispatch(
+    bool log_installed, bool log_usable,
+    const std::vector<GuestExecutionCaptureExternalEventActiveCall>& calls) {
+  if (!log_installed) {
+    return "export=nolog";
+  }
+  if (!log_usable) {
+    return "export=rejected";
+  }
+  const GuestExecutionCaptureExternalEventActiveCall* outermost = nullptr;
+  for (const GuestExecutionCaptureExternalEventActiveCall& call : calls) {
+    if (!outermost || call.participant_depth < outermost->participant_depth) {
+      outermost = &call;
+    }
+  }
+  if (!outermost) {
+    return "export=none";
+  }
+  return fmt::format("export={}/{:08X}/{:08X}", outermost->export_ordinal,
+                     outermost->guest_address, outermost->call_site_address);
+}
+
 }  // namespace
 
 struct GuestExecutionSessionCaptureProvider::Impl {
@@ -728,11 +763,26 @@ struct GuestExecutionSessionCaptureProvider::Impl {
       const CheckpointParticipant& participant,
       GuestExecutionCaptureExternalEventActiveCall* output,
       std::string* reason) const {
+    // Queried before the first refusal so every refusal names the wait it
+    // refused and the dispatch it did or did not find, which is what separates
+    // an unwired wait from a wired one that failed a later check.
+    const std::shared_ptr<GuestExecutionCaptureExternalEventLog> log =
+        processor.guest_execution_capture_external_event_log();
+    std::vector<GuestExecutionCaptureExternalEventActiveCall> calls;
+    const bool log_usable =
+        log &&
+        log->CopyParticipantActiveCalls(
+            {participant.capture_instance_id, participant.thread_id}, &calls);
     const auto refuse = [&](std::string_view text) {
       if (reason) {
         reason->assign(text);
         reason->append(": ");
         reason->append(DescribeParticipant(participant));
+        reason->push_back(' ');
+        reason->append(
+            DescribeOpenExportDispatch(log != nullptr, log_usable, calls));
+        reason->push_back(' ');
+        reason->append(DescribeParticipantWaitShape(participant));
       }
       return false;
     };
@@ -741,15 +791,11 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           "capture provider blocked participant is outside the modeled "
           "blocking-export wait allowlist");
     }
-    const std::shared_ptr<GuestExecutionCaptureExternalEventLog> log =
-        processor.guest_execution_capture_external_event_log();
     if (!log) {
       return refuse(
           "capture provider has no installed modeled export event log");
     }
-    std::vector<GuestExecutionCaptureExternalEventActiveCall> calls;
-    if (!log->CopyParticipantActiveCalls(
-            {participant.capture_instance_id, participant.thread_id}, &calls)) {
+    if (!log_usable) {
       return refuse(
           "capture provider modeled export event log is not replayable");
     }

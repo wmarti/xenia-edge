@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -888,6 +889,11 @@ class FakeCheckpointController final
   CheckpointRejection Pause(std::chrono::milliseconds,
                             CheckpointSnapshot* snapshot) override {
     const uint32_t current_pause = ++pause_count;
+    // The runtime installs its modeled export event log before the first
+    // barrier, so this is a test's only window to open a dispatch on it.
+    if (pause_hook) {
+      pause_hook(current_pause);
+    }
     {
       std::unique_lock<std::mutex> lock(mutex);
       if (block_pause_number.load(std::memory_order_acquire) == current_pause) {
@@ -981,6 +987,7 @@ class FakeCheckpointController final
   }
 
   CheckpointSnapshot provisional;
+  std::function<void(uint32_t)> pause_hook;
   CheckpointRejection pause_result = CheckpointRejection::kNone;
   // Zero fails every pause; otherwise only the leading pauses fail.
   std::atomic<uint32_t> pause_failure_limit{0};
@@ -2013,7 +2020,8 @@ TEST_CASE(
   const std::string census =
       "capture runtime passive scheduler participant has an active outer host "
       "call: tid=00000001 state=1 resume_kind=1 restorable=false pc=00000000 "
-      "hostcall=depth=1,fn=82002000,ret=82003000; unsupported=1/1";
+      "hostcall=depth=1,fn=82002000,ret=82003000 export=none "
+      "wait=0/0/0/00000000/0; unsupported=1/1";
   INFO(status.message);
   REQUIRE(status.message.compare(0, census.size(), census) == 0);
   REQUIRE(status.message.find('\n') == std::string::npos);
@@ -2082,6 +2090,12 @@ TEST_CASE("session capture runtime censuses passive participants in host calls",
   ready.resume_kind =
       kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
   ready.restorable = false;
+  // The scalar wait shape the scheduler now publishes for a ready participant.
+  ready.blocked_wait_kind = kernel::GuestSchedulerCaptureWaitKind::kSingle;
+  ready.blocked_wait.handle_count = 1;
+  ready.blocked_wait.flags =
+      kernel::kGuestSchedulerCaptureWaitFlagGated |
+      kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
   harness.checkpoint.start_guest_pc = 0;
   CheckpointParticipant suspended;
   suspended.thread_id = second->thread_id();
@@ -2123,9 +2137,11 @@ TEST_CASE("session capture runtime censuses passive participants in host calls",
   const std::string census =
       "capture runtime passive scheduler participant has an active outer host "
       "call: tid=00000001 state=1 resume_kind=1 restorable=false pc=00000000 "
-      "hostcall=depth=1,fn=82002000,ret=82003000"
+      "hostcall=depth=1,fn=82002000,ret=82003000 export=none "
+      "wait=1/1/5/00000000/0"
       "; also: tid=00000002 state=3 resume_kind=3 restorable=false "
-      "pc=00000000 hostcall=depth=1,fn=82004000,ret=82005000"
+      "pc=00000000 hostcall=depth=1,fn=82004000,ret=82005000 export=none "
+      "wait=0/0/0/00000000/0"
       "; unsupported=2/2";
   REQUIRE(status.message.compare(0, census.size(), census) == 0);
   REQUIRE(status.message.find("; unsupported=2/2") != std::string::npos);
@@ -2137,6 +2153,81 @@ TEST_CASE("session capture runtime censuses passive participants in host calls",
   harness.runtime->Shutdown();
   second.reset();
   first.reset();
+}
+
+TEST_CASE("session capture runtime censuses an open modeled export dispatch",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  auto& participant = harness.checkpoint.provisional.participants.front();
+  participant.state = kernel::GuestSchedulerCheckpointParticipantState::kReady;
+  participant.guest_pc = 0;
+  participant.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+  participant.restorable = false;
+  participant.blocked_wait_kind =
+      kernel::GuestSchedulerCaptureWaitKind::kMultiAny;
+  participant.blocked_wait.handle_count = 2;
+  participant.blocked_wait.flags =
+      kernel::kGuestSchedulerCaptureWaitFlagAlertable;
+  harness.checkpoint.start_guest_pc = 0;
+
+  std::shared_ptr<GuestExecutionCaptureExternalEventLog> log;
+  GuestExecutionCaptureExternalEventToken token;
+  harness.checkpoint.pause_hook = [&](uint32_t) {
+    log = environment.processor->guest_execution_capture_external_event_log();
+    if (!log) {
+      return;
+    }
+    GuestExecutionCaptureExternalEventBegin begin;
+    begin.participant = {thread->guest_execution_capture_instance_id(),
+                         thread->thread_id()};
+    begin.kind = GuestExecutionCaptureExternalEventKind::kKernelExport;
+    begin.export_ordinal = 0x123;
+    begin.guest_address = 0x82063D80;
+    begin.call_site_address = 0x82065B14;
+    token = log->OnExternalEventBegin(begin, {});
+  };
+
+  BlockingGuestFunction function(0x82002000, 0x82002100);
+  bool call_result = false;
+  std::thread source(
+      [&]() { call_result = function.Call(thread.get(), 0x82003000); });
+  const bool entered = function.WaitForEntry();
+  const bool requested = entered && harness.runtime->RequestStart();
+  const bool terminal = requested && harness.runtime->WaitForTerminal(2s);
+  const auto status = harness.runtime->status();
+  function.Release();
+  source.join();
+
+  REQUIRE(entered);
+  REQUIRE(requested);
+  REQUIRE(terminal);
+  INFO(status.message);
+  REQUIRE(log);
+  REQUIRE(token);
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
+  const std::string census =
+      "capture runtime passive scheduler participant has an active outer host "
+      "call: tid=00000001 state=1 resume_kind=1 restorable=false pc=00000000 "
+      "hostcall=depth=1,fn=82002000,ret=82003000 "
+      "export=291/82063D80/82065B14 wait=2/2/2/00000000/0"
+      "; unsupported=1/1";
+  REQUIRE(status.message.compare(0, census.size(), census) == 0);
+  REQUIRE(status.message.find('\n') == std::string::npos);
+  REQUIRE(harness.provider.begin_count.load() == 0);
+  REQUIRE(call_result);
+
+  GuestExecutionCaptureExternalEventEnd end;
+  end.disposition =
+      GuestExecutionCaptureExternalEventDisposition::kReplayCaptured;
+  end.mutation_source = GuestExecutionCaptureExternalEventMutationSource::kNone;
+  REQUIRE(log->OnExternalEventEnd(token, end, {}));
+  harness.runtime->Shutdown();
+  thread.reset();
 }
 
 TEST_CASE("session capture runtime rejects a partial preemption episode",
