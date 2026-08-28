@@ -48,7 +48,7 @@ class JitCorpus {
  public:
   // 'XJC1' -- bump kVersion on any layout change.
   static constexpr uint32_t kMagic = 0x3143584Au;
-  static constexpr uint32_t kVersion = 3;
+  static constexpr uint32_t kVersion = 4;
   static constexpr uint32_t kPageSize = 0x1000u;
 
   // Codegen-affecting settings latched at capture, carried in the header's
@@ -106,6 +106,10 @@ class JitCorpus {
   enum RecordTag : uint32_t {
     kTagPage = 1,
     kTagFunction = 2,
+    // A function the loader synthesized and declared but never translated,
+    // so it has an extent and metadata but no body and no pages. Replay
+    // declares it exactly as the loader did rather than shipping its bytes.
+    kTagSaverest = 3,
   };
 
   JitCorpus() = default;

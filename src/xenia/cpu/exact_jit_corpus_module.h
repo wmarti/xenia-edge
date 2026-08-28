@@ -69,9 +69,12 @@ class ExactJitCorpusModule final : public Module {
   const ExecutionJitCorpus::FunctionRecord* FindFunction(
       uint32_t entry_address) const;
   const ResumeEntry* FindResumeEntry(uint32_t resume_pc) const;
+  const ExecutionJitCorpus::SaverestRecord* FindSaverest(
+      uint32_t entry_address) const;
 
   std::string name_;
   std::vector<ExecutionJitCorpus::FunctionRecord> functions_;
+  std::vector<ExecutionJitCorpus::SaverestRecord> saverest_records_;
   std::vector<ResumeEntry> resume_entries_;
 };
 

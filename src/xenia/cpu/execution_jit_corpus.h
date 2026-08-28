@@ -36,12 +36,25 @@ class ExecutionJitCorpus {
  public:
   using FunctionRecord = JitCorpus::FunctionRecord;
 
+  // A save/restore helper the XEX loader synthesized: an entry the backend
+  // inlines from its metadata rather than calling, so it carries an extent and
+  // flags but never a body. It is deliberately not a FunctionRecord: it has no
+  // host code size, requires no code pages, and takes no definition order.
+  struct SaverestRecord {
+    uint32_t address;
+    uint32_t end_address;
+    uint32_t flags;
+  };
+
   // Resource-safety limits for untrusted replay input. These are acceptance
   // ceilings, not capture targets.
   static constexpr uint64_t kMaxCorpusSize = 512ull * 1024ull * 1024ull;
   static constexpr uint32_t kMaxPageRecords = 65536;
   static constexpr uint32_t kMaxFunctionRecords = 1024 * 1024;
   static constexpr uint32_t kMaxFunctionSize = 16u * 1024u * 1024u;
+  // The XEX chains are 18 GPR, 18 FPR and 2 x 18 VMX entries in each
+  // direction; this is a resource ceiling well above any real loader set.
+  static constexpr uint32_t kMaxSaverestRecords = 1024;
 
   ExecutionJitCorpus() = default;
 
@@ -79,13 +92,19 @@ class ExecutionJitCorpus {
     return function_definition_order_;
   }
 
+  const std::vector<SaverestRecord>& saverest_records() const {
+    return saverest_records_;
+  }
+
   const uint8_t* FindPageData(uint32_t page_address) const;
   const FunctionRecord* FindFunction(uint32_t entry_address) const;
+  const SaverestRecord* FindSaverest(uint32_t entry_address) const;
 
  private:
   std::vector<uint32_t> page_addresses_;
   std::vector<uint8_t> page_data_;
   std::vector<FunctionRecord> functions_;
+  std::vector<SaverestRecord> saverest_records_;
   std::vector<uint32_t> function_definition_order_;
   uint32_t version_ = 0;
   uint32_t config_flags_ = 0;
@@ -118,6 +137,8 @@ class ExecutionJitCorpusBuilder {
                    size_t page_data_size, std::string* error = nullptr);
   bool AddFunction(const FunctionRecord& function,
                    std::string* error = nullptr);
+  bool AddSaverest(const ExecutionJitCorpus::SaverestRecord& saverest,
+                   std::string* error = nullptr);
 
   // On success, output is a canonical little-endian JitCorpus v3 stream that
   // the strict ExecutionJitCorpus decoder accepts. On failure, output is
@@ -127,6 +148,7 @@ class ExecutionJitCorpusBuilder {
 
   size_t code_page_count() const { return pages_.size(); }
   size_t function_count() const { return functions_.size(); }
+  size_t saverest_count() const { return saverest_records_.size(); }
 
  private:
   bool Fail(std::string_view message, std::string* error);
@@ -135,6 +157,8 @@ class ExecutionJitCorpusBuilder {
   std::map<uint32_t, CodePage> pages_;
   std::vector<FunctionRecord> functions_;
   std::unordered_set<uint32_t> function_addresses_;
+  std::vector<ExecutionJitCorpus::SaverestRecord> saverest_records_;
+  std::unordered_set<uint32_t> saverest_addresses_;
   uint32_t config_flags_ = 0;
   bool failed_ = false;
   std::string failure_;

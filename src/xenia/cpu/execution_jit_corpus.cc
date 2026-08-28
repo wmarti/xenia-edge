@@ -24,12 +24,13 @@ namespace cpu {
 namespace {
 
 constexpr uint32_t kKnownConfigFlags = JitCorpus::kConfigGuestScheduler;
-constexpr uint32_t kSupportedVersion = 3;
+constexpr uint32_t kSupportedVersion = 4;
 constexpr uint32_t kSupportedPageSize = 4096;
 constexpr size_t kHeaderSize = 4 * sizeof(uint32_t);
 constexpr uint64_t kEncodedPageRecordSize =
     2 * sizeof(uint32_t) + JitCorpus::kPageSize;
 constexpr uint64_t kEncodedFunctionRecordSize = 5 * sizeof(uint32_t);
+constexpr uint64_t kEncodedSaverestRecordSize = 4 * sizeof(uint32_t);
 
 static_assert(JitCorpus::kVersion == kSupportedVersion,
               "review the execution decoder before accepting a new format");
@@ -115,6 +116,62 @@ bool ValidateCodePageAddress(uint32_t address, std::string* error) {
       error->assign(
           "corpus contains a code page outside the supported XEX executable "
           "range");
+    }
+    return false;
+  }
+  return true;
+}
+
+bool ValidateSaverestRecord(const ExecutionJitCorpus::SaverestRecord& saverest,
+                            std::string* error) {
+  JitCorpus::FunctionMetadata metadata;
+  if ((saverest.flags & ~JitCorpus::kKnownFunctionFlags) ||
+      !JitCorpus::DecodeFunctionFlags(saverest.flags, &metadata)) {
+    if (error) {
+      error->assign("saverest record contains invalid metadata");
+    }
+    return false;
+  }
+  // Admission is keyed on being a save/restore helper, never on lacking a
+  // body. Without this an extern or builtin would qualify for a record that
+  // carries no code and is therefore never validated against any page.
+  if (metadata.saverest_type == SaveRestoreType::NONE) {
+    if (error) {
+      error->assign("saverest record is not a save/restore helper");
+    }
+    return false;
+  }
+  if (metadata.behavior == Function::Behavior::kBuiltin ||
+      metadata.behavior == Function::Behavior::kExtern) {
+    if (error) {
+      error->assign("saverest record is host-backed");
+    }
+    return false;
+  }
+  if (!saverest.address || (saverest.address & 3) ||
+      (saverest.end_address & 3) || saverest.end_address < saverest.address ||
+      saverest.end_address >
+          std::numeric_limits<uint32_t>::max() - sizeof(uint32_t)) {
+    if (error) {
+      error->assign("saverest record contains an invalid extent");
+    }
+    return false;
+  }
+  const uint64_t extent =
+      uint64_t(saverest.end_address) - saverest.address + sizeof(uint32_t);
+  if (extent > ExecutionJitCorpus::kMaxFunctionSize) {
+    if (error) {
+      error->assign("saverest record extent exceeds the size limit");
+    }
+    return false;
+  }
+  const uint32_t first_page = saverest.address & ~(JitCorpus::kPageSize - 1);
+  const uint32_t last_page = saverest.end_address & ~(JitCorpus::kPageSize - 1);
+  if (!IsSupportedCodePageAddress(first_page) ||
+      !IsSupportedCodePageAddress(last_page)) {
+    if (error) {
+      error->assign(
+          "saverest record is outside the supported XEX executable range");
     }
     return false;
   }
@@ -236,6 +293,7 @@ bool ExecutionJitCorpus::Decode(const uint8_t* data, size_t data_size,
 
   std::vector<PageRecord> pages;
   std::vector<FunctionRecord> functions;
+  std::vector<ExecutionJitCorpus::SaverestRecord> saverest_records;
   while (reader.remaining()) {
     if (reader.remaining() < sizeof(uint32_t)) {
       return Fail(output, error, "corpus has trailing bytes");
@@ -272,6 +330,20 @@ bool ExecutionJitCorpus::Decode(const uint8_t* data, size_t data_size,
         return Fail(output, error, "corpus exceeds the function-count limit");
       }
       functions.push_back(function);
+    } else if (tag == JitCorpus::kTagSaverest) {
+      ExecutionJitCorpus::SaverestRecord saverest = {};
+      if (!reader.ReadU32(&saverest.address) ||
+          !reader.ReadU32(&saverest.end_address) ||
+          !reader.ReadU32(&saverest.flags)) {
+        return Fail(output, error, "corpus saverest record is truncated");
+      }
+      if (!ValidateSaverestRecord(saverest, &validation_error)) {
+        return Fail(output, error, validation_error);
+      }
+      if (saverest_records.size() >= ExecutionJitCorpus::kMaxSaverestRecords) {
+        return Fail(output, error, "corpus exceeds the saverest-count limit");
+      }
+      saverest_records.push_back(saverest);
     } else {
       return Fail(output, error, "corpus contains an unsupported record tag");
     }
@@ -337,9 +409,36 @@ bool ExecutionJitCorpus::Decode(const uint8_t* data, size_t data_size,
     }
   }
 
+  std::sort(saverest_records.begin(), saverest_records.end(),
+            [](const ExecutionJitCorpus::SaverestRecord& left,
+               const ExecutionJitCorpus::SaverestRecord& right) {
+              return left.address < right.address;
+            });
+  for (size_t i = 1; i < saverest_records.size(); ++i) {
+    if (saverest_records[i - 1].address == saverest_records[i].address) {
+      return Fail(output, error, "corpus contains duplicate saverest entries");
+    }
+  }
+  // One address cannot be both a translated function and a declaration the
+  // backend inlines without a body, and letting both exist would make which
+  // one a lookup returns depend on search order.
+  for (const ExecutionJitCorpus::SaverestRecord& saverest : saverest_records) {
+    const auto it =
+        std::lower_bound(functions.cbegin(), functions.cend(), saverest.address,
+                         [](const FunctionRecord& function, uint32_t address) {
+                           return function.address < address;
+                         });
+    if (it != functions.cend() && it->address == saverest.address) {
+      return Fail(output, error,
+                  "corpus declares one address as both a function and a "
+                  "saverest helper");
+    }
+  }
+
   ExecutionJitCorpus decoded;
   decoded.version_ = version;
   decoded.config_flags_ = config_flags;
+  decoded.saverest_records_ = std::move(saverest_records);
   decoded.functions_ = std::move(functions);
   decoded.function_definition_order_ = std::move(function_definition_order);
   decoded.page_addresses_.reserve(pages.size());
@@ -397,6 +496,18 @@ const uint8_t* ExecutionJitCorpus::FindPageData(uint32_t page_address) const {
   }
   const size_t index = static_cast<size_t>(it - page_addresses_.cbegin());
   return page_data_.data() + index * JitCorpus::kPageSize;
+}
+
+const ExecutionJitCorpus::SaverestRecord* ExecutionJitCorpus::FindSaverest(
+    uint32_t entry_address) const {
+  const auto it = std::lower_bound(
+      saverest_records_.cbegin(), saverest_records_.cend(), entry_address,
+      [](const SaverestRecord& saverest, uint32_t address) {
+        return saverest.address < address;
+      });
+  return it != saverest_records_.cend() && it->address == entry_address
+             ? &*it
+             : nullptr;
 }
 
 const ExecutionJitCorpus::FunctionRecord* ExecutionJitCorpus::FindFunction(
@@ -471,6 +582,33 @@ bool ExecutionJitCorpusBuilder::AddCodePage(uint32_t page_address,
   return true;
 }
 
+bool ExecutionJitCorpusBuilder::AddSaverest(
+    const ExecutionJitCorpus::SaverestRecord& saverest, std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!CheckUsable(error)) {
+    return false;
+  }
+  std::string validation_error;
+  if (!ValidateSaverestRecord(saverest, &validation_error)) {
+    return Fail(validation_error, error);
+  }
+  if (saverest_records_.size() >= ExecutionJitCorpus::kMaxSaverestRecords) {
+    return Fail("exact corpus exceeds the saverest-count limit", error);
+  }
+  if (function_addresses_.contains(saverest.address)) {
+    return Fail("exact corpus already defines that address as a function",
+                error);
+  }
+  if (!saverest_addresses_.insert(saverest.address).second) {
+    return Fail("exact corpus contains a duplicate saverest declaration",
+                error);
+  }
+  saverest_records_.push_back(saverest);
+  return true;
+}
+
 bool ExecutionJitCorpusBuilder::AddFunction(const FunctionRecord& function,
                                             std::string* error) {
   if (error) {
@@ -485,6 +623,12 @@ bool ExecutionJitCorpusBuilder::AddFunction(const FunctionRecord& function,
   }
   if (functions_.size() >= ExecutionJitCorpus::kMaxFunctionRecords) {
     return Fail("exact corpus exceeds the function-count limit", error);
+  }
+  if (saverest_addresses_.contains(function.address)) {
+    return Fail(
+        "exact corpus already declares that address as a saverest "
+        "helper",
+        error);
   }
   if (!function_addresses_.insert(function.address).second) {
     return Fail("exact corpus contains a duplicate function definition", error);
@@ -537,6 +681,12 @@ bool ExecutionJitCorpusBuilder::Encode(std::vector<uint8_t>* output,
     return fail("exact corpus exceeds the byte-size limit");
   }
   encoded_size += functions_.size() * kEncodedFunctionRecordSize;
+  if (saverest_records_.size() >
+      (ExecutionJitCorpus::kMaxCorpusSize - encoded_size) /
+          kEncodedSaverestRecordSize) {
+    return fail("exact corpus exceeds the byte-size limit");
+  }
+  encoded_size += saverest_records_.size() * kEncodedSaverestRecordSize;
 
   std::vector<uint8_t> encoded;
   encoded.reserve(static_cast<size_t>(encoded_size));
@@ -556,6 +706,12 @@ bool ExecutionJitCorpusBuilder::Encode(std::vector<uint8_t>* output,
     AppendU32(&encoded, function.host_code_size);
     AppendU32(&encoded, function.flags);
   }
+  for (const ExecutionJitCorpus::SaverestRecord& saverest : saverest_records_) {
+    AppendU32(&encoded, JitCorpus::kTagSaverest);
+    AppendU32(&encoded, saverest.address);
+    AppendU32(&encoded, saverest.end_address);
+    AppendU32(&encoded, saverest.flags);
+  }
   if (encoded.size() != encoded_size) {
     return fail("exact corpus encoded size is inconsistent");
   }
@@ -567,7 +723,8 @@ bool ExecutionJitCorpusBuilder::Encode(std::vector<uint8_t>* output,
   if (decoded.version() != JitCorpus::kVersion ||
       decoded.config_flags() != config_flags_ ||
       decoded.page_addresses().size() != pages_.size() ||
-      decoded.functions().size() != functions_.size()) {
+      decoded.functions().size() != functions_.size() ||
+      decoded.saverest_records().size() != saverest_records_.size()) {
     return fail("exact corpus failed its codec round trip");
   }
   for (const auto& [page_address, page] : pages_) {

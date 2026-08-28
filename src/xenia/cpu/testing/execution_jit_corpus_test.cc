@@ -548,4 +548,92 @@ TEST_CASE("execution JIT corpus requires every page spanning every extent",
   RequireDecodeFailure(missing_middle_page);
 }
 
+TEST_CASE("execution JIT corpus carries save/restore declarations",
+          "[execution-jit-corpus]") {
+  const ExecutionJitCorpusBuilder::CodePage page = MakeCodePage(0x11);
+  const ExecutionJitCorpus::FunctionRecord root = {
+      0x82000000, 0x820000FC, 64,
+      FunctionFlags(Function::Behavior::kDefault, SaveRestoreType::NONE, false,
+                    0)};
+  // Deliberately on a page the corpus does not supply. A declaration carries
+  // no body, so it must not pull a page set in behind it.
+  const ExecutionJitCorpus::SaverestRecord helper = {
+      0x83000000, 0x83000048,
+      FunctionFlags(Function::Behavior::kProlog, SaveRestoreType::GPR, false,
+                    14)};
+
+  ExecutionJitCorpusBuilder builder(JitCorpus::kConfigGuestScheduler);
+  std::string error;
+  REQUIRE(builder.AddCodePage(0x82000000, page.data(), page.size(), &error));
+  REQUIRE(builder.AddFunction(root, &error));
+  REQUIRE(builder.AddSaverest(helper, &error));
+  REQUIRE(builder.saverest_count() == 1);
+
+  std::vector<uint8_t> encoded;
+  REQUIRE(builder.Encode(&encoded, &error));
+  REQUIRE(error.empty());
+
+  ExecutionJitCorpus corpus;
+  REQUIRE(ExecutionJitCorpus::Decode(encoded, &corpus, &error));
+  REQUIRE(corpus.saverest_records().size() == 1);
+  REQUIRE(corpus.FindSaverest(0x83000000));
+  REQUIRE(corpus.FindSaverest(0x83000000)->end_address == 0x83000048);
+  REQUIRE_FALSE(corpus.FindSaverest(0x82000000));
+  // A declaration is not a function: it takes no definition-order slot and
+  // adds no page requirement.
+  REQUIRE(corpus.function_definition_order() ==
+          std::vector<uint32_t>{0x82000000});
+  REQUIRE(corpus.page_addresses() == std::vector<uint32_t>{0x82000000});
+}
+
+TEST_CASE("execution JIT corpus admits only save/restore declarations",
+          "[execution-jit-corpus]") {
+  ExecutionJitCorpusBuilder builder(JitCorpus::kConfigGuestScheduler);
+  std::string error;
+
+  SECTION("a host-backed extern is refused") {
+    const ExecutionJitCorpus::SaverestRecord record = {
+        0x83000000, 0x83000048,
+        FunctionFlags(Function::Behavior::kExtern, SaveRestoreType::NONE, false,
+                      0)};
+    REQUIRE_FALSE(builder.AddSaverest(record, &error));
+    REQUIRE_FALSE(error.empty());
+  }
+  SECTION("a host-backed builtin is refused") {
+    const ExecutionJitCorpus::SaverestRecord record = {
+        0x83000000, 0x83000048,
+        FunctionFlags(Function::Behavior::kBuiltin, SaveRestoreType::NONE,
+                      false, 0)};
+    REQUIRE_FALSE(builder.AddSaverest(record, &error));
+    REQUIRE_FALSE(error.empty());
+  }
+  SECTION("an ordinary declared function is refused") {
+    // Legal metadata, but not a helper. This is the case the predicate has to
+    // catch on its own: keying admission on being undefined instead would let
+    // it through.
+    const ExecutionJitCorpus::SaverestRecord record = {
+        0x83000000, 0x83000048,
+        FunctionFlags(Function::Behavior::kDefault, SaveRestoreType::NONE,
+                      false, 0)};
+    REQUIRE_FALSE(builder.AddSaverest(record, &error));
+    REQUIRE_FALSE(error.empty());
+  }
+  SECTION("one address cannot be both a function and a declaration") {
+    const uint32_t helper_flags = FunctionFlags(
+        Function::Behavior::kProlog, SaveRestoreType::GPR, false, 14);
+    const ExecutionJitCorpus::FunctionRecord function = {0x83000000, 0x83000048,
+                                                         64, helper_flags};
+    const ExecutionJitCorpus::SaverestRecord declaration = {
+        0x83000000, 0x83000048, helper_flags};
+    REQUIRE(builder.AddSaverest(declaration, &error));
+    REQUIRE_FALSE(builder.AddFunction(function, &error));
+    REQUIRE_FALSE(error.empty());
+
+    ExecutionJitCorpusBuilder reverse(JitCorpus::kConfigGuestScheduler);
+    REQUIRE(reverse.AddFunction(function, &error));
+    REQUIRE_FALSE(reverse.AddSaverest(declaration, &error));
+    REQUIRE_FALSE(error.empty());
+  }
+}
+
 }  // namespace xe::cpu::test

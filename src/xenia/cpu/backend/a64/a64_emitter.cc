@@ -955,6 +955,15 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   if (TryInlinePPCGprLrSaveRestore(instr, function)) {
     return;
   }
+  if (function->is_declaration_only()) {
+    // The loader declared this helper and never translated it, so there is no
+    // body to call anywhere and resolving one would translate bytes the corpus
+    // never carried. Reaching here means the inline above declined a form it
+    // was expected to handle.
+    XELOGE("Call to declaration-only function {:08X} from {:08X}",
+           function->address(), current_guest_function_);
+    return;
+  }
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE

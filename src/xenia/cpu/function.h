@@ -61,6 +61,13 @@ class Function : public Symbol {
 
   bool IsSaverest() const { return saverest_type_ != SaveRestoreType::NONE; }
 
+  // Set for a function the loader declared but never translated, which the
+  // backend reproduces by inlining its metadata. It has an extent and
+  // metadata but no body anywhere, so emitting a real call to it is a defect
+  // rather than a cache miss to resolve.
+  bool is_declaration_only() const { return declaration_only_ != 0; }
+  void set_declaration_only(bool value) { declaration_only_ = value ? 1 : 0; }
+
   SaveRestoreType SaverestType() const { return saverest_type_; }
   unsigned SaverestIndex() const { return saverest_index_; }
 
@@ -90,6 +97,7 @@ class Function : public Symbol {
   SaveRestoreType saverest_type_ = SaveRestoreType::NONE;
   uint8_t is_restore_ = 0;
   uint8_t saverest_index_ = 0;
+  uint8_t declaration_only_ = 0;
 };
 
 class BuiltinFunction : public Function {

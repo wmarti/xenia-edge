@@ -369,6 +369,26 @@ struct GuestInvocationCaptureRuntime::Impl {
       return Fail(error,
                   "capture translation closure does not contain one root");
     }
+
+    // The backend reproduces a save/restore helper by inlining its metadata,
+    // so replay needs the loader's declaration but never the helper's bytes.
+    // Admission is keyed on that metadata rather than on the target lacking a
+    // definition: every extern and builtin the registry declared is also
+    // undefined, and only this predicate keeps them out.
+    for (uint32_t address : result.declared_only_dependencies) {
+      Function* function = processor.LookupFunction(address);
+      if (!function || !function->is_guest() || !function->IsSaverest() ||
+          function->behavior() == Function::Behavior::kExtern ||
+          function->behavior() == Function::Behavior::kBuiltin) {
+        continue;
+      }
+      const ExecutionJitCorpus::SaverestRecord saverest_record = {
+          function->address(), function->end_address(),
+          JitCorpus::EncodeFunctionFlags(*function)};
+      if (!corpus_builder.AddSaverest(saverest_record, error)) {
+        return false;
+      }
+    }
     std::vector<uint8_t> exact_corpus_bytes;
     if (!corpus_builder.Encode(&exact_corpus_bytes, error) ||
         !WriteGuestInvocationCaptureBundle(
