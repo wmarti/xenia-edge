@@ -942,6 +942,7 @@ class FakeCheckpointController final
         row.blocked_wait_kind = blocked_wait_kind;
         row.blocked_wait.handle_count = blocked_wait_handle_count;
         row.blocked_wait.flags = blocked_wait_flags;
+        row.blocked_wait.deadline_ms = blocked_wait_deadline_ms;
       }
       if (current_pause == 1 ? woken_at_start : woken_at_stop) {
         auto& row = held_snapshot.participants.front();
@@ -1045,6 +1046,7 @@ class FakeCheckpointController final
       kernel::GuestSchedulerCaptureWaitKind::kSingle;
   uint8_t blocked_wait_handle_count = 1;
   uint8_t blocked_wait_flags = 0;
+  uint64_t blocked_wait_deadline_ms = 0;
   std::atomic<uint32_t> block_pause_number{0};
   uint32_t cancel_failures = 0;
   std::atomic<uint32_t> pause_count{0};
@@ -1532,7 +1534,10 @@ TEST_CASE("session capture runtime binds initial state to a blocked export",
   thread.reset();
 }
 
-TEST_CASE("session capture runtime refuses an unmodeled blocked export wait",
+// The scheduler stamps a delayed sleeper with the same link register and the
+// same resume kind as an object waiter, so it takes the same route and fails
+// for the same reason rather than for the wait it is in.
+TEST_CASE("session capture runtime routes a delay wait like an object wait",
           "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;
   auto thread = environment.MakeThread(1);
@@ -1541,6 +1546,11 @@ TEST_CASE("session capture runtime refuses an unmodeled blocked export wait",
   harness.checkpoint.blocked_at_start = true;
   harness.checkpoint.blocked_wait_kind =
       kernel::GuestSchedulerCaptureWaitKind::kDelay;
+  harness.checkpoint.blocked_wait_handle_count = 0;
+  harness.checkpoint.blocked_wait_flags =
+      kernel::kGuestSchedulerCaptureWaitFlagGated |
+      kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
+  harness.checkpoint.blocked_wait_deadline_ms = 1000;
 
   REQUIRE(harness.runtime->RequestStart());
   REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
@@ -1550,9 +1560,12 @@ TEST_CASE("session capture runtime refuses an unmodeled blocked export wait",
   const auto status = harness.runtime->status();
   REQUIRE(status.state == RuntimeState::kRejected);
   REQUIRE(status.rejection == RuntimeRejection::kBundleValidation);
-  REQUIRE(status.message.find(
-              "blocked-export wait is outside the modeled allowlist") !=
+  INFO(status.message);
+  REQUIRE(status.message.find("outside the modeled allowlist") ==
           std::string::npos);
+  REQUIRE(status.message.find(
+              "initial PPC continuation differs from the held scheduler "
+              "blocked export") != std::string::npos);
   REQUIRE_FALSE(status.canonical_output_published);
 
   harness.runtime->Shutdown();
@@ -2241,6 +2254,9 @@ TEST_CASE("session capture runtime censuses passive participants in host calls",
   first.reset();
 }
 
+// A fiber the scheduler has never dispatched owns no host call, so a roster
+// that puts one inside an open modeled export dispatch describes no thread the
+// emulator can produce and no class admits it.
 TEST_CASE("session capture runtime censuses an open modeled export dispatch",
           "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;
@@ -2251,7 +2267,7 @@ TEST_CASE("session capture runtime censuses an open modeled export dispatch",
   participant.state = kernel::GuestSchedulerCheckpointParticipantState::kReady;
   participant.guest_pc = 0;
   participant.resume_kind =
-      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+      kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun;
   participant.restorable = false;
   participant.blocked_wait_kind =
       kernel::GuestSchedulerCaptureWaitKind::kMultiAny;
@@ -2298,7 +2314,7 @@ TEST_CASE("session capture runtime censuses an open modeled export dispatch",
   REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
   const std::string census =
       "capture runtime passive scheduler participant has an active outer host "
-      "call: tid=00000001 state=1 resume_kind=1 restorable=false pc=00000000 "
+      "call: tid=00000001 state=1 resume_kind=3 restorable=false pc=00000000 "
       "hostcall=depth=1,fn=82002000,ret=82003000 "
       "export=291/82063D80/82065B14 wait=2/2/2/00000000/0"
       "; unsupported=1/1";
@@ -2335,6 +2351,7 @@ TEST_CASE("session capture runtime admits a woken export participant",
   participant.blocked_wait.handle_count = 1;
   participant.blocked_wait.flags =
       kernel::kGuestSchedulerCaptureWaitFlagGated |
+      kernel::kGuestSchedulerCaptureWaitFlagAlertable |
       kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
   harness.checkpoint.start_guest_pc = 0;
 
@@ -2436,6 +2453,61 @@ TEST_CASE("session capture runtime parks a woken waiter with no dispatch",
   REQUIRE(harness.provider.begin_count.load() == 1);
   // The stop reached the provider's seal, so the participant claimed the park
   // at the final boundary too instead of an arrival it never made.
+  REQUIRE(harness.provider.seal_count.load() == 1);
+  REQUIRE(status.rejection != RuntimeRejection::kAssemblerFailure);
+  REQUIRE(status.message.find("cannot represent a non-safepoint active outer "
+                              "call") == std::string::npos);
+  REQUIRE(status.message.find("passive scheduler participant has an active "
+                              "outer host call") == std::string::npos);
+  REQUIRE(call_result);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+// The dispatcher parks a thread that already ran on the suspended list, still
+// below the root entry-point call it owns, so the same park has to reach a
+// boundary from there.
+TEST_CASE("session capture runtime parks a suspended participant",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  auto& participant = harness.checkpoint.provisional.participants.front();
+  participant.state =
+      kernel::GuestSchedulerCheckpointParticipantState::kSuspended;
+  participant.guest_pc = 0;
+  participant.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+  participant.restorable = false;
+  participant.suspension_count = 1;
+  harness.checkpoint.start_guest_pc = 0;
+  harness.checkpoint.stop_guest_pc = 0;
+
+  BlockingGuestFunction function(0x82002000, 0x82002100);
+  bool call_result = false;
+  std::thread source(
+      [&]() { call_result = function.Call(thread.get(), 0x82003000); });
+  const bool entered = function.WaitForEntry();
+  const bool requested = entered && harness.runtime->RequestStart();
+  const bool recording =
+      requested && WaitForState(*harness.runtime, RuntimeState::kRecording);
+  const bool dispatched =
+      recording && RecordCanonicalDispatch(*harness.runtime, *thread);
+  const bool stopped = dispatched && harness.runtime->RequestStop() &&
+                       harness.runtime->WaitForTerminal(2s);
+  const auto status = harness.runtime->status();
+  function.Release();
+  source.join();
+
+  REQUIRE(entered);
+  REQUIRE(requested);
+  INFO(status.message);
+  REQUIRE(recording);
+  REQUIRE(dispatched);
+  REQUIRE(stopped);
+  REQUIRE(harness.provider.begin_count.load() == 1);
   REQUIRE(harness.provider.seal_count.load() == 1);
   REQUIRE(status.rejection != RuntimeRejection::kAssemblerFailure);
   REQUIRE(status.message.find("cannot represent a non-safepoint active outer "

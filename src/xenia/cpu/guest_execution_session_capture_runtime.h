@@ -104,19 +104,20 @@ struct GuestExecutionSessionInstructionCoverageDelta {
 };
 
 // A waiter the scheduler put back on a ready queue without unwinding its wait:
-// the passive outside-guest shape of a fiber that has already run, still
-// carrying a modeled blocking-export wait. Nothing of the wait's outcome has
-// been applied yet, so the thread is guest-visibly parked where a blocked one
-// is. Binding it to the modeled export dispatch it is parked inside needs the
-// export event log and is not decided here.
+// the passive outside-guest shape of a fiber that has already run. Nothing of
+// the wait's outcome has been applied yet, so the thread is guest-visibly
+// parked where a blocked one is. Binding it to the modeled export dispatch it
+// is parked inside needs the export event log and is not decided here, and the
+// dispatch is what separates this class from a plain parity park.
 bool IsGuestExecutionSessionWokenInWaitCheckpointParticipant(
     const kernel::GuestSchedulerCheckpointParticipant& participant);
 
-// A fiber the barrier caught on a ready queue carrying no durable block-head
-// route: it has run, so it is parked below the dispatch that owns it, and it
-// is published as passive parity rather than resumed. Whether it owns exactly
-// one root host call and whether anything modeled is open beneath it are
-// decided against the host-call roster and the export event log, not here.
+// A fiber the barrier caught off-CPU on a ready queue or on the suspended list
+// carrying no durable block-head route: it has run, so it is parked below the
+// dispatch that owns it, and it is published as passive parity rather than
+// resumed. Whether it owns exactly one root host call and whether anything
+// modeled is open beneath it are decided against the host-call roster and the
+// export event log, not here.
 bool IsGuestExecutionSessionReadyParityCheckpointParticipant(
     const kernel::GuestSchedulerCheckpointParticipant& participant);
 

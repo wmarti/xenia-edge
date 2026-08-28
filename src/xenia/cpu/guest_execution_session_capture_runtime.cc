@@ -120,30 +120,7 @@ bool IsPassiveOutsideGuestParticipant(
          participant.resume_kind == CheckpointResumeKind::kNotYetRun;
 }
 
-// The wait classes whose link register is the modeled export's single return
-// point, matching the allowlist the provider applies to a still-blocked
-// participant. A delay, a fence or spin poll and the I/O classes reach that
-// link register once per poll rather than once per export, an alertable or
-// APC-pending wait can run guest code on the waiting thread's stack before the
-// export returns, and a wait naming more handles than the binding holds is not
-// representable at all.
-bool IsWokenInWaitAllowlist(
-    kernel::GuestSchedulerCaptureWaitKind kind,
-    const kernel::GuestSchedulerCaptureWaitState& wait) {
-  const bool modeled_kind =
-      kind == kernel::GuestSchedulerCaptureWaitKind::kSingle ||
-      kind == kernel::GuestSchedulerCaptureWaitKind::kMultiAny ||
-      kind == kernel::GuestSchedulerCaptureWaitKind::kMultiAll;
-  constexpr uint8_t kRefusedWaitFlags =
-      kernel::kGuestSchedulerCaptureWaitFlagAlertable |
-      kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
-  return modeled_kind && wait.handle_count &&
-         wait.handle_count <=
-             kernel::kGuestSchedulerCaptureMaximumWaitHandles &&
-         !(wait.flags & kRefusedWaitFlags);
-}
-
-// The ready face of the blocked-in-export shape. A suspended waiter carries the
+// The ready face of the parked-in-export shape. A suspended fiber carries the
 // same registers but is not on a ready queue, so it is not this class.
 bool IsWokenExportWaiter(const CheckpointParticipant& participant) {
   return participant.state ==
@@ -204,23 +181,6 @@ bool IsBlockedExportParticipant(const CheckpointParticipant& participant) {
          participant.state ==
              kernel::GuestSchedulerCheckpointParticipantState::kBlocked &&
          participant.resume_kind == CheckpointResumeKind::kAfterBlockingExport;
-}
-
-// The provider's admission allowlist, re-derived here so publication does not
-// take the encoded route's word for what kind of wait it came from.
-bool IsBlockedExportWaitInAllowlist(const CheckpointParticipant& participant) {
-  const bool modeled_kind =
-      participant.blocked_wait_kind ==
-          kernel::GuestSchedulerCaptureWaitKind::kSingle ||
-      participant.blocked_wait_kind ==
-          kernel::GuestSchedulerCaptureWaitKind::kMultiAny ||
-      participant.blocked_wait_kind ==
-          kernel::GuestSchedulerCaptureWaitKind::kMultiAll;
-  const uint8_t refused_flags =
-      kernel::kGuestSchedulerCaptureWaitFlagAlertable |
-      kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
-  return modeled_kind && participant.blocked_wait.handle_count &&
-         !(participant.blocked_wait.flags & refused_flags);
 }
 
 bool CurrentTitleCaptureConfig(GuestExecutionSessionTitleCaptureConfig* output,
@@ -442,11 +402,6 @@ bool ValidateRuntimeCheckpointStateBindings(
         return Fail(error,
                     "capture runtime final blocked-export participant has no "
                     "durable replay route");
-      }
-      if (!IsBlockedExportWaitInAllowlist(*scheduler_participant)) {
-        return Fail(error,
-                    "capture runtime blocked-export wait is outside the "
-                    "modeled allowlist");
       }
       if (decoded.resume_kind !=
               ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern ||
@@ -712,12 +667,13 @@ bool IsWokenExportDispatchParticipant(
 }
 
 // A fiber parked below the single host call its own dispatch opened, with
-// nothing modeled beneath it, in either of the two states that can hold one
-// there: on a ready queue, or blocked in a wait no modeled dispatch owns. It
-// never arrives at either barrier and is never resumed, so the class is a
-// parity claim rather than a route. Absence of a modeled dispatch is part of
-// that claim, and only the export event log can witness it: a missing or
-// unreadable log refuses the class instead of assuming it.
+// nothing modeled beneath it, in any of the off-CPU states that can hold one
+// there: on a ready queue, on the suspended list, or blocked in a wait no
+// modeled dispatch owns. It never arrives at either barrier and is never
+// resumed, so the class is a parity claim rather than a route. Absence of a
+// modeled dispatch is part of that claim, and only the export event log can
+// witness it: a missing or unreadable log refuses the class instead of
+// assuming it.
 bool IsParityRootCallParticipant(
     const CheckpointParticipant& participant,
     const GuestExecutionCaptureParticipantIdentity& identity,
@@ -1197,21 +1153,28 @@ bool IsGuestExecutionSessionWokenInWaitCheckpointParticipant(
       participant.capture_declined_safepoints) {
     return false;
   }
-  return IsWokenInWaitAllowlist(participant.blocked_wait_kind,
-                                participant.blocked_wait);
+  // The wait shape a re-readied fiber still carries names no route of its own:
+  // the scheduler stamps every parked fiber alike whatever it waits on, and the
+  // dispatch the fiber is parked inside is what the route is bound to.
+  return true;
 }
 
 bool IsGuestExecutionSessionReadyParityCheckpointParticipant(
     const kernel::GuestSchedulerCheckpointParticipant& participant) {
-  // A suspended participant wears the same registers but is one resume away
-  // from running, and a participant that has never run holds no dispatch to be
-  // parked below, so neither is this class.
-  if (participant.state !=
-          kernel::GuestSchedulerCheckpointParticipantState::kReady ||
+  // A participant that has never run holds no dispatch to be parked below, so
+  // it is not this class. A suspended one is: the dispatcher parks a thread
+  // that already ran on the suspended list, below the call it still owns.
+  const bool off_cpu =
+      (participant.state ==
+           kernel::GuestSchedulerCheckpointParticipantState::kReady &&
+       !participant.suspension_count) ||
+      (participant.state ==
+           kernel::GuestSchedulerCheckpointParticipantState::kSuspended &&
+       participant.suspension_count);
+  if (!off_cpu ||
       participant.resume_kind !=
           kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation ||
-      participant.restorable || participant.guest_pc ||
-      participant.suspension_count) {
+      participant.restorable || participant.guest_pc) {
     return false;
   }
   // Already required of every roster participant, restated so the predicate is
@@ -2006,8 +1969,7 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       // route either way.
       const bool parked_in_export =
           start_rendezvous && checkpoint_participant &&
-          ((IsBlockedExportParticipant(*checkpoint_participant) &&
-            IsBlockedExportWaitInAllowlist(*checkpoint_participant)) ||
+          (IsBlockedExportParticipant(*checkpoint_participant) ||
            IsWokenExportDispatchParticipant(*checkpoint_participant,
                                             participant.identity,
                                             external_event_log));

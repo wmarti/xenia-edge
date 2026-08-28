@@ -406,22 +406,6 @@ bool CollectRequiredBlobs(
   return true;
 }
 
-// The wait classes whose link register is the export's single return point.
-// A delay, a fence or spin poll and the I/O classes reach it once per poll
-// rather than once per export, and an alertable or APC-pending wait can run
-// guest code on the waiting thread's stack before the export returns.
-bool IsModeledBlockingExportWait(
-    const GuestExecutionSessionSchedulerBlockedWaitBinding& wait) {
-  const bool modeled_kind =
-      wait.kind == GuestExecutionSessionSchedulerWaitKind::kSingle ||
-      wait.kind == GuestExecutionSessionSchedulerWaitKind::kMultiAny ||
-      wait.kind == GuestExecutionSessionSchedulerWaitKind::kMultiAll;
-  const uint32_t refused_flags =
-      kGuestExecutionSessionSchedulerWaitFlagAlertable |
-      kGuestExecutionSessionSchedulerWaitFlagUserApcPending;
-  return modeled_kind && wait.handle_count && !(wait.flags & refused_flags);
-}
-
 struct ValidatedBundle {
   std::vector<uint8_t> manifest_bytes;
   std::map<GuestExecutionSessionSha256, RequiredBlob> requirements;
@@ -612,12 +596,10 @@ bool ValidateBlockedExportRoutes(
             &transitions, error)) {
       return false;
     }
-    if (woken_row) {
-      if (transitions.blocked_before_export) {
-        return Fail(error,
-                    "scheduler woken-export participant re-blocked before its "
-                    "export event");
-      }
+    // A wait export polls in a loop, so a waiter re-blocks inside the same
+    // export as often as its wait stays unsatisfied. Only a woken row whose
+    // wake predates the interval entirely has nothing on the tape to prove.
+    if (woken_row && !transitions.blocked_before_export) {
       continue;
     }
     if (!transitions.has_transition ||
@@ -846,11 +828,6 @@ bool ValidateSchedulerTopologyCheckpointBindings(
                         "scheduler start blocked-export topology row is not a "
                         "blocked participant");
           }
-          if (!IsModeledBlockingExportWait(participant.blocked_wait)) {
-            return Fail(error,
-                        "scheduler start blocked-export wait is outside the "
-                        "modeled allowlist");
-          }
           break;
         case GuestExecutionSessionSchedulerResumeKind::kNativeContinuation:
           if (decoded.resume_kind ==
@@ -929,12 +906,13 @@ bool ValidateSchedulerTopologyCheckpointBindings(
                                  ppc::GuestPPCThreadResumeKind::kOutsideGuest;
     const bool final_outside =
         final_state.resume_kind == ppc::GuestPPCThreadResumeKind::kOutsideGuest;
-    if (initial_outside != final_outside) {
-      return Fail(error,
-                  "scheduler continuation class changed without a typed "
-                  "entry route");
-    }
-    if (initial_outside) {
+    // A participant may enter or leave guest code inside the interval: the
+    // dispatcher runs a thread that had never run, and a wake clears the exact
+    // route of one that had. Only a participant outside guest code at both
+    // boundaries claims it executed nothing, so only that one owes the parity
+    // below.
+    const bool outside_both = initial_outside && final_outside;
+    if (outside_both) {
       if (initial_checkpoint.checkpoint.thread_states[ordinal] !=
               final_checkpoint.checkpoint.thread_states[ordinal] ||
           initial_state != final_state ||
@@ -954,7 +932,7 @@ bool ValidateSchedulerTopologyCheckpointBindings(
                         topology_difference);
       }
     }
-    if (initial_outside &&
+    if (outside_both &&
         scheduler_event_subjects.contains(static_cast<uint32_t>(ordinal))) {
       return Fail(error,
                   "scheduler event subjects an outside-guest participant");
@@ -972,10 +950,22 @@ bool ValidateSchedulerTopologyCheckpointBindings(
     // nothing the tape recorded in any role.
     const auto parity_row =
         [](const GuestExecutionSessionSchedulerTopologyParticipant& row) {
+          // The dispatcher parks a thread that already ran on the suspended
+          // list, so the ready parity shape also reaches a boundary there,
+          // holding a suspension count instead of a queue position.
+          const bool suspended_parity =
+              row.state ==
+                  GuestExecutionSessionSchedulerParticipantState::kSuspended &&
+              row.resume_kind == GuestExecutionSessionSchedulerResumeKind::
+                                     kNativeContinuation &&
+              !row.restorable && !row.guest_pc && row.suspension_count &&
+              row.blocked_wait ==
+                  GuestExecutionSessionSchedulerBlockedWaitBinding{};
           return IsGuestExecutionSessionReadyParityParticipant(row) ||
+                 suspended_parity ||
                  IsGuestExecutionSessionBlockedParityParticipant(row);
         };
-    if (!initial_outside || !parity_row(start_topology.participants[ordinal]) ||
+    if (!outside_both || !parity_row(start_topology.participants[ordinal]) ||
         !parity_row(final_topology.participants[ordinal])) {
       return Fail(error,
                   "scheduler parked participant has no parity boundary row");

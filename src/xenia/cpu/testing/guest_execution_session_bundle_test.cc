@@ -2262,12 +2262,14 @@ TEST_CASE("session bundle proves every ready-parity obligation",
                      "scheduler parked participant has no parity boundary "
                      "row");
   }
+  // The dispatcher parks a thread that already ran on the suspended list, so
+  // the park reaches a boundary from there wearing the same passive shape.
   SECTION("a park claimed by a suspended row") {
     ParityParkOptions options;
     options.suspended_row = true;
-    require_rejected(MakeParityParkBundle(options),
-                     "scheduler parked participant has no parity boundary "
-                     "row");
+    error.clear();
+    REQUIRE(ValidateGuestExecutionSessionBundle(MakeParityParkBundle(options),
+                                                &error));
   }
   SECTION("a park claimed by a scheduler record's subject") {
     ParityParkOptions options;
@@ -2435,35 +2437,50 @@ TEST_CASE("session bundle proves every blocked export obligation",
     require_rejected(MakePendingExportBundle(options),
                      "final blocked export has no durable replay route");
   }
-  SECTION("an alertable wait is outside the modeled allowlist") {
+  // The scheduler stamps every blocked fiber with the same route whatever it
+  // waits on, so the wait shape names no route of its own and the event the
+  // route points at is what has to hold.
+  SECTION("an alertable wait carries the same route") {
     PendingExportOptions options;
     options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagAlertable;
-    require_rejected(MakePendingExportBundle(options),
-                     "blocked-export wait is outside the modeled allowlist");
+    error.clear();
+    REQUIRE(ValidateGuestExecutionSessionBundle(
+        MakePendingExportBundle(options), &error));
   }
-  SECTION("an APC-pending wait is outside the modeled allowlist") {
+  SECTION("an APC-pending wait carries the same route") {
     PendingExportOptions options;
     options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagAlertable |
                           kGuestExecutionSessionSchedulerWaitFlagUserApcPending;
-    require_rejected(MakePendingExportBundle(options),
-                     "blocked-export wait is outside the modeled allowlist");
+    error.clear();
+    REQUIRE(ValidateGuestExecutionSessionBundle(
+        MakePendingExportBundle(options), &error));
   }
-  SECTION("a delay wait is outside the modeled allowlist") {
+  SECTION("a delay wait carries the same route") {
     PendingExportOptions options;
     options.wait_kind = GuestExecutionSessionSchedulerWaitKind::kDelay;
     options.wait_handle_count = 0;
     options.wait_deadline_ms = 1000;
     options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagGated;
-    require_rejected(MakePendingExportBundle(options),
-                     "blocked-export wait is outside the modeled allowlist");
+    error.clear();
+    REQUIRE(ValidateGuestExecutionSessionBundle(
+        MakePendingExportBundle(options), &error));
   }
-  SECTION("a multi-object wait stays inside the modeled allowlist") {
+  SECTION("a multi-object wait carries the same route") {
     PendingExportOptions options;
     options.wait_kind = GuestExecutionSessionSchedulerWaitKind::kMultiAny;
     options.wait_handle_count = 2;
     error.clear();
     REQUIRE(ValidateGuestExecutionSessionBundle(
         MakePendingExportBundle(options), &error));
+  }
+  SECTION("an impossible wait shape still rejects") {
+    PendingExportOptions options;
+    options.wait_kind = GuestExecutionSessionSchedulerWaitKind::kDelay;
+    options.wait_handle_count = 1;
+    options.wait_deadline_ms = 1000;
+    options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagGated;
+    require_rejected(MakePendingExportBundle(options),
+                     "scheduler handle-free wait names an object");
   }
   SECTION("a pending sequence past the interval rejects") {
     PendingExportOptions options;
@@ -2585,12 +2602,14 @@ TEST_CASE("session bundle proves every woken export obligation",
                      "scheduler start woken-export participant has no seeded "
                      "ready position");
   }
-  SECTION("a participant re-blocked before its export rejects") {
+  // A wait export polls in a loop, so re-blocking inside it is ordinary; what
+  // the tape still owes is the wake that let the export return.
+  SECTION("a participant re-blocked before its export needs a wake witness") {
     PendingExportOptions options = woken_options();
     options.witness_kind = 8;  // kBlock
     require_rejected(MakePendingExportBundle(options),
-                     "scheduler woken-export participant re-blocked before its "
-                     "export event");
+                     "scheduler blocked-export wake has no kReready witness "
+                     "before its export event");
   }
   SECTION("a ready row without a pending export stays passive") {
     PendingExportOptions options = woken_options();
