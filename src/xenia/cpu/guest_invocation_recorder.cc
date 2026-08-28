@@ -567,8 +567,10 @@ struct GuestInvocationRecorder::Impl {
       const auto definition = definitions.find(function_address);
       if (definition == definitions.cend() || !definition->second.defined) {
         // Translation declares every call target but only defines the ones the
-        // title actually demands, and a declared target has no emitted code.
-        // Entering one later reseeds the closure from its own definition.
+        // title actually demands. Entering one later reseeds the closure from
+        // its own definition, but a target the backend inlines is never
+        // entered, so report it for the layer that can read its metadata.
+        declared_only_dependencies.insert(function_address);
         continue;
       }
       if (AnyPageWasWritten(owner_written_pages,
@@ -820,6 +822,8 @@ struct GuestInvocationRecorder::Impl {
     }
     accepted.touched_page_addresses.assign(known_pages.cbegin(),
                                            known_pages.cend());
+    accepted.declared_only_dependencies.assign(
+        declared_only_dependencies.cbegin(), declared_only_dependencies.cend());
     result = std::move(accepted);
     state = GuestInvocationRecorderState::kComplete;
     initial_pages.clear();
@@ -1204,6 +1208,7 @@ struct GuestInvocationRecorder::Impl {
   std::map<uint32_t, uint32_t> closure_code_backing_views;
   std::map<uint32_t, uint32_t> closure_functions;
   std::set<uint32_t> entered_functions;
+  std::set<uint32_t> declared_only_dependencies;
   std::set<uint32_t> known_pages;
   std::set<uint32_t> supplied_data_pages;
   std::map<uint32_t, uint32_t> supplied_data_backing_views;

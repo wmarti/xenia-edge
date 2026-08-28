@@ -133,6 +133,15 @@ struct GuestInvocationRecorderResult {
   // the runtime call tree so an exact-corpus builder can reproduce code
   // placement.
   std::vector<GuestInvocationRecorderFunction> translation_dependencies;
+  // Call targets a closure member declared but the registry never defined, in
+  // address order. A declared-only target that is *called* is safe to drop,
+  // because reaching it enters it and reseeds the closure from its own
+  // definition. A declared-only target the backend *inlines* is not: it never
+  // executes as a function, is never entered, and yet its identity and
+  // metadata are still required to reproduce the inline. The recorder cannot
+  // tell the two apart, so it reports the addresses and leaves identifying the
+  // inlinable ones to the layer that can read their metadata.
+  std::vector<uint32_t> declared_only_dependencies;
   // Immutable guest code pages sampled immediately after successful
   // translation and before backend publication. Only pages required by the
   // selected translation closure are retained, in address order.
