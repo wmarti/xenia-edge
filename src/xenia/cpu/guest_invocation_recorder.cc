@@ -937,13 +937,28 @@ struct GuestInvocationRecorder::Impl {
         static_cast<uint32_t>(state), limits.host_protection_page_size);
   }
 
+  // A foreign write inside the final attempt makes this attempt's recording
+  // unusable but says nothing about the next one, so spend an attempt rather
+  // than the capture. Exhausting the budget is what distinguishes one stray
+  // write from a page the title writes on every attempt.
+  bool RetakeFinalAttempt(std::string_view detail) {
+    if (attempt_count >= limits.max_attempts) {
+      return Reject(GuestInvocationRecorderRejection::kCrossThreadMutation,
+                    detail, kGuestInvocationDependencyCrossThreadMutation);
+    }
+    state = GuestInvocationRecorderState::kRecordingDiscovery;
+    initial_pages.clear();
+    cross_thread_written_backing_pages.clear();
+    return true;
+  }
+
   bool AddOwnerPages(const std::vector<uint32_t>& pages) {
     for (uint32_t page : pages) {
-      if (cross_thread_written_backing_pages.contains(
-              BackingPageAddress(page))) {
-        return Reject(GuestInvocationRecorderRejection::kCrossThreadMutation,
-                      CrossThreadDetail("owner-access", page),
-                      kGuestInvocationDependencyCrossThreadMutation);
+      if (state == GuestInvocationRecorderState::kRecordingFinalAttempt &&
+          cross_thread_written_backing_pages.contains(
+              BackingPageAddress(page)) &&
+          !RetakeFinalAttempt(CrossThreadDetail("owner-access", page))) {
+        return false;
       }
       if (state == GuestInvocationRecorderState::kRecordingFinalAttempt &&
           !known_pages.contains(page)) {
@@ -1041,19 +1056,18 @@ struct GuestInvocationRecorder::Impl {
                       kGuestInvocationDependencyCrossThreadMutation);
       }
     }
-    // Invocation input is snapshotted when an attempt begins, so a write
-    // outside one is already reflected in what the next attempt records. Only
-    // a page this attempt actually read can still change what replay must
-    // reproduce; a granule neighbour is left to the initial-versus-final
-    // comparison at completion.
-    if (!IsRecordingAttempt()) {
+    // Invocation input is snapshotted only on the transition into the final
+    // attempt, so nothing a discovery attempt observes has a snapshot to
+    // invalidate. Only a write inside the final attempt, to a page that
+    // attempt actually read, can change what replay must reproduce; a granule
+    // neighbour is left to the initial-versus-final comparison at completion.
+    if (state != GuestInvocationRecorderState::kRecordingFinalAttempt) {
       return true;
     }
     for (uint32_t page : pages) {
       if (attempt_read_backing_pages.contains(BackingPageAddress(page))) {
-        return Reject(GuestInvocationRecorderRejection::kCrossThreadMutation,
-                      CrossThreadDetail("foreign-write-data", page),
-                      kGuestInvocationDependencyCrossThreadMutation);
+        return RetakeFinalAttempt(
+            CrossThreadDetail("foreign-write-data", page));
       }
     }
     std::set<uint32_t> new_backing_pages;

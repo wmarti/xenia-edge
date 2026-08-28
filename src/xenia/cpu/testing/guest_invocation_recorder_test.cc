@@ -1267,22 +1267,40 @@ TEST_CASE("guest invocation recorder rejects cross-thread closure writes",
   SECTION("write follows owner access") {
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
+    ConvergeOnPage(*recorder);
     EnterRoot(*recorder);
     Access(*recorder, kDataPageA);
-    REQUIRE_FALSE(recorder->OnMemoryAccess(
+    // Inside the final attempt this recording is unusable, so the attempt is
+    // spent rather than the capture.
+    REQUIRE(recorder->OnMemoryAccess(
         kOther, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kWrite));
-    RequireRejected(*recorder,
-                    GuestInvocationRecorderRejection::kCrossThreadMutation,
-                    kGuestInvocationDependencyCrossThreadMutation);
+    REQUIRE(recorder->rejection() == GuestInvocationRecorderRejection::kNone);
+    REQUIRE(recorder->state() ==
+            GuestInvocationRecorderState::kRecordingDiscovery);
   }
   SECTION("write precedes owner access") {
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
+    ConvergeOnPage(*recorder);
     EnterRoot(*recorder);
     REQUIRE(recorder->OnMemoryAccess(
         kOther, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kWrite));
-    REQUIRE_FALSE(recorder->OnMemoryAccess(
+    REQUIRE(recorder->OnMemoryAccess(
         kOwner, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kRead));
+    REQUIRE(recorder->rejection() == GuestInvocationRecorderRejection::kNone);
+    REQUIRE(recorder->state() ==
+            GuestInvocationRecorderState::kRecordingDiscovery);
+  }
+  SECTION("a foreign write on every attempt still ends the capture") {
+    GuestInvocationRecorderLimits limits = MakeLimits();
+    limits.max_attempts = 3;
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock, limits);
+    ConvergeOnPage(*recorder);
+    EnterRoot(*recorder);
+    Access(*recorder, kDataPageA);
+    REQUIRE_FALSE(recorder->OnMemoryAccess(
+        kOther, kDataPageA, 4, GuestInvocationRecorderMemoryAccess::kWrite));
     RequireRejected(*recorder,
                     GuestInvocationRecorderRejection::kCrossThreadMutation,
                     kGuestInvocationDependencyCrossThreadMutation);
@@ -1331,7 +1349,7 @@ TEST_CASE("guest invocation recorder rejects cross-thread closure writes",
     REQUIRE(recorder->state() ==
             GuestInvocationRecorderState::kWaitingForFinalAttempt);
   }
-  SECTION("cross-thread writes are watched only inside a recorded attempt") {
+  SECTION("cross-thread writes are watched only inside the final attempt") {
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
     DiscoveryAttempt(*recorder, {kDataPageB});
@@ -1341,13 +1359,16 @@ TEST_CASE("guest invocation recorder rejects cross-thread closure writes",
         kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
     REQUIRE(recorder->state() ==
             GuestInvocationRecorderState::kWaitingForDiscoveryAttempt);
+    // A discovery attempt takes no snapshot either, so a write it observes
+    // has nothing to invalidate.
     EnterRoot(*recorder);
     Access(*recorder, kDataPageB);
-    REQUIRE_FALSE(recorder->OnMemoryAccess(
+    REQUIRE(recorder->OnMemoryAccess(
         kOther, kDataPageB, 4, GuestInvocationRecorderMemoryAccess::kWrite));
-    RequireRejected(*recorder,
-                    GuestInvocationRecorderRejection::kCrossThreadMutation,
-                    kGuestInvocationDependencyCrossThreadMutation);
+    REQUIRE(recorder->rejection() == GuestInvocationRecorderRejection::kNone);
+    ExitRoot(*recorder);
+    REQUIRE(recorder->state() ==
+            GuestInvocationRecorderState::kWaitingForFinalAttempt);
   }
   SECTION("a granule neighbour the invocation never read is not watched") {
     GuestInvocationRecorderLimits limits = MakeLimits();
