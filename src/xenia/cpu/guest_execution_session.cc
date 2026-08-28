@@ -1859,6 +1859,42 @@ bool ReadContentReference(Reader* reader,
   return true;
 }
 
+// observed_uptime_ms is a per-snapshot host clock read rather than thread
+// state, so two boundaries are expected to disagree on it; how near the wait
+// is to its own deadline is stated durably by deadline_ms instead.
+const char* BlockedWaitFirstDifference(
+    const GuestExecutionSessionSchedulerBlockedWaitBinding& initial,
+    const GuestExecutionSessionSchedulerBlockedWaitBinding& final_wait) {
+  if (initial.kind != final_wait.kind) {
+    return "blocked_wait.kind";
+  }
+  if (initial.deadline_ms != final_wait.deadline_ms) {
+    return "blocked_wait.deadline_ms";
+  }
+  if (initial.wait_epoch != final_wait.wait_epoch) {
+    return "blocked_wait.wait_epoch";
+  }
+  if (initial.observed_wait_epoch != final_wait.observed_wait_epoch) {
+    return "blocked_wait.observed_wait_epoch";
+  }
+  if (initial.handle_count != final_wait.handle_count) {
+    return "blocked_wait.handle_count";
+  }
+  if (initial.flags != final_wait.flags) {
+    return "blocked_wait.flags";
+  }
+  if (initial.handles != final_wait.handles) {
+    return "blocked_wait.handles";
+  }
+  if (initial.signal_epochs_before != final_wait.signal_epochs_before) {
+    return "blocked_wait.signal_epochs_before";
+  }
+  if (initial.signal_epochs_observed != final_wait.signal_epochs_observed) {
+    return "blocked_wait.signal_epochs_observed";
+  }
+  return nullptr;
+}
+
 const char* SchedulerTopologyFirstDifference(
     const GuestExecutionSessionSchedulerTopologyParticipant& initial,
     const GuestExecutionSessionSchedulerTopologyParticipant& final_row,
@@ -1906,10 +1942,8 @@ const char* SchedulerTopologyFirstDifference(
   if (initial.restorable != final_row.restorable) {
     return "restorable";
   }
-  if (initial.blocked_wait != final_row.blocked_wait) {
-    return "blocked_wait";
-  }
-  return nullptr;
+  return BlockedWaitFirstDifference(initial.blocked_wait,
+                                    final_row.blocked_wait);
 }
 
 std::string HexGuestThreadId(uint32_t guest_thread_id) {
