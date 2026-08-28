@@ -2448,6 +2448,64 @@ TEST_CASE("session capture runtime parks a woken waiter with no dispatch",
   thread.reset();
 }
 
+// The blocked twin of the park above. The waiter sits below the same root
+// entry-point call, and the wait it is in has no modeled export dispatch to
+// bind, so nothing beneath it can be resumed and the park is the only claim
+// either boundary can make about it.
+TEST_CASE("session capture runtime parks a blocked waiter with no dispatch",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  auto& participant = harness.checkpoint.provisional.participants.front();
+  participant.state =
+      kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
+  participant.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+  participant.restorable = false;
+  participant.blocked_wait_kind =
+      kernel::GuestSchedulerCaptureWaitKind::kSingle;
+  participant.blocked_wait.handle_count = 1;
+  participant.blocked_wait.flags =
+      kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
+  participant.blocked_wait.handles[0] = 0x00110001u;
+
+  BlockingGuestFunction function(0x82002000, 0x82002100);
+  bool call_result = false;
+  std::thread source(
+      [&]() { call_result = function.Call(thread.get(), 0x82003000); });
+  const bool entered = function.WaitForEntry();
+  const bool requested = entered && harness.runtime->RequestStart();
+  const bool recording =
+      requested && WaitForState(*harness.runtime, RuntimeState::kRecording);
+  const bool dispatched =
+      recording && RecordCanonicalDispatch(*harness.runtime, *thread);
+  const bool stopped = dispatched && harness.runtime->RequestStop() &&
+                       harness.runtime->WaitForTerminal(2s);
+  const auto status = harness.runtime->status();
+  function.Release();
+  source.join();
+
+  REQUIRE(entered);
+  REQUIRE(requested);
+  INFO(status.message);
+  REQUIRE(recording);
+  REQUIRE(dispatched);
+  REQUIRE(stopped);
+  REQUIRE(harness.provider.begin_count.load() == 1);
+  // The stop reached the provider's seal, so the participant claimed the park
+  // at the final boundary too instead of an arrival it never made.
+  REQUIRE(harness.provider.seal_count.load() == 1);
+  REQUIRE(status.rejection != RuntimeRejection::kAssemblerFailure);
+  REQUIRE(status.message.find("cannot represent a non-safepoint active outer "
+                              "call") == std::string::npos);
+  REQUIRE(call_result);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
 TEST_CASE("session capture runtime rejects a partial preemption episode",
           "[guest-execution-session-capture-runtime]") {
   RuntimeEnvironment environment;

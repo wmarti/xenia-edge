@@ -398,12 +398,17 @@ bool ValidateRuntimeCheckpointStateBindings(
       return Fail(error, std::string("capture runtime ") + boundary +
                              " scheduler and bundle identities differ");
     }
+    // The park is the whole route. The check above proved the class against
+    // the live scheduler row, and the passive shape it publishes is the
+    // bundle's to prove, so none of the route arms below describes it. A
+    // blocked one wears the modeled-export row and must not be read as one.
+    if (parked_below_outer_call) {
+      continue;
+    }
     // A waiter re-readied inside a modeled export carries the same pending
     // route as a still-blocked one, and is published in the passive shape, so
-    // it has to be recognised before the passive rule below. The parity class
-    // shares this row and is told apart from it only by the park.
-    if (IsWokenExportWaiter(*scheduler_participant) &&
-        !parked_below_outer_call) {
+    // it has to be recognised before the passive rule below.
+    if (IsWokenExportWaiter(*scheduler_participant)) {
       if (!initial_boundary) {
         return Fail(error,
                     "capture runtime final woken-export participant has no "
@@ -706,18 +711,20 @@ bool IsWokenExportDispatchParticipant(
   return log->CopyParticipantActiveCalls(identity, &calls) && !calls.empty();
 }
 
-// A ready fiber parked below the single host call its own dispatch opened,
-// with nothing modeled beneath it. It never arrives at either barrier and is
-// never resumed, so the class is a parity claim rather than a route. Absence
-// of a modeled dispatch is part of that claim, and only the export event log
-// can witness it: a missing or unreadable log refuses the class instead of
-// assuming it.
-bool IsReadyParityRootCallParticipant(
+// A fiber parked below the single host call its own dispatch opened, with
+// nothing modeled beneath it, in either of the two states that can hold one
+// there: on a ready queue, or blocked in a wait no modeled dispatch owns. It
+// never arrives at either barrier and is never resumed, so the class is a
+// parity claim rather than a route. Absence of a modeled dispatch is part of
+// that claim, and only the export event log can witness it: a missing or
+// unreadable log refuses the class instead of assuming it.
+bool IsParityRootCallParticipant(
     const CheckpointParticipant& participant,
     const GuestExecutionCaptureParticipantIdentity& identity,
     const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
     const GuestExecutionCaptureExternalEventLog* log) {
-  if (!IsGuestExecutionSessionReadyParityCheckpointParticipant(participant)) {
+  if (!IsGuestExecutionSessionReadyParityCheckpointParticipant(participant) &&
+      !IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant)) {
     return false;
   }
   std::vector<GuestExecutionCaptureExternalEventActiveCall> calls;
@@ -797,8 +804,8 @@ std::string CensusPassiveParticipantHostCalls(
     if (!participant || !IsPassiveOutsideGuestParticipant(*participant) ||
         IsWokenExportDispatchParticipant(*participant, lifecycle.participant,
                                          external_event_log) ||
-        IsReadyParityRootCallParticipant(*participant, lifecycle.participant,
-                                         host_calls, external_event_log)) {
+        IsParityRootCallParticipant(*participant, lifecycle.participant,
+                                    host_calls, external_event_log)) {
       continue;
     }
     const GuestExecutionCaptureActiveHostCall* call =
@@ -841,8 +848,7 @@ bool ActiveHostCallHasDurableContinuation(
           kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
   return restorable_safepoint || blocked_in_export ||
          IsWokenExportDispatchParticipant(*participant, identity, log) ||
-         IsReadyParityRootCallParticipant(*participant, identity, host_calls,
-                                          log);
+         IsParityRootCallParticipant(*participant, identity, host_calls, log);
 }
 
 std::string CensusUnrepresentableActiveHostCalls(
@@ -851,7 +857,7 @@ std::string CensusUnrepresentableActiveHostCalls(
     const GuestExecutionCaptureExternalEventLog* external_event_log) {
   std::string message =
       "capture runtime active outer call lacks an exact-PC JIT safepoint, a "
-      "modeled blocking-export continuation or a ready-parity park";
+      "modeled blocking-export continuation or a parity park";
   size_t unsupported_count = 0;
   for (const GuestExecutionCaptureActiveHostCall& call :
        host_calls.active_calls) {
@@ -1880,9 +1886,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
           !IsWokenExportDispatchParticipant(*checkpoint_participant,
                                             lifecycle.participant,
                                             external_event_log) &&
-          !IsReadyParityRootCallParticipant(*checkpoint_participant,
-                                            lifecycle.participant, host_calls,
-                                            external_event_log)) {
+          !IsParityRootCallParticipant(*checkpoint_participant,
+                                       lifecycle.participant, host_calls,
+                                       external_event_log)) {
         return fail_participant(CensusPassiveParticipantHostCalls(
             checkpoint, registry, host_calls, external_event_log));
       }
@@ -1984,9 +1990,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       // safepoint at either boundary, and claims no outcome the interval has
       // to contain, so it claims the park instead of an arrival at both.
       if (checkpoint_participant &&
-          IsReadyParityRootCallParticipant(*checkpoint_participant,
-                                           participant.identity, host_calls,
-                                           external_event_log)) {
+          IsParityRootCallParticipant(*checkpoint_participant,
+                                      participant.identity, host_calls,
+                                      external_event_log)) {
         if (assembler->ParkBelowOuterCall(participant.identity) ==
             AssemblerAction::kReject) {
           return Fail(error, assembler->status().message);
