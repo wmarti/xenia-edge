@@ -1095,12 +1095,20 @@ bool BuildGuestExecutionContinuousReplayPlan(
               GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside ||
           (!initial_scheduler_unowned &&
            (!is_passive_resume(initial_topology) ||
-            !is_passive_resume(final_topology) ||
-            initial_topology.resume_kind != final_topology.resume_kind)) ||
+            !is_passive_resume(final_topology))) ||
           has_guest_execution_event) {
         return fail(
             "continuous outside-guest participant is not passive and "
             "byte-stable");
+      }
+      const char* topology_difference =
+          GuestExecutionSessionSchedulerTopologyFirstDifference(
+              initial_topology, final_topology);
+      if (topology_difference) {
+        return fail(std::string("continuous outside-guest participant "
+                                "scheduler topology changes between "
+                                "boundaries: ") +
+                    topology_difference);
       }
     } else {
       if (final_scheduler_unowned || !final_routes[i]) {

@@ -1754,6 +1754,57 @@ bool ReadContentReference(Reader* reader,
 
 }  // namespace
 
+const char* GuestExecutionSessionSchedulerTopologyFirstDifference(
+    const GuestExecutionSessionSchedulerTopologyParticipant& initial,
+    const GuestExecutionSessionSchedulerTopologyParticipant& final_row) {
+  if (initial.ordinal != final_row.ordinal) {
+    return "ordinal";
+  }
+  if (initial.guest_thread_id != final_row.guest_thread_id) {
+    return "guest_thread_id";
+  }
+  if (initial.capture_instance_id != final_row.capture_instance_id) {
+    return "capture_instance_id";
+  }
+  if (initial.state != final_row.state) {
+    return "state";
+  }
+  if (initial.cpu != final_row.cpu) {
+    return "cpu";
+  }
+  if (initial.effective_priority != final_row.effective_priority) {
+    return "effective_priority";
+  }
+  if (initial.base_priority != final_row.base_priority) {
+    return "base_priority";
+  }
+  if (initial.suspension_count != final_row.suspension_count) {
+    return "suspension_count";
+  }
+  if (initial.quantum_remaining_us != final_row.quantum_remaining_us) {
+    return "quantum_remaining_us";
+  }
+  if (initial.ready_queue_level != final_row.ready_queue_level) {
+    return "ready_queue_level";
+  }
+  if (initial.ready_queue_fifo_ordinal != final_row.ready_queue_fifo_ordinal) {
+    return "ready_queue_fifo_ordinal";
+  }
+  if (initial.resume_kind != final_row.resume_kind) {
+    return "resume_kind";
+  }
+  if (initial.guest_pc != final_row.guest_pc) {
+    return "guest_pc";
+  }
+  if (initial.restorable != final_row.restorable) {
+    return "restorable";
+  }
+  if (initial.blocked_wait != final_row.blocked_wait) {
+    return "blocked_wait";
+  }
+  return nullptr;
+}
+
 GuestExecutionSessionSha256 GuestExecutionSessionCodec::HashBytes(
     const uint8_t* data, size_t data_size) {
   sha256::SHA256 hasher;

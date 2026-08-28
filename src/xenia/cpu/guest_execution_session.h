@@ -436,6 +436,12 @@ struct GuestExecutionSessionSchedulerTopologyParticipant {
       const GuestExecutionSessionSchedulerTopologyParticipant&) const = default;
 };
 
+// Names the first field differing between two boundary rows of one scheduler
+// topology participant, or nullptr when every serialized field matches.
+const char* GuestExecutionSessionSchedulerTopologyFirstDifference(
+    const GuestExecutionSessionSchedulerTopologyParticipant& initial,
+    const GuestExecutionSessionSchedulerTopologyParticipant& final_row);
+
 struct GuestExecutionSessionSchedulerTopologyChunk {
   uint64_t session_epoch = 0;
   uint32_t ordinal = 0;

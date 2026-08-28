@@ -617,16 +617,25 @@ bool ValidateSchedulerTopologyCheckpointBindings(
                   "scheduler continuation class changed without a typed "
                   "entry route");
     }
-    if (initial_outside &&
-        (initial_checkpoint.checkpoint.thread_states[ordinal] !=
-             final_checkpoint.checkpoint.thread_states[ordinal] ||
-         initial_state != final_state ||
-         start_topology.participants[ordinal].resume_kind !=
-             final_topology.participants[ordinal].resume_kind ||
-         guest_execution_actors.contains(static_cast<uint32_t>(ordinal)))) {
-      return Fail(error,
-                  "outside-guest participant changed or executed between "
-                  "boundaries");
+    if (initial_outside) {
+      if (initial_checkpoint.checkpoint.thread_states[ordinal] !=
+              final_checkpoint.checkpoint.thread_states[ordinal] ||
+          initial_state != final_state ||
+          guest_execution_actors.contains(static_cast<uint32_t>(ordinal))) {
+        return Fail(error,
+                    "outside-guest participant changed or executed between "
+                    "boundaries");
+      }
+      const char* topology_difference =
+          GuestExecutionSessionSchedulerTopologyFirstDifference(
+              start_topology.participants[ordinal],
+              final_topology.participants[ordinal]);
+      if (topology_difference) {
+        return Fail(error,
+                    std::string("outside-guest participant scheduler topology "
+                                "changed between boundaries: ") +
+                        topology_difference);
+      }
     }
   }
   return true;
