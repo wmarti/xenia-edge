@@ -3365,9 +3365,10 @@ bool GuestExecutionSessionCaptureRuntime::OnSchedulerEvent(
 
 bool GuestExecutionSessionCaptureRuntime::OnSchedulerSignalWitness(
     const kernel::GuestSchedulerCaptureSignalWitness& witness) noexcept {
-  // Delivered under the same lock as the events, so the anchor is exactly the
-  // sequence this runtime has already accounted for.
-  if (witness.after_scheduler_sequence !=
+  // The anchor names a tape position the signal is already past, so it may lag
+  // the runtime's cursor but can never claim a sequence the tape has not
+  // reached.
+  if (witness.after_scheduler_sequence >
       impl_->last_scheduler_sequence.load(std::memory_order_relaxed)) {
     impl_->LatchAsyncFailure(AsyncFailure::kSignalWitnessAnchor);
     return false;

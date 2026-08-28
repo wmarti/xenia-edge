@@ -3064,7 +3064,7 @@ bool GuestScheduler::AttachCaptureObserverTransactionally(
     return false;
   }
   capture_observer_ = std::move(observer);
-  capture_sequence_ = 0;
+  capture_sequence_.store(0, std::memory_order_relaxed);
   capture_rejected_ = false;
   capture_signal_witness_armed_.store(true, std::memory_order_release);
   return true;
@@ -3116,7 +3116,14 @@ void GuestScheduler::NoteCooperativeSignal(uint32_t object_handle,
     epoch->fetch_add(1, std::memory_order_acq_rel);
     return;
   }
+  // The tape position is read before the bump so a waiter that observes the
+  // signal is always sequenced after it, and nothing but that load may come
+  // between a signaller and its bump: a waiter's decision runs concurrently.
   GuestSchedulerCaptureSignalWitness witness;
+  witness.after_scheduler_sequence =
+      capture_sequence_.load(std::memory_order_acquire);
+  witness.signal_epoch =
+      epoch->fetch_add(1, std::memory_order_acq_rel) + uint32_t(1);
   witness.object_handle = object_handle;
   witness.object_type = object_type;
   if (auto* thread = XThread::GetCurrentThread()) {
@@ -3127,12 +3134,9 @@ void GuestScheduler::NoteCooperativeSignal(uint32_t object_handle,
     }
   }
   std::lock_guard<std::mutex> lock(lock_);
-  witness.signal_epoch =
-      epoch->fetch_add(1, std::memory_order_acq_rel) + uint32_t(1);
   if (!capture_observer_ || capture_rejected_) {
     return;
   }
-  witness.after_scheduler_sequence = capture_sequence_;
   if (!capture_observer_->OnSchedulerSignalWitness(witness)) {
     capture_rejected_ = true;
     XELOGE(
@@ -3151,7 +3155,8 @@ void GuestScheduler::EmitCaptureLocked(
     return;
   }
   GuestSchedulerCaptureEvent event;
-  event.sequence = ++capture_sequence_;
+  event.sequence =
+      capture_sequence_.fetch_add(1, std::memory_order_acq_rel) + uint64_t(1);
   if (thread) {
     if (auto* thread_state = thread->thread_state()) {
       event.capture_instance_id =

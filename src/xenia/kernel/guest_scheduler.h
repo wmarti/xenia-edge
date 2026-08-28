@@ -447,7 +447,7 @@ class GuestScheduler {
 
   // All guarded by lock_.
   std::shared_ptr<GuestSchedulerCaptureObserver> capture_observer_;
-  uint64_t capture_sequence_ = 0;
+  std::atomic<uint64_t> capture_sequence_{0};
   bool capture_dispatch_seen_ = false;
   bool capture_closed_ = false;
   bool capture_rejected_ = false;

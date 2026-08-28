@@ -91,7 +91,7 @@ bool GuestSchedulerCaptureEventRecorder::OnSchedulerSignalWitness(
     return false;
   }
   if (!witness.signal_epoch ||
-      witness.after_scheduler_sequence != last_sequence_ ||
+      witness.after_scheduler_sequence > last_sequence_ ||
       (witness.capture_instance_id && !witness.guest_thread_id)) {
     rejection_ = GuestSchedulerCaptureRecorderRejection::kInvalidSignalWitness;
     return false;

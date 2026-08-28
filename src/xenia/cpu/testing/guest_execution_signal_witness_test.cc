@@ -419,7 +419,7 @@ TEST_CASE("scheduler capture recorder anchors signal provenance to the tape",
     REQUIRE(snapshot.signal_witnesses[1].after_scheduler_sequence == 1);
   }
 
-  SECTION("an anchor that does not name the tape position is refused") {
+  SECTION("an anchor ahead of the tape position is refused") {
     REQUIRE(recorder.OnSchedulerEvent(DispatchEvent(1)));
     REQUIRE_FALSE(recorder.OnSchedulerSignalWitness(CaptureWitness(2, 1)));
     REQUIRE(

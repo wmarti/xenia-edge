@@ -2052,7 +2052,7 @@ TEST_CASE("session bundle admits a blocked export replay route",
 
 TEST_CASE("session bundle binds signal-epoch wakes to their signal witnesses",
           "[guest-execution-session-bundle]") {
-  BlockedExportOptions options;
+  PendingExportOptions options;
   options.wake_wait_handle = 0x2000;
   options.wake_signal_epoch_before = 4;
   options.wake_signal_epoch_observed = 5;
@@ -2066,7 +2066,7 @@ TEST_CASE("session bundle binds signal-epoch wakes to their signal witnesses",
   };
 
   SECTION("a signal recorded before the wake is admitted") {
-    GuestExecutionSessionBundle bundle = MakeBlockedExportBundle(options);
+    GuestExecutionSessionBundle bundle = MakePendingExportBundle(options);
     AttachSignalWitnesses(&bundle, {ParticipantSignalWitness(0, 0x2000, 5)});
     REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
                                                         bundle.chunks, &error));
@@ -2075,7 +2075,7 @@ TEST_CASE("session bundle binds signal-epoch wakes to their signal witnesses",
   }
 
   SECTION("a signal at or after the wake's own tape position rejects") {
-    GuestExecutionSessionBundle bundle = MakeBlockedExportBundle(options);
+    GuestExecutionSessionBundle bundle = MakePendingExportBundle(options);
     AttachSignalWitnesses(&bundle, {ParticipantSignalWitness(1, 0x2000, 5)});
     require_rejected(bundle,
                      "signal witness is not earlier than the wake it "
@@ -2083,7 +2083,7 @@ TEST_CASE("session bundle binds signal-epoch wakes to their signal witnesses",
   }
 
   SECTION("a signal claimed for a participant off the roster rejects") {
-    GuestExecutionSessionBundle bundle = MakeBlockedExportBundle(options);
+    GuestExecutionSessionBundle bundle = MakePendingExportBundle(options);
     GuestExecutionSessionSignalWitness witness =
         ParticipantSignalWitness(0, 0x2000, 5);
     witness.guest_thread_id = 0x999;
@@ -2092,7 +2092,7 @@ TEST_CASE("session bundle binds signal-epoch wakes to their signal witnesses",
   }
 
   SECTION("a signal by an off-roster thread publishes and authorizes nothing") {
-    GuestExecutionSessionBundle bundle = MakeBlockedExportBundle(options);
+    GuestExecutionSessionBundle bundle = MakePendingExportBundle(options);
     GuestExecutionSessionSignalWitness witness =
         ParticipantSignalWitness(0, 0x2000, 5);
     witness.guest_thread_id = 0x999;
@@ -2120,7 +2120,7 @@ TEST_CASE("session bundle binds signal-epoch wakes to their signal witnesses",
 
   SECTION(
       "a wake with no witness table at all publishes and stays detectable") {
-    const GuestExecutionSessionBundle bundle = MakeBlockedExportBundle(options);
+    const GuestExecutionSessionBundle bundle = MakePendingExportBundle(options);
     REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
     REQUIRE(std::none_of(
         bundle.manifest.chunks.cbegin(), bundle.manifest.chunks.cend(),
