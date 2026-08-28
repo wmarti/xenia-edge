@@ -535,9 +535,12 @@ struct GuestExecutionSessionCaptureProvider::Impl {
       // one that stopped being readable while it was being sampled.
       RejectLocked(fmt::format(
           "capture provider could not read a guest code page: page={:08X} "
-          "first={} second={} retryable={} site={}",
+          "first={} second={} retryable={} site={} fn={:08X}-{:08X}",
           page_address, first, second, page_reader.last_read_was_retryable(),
-          page_reader.last_read_failure_site()));
+          page_reader.last_read_failure_site(), snapshotting_definition_,
+          definitions.count(snapshotting_definition_)
+              ? definitions.at(snapshotting_definition_).end_address
+              : 0));
       return CodeReadResult::kFailure;
     }
     if (*output != verification) {
@@ -549,7 +552,9 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     return CodeReadResult::kSuccess;
   }
 
-  CodeReadResult SnapshotDefinitionLocked(DefinitionRecord& definition) {
+  CodeReadResult SnapshotDefinitionLocked(uint32_t definition_address,
+                                          DefinitionRecord& definition) {
+    snapshotting_definition_ = definition_address;
     std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> snapshots;
     for (uint32_t page_address : definition.code_pages) {
       if (written_backing_pages.contains(BackingPageAddress(page_address))) {
@@ -581,7 +586,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     for (auto it = pending_definition_snapshots.begin();
          it != pending_definition_snapshots.end();) {
       DefinitionRecord& definition = definitions.at(*it);
-      const CodeReadResult result = SnapshotDefinitionLocked(definition);
+      const CodeReadResult result = SnapshotDefinitionLocked(*it, definition);
       if (result == CodeReadResult::kRetry) {
         if (final_attempt) {
           return RejectLocked(
@@ -681,7 +686,8 @@ struct GuestExecutionSessionCaptureProvider::Impl {
         static_cast<uint32_t>(definition_order.size());
     definition->code_pages = std::move(pages);
     definition_order.push_back(address);
-    const CodeReadResult result = SnapshotDefinitionLocked(*definition);
+    const CodeReadResult result =
+        SnapshotDefinitionLocked(address, *definition);
     if (result == CodeReadResult::kRetry) {
       pending_definition_snapshots.insert(address);
       return true;
@@ -1739,6 +1745,8 @@ struct GuestExecutionSessionCaptureProvider::Impl {
   std::vector<InstructionCounter> instruction_counters;
   std::vector<ppc::PPCContext*> instruction_counter_context_scratch;
   std::map<uint32_t, uint32_t> closure_seeds;
+  // The definition whose extent pulled the page currently being sampled.
+  uint32_t snapshotting_definition_ = 0;
 
   std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> initial_data_pages;
   std::map<uint32_t, uint32_t> data_backing_views;
