@@ -71,6 +71,9 @@ enum class GuestExecutionSessionBoundaryArrivalKind : uint32_t {
 enum class GuestExecutionSessionInitialOuterCallState : uint32_t {
   kOutside = 1,
   kActive = 2,
+  // Parked inside a modeled blocking export, which always sits below an outer
+  // host call the participant never arrived at. No capture produces this yet.
+  kBlockedInExport = 3,
 };
 
 struct GuestExecutionSessionBoundaryPolicy {

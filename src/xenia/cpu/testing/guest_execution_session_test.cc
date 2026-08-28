@@ -1758,6 +1758,30 @@ TEST_CASE("Guest execution asynchronous rendezvous is fail closed", "[cpu]") {
         static_cast<GuestExecutionSessionInitialOuterCallState>(UINT32_MAX);
     CHECK_FALSE(GuestExecutionSessionCodec::EncodeManifest(fixture.manifest,
                                                            &output, &error));
+    fixture = MakeAsynchronousRendezvousFixture();
+    fixture.manifest.participants[1].initial_outer_call_state =
+        static_cast<GuestExecutionSessionInitialOuterCallState>(4);
+    CHECK_FALSE(GuestExecutionSessionCodec::EncodeManifest(fixture.manifest,
+                                                           &output, &error));
+  }
+
+  SECTION("blocked-in-export outer-call state round trips unadmitted") {
+    fixture.manifest.participants[0].initial_outer_call_state =
+        GuestExecutionSessionInitialOuterCallState::kBlockedInExport;
+    REQUIRE(GuestExecutionSessionCodec::EncodeManifest(fixture.manifest,
+                                                       &output, &error));
+    // The record is fixed width, so admitting the value cannot move the wire.
+    CHECK(output.size() == fixture.encoded_manifest.size());
+    GuestExecutionSessionManifest decoded;
+    REQUIRE(
+        GuestExecutionSessionCodec::DecodeManifest(output, &decoded, &error));
+    CHECK(decoded == fixture.manifest);
+    CHECK(decoded.participants[0].initial_outer_call_state ==
+          GuestExecutionSessionInitialOuterCallState::kBlockedInExport);
+    // The class sits below an outer host call it never arrived at, so the
+    // request reconciliation still refuses it.
+    CHECK_FALSE(GuestExecutionSessionCodec::ValidateSession(
+        decoded, fixture.chunks, &error));
   }
 
   SECTION("arrival disposition and held sequence are canonical") {

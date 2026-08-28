@@ -429,6 +429,7 @@ bool IsKnownInitialOuterCallState(
   switch (state) {
     case GuestExecutionSessionInitialOuterCallState::kOutside:
     case GuestExecutionSessionInitialOuterCallState::kActive:
+    case GuestExecutionSessionInitialOuterCallState::kBlockedInExport:
       return true;
     default:
       return false;
@@ -2714,9 +2715,10 @@ bool GuestExecutionSessionCodec::ValidateSession(
   std::vector<ObservedParticipantRange> observed_participant_ranges(
       manifest.participants.size());
   for (size_t i = 0; i < manifest.participants.size(); ++i) {
+    // Every initial state other than outside seeds one open outer host call.
     observed_participant_ranges[i].outer_host_call_active =
-        manifest.participants[i].initial_outer_call_state ==
-        GuestExecutionSessionInitialOuterCallState::kActive;
+        manifest.participants[i].initial_outer_call_state !=
+        GuestExecutionSessionInitialOuterCallState::kOutside;
   }
   std::vector<uint32_t> observed_arrival_counts(manifest.participants.size());
   uint64_t stop_request_accepted_segment_count = 0;
