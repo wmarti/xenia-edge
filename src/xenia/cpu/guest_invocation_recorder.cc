@@ -922,10 +922,20 @@ struct GuestInvocationRecorder::Impl {
       }
       if (state == GuestInvocationRecorderState::kRecordingFinalAttempt &&
           !known_pages.contains(page)) {
-        return Reject(
-            GuestInvocationRecorderRejection::kIncompletePageDiscovery,
-            "the final attempt touched a page absent from discovery",
-            kGuestInvocationDependencyIncompletePageDiscovery);
+        if (attempt_count >= limits.max_attempts) {
+          return Reject(
+              GuestInvocationRecorderRejection::kIncompletePageDiscovery,
+              fmt::format("the final attempt touched a page absent from "
+                          "discovery and no attempt remains: page {:08X} "
+                          "attempt {}",
+                          page, attempt_count),
+              kGuestInvocationDependencyIncompletePageDiscovery);
+        }
+        // Two agreeing attempts are evidence, not proof: a live title can
+        // reach a page no earlier attempt did. Spend this attempt on discovery
+        // and let the page join the closure below.
+        state = GuestInvocationRecorderState::kRecordingDiscovery;
+        initial_pages.clear();
       }
     }
     std::vector<uint32_t>& supplied_pages = supplied_page_scratch;

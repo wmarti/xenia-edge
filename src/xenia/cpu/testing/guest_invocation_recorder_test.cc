@@ -811,6 +811,7 @@ TEST_CASE("guest invocation discovery requires exact consecutive page sets",
   FakePageReader reader;
   reader.AddPage(kDataPageA, 1);
   reader.AddPage(kDataPageB, 2);
+  reader.AddPage(kDataPageC, 3);
   FakeClock clock;
   std::unique_ptr<GuestInvocationRecorder> recorder =
       MakeRecorder(reader, clock);
@@ -823,6 +824,44 @@ TEST_CASE("guest invocation discovery requires exact consecutive page sets",
   REQUIRE(recorder->state() ==
           GuestInvocationRecorderState::kWaitingForFinalAttempt);
 
+  // A page no earlier attempt reached returns the capture to discovery
+  // instead of ending it, and the attempt already in flight becomes the next
+  // discovery attempt.
+  EnterRoot(*recorder);
+  REQUIRE(recorder->OnMemoryAccess(kOwner, kDataPageC, 4,
+                                   GuestInvocationRecorderMemoryAccess::kRead));
+  REQUIRE(recorder->state() ==
+          GuestInvocationRecorderState::kRecordingDiscovery);
+  ExitRoot(*recorder);
+  REQUIRE(recorder->state() ==
+          GuestInvocationRecorderState::kWaitingForDiscoveryAttempt);
+
+  DiscoveryAttempt(*recorder, {kDataPageA, kDataPageB, kDataPageC});
+  DiscoveryAttempt(*recorder, {kDataPageA, kDataPageB, kDataPageC});
+  REQUIRE(recorder->state() ==
+          GuestInvocationRecorderState::kWaitingForFinalAttempt);
+  EnterRoot(*recorder);
+  Access(*recorder, kDataPageA);
+  Access(*recorder, kDataPageB);
+  Access(*recorder, kDataPageC);
+  ExitRoot(*recorder);
+  REQUIRE(recorder->state() == GuestInvocationRecorderState::kComplete);
+  REQUIRE(recorder->result());
+}
+
+TEST_CASE(
+    "guest invocation discovery divergence still ends at the attempt "
+    "limit",
+    "[guest-invocation-recorder]") {
+  FakePageReader reader;
+  reader.AddPage(kDataPageA, 1);
+  FakeClock clock;
+  GuestInvocationRecorderLimits limits = MakeLimits();
+  limits.max_attempts = 3;
+  std::unique_ptr<GuestInvocationRecorder> recorder =
+      MakeRecorder(reader, clock, limits);
+
+  ConvergeOnPage(*recorder);
   EnterRoot(*recorder);
   REQUIRE_FALSE(recorder->OnMemoryAccess(
       kOwner, kDataPageC, 4, GuestInvocationRecorderMemoryAccess::kRead));
