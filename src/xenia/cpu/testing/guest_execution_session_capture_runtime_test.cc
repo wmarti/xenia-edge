@@ -1847,6 +1847,14 @@ TEST_CASE(
   REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
   REQUIRE(status.message.find("passive scheduler participant has an active "
                               "outer host call") != std::string::npos);
+  // A rejection may append its own release diagnostics after the census.
+  const std::string census =
+      "capture runtime passive scheduler participant has an active outer host "
+      "call: tid=00000001 state=1 resume_kind=1 restorable=false pc=00000000 "
+      "hostcall=depth=1,fn=82002000,ret=82003000; unsupported=1/1";
+  INFO(status.message);
+  REQUIRE(status.message.compare(0, census.size(), census) == 0);
+  REQUIRE(status.message.find('\n') == std::string::npos);
   REQUIRE(harness.provider.begin_count.load() == 0);
   REQUIRE(call_result);
   harness.runtime->Shutdown();
@@ -1890,6 +1898,77 @@ TEST_CASE("session capture runtime reports every unsupported participant",
   REQUIRE_FALSE(status.canonical_output_published);
   REQUIRE(harness.provider.begin_count.load() == 0);
 
+  harness.runtime->Shutdown();
+  second.reset();
+  first.reset();
+}
+
+TEST_CASE("session capture runtime censuses passive participants in host calls",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto first = environment.MakeThread(1);
+  auto second = environment.MakeThread(2);
+  RuntimeHarness harness(environment, *first, 8);
+  REQUIRE(harness.runtime);
+  auto& participants = harness.checkpoint.provisional.participants;
+  auto& ready = participants.front();
+  ready.state = kernel::GuestSchedulerCheckpointParticipantState::kReady;
+  ready.guest_pc = 0;
+  ready.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+  ready.restorable = false;
+  harness.checkpoint.start_guest_pc = 0;
+  CheckpointParticipant suspended;
+  suspended.thread_id = second->thread_id();
+  suspended.capture_instance_id = second->guest_execution_capture_instance_id();
+  suspended.guest_pc = 0;
+  suspended.cpu = 0;
+  suspended.state =
+      kernel::GuestSchedulerCheckpointParticipantState::kSuspended;
+  suspended.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun;
+  suspended.restorable = false;
+  participants.push_back(suspended);
+
+  BlockingGuestFunction first_function(0x82002000, 0x82002100);
+  BlockingGuestFunction second_function(0x82004000, 0x82004100);
+  bool first_result = false;
+  bool second_result = false;
+  std::thread first_source(
+      [&]() { first_result = first_function.Call(first.get(), 0x82003000); });
+  std::thread second_source([&]() {
+    second_result = second_function.Call(second.get(), 0x82005000);
+  });
+  const bool entered =
+      first_function.WaitForEntry() && second_function.WaitForEntry();
+  const bool requested = entered && harness.runtime->RequestStart();
+  const bool terminal = requested && harness.runtime->WaitForTerminal(2s);
+  const auto status = harness.runtime->status();
+  first_function.Release();
+  second_function.Release();
+  first_source.join();
+  second_source.join();
+
+  REQUIRE(entered);
+  REQUIRE(requested);
+  REQUIRE(terminal);
+  INFO(status.message);
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
+  const std::string census =
+      "capture runtime passive scheduler participant has an active outer host "
+      "call: tid=00000001 state=1 resume_kind=1 restorable=false pc=00000000 "
+      "hostcall=depth=1,fn=82002000,ret=82003000"
+      "; also: tid=00000002 state=3 resume_kind=3 restorable=false "
+      "pc=00000000 hostcall=depth=1,fn=82004000,ret=82005000"
+      "; unsupported=2/2";
+  REQUIRE(status.message.compare(0, census.size(), census) == 0);
+  REQUIRE(status.message.find("; unsupported=2/2") != std::string::npos);
+  REQUIRE(status.message.find('\n') == std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.provider.begin_count.load() == 0);
+  REQUIRE(first_result);
+  REQUIRE(second_result);
   harness.runtime->Shutdown();
   second.reset();
   first.reset();

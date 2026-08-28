@@ -474,6 +474,105 @@ const CheckpointParticipant* FindCheckpointParticipant(
   return it == checkpoint.participants.end() ? nullptr : &*it;
 }
 
+const GuestExecutionCaptureActiveHostCall* FindOutermostActiveHostCall(
+    const GuestExecutionCaptureHostCallRosterSnapshot& host_calls,
+    const GuestExecutionCaptureParticipantIdentity& identity) {
+  const GuestExecutionCaptureActiveHostCall* outermost = nullptr;
+  for (const GuestExecutionCaptureActiveHostCall& call :
+       host_calls.active_calls) {
+    if (call.participant == identity &&
+        (!outermost || call.participant_depth < outermost->participant_depth)) {
+      outermost = &call;
+    }
+  }
+  return outermost;
+}
+
+std::string DescribeActiveHostCall(
+    const GuestExecutionCaptureActiveHostCall& call) {
+  return fmt::format("hostcall=depth={},fn={:08X},ret={:08X}",
+                     call.participant_depth, call.function_address,
+                     call.return_address);
+}
+
+// The census names every offender, not only the one that stopped the loop.
+std::string CensusPassiveParticipantHostCalls(
+    const CheckpointSnapshot& checkpoint,
+    const GuestExecutionCaptureThreadStateRegistrySnapshot& registry,
+    const GuestExecutionCaptureHostCallRosterSnapshot& host_calls) {
+  std::string message =
+      "capture runtime passive scheduler participant has an active outer "
+      "host call";
+  size_t unsupported_count = 0;
+  for (const auto& lifecycle : registry.participants) {
+    const CheckpointParticipant* participant = FindCheckpointParticipant(
+        checkpoint, lifecycle.participant.guest_thread_id);
+    if (!participant || !IsPassiveOutsideGuestParticipant(*participant)) {
+      continue;
+    }
+    const GuestExecutionCaptureActiveHostCall* call =
+        FindOutermostActiveHostCall(host_calls, lifecycle.participant);
+    if (!call) {
+      continue;
+    }
+    if (unsupported_count < kMaxReportedUnsupportedParticipants) {
+      message.append(unsupported_count ? "; also: " : ": ");
+      message.append(DescribeCheckpointParticipant(*participant));
+      message.push_back(' ');
+      message.append(DescribeActiveHostCall(*call));
+    }
+    ++unsupported_count;
+  }
+  return message + fmt::format("; unsupported={}/{}", unsupported_count,
+                               checkpoint.participants.size());
+}
+
+bool ActiveHostCallHasDurableContinuation(
+    const CheckpointParticipant* participant) {
+  if (!participant) {
+    return false;
+  }
+  const bool restorable_safepoint =
+      participant->resume_kind == CheckpointResumeKind::kJitSafepoint &&
+      participant->restorable;
+  const bool blocked_in_export =
+      participant->resume_kind == CheckpointResumeKind::kAfterBlockingExport &&
+      !participant->restorable &&
+      participant->state ==
+          kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
+  return restorable_safepoint || blocked_in_export;
+}
+
+std::string CensusUnrepresentableActiveHostCalls(
+    const CheckpointSnapshot& checkpoint,
+    const GuestExecutionCaptureHostCallRosterSnapshot& host_calls) {
+  std::string message =
+      "capture runtime active outer call lacks an exact-PC JIT safepoint or "
+      "modeled blocking-export continuation";
+  size_t unsupported_count = 0;
+  for (const GuestExecutionCaptureActiveHostCall& call :
+       host_calls.active_calls) {
+    const CheckpointParticipant* participant =
+        FindCheckpointParticipant(checkpoint, call.participant.guest_thread_id);
+    if (ActiveHostCallHasDurableContinuation(participant)) {
+      continue;
+    }
+    if (unsupported_count < kMaxReportedUnsupportedParticipants) {
+      message.append(unsupported_count ? "; also: " : ": ");
+      message.append(participant
+                         ? DescribeCheckpointParticipant(*participant)
+                         : fmt::format("tid={:08X} state=none resume_kind=none "
+                                       "restorable=none pc=none",
+                                       call.participant.guest_thread_id));
+      message.push_back(' ');
+      message.append(DescribeActiveHostCall(call));
+    }
+    ++unsupported_count;
+  }
+  return message + fmt::format("; unsupported={}/{}", unsupported_count,
+                               host_calls.active_calls.size());
+}
+
 class DirectCheckpointController final
     : public GuestExecutionSessionCaptureRuntimeCheckpointController {
  public:
@@ -1243,8 +1342,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
                       fmt::format("; unsupported={}/{}", unsupported_count,
                                   checkpoint.participants.size()));
     };
-    auto fail_participant = [&](const char* message) {
-      return unsupported_count ? fail_unsupported() : Fail(error, message);
+    auto fail_participant = [&](std::string message) {
+      return unsupported_count ? fail_unsupported()
+                               : Fail(error, std::move(message));
     };
     for (size_t index = 0; index < registry.participants.size(); ++index) {
       const auto& lifecycle = registry.participants[index];
@@ -1284,13 +1384,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
             "preemption episode");
       }
       if (IsPassiveOutsideGuestParticipant(*checkpoint_participant) &&
-          std::any_of(host_calls.active_calls.cbegin(),
-                      host_calls.active_calls.cend(), [&](const auto& call) {
-                        return call.participant == lifecycle.participant;
-                      })) {
-        return fail_participant(
-            "capture runtime passive scheduler participant has an "
-            "active outer host call");
+          FindOutermostActiveHostCall(host_calls, lifecycle.participant)) {
+        return fail_participant(CensusPassiveParticipantHostCalls(
+            checkpoint, registry, host_calls));
       }
       std::string capability_error;
       if (!dependencies.provider->SupportsCheckpointParticipant(
@@ -1326,22 +1422,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       // expected exactly like a safepoint's. The provider has already refused
       // any blocked participant it could not bind to a modeled export
       // dispatch, so reaching here means this one carries a typed route.
-      const bool restorable_safepoint =
-          checkpoint_participant &&
-          checkpoint_participant->resume_kind ==
-              CheckpointResumeKind::kJitSafepoint &&
-          checkpoint_participant->restorable;
-      const bool blocked_in_export =
-          checkpoint_participant &&
-          checkpoint_participant->resume_kind ==
-              CheckpointResumeKind::kAfterBlockingExport &&
-          !checkpoint_participant->restorable &&
-          checkpoint_participant->state ==
-              kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
-      if (!restorable_safepoint && !blocked_in_export) {
-        return Fail(error,
-                    "capture runtime active outer call lacks an exact-PC JIT "
-                    "safepoint or modeled blocking-export continuation");
+      if (!ActiveHostCallHasDurableContinuation(checkpoint_participant)) {
+        return Fail(error, CensusUnrepresentableActiveHostCalls(checkpoint,
+                                                                host_calls));
       }
     }
     return true;
