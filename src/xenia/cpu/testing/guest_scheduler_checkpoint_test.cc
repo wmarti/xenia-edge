@@ -73,8 +73,8 @@ TEST_CASE("Scheduler checkpoint barrier holds running and preserves passive",
   participants[2].blocked_wait.flags = kGuestSchedulerCaptureWaitFlagGated;
 
   REQUIRE(barrier.Begin(0b11, participants));
-  REQUIRE(barrier.ArriveAtSafepoint(0x101, 0, 0x82002000, 3, 5, 8));
-  REQUIRE(barrier.ArriveAtSafepoint(0x202, 1, 0x82003000));
+  REQUIRE(barrier.ArriveAtSafepoint(0x101, 0, 0x82002000, 0x82002000, 3, 5, 8));
+  REQUIRE(barrier.ArriveAtSafepoint(0x202, 1, 0x82003000, 0x82003000));
   REQUIRE(barrier.ConfirmSwitchOut(0x101, 0));
   REQUIRE(barrier.ConfirmSwitchOut(0x202, 1));
   REQUIRE(barrier.AcknowledgeDispatchQuiesced(0));
@@ -143,7 +143,7 @@ TEST_CASE("Scheduler checkpoint barrier waits for switch-out and every CPU",
       MakeParticipant(0x101, 0, ParticipantState::kRunning),
   };
   REQUIRE(barrier.Begin(0b11, participants));
-  REQUIRE(barrier.ArriveAtSafepoint(0x101, 0, 0x82002000));
+  REQUIRE(barrier.ArriveAtSafepoint(0x101, 0, 0x82002000, 0x82002000));
   REQUIRE(barrier.AcknowledgeDispatchQuiesced(0));
 
   auto snapshot = barrier.snapshot();
@@ -168,7 +168,7 @@ TEST_CASE("Scheduler checkpoint barrier rejects invalid safepoints",
                       ResumeKind::kAfterBlockingExport),
   };
   REQUIRE(barrier.Begin(0b11, participants));
-  REQUIRE_FALSE(barrier.ArriveAtSafepoint(0x202, 1, 0x82002000));
+  REQUIRE_FALSE(barrier.ArriveAtSafepoint(0x202, 1, 0x82002000, 0x82002000));
   REQUIRE(barrier.snapshot().rejection == Rejection::kUnexpectedSafepoint);
   REQUIRE_FALSE(barrier.WaitUntilQuiesced(std::chrono::milliseconds(1)));
   const auto snapshot = barrier.snapshot();
@@ -205,7 +205,7 @@ TEST_CASE("Scheduler checkpoint barrier validates passive ownership and PC",
       MakeParticipant(0x202, 0, ParticipantState::kRunning),
   };
   REQUIRE(barrier.Begin(0b1, running));
-  REQUIRE_FALSE(barrier.ArriveAtSafepoint(0x202, 0, 0x82002002));
+  REQUIRE_FALSE(barrier.ArriveAtSafepoint(0x202, 0, 0x82002002, 0x82002000));
   const auto snapshot = barrier.snapshot();
   REQUIRE(snapshot.rejection == Rejection::kInvalidGuestPc);
   Rejection final_rejection = Rejection::kNone;

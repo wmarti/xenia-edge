@@ -143,6 +143,7 @@ class GuestSchedulerCheckpointBarrier {
              std::span<const GuestSchedulerCheckpointParticipant> participants,
              uint64_t* out_generation = nullptr);
   bool ArriveAtSafepoint(uint32_t thread_id, int cpu, uint32_t guest_pc,
+                         uint32_t owning_function_address = 0,
                          uint32_t preempt_defers_irql = 0,
                          uint32_t preempt_defers_lock = 0,
                          uint32_t capture_declined_safepoints = 0,

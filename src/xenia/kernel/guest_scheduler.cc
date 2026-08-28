@@ -955,7 +955,7 @@ bool GuestScheduler::TryCheckpointCurrentFiber(
     }
     const auto& links = thread->scheduler_links();
     if (!checkpoint_barrier_.ArriveAtSafepoint(
-            thread->thread_id(), cpu_index, guest_pc,
+            thread->thread_id(), cpu_index, guest_pc, owning_function_address,
             links.preempt_defers_irql.load(std::memory_order_relaxed),
             links.preempt_defers_lock.load(std::memory_order_relaxed),
             links.capture_declined_safepoints.load(std::memory_order_relaxed),

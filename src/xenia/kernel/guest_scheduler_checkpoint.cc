@@ -85,15 +85,17 @@ bool GuestSchedulerCheckpointBarrier::Begin(
 
 bool GuestSchedulerCheckpointBarrier::ArriveAtSafepoint(
     uint32_t thread_id, int cpu, uint32_t guest_pc,
-    uint32_t preempt_defers_irql, uint32_t preempt_defers_lock,
-    uint32_t capture_declined_safepoints, uint32_t quantum_remaining_us) {
+    uint32_t owning_function_address, uint32_t preempt_defers_irql,
+    uint32_t preempt_defers_lock, uint32_t capture_declined_safepoints,
+    uint32_t quantum_remaining_us) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!active_.load(std::memory_order_relaxed) ||
       rejection_ != GuestSchedulerCheckpointBarrierRejection::kNone) {
     return false;
   }
-  if (!guest_pc || (guest_pc & 3) || cpu < 0 ||
-      cpu >= std::numeric_limits<uint8_t>::digits) {
+  if (!guest_pc || (guest_pc & 3) || !owning_function_address ||
+      (owning_function_address & 3) || owning_function_address > guest_pc ||
+      cpu < 0 || cpu >= std::numeric_limits<uint8_t>::digits) {
     rejection_ = GuestSchedulerCheckpointBarrierRejection::kInvalidGuestPc;
     NotifyIfTerminalLocked();
     return false;
@@ -118,6 +120,7 @@ bool GuestSchedulerCheckpointBarrier::ArriveAtSafepoint(
   }
   arrivals_[index].arrived = true;
   it->guest_pc = guest_pc;
+  it->owning_function_address = owning_function_address;
   it->resume_kind = GuestSchedulerCheckpointResumeKind::kJitSafepoint;
   it->restorable = true;
   it->preempt_defers_irql = preempt_defers_irql;
