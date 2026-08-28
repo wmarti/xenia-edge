@@ -509,9 +509,9 @@ inline XReg AddGuestMemoryOffset(A64Emitter& e, const XReg& base,
     const uint32_t imm = static_cast<uint32_t>(offset.constant());
     const uint32_t neg = 0u - imm;
     if (imm == 0) {
-      if (base.getIdx() != 0) {
-        e.mov(e.w0, src);
-      }
+      // Nothing to add, so the base already holds the address. Say so instead
+      // of copying it, and let the caller decide whether it needs the scratch.
+      return base;
     } else if (imm <= 0xFFF) {
       e.add(e.w0, src, imm);
     } else if (!(imm & 0xFFF) && (imm >> 12) <= 0xFFF) {
@@ -549,8 +549,8 @@ inline void EmitGuestInvocationCaptureMemoryAccessOffset(
     } else {
       e.mov(e.w0, WReg(base.reg().getIdx()));
     }
-    AddGuestMemoryOffset(e, e.x0, offset);
-    e.mov(e.w1, e.w0);
+    const XReg address = AddGuestMemoryOffset(e, e.x0, offset);
+    e.mov(e.w1, WReg(address.getIdx()));
   }
   e.mov(e.w2, static_cast<uint64_t>(size));
   EmitGuestInvocationCapturePreparedMemoryAccess(e, access);
@@ -580,14 +580,17 @@ inline XReg ComputeMemoryAddressOffset(A64Emitter& e, const I64Op& guest,
     e.mov(e.x0, static_cast<uint64_t>(address));
     return e.x0;
   }
+  XReg address = e.x0;
   if (guest.is_constant) {
     e.mov(e.w0, static_cast<uint64_t>(static_cast<uint32_t>(guest.constant())));
-    AddGuestMemoryOffset(e, e.x0, offset);
+    address = AddGuestMemoryOffset(e, e.x0, offset);
   } else {
-    AddGuestMemoryOffset(e, guest.reg(), offset);
+    address = AddGuestMemoryOffset(e, guest.reg(), offset);
   }
   if (NeedsPhysicalRemap()) {
-    ApplyPhysicalRemapW0(e);
+    ApplyPhysicalRemapW0(e, WReg(address.getIdx()));
+  } else if (address.getIdx() != e.x0.getIdx()) {
+    e.mov(e.w0, WReg(address.getIdx()));
   }
   return e.x0;
 }
