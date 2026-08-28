@@ -870,6 +870,37 @@ TEST_CASE(
                   kGuestInvocationDependencyIncompletePageDiscovery);
 }
 
+TEST_CASE("guest invocation capture survives a contended snapshot",
+          "[guest-invocation-recorder]") {
+  FakePageReader reader;
+  reader.AddPage(kDataPageA, 1);
+  FakeClock clock;
+  std::unique_ptr<GuestInvocationRecorder> recorder =
+      MakeRecorder(reader, clock);
+
+  ConvergeOnPage(*recorder);
+  // One contended closure resample and one contended input snapshot. Neither
+  // says anything about the invocation, so the attempt is spent on discovery
+  // instead of ending the capture.
+  reader.retryable_read_count = 2;
+  EnterRoot(*recorder);
+  REQUIRE(recorder->rejection() == GuestInvocationRecorderRejection::kNone);
+  REQUIRE(recorder->state() ==
+          GuestInvocationRecorderState::kRecordingDiscovery);
+  Access(*recorder, kDataPageA);
+  ExitRoot(*recorder);
+  REQUIRE(recorder->state() ==
+          GuestInvocationRecorderState::kWaitingForFinalAttempt);
+
+  EnterRoot(*recorder);
+  REQUIRE(recorder->state() ==
+          GuestInvocationRecorderState::kRecordingFinalAttempt);
+  Access(*recorder, kDataPageA);
+  ExitRoot(*recorder);
+  REQUIRE(recorder->state() == GuestInvocationRecorderState::kComplete);
+  REQUIRE(recorder->result());
+}
+
 TEST_CASE("guest invocation recorder rejects every resource bound",
           "[guest-invocation-recorder]") {
   FakePageReader reader;

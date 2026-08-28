@@ -298,26 +298,6 @@ struct GuestInvocationRecorder::Impl {
     return CodePageReadResult::kSuccess;
   }
 
-  bool RequireStableCodePage(uint32_t page_address,
-                             std::array<uint8_t, kGuestPageSize>* stable_page,
-                             std::string_view site) {
-    const CodePageReadResult read =
-        ReadStableCodePage(page_address, stable_page);
-    if (read == CodePageReadResult::kSuccess) {
-      return true;
-    }
-    if (read == CodePageReadResult::kRetry) {
-      return Reject(
-          GuestInvocationRecorderRejection::kPageReadFailure,
-          fmt::format("global memory snapshot was contended at capture "
-                      "boundary: {} page {:08X} closure {} attempt {} state {}",
-                      site, page_address, closure_code_pages.size(),
-                      attempt_count, static_cast<uint32_t>(state)),
-          kGuestInvocationDependencyUnsupportedMappingOrProtection);
-    }
-    return false;
-  }
-
   CodePageReadResult SnapshotDefinition(DefinitionRecord& definition) {
     std::map<uint32_t, CodePageSnapshot> code_pages;
     for (uint32_t page_address : definition.code_page_addresses) {
@@ -491,7 +471,9 @@ struct GuestInvocationRecorder::Impl {
     return true;
   }
 
-  bool ValidateClosureCodePages(std::string_view site) {
+  // A contended resample reports lock traffic, not guest code. Only the
+  // completion sweep, which gates the result, insists on completing one.
+  bool ValidateClosureCodePages(std::string_view site, bool required) {
     for (const auto& [page_address, snapshot] : closure_code_pages) {
       const auto generation =
           definition_page_write_generations.find(page_address);
@@ -502,8 +484,23 @@ struct GuestInvocationRecorder::Impl {
                       kGuestInvocationDependencySelfModifyingCode);
       }
       std::array<uint8_t, kGuestPageSize> current = {};
-      if (!RequireStableCodePage(page_address, &current, site)) {
+      const CodePageReadResult read =
+          ReadStableCodePage(page_address, &current);
+      if (read == CodePageReadResult::kFailure) {
         return false;
+      }
+      if (read == CodePageReadResult::kRetry) {
+        if (!required) {
+          return true;
+        }
+        return Reject(
+            GuestInvocationRecorderRejection::kPageReadFailure,
+            fmt::format("global memory snapshot was contended at capture "
+                        "boundary: {} page {:08X} closure {} attempt {} "
+                        "state {}",
+                        site, page_address, closure_code_pages.size(),
+                        attempt_count, static_cast<uint32_t>(state)),
+            kGuestInvocationDependencyUnsupportedMappingOrProtection);
       }
       if (current != snapshot.data) {
         return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
@@ -587,8 +584,8 @@ struct GuestInvocationRecorder::Impl {
         closure_code_pages.size() == closure_code_page_count) {
       return true;
     }
-    return ValidateClosureCodePages(revalidate_closure_code ? "attempt-boundary"
-                                                            : "closure-growth");
+    return ValidateClosureCodePages(
+        revalidate_closure_code ? "attempt-boundary" : "closure-growth", false);
   }
 
   bool ValidateReturnBoundary(uint32_t function_address,
@@ -619,7 +616,7 @@ struct GuestInvocationRecorder::Impl {
     return true;
   }
 
-  bool SnapshotSuppliedDataPages(
+  CodePageReadResult SnapshotSuppliedDataPages(
       std::map<uint32_t, std::array<uint8_t, kGuestPageSize>>* output) {
     output->clear();
     for (uint32_t page_address : supplied_data_pages) {
@@ -627,17 +624,25 @@ struct GuestInvocationRecorder::Impl {
       const bool read = page_reader.ReadPage(page_address, &page);
       if (state == GuestInvocationRecorderState::kRejected) {
         output->clear();
-        return false;
+        return CodePageReadResult::kFailure;
       }
       if (!read) {
+        const bool retryable = page_reader.last_read_was_retryable();
         output->clear();
-        return Reject(GuestInvocationRecorderRejection::kPageReadFailure,
-                      "unable to snapshot a supplied guest data page",
-                      kGuestInvocationDependencyUnsupportedMappingOrProtection);
+        if (retryable) {
+          return CodePageReadResult::kRetry;
+        }
+        Reject(GuestInvocationRecorderRejection::kPageReadFailure,
+               fmt::format("unable to snapshot a supplied guest data page: "
+                           "page {:08X} supplied {} attempt {} state {}",
+                           page_address, supplied_data_pages.size(),
+                           attempt_count, static_cast<uint32_t>(state)),
+               kGuestInvocationDependencyUnsupportedMappingOrProtection);
+        return CodePageReadResult::kFailure;
       }
       output->emplace(page_address, std::move(page));
     }
-    return true;
+    return CodePageReadResult::kSuccess;
   }
 
   bool BeginAttempt(const GuestPPCRegisterState& entry_state) {
@@ -667,14 +672,20 @@ struct GuestInvocationRecorder::Impl {
     attempt_return_address = return_address;
 
     if (state == GuestInvocationRecorderState::kWaitingForFinalAttempt) {
-      if (!SnapshotSuppliedDataPages(&initial_pages)) {
+      const CodePageReadResult snapshot =
+          SnapshotSuppliedDataPages(&initial_pages);
+      if (snapshot == CodePageReadResult::kFailure) {
         return false;
       }
-      state = GuestInvocationRecorderState::kRecordingFinalAttempt;
-    } else {
-      initial_pages.clear();
-      state = GuestInvocationRecorderState::kRecordingDiscovery;
+      if (snapshot == CodePageReadResult::kSuccess) {
+        state = GuestInvocationRecorderState::kRecordingFinalAttempt;
+        return true;
+      }
     }
+    // A contended input snapshot says nothing about the invocation, so spend
+    // this attempt on discovery and reach the final attempt again.
+    initial_pages.clear();
+    state = GuestInvocationRecorderState::kRecordingDiscovery;
     return true;
   }
 
@@ -700,12 +711,26 @@ struct GuestInvocationRecorder::Impl {
   }
 
   bool CompleteFinalAttempt(const GuestPPCRegisterState& exit_state) {
-    if (!ValidateClosureCodePages("final-exit")) {
+    if (!ValidateClosureCodePages("final-exit", true)) {
       return false;
     }
     std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> final_pages;
-    if (!SnapshotSuppliedDataPages(&final_pages)) {
+    const CodePageReadResult snapshot = SnapshotSuppliedDataPages(&final_pages);
+    if (snapshot == CodePageReadResult::kFailure) {
       return false;
+    }
+    if (snapshot == CodePageReadResult::kRetry) {
+      if (attempt_count >= limits.max_attempts) {
+        return Reject(
+            GuestInvocationRecorderRejection::kPageReadFailure,
+            "guest data snapshot was contended at the final exit and no "
+            "attempt remains",
+            kGuestInvocationDependencyUnsupportedMappingOrProtection);
+      }
+      // Take the final attempt again rather than losing the capture.
+      initial_pages.clear();
+      state = GuestInvocationRecorderState::kWaitingForFinalAttempt;
+      return true;
     }
 
     GuestInvocationRecorderResult accepted;
