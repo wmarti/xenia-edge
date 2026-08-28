@@ -720,8 +720,12 @@ struct GuestExecutionSessionCaptureProvider::Impl {
         continue;
       }
       if (owner) {
-        RejectLocked(
-            "capture provider checkpoint PC has overlapping catalog owners");
+        RejectLocked(fmt::format(
+            "capture provider checkpoint PC has overlapping catalog owners: "
+            "pc={:08X} first={:08X}-{:08X} second={:08X}-{:08X} order={}/{}",
+            guest_pc, FindDefinitionAddressLocked(owner), owner->end_address,
+            address, definition.end_address, owner->definition_order,
+            definition.definition_order));
         return nullptr;
       }
       owner = &definition;
