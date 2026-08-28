@@ -870,6 +870,34 @@ TEST_CASE(
                   kGuestInvocationDependencyIncompletePageDiscovery);
 }
 
+TEST_CASE("guest invocation data inside a code granule is supplied once",
+          "[guest-invocation-recorder]") {
+  FakePageReader reader;
+  FakeClock clock;
+  GuestInvocationRecorderLimits limits = MakeLimits();
+  limits.host_protection_page_size = 16 * 1024;
+  std::unique_ptr<GuestInvocationRecorder> recorder =
+      MakeRecorder(reader, clock, limits);
+
+  // The root's code closure covers its whole 16 KiB granule, so this read
+  // lands on a page the corpus already supplies.
+  constexpr uint32_t kInCodeGranulePage = kRootAddress + kGuestPageSize;
+  DiscoveryAttempt(*recorder, {kInCodeGranulePage});
+  DiscoveryAttempt(*recorder, {kInCodeGranulePage});
+  REQUIRE(recorder->state() ==
+          GuestInvocationRecorderState::kWaitingForFinalAttempt);
+  EnterRoot(*recorder);
+  Access(*recorder, kInCodeGranulePage);
+  ExitRoot(*recorder);
+
+  REQUIRE(recorder->state() == GuestInvocationRecorderState::kComplete);
+  const GuestInvocationRecorderResult* result = recorder->result();
+  REQUIRE(result);
+  REQUIRE(result->invocation.input_data_pages.empty());
+  REQUIRE(result->code_pages.size() == 4);
+  REQUIRE(result->code_pages[0].guest_address == kRootAddress);
+}
+
 TEST_CASE("guest invocation capture survives a contended snapshot",
           "[guest-invocation-recorder]") {
   FakePageReader reader;

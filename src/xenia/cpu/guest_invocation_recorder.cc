@@ -978,21 +978,24 @@ struct GuestInvocationRecorder::Impl {
       const uint32_t backing = BackingPageAddress(page);
       const auto code_backing = closure_code_backing_views.find(backing);
       if (code_backing != closure_code_backing_views.cend()) {
-        const bool same_page = code_backing->second == page;
-        const uint32_t dependency =
-            same_page ? kGuestInvocationDependencyUnsupportedMappingOrProtection
-                      : kGuestInvocationDependencyPhysicalAlias;
-        const bool directly_read =
-            std::find(pages.cbegin(), pages.cend(), page) != pages.cend();
-        return Reject(
-            GuestInvocationRecorderRejection::kUnsupportedDependency,
-            fmt::format("invocation data overlaps the code closure: page "
-                        "{:08X} backing {:08X} read {} samepage {} access "
-                        "{:08X}-{:08X} granule {}",
-                        page, backing, directly_read ? 1 : 0, same_page ? 1 : 0,
-                        pages.front(), pages.back(),
-                        limits.host_protection_page_size),
-            dependency);
+        if (code_backing->second != page) {
+          const bool directly_read =
+              std::find(pages.cbegin(), pages.cend(), page) != pages.cend();
+          return Reject(
+              GuestInvocationRecorderRejection::kUnsupportedDependency,
+              fmt::format("invocation data aliases the code closure: page "
+                          "{:08X} backing {:08X} read {} access {:08X}-{:08X} "
+                          "granule {}",
+                          page, backing, directly_read ? 1 : 0, pages.front(),
+                          pages.back(), limits.host_protection_page_size),
+              kGuestInvocationDependencyPhysicalAlias);
+        }
+        // The corpus supplies this page and every closure code page is proven
+        // unchanged from its definition snapshot through the completion sweep,
+        // so its captured bytes are the bytes the invocation read. Replay
+        // closes the granule from the corpus and data pages together, leaving
+        // nothing for a second copy in the data set to disagree with.
+        continue;
       }
       const auto known = supplied_data_backing_views.find(backing);
       const uint32_t* added = FindBackingView(new_backing_views, backing);
@@ -1015,6 +1018,9 @@ struct GuestInvocationRecorder::Impl {
                     "invocation data closure exceeds the page limit",
                     kGuestInvocationDependencyPageDiscoveryOverflow);
     }
+    std::erase_if(supplied_pages, [this](uint32_t page) {
+      return closure_code_backing_views.contains(BackingPageAddress(page));
+    });
     attempt_pages.insert(pages.cbegin(), pages.cend());
     for (uint32_t page : pages) {
       attempt_read_backing_pages.insert(BackingPageAddress(page));
