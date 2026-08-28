@@ -1807,6 +1807,30 @@ const char* GuestExecutionSessionSchedulerTopologyFirstDifference(
   return nullptr;
 }
 
+bool IsGuestExecutionSessionWokenInWaitParticipant(
+    const GuestExecutionSessionSchedulerTopologyParticipant& participant) {
+  if (participant.state !=
+          GuestExecutionSessionSchedulerParticipantState::kReady ||
+      participant.resume_kind !=
+          GuestExecutionSessionSchedulerResumeKind::kNativeContinuation ||
+      participant.restorable || participant.guest_pc) {
+    return false;
+  }
+  // A replay seed reconstructs a ready participant from its queue position
+  // alone, so the position has to be the dense one the encoder writes.
+  if (participant.effective_priority ==
+          kGuestExecutionSessionSchedulerNoValue ||
+      participant.ready_queue_level != participant.effective_priority ||
+      participant.ready_queue_fifo_ordinal ==
+          kGuestExecutionSessionSchedulerNoValue) {
+    return false;
+  }
+  // Only a blocked row serializes a wait binding. Restated so the predicate is
+  // self-contained.
+  return participant.blocked_wait ==
+         GuestExecutionSessionSchedulerBlockedWaitBinding{};
+}
+
 GuestExecutionSessionSha256 GuestExecutionSessionCodec::HashBytes(
     const uint8_t* data, size_t data_size) {
   sha256::SHA256 hasher;

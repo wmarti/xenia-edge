@@ -28,6 +28,7 @@
 #include "xenia/base/memory.h"
 #include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/guest_execution_external_event.h"
+#include "xenia/cpu/guest_execution_session.h"
 #include "xenia/cpu/guest_execution_session_capture_provider.h"
 #include "xenia/cpu/guest_invocation_artifact.h"
 #include "xenia/cpu/test_module.h"
@@ -415,6 +416,49 @@ bool WaitForLifecycleWaiter(GuestExecutionSessionCaptureProvider& provider,
 
 void DestroyThreadState(void* context) {
   static_cast<std::unique_ptr<ThreadState>*>(context)->reset();
+}
+
+constexpr uint32_t kWaitHandle = 0x00110001u;
+constexpr uint8_t kWaitPriority = 13;
+
+kernel::GuestSchedulerCheckpointParticipant WokenInWaitParticipant() {
+  kernel::GuestSchedulerCheckpointParticipant participant;
+  participant.thread_id = kSecondThreadId;
+  participant.capture_instance_id = 2;
+  participant.cpu = 1;
+  participant.effective_priority = kWaitPriority;
+  participant.base_priority = kWaitPriority;
+  participant.ready_queue_level = static_cast<int8_t>(kWaitPriority);
+  participant.ready_queue_fifo_ordinal = 0;
+  participant.state = kernel::GuestSchedulerCheckpointParticipantState::kReady;
+  participant.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+  participant.blocked_wait_kind =
+      kernel::GuestSchedulerCaptureWaitKind::kSingle;
+  participant.blocked_wait.handle_count = 1;
+  participant.blocked_wait.flags =
+      kernel::kGuestSchedulerCaptureWaitFlagGated |
+      kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
+  participant.blocked_wait.handles[0] = kWaitHandle;
+  return participant;
+}
+
+GuestExecutionSessionSchedulerTopologyParticipant WokenInWaitRow() {
+  GuestExecutionSessionSchedulerTopologyParticipant participant;
+  participant.ordinal = 1;
+  participant.guest_thread_id = kSecondThreadId;
+  participant.capture_instance_id = 2;
+  participant.state = GuestExecutionSessionSchedulerParticipantState::kReady;
+  participant.cpu = 1;
+  participant.effective_priority = kWaitPriority;
+  participant.base_priority = kWaitPriority;
+  participant.suspension_count = 0;
+  participant.quantum_remaining_us = 0;
+  participant.ready_queue_level = kWaitPriority;
+  participant.ready_queue_fifo_ordinal = 0;
+  participant.resume_kind =
+      GuestExecutionSessionSchedulerResumeKind::kNativeContinuation;
+  return participant;
 }
 
 }  // namespace
@@ -1217,6 +1261,228 @@ TEST_CASE("guest execution session provider rejects inexact production inputs",
     REQUIRE(harness.provider->status().state ==
             GuestExecutionSessionCaptureProviderState::kRejected);
   }
+}
+
+TEST_CASE("guest execution session classifies a woken-in-wait checkpoint",
+          "[guest-execution-session-capture-provider]") {
+  auto participant = WokenInWaitParticipant();
+  REQUIRE(IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+
+  SECTION("a suspended waiter is the same class") {
+    participant.state =
+        kernel::GuestSchedulerCheckpointParticipantState::kSuspended;
+    participant.suspension_count = 1;
+    REQUIRE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("a running participant") {
+    participant.state =
+        kernel::GuestSchedulerCheckpointParticipantState::kRunning;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("a still-blocked participant") {
+    participant.state =
+        kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
+    participant.guest_pc = kFunctionAddress;
+    participant.resume_kind =
+        kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("a thread that never ran") {
+    participant.resume_kind =
+        kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("an exact-PC JIT resume route") {
+    participant.resume_kind =
+        kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("a restorable participant") {
+    participant.restorable = true;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("a published link register") {
+    participant.guest_pc = kFunctionAddress;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("an in-flight IRQL preemption episode") {
+    participant.preempt_defers_irql = 1;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("an in-flight lock preemption episode") {
+    participant.preempt_defers_lock = 1;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("a declined safepoint") {
+    participant.capture_declined_safepoints = 1;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("no wait at all") {
+    participant.blocked_wait_kind =
+        kernel::GuestSchedulerCaptureWaitKind::kNone;
+    participant.blocked_wait = {};
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("a wait kind the export dispatch does not model") {
+    participant.blocked_wait_kind =
+        kernel::GuestSchedulerCaptureWaitKind::kIoCompletion;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+    participant.blocked_wait_kind =
+        kernel::GuestSchedulerCaptureWaitKind::kDelay;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("the other modeled wait kinds") {
+    participant.blocked_wait_kind =
+        kernel::GuestSchedulerCaptureWaitKind::kMultiAny;
+    REQUIRE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+    participant.blocked_wait_kind =
+        kernel::GuestSchedulerCaptureWaitKind::kMultiAll;
+    REQUIRE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("a wait naming no object") {
+    participant.blocked_wait.handle_count = 0;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("more handles than the binding holds") {
+    participant.blocked_wait.handle_count = static_cast<uint8_t>(
+        kernel::kGuestSchedulerCaptureMaximumWaitHandles + 1);
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("an alertable wait") {
+    participant.blocked_wait.flags |=
+        kernel::kGuestSchedulerCaptureWaitFlagAlertable;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+  SECTION("a pending user APC") {
+    participant.blocked_wait.flags |=
+        kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
+    REQUIRE_FALSE(
+        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+  }
+}
+
+TEST_CASE("guest execution session classifies a woken-in-wait topology row",
+          "[guest-execution-session-capture-provider]") {
+  auto participant = WokenInWaitRow();
+  REQUIRE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+
+  SECTION("a participant that is not ready") {
+    participant.state =
+        GuestExecutionSessionSchedulerParticipantState::kSuspended;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+    participant.state =
+        GuestExecutionSessionSchedulerParticipantState::kRunning;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+    participant.state =
+        GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+  SECTION("a still-blocked row") {
+    participant.state =
+        GuestExecutionSessionSchedulerParticipantState::kBlocked;
+    participant.resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport;
+    participant.guest_pc = kFunctionAddress;
+    participant.ready_queue_level = kGuestExecutionSessionSchedulerNoValue;
+    participant.ready_queue_fifo_ordinal =
+        kGuestExecutionSessionSchedulerNoValue;
+    participant.blocked_wait.kind =
+        GuestExecutionSessionSchedulerWaitKind::kSingle;
+    participant.blocked_wait.handle_count = 1;
+    participant.blocked_wait.handles[0] = kWaitHandle;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+  SECTION("a thread that never ran") {
+    participant.resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kNotYetRun;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+  SECTION("an exact-PC JIT resume route") {
+    participant.resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kJitSafepoint;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+  SECTION("an unrouted row") {
+    participant.resume_kind = GuestExecutionSessionSchedulerResumeKind::kNone;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+  SECTION("a restorable participant") {
+    participant.restorable = true;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+  SECTION("a published link register") {
+    participant.guest_pc = kFunctionAddress;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+  SECTION("no effective priority") {
+    participant.effective_priority = kGuestExecutionSessionSchedulerNoValue;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+  SECTION("a queue level away from the effective priority") {
+    participant.ready_queue_level = kWaitPriority + 1;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+  SECTION("no seeded queue position") {
+    participant.ready_queue_fifo_ordinal =
+        kGuestExecutionSessionSchedulerNoValue;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+  SECTION("a serialized wait binding") {
+    participant.blocked_wait.kind =
+        GuestExecutionSessionSchedulerWaitKind::kSingle;
+    participant.blocked_wait.handle_count = 1;
+    participant.blocked_wait.handles[0] = kWaitHandle;
+    REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitParticipant(participant));
+  }
+}
+
+TEST_CASE("guest execution session provider still gates a woken waiter",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+
+  REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitCheckpointParticipant(
+      harness.BlockedSecondThreadCheckpoint().participants.back()));
+
+  auto woken = harness.PassiveSecondThreadCheckpoint().participants.back();
+  REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitCheckpointParticipant(woken));
+  woken.blocked_wait_kind = kernel::GuestSchedulerCaptureWaitKind::kSingle;
+  woken.blocked_wait.handle_count = 1;
+  woken.blocked_wait.handles[0] = kWaitHandle;
+  REQUIRE(IsGuestExecutionSessionWokenInWaitCheckpointParticipant(woken));
+
+  // The class is a strict subset of the passive one, so the classifier moves
+  // no participant across the capability gate.
+  std::string error;
+  REQUIRE(harness.provider->SupportsCheckpointParticipant(woken, &error));
+  REQUIRE(error.empty());
+
+  const auto dormant =
+      harness
+          .PassiveSecondThreadCheckpoint(
+              kernel::GuestSchedulerCheckpointResumeKind::kNotYetRun)
+          .participants.back();
+  REQUIRE_FALSE(
+      IsGuestExecutionSessionWokenInWaitCheckpointParticipant(dormant));
+  REQUIRE(harness.provider->SupportsCheckpointParticipant(dormant, &error));
 }
 
 }  // namespace testing

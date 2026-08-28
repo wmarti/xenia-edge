@@ -442,6 +442,14 @@ const char* GuestExecutionSessionSchedulerTopologyFirstDifference(
     const GuestExecutionSessionSchedulerTopologyParticipant& initial,
     const GuestExecutionSessionSchedulerTopologyParticipant& final_row);
 
+// The row-side counterpart of the woken-in-wait checkpoint classifier: a
+// participant this boundary carries as ready with no durable resume route, at
+// a densified queue position. The wait itself is not serialized for a row that
+// is not blocked, so whether it is parked inside a modeled export is a
+// capture-side question this row cannot answer.
+bool IsGuestExecutionSessionWokenInWaitParticipant(
+    const GuestExecutionSessionSchedulerTopologyParticipant& participant);
+
 struct GuestExecutionSessionSchedulerTopologyChunk {
   uint64_t session_epoch = 0;
   uint32_t ordinal = 0;

@@ -120,6 +120,29 @@ bool IsPassiveOutsideGuestParticipant(
          participant.resume_kind == CheckpointResumeKind::kNotYetRun;
 }
 
+// The wait classes whose link register is the modeled export's single return
+// point, matching the allowlist the provider applies to a still-blocked
+// participant. A delay, a fence or spin poll and the I/O classes reach that
+// link register once per poll rather than once per export, an alertable or
+// APC-pending wait can run guest code on the waiting thread's stack before the
+// export returns, and a wait naming more handles than the binding holds is not
+// representable at all.
+bool IsWokenInWaitAllowlist(
+    kernel::GuestSchedulerCaptureWaitKind kind,
+    const kernel::GuestSchedulerCaptureWaitState& wait) {
+  const bool modeled_kind =
+      kind == kernel::GuestSchedulerCaptureWaitKind::kSingle ||
+      kind == kernel::GuestSchedulerCaptureWaitKind::kMultiAny ||
+      kind == kernel::GuestSchedulerCaptureWaitKind::kMultiAll;
+  constexpr uint8_t kRefusedWaitFlags =
+      kernel::kGuestSchedulerCaptureWaitFlagAlertable |
+      kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
+  return modeled_kind && wait.handle_count &&
+         wait.handle_count <=
+             kernel::kGuestSchedulerCaptureMaximumWaitHandles &&
+         !(wait.flags & kRefusedWaitFlags);
+}
+
 // The rejection diagnostic is one parsed log line, so its census is bounded.
 constexpr size_t kMaxReportedUnsupportedParticipants = 32;
 
@@ -850,6 +873,32 @@ const char* AsyncFailureMessage(AsyncFailure failure) {
 }
 
 }  // namespace
+
+bool IsGuestExecutionSessionWokenInWaitCheckpointParticipant(
+    const kernel::GuestSchedulerCheckpointParticipant& participant) {
+  // A fiber re-readied out of its wait is published exactly as the passive
+  // class is, because the scheduler cleared its exact-PC route and no frame of
+  // the wait has unwound: no durable block-head PC, so no link register and
+  // nothing restorable. Only a participant that has run can be one, which is
+  // what separates it from kNotYetRun.
+  if ((participant.state !=
+           kernel::GuestSchedulerCheckpointParticipantState::kReady &&
+       participant.state !=
+           kernel::GuestSchedulerCheckpointParticipantState::kSuspended) ||
+      participant.resume_kind !=
+          kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation ||
+      participant.restorable || participant.guest_pc) {
+    return false;
+  }
+  // Already required of every roster participant, restated so the predicate is
+  // self-contained.
+  if (participant.preempt_defers_irql || participant.preempt_defers_lock ||
+      participant.capture_declined_safepoints) {
+    return false;
+  }
+  return IsWokenInWaitAllowlist(participant.blocked_wait_kind,
+                                participant.blocked_wait);
+}
 
 struct GuestExecutionSessionCaptureRuntimePm4Wiring::MarkerBridge final
     : GuestExecutionMarkerBoundarySink {

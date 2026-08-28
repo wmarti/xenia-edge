@@ -101,6 +101,15 @@ struct GuestExecutionSessionInstructionCoverageDelta {
   uint64_t guest_instruction_delta = 0;
 };
 
+// A waiter the scheduler put back on a ready queue without unwinding its wait:
+// the passive outside-guest shape of a fiber that has already run, still
+// carrying a modeled blocking-export wait. Nothing of the wait's outcome has
+// been applied yet, so the thread is guest-visibly parked where a blocked one
+// is. Binding it to the modeled export dispatch it is parked inside needs the
+// export event log and is not decided here.
+bool IsGuestExecutionSessionWokenInWaitCheckpointParticipant(
+    const kernel::GuestSchedulerCheckpointParticipant& participant);
+
 // Owns the exact-PC checkpoint encoding and sparse memory/code observation.
 // BeginCapture runs while the provisional start barrier is held and must arm
 // every writer before returning. SealCapture runs while the stop barrier is
