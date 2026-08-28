@@ -2474,13 +2474,46 @@ TEST_CASE("session bundle proves every blocked export obligation",
         MakePendingExportBundle(options), &error));
   }
   SECTION("an impossible wait shape still rejects") {
-    PendingExportOptions options;
-    options.wait_kind = GuestExecutionSessionSchedulerWaitKind::kDelay;
-    options.wait_handle_count = 1;
-    options.wait_deadline_ms = 1000;
-    options.wait_flags |= kGuestExecutionSessionSchedulerWaitFlagGated;
-    require_rejected(MakePendingExportBundle(options),
-                     "scheduler handle-free wait names an object");
+    // The shape is refused where the row is encoded, before any bundle exists.
+    GuestExecutionSessionSchedulerTopologyChunk topology;
+    topology.session_epoch = 0x123456789ABCDEF0ull;
+    topology.ordinal = 4;
+    topology.boundary = GuestExecutionSessionSchedulerTopologyBoundary::kStart;
+    topology.global_sequence = 0;
+    GuestExecutionSessionSchedulerTopologyParticipant row;
+    row.guest_thread_id = 7;
+    row.capture_instance_id = 0x100;
+    row.state = GuestExecutionSessionSchedulerParticipantState::kBlocked;
+    row.cpu = 0;
+    row.effective_priority = 8;
+    row.base_priority = 6;
+    row.suspension_count = 0;
+    row.quantum_remaining_us = 500;
+    row.resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport;
+    row.guest_pc = 0x82000040;
+    row.restorable = false;
+    row.blocked_wait.kind = GuestExecutionSessionSchedulerWaitKind::kDelay;
+    row.blocked_wait.handle_count = 1;
+    row.blocked_wait.handles[0] = 0x40;
+    row.blocked_wait.deadline_ms = 1000;
+    row.blocked_wait.flags =
+        kGuestExecutionSessionSchedulerWaitFlagGated |
+        kGuestExecutionSessionSchedulerWaitFlagInterruptible;
+    topology.participants.push_back(row);
+
+    std::vector<uint8_t> encoded;
+    error.clear();
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        topology, &encoded, &error));
+    REQUIRE_FALSE(error.empty());
+
+    // The same row with a handle-free delay is the shape the emulator makes.
+    topology.participants[0].blocked_wait.handle_count = 0;
+    topology.participants[0].blocked_wait.handles[0] = 0;
+    error.clear();
+    REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        topology, &encoded, &error));
   }
   SECTION("a pending sequence past the interval rejects") {
     PendingExportOptions options;

@@ -1728,8 +1728,8 @@ TEST_CASE(
   REQUIRE(harness.processor->ResolveFunction(kLateFunctionAddress));
   std::string error;
   REQUIRE(harness.provider->BeginCapture(
-      harness.Checkpoint(kLateFunctionAddress + 4), harness.Participants(),
-      harness.HostCalls(), &error));
+      harness.Checkpoint(kLateFunctionAddress + 4, kLateFunctionAddress),
+      harness.Participants(), harness.HostCalls(), &error));
   REQUIRE(error.empty());
   std::vector<uint8_t> state_bytes;
   REQUIRE(harness.provider->EncodeParticipantState(harness.participant, true,
@@ -1753,7 +1753,8 @@ TEST_CASE(
                                                  kUncataloguedFunctionAddress));
   REQUIRE(harness.processor->ResolveFunction(kLateFunctionAddress));
   std::string error;
-  const auto checkpoint = harness.Checkpoint(kLateFunctionAddress);
+  const auto checkpoint =
+      harness.Checkpoint(kLateFunctionAddress, kLateFunctionAddress);
   REQUIRE(harness.provider->BeginCapture(checkpoint, harness.Participants(),
                                          harness.HostCalls(), &error));
   REQUIRE(
