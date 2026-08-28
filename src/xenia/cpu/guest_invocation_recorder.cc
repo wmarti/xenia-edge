@@ -17,6 +17,8 @@
 #include <string_view>
 #include <utility>
 
+#include "third_party/fmt/include/fmt/format.h"
+
 namespace xe {
 namespace cpu {
 namespace ppc {
@@ -585,7 +587,7 @@ struct GuestInvocationRecorder::Impl {
   bool ValidateReturnBoundary(uint32_t function_address,
                               uint32_t function_end_address,
                               const GuestPPCRegisterState& state,
-                              uint32_t* output) {
+                              bool is_root_entry, uint32_t* output) {
     if (!state.link_register ||
         state.link_register > std::numeric_limits<uint32_t>::max() ||
         (state.link_register & 3)) {
@@ -595,8 +597,16 @@ struct GuestInvocationRecorder::Impl {
     const uint32_t return_address = static_cast<uint32_t>(state.link_register);
     if (return_address >= function_address &&
         return_address <= function_end_address) {
-      return Reject(GuestInvocationRecorderRejection::kInvalidEvent,
-                    "return boundary is inside the entered function");
+      const size_t depth = is_root_entry ? 0 : call_stack.size();
+      const uint32_t caller =
+          is_root_entry || call_stack.empty() ? 0 : call_stack.back().address;
+      return Reject(
+          GuestInvocationRecorderRejection::kInvalidEvent,
+          fmt::format("return boundary is inside the entered function: {} "
+                      "entry {:08X}-{:08X} return {:08X} depth {} caller "
+                      "{:08X}",
+                      is_root_entry ? "root" : "nested", function_address,
+                      function_end_address, return_address, depth, caller));
     }
     *output = return_address;
     return true;
@@ -630,7 +640,7 @@ struct GuestInvocationRecorder::Impl {
     }
     uint32_t return_address = 0;
     if (!ValidateReturnBoundary(selection.root_address,
-                                selection.root_end_address, entry_state,
+                                selection.root_end_address, entry_state, true,
                                 &return_address)) {
       return false;
     }
@@ -1268,7 +1278,7 @@ bool GuestInvocationRecorder::OnFunctionEntry(
     return false;
   }
   uint32_t return_address = 0;
-  if (!impl_->ValidateReturnBoundary(address, end_address, entry_state,
+  if (!impl_->ValidateReturnBoundary(address, end_address, entry_state, false,
                                      &return_address)) {
     return false;
   }
