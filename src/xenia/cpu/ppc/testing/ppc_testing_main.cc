@@ -83,6 +83,11 @@ DEFINE_path(guest_invocation_in, "",
             "Execute one strictly verified guest invocation artifact against "
             "the exact code corpus supplied by --jit_corpus_in.",
             "CPU");
+DEFINE_bool(guest_invocation_replay_dump_plan, false,
+            "Log the corpus function extents and the replay page closure "
+            "before warmup. Diagnostic only; the benchmark marker is "
+            "unaffected.",
+            "CPU");
 DEFINE_uint64(
     guest_invocation_batches, 1,
     "Alternating timed batches per leg; each leg reports its cheapest batch.",
@@ -1202,6 +1207,29 @@ bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
     return Reject(
         "configuration provenance",
         "runtime replay configuration SHA-256 does not match the artifact");
+  }
+
+  if (cvars::guest_invocation_replay_dump_plan) {
+    const GuestInvocationReplayPlan& plan = runner->plan();
+    XELOGI("replay plan: host_page_size={} functions={} supplied_pages={}",
+           plan.host_page_size, corpus.functions().size(),
+           plan.supplied_page_addresses.size());
+    for (const ExecutionJitCorpus::FunctionRecord& record :
+         corpus.functions()) {
+      XELOGI("replay corpus function {:08X}-{:08X} host_code_size={}",
+             record.address, record.end_address, record.host_code_size);
+    }
+    for (uint32_t address : corpus.page_addresses()) {
+      XELOGI("replay corpus code page {:08X}", address);
+    }
+    for (const GuestInvocationReplayProtectionGranule& granule :
+         plan.protection_granules) {
+      XELOGI("replay granule {:08X}+{:X} writable={}", granule.guest_address,
+             granule.size, granule.writable ? 1 : 0);
+    }
+    for (uint32_t address : plan.reset_page_addresses) {
+      XELOGI("replay reset page {:08X}", address);
+    }
   }
 
 #if XE_PLATFORM_MAC
