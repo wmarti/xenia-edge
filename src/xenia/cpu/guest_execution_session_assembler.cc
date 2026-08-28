@@ -986,6 +986,18 @@ struct GuestExecutionSessionAssembler::Impl {
     if (!EncodeParticipantStatesLocked(true, true, &initial_thread_states)) {
       return false;
     }
+    // A provider that stopped deferring between the two passes would leave an
+    // unwritten slot, which must not be published as a thread state.
+    if (initial_thread_states.size() != participants.size() ||
+        std::any_of(
+            initial_thread_states.cbegin(), initial_thread_states.cend(),
+            [](const GuestExecutionSessionThreadStateReference& reference) {
+              return !reference.byte_size;
+            })) {
+      RejectLocked(Rejection::kCheckpointFailure,
+                   "capture session initial participant state is incomplete");
+      return false;
+    }
     initial.thread_states = initial_thread_states;
     if (!EncodeParticipantStatesLocked(false, false,
                                        &final_checkpoint.thread_states) ||
