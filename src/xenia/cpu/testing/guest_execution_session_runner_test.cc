@@ -970,7 +970,7 @@ TEST_CASE("continuous replay planner rejects ambiguous continuation routes",
     ReplaceContinuousControlEvents(&bundle, events);
     REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
                                                           &plan, &error));
-    REQUIRE(error == "continuous final checkpoint route is missing");
+    REQUIRE(error == "continuous executable participant route is missing");
   }
 
   SECTION("a participant final route is duplicated") {
