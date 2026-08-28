@@ -496,6 +496,8 @@ class GuestExecutionSessionCodec {
   static constexpr uint32_t kSchedulerTopologyVersion = 1;
   static constexpr uint32_t kSchedulerTopologyPayloadHeaderSize = 32;
   static constexpr uint32_t kSchedulerTopologyRecordSize = 200;
+  static constexpr uint32_t kSchedulerEventPayloadVersion = 2;
+  static constexpr uint32_t kSchedulerEventPayloadSize = 192;
   static constexpr uint32_t kGuestPageSize = 4096;
 
   static GuestExecutionSessionSha256 HashBytes(const uint8_t* data,
@@ -581,6 +583,22 @@ class GuestExecutionSessionCodec {
       std::string* error = nullptr, GuestExecutionSessionLimits limits = {}) {
     return DecodeSchedulerTopologyChunk(data.data(), data.size(), output, error,
                                         limits);
+  }
+
+  // Resolves the roster ordinal of the one participant a kThreadDispatch or
+  // kSynchronization scheduler payload subjects. Unknown envelope versions,
+  // malformed records, kind/label mismatches and off-roster subjects reject.
+  static bool ResolveSchedulerEventSubject(
+      GuestExecutionSessionEventKind kind, const uint8_t* data,
+      size_t data_size,
+      const std::vector<GuestExecutionSessionParticipant>& participants,
+      uint32_t* subject_ordinal, std::string* error = nullptr);
+  static bool ResolveSchedulerEventSubject(
+      GuestExecutionSessionEventKind kind, const std::vector<uint8_t>& data,
+      const std::vector<GuestExecutionSessionParticipant>& participants,
+      uint32_t* subject_ordinal, std::string* error = nullptr) {
+    return ResolveSchedulerEventSubject(kind, data.data(), data.size(),
+                                        participants, subject_ordinal, error);
   }
 
   // Fully decodes and binds each supplied chunk to the corresponding manifest

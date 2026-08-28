@@ -492,6 +492,7 @@ bool ValidateSchedulerTopologyCheckpointBindings(
     return false;
   }
   std::set<uint32_t> guest_execution_actors;
+  std::set<uint32_t> scheduler_event_subjects;
   for (size_t index = 0; index < bundle.chunks.size(); ++index) {
     if (bundle.manifest.chunks[index].kind !=
         GuestExecutionSessionChunkKind::kEvents) {
@@ -503,9 +504,22 @@ bool ValidateSchedulerTopologyCheckpointBindings(
       return false;
     }
     for (const GuestExecutionSessionEvent& event : events.events) {
-      if (event.thread_ordinal != kGuestExecutionSessionNoThread &&
-          event.kind != GuestExecutionSessionEventKind::kThreadDispatch &&
-          event.kind != GuestExecutionSessionEventKind::kSynchronization) {
+      if (event.kind == GuestExecutionSessionEventKind::kThreadDispatch ||
+          event.kind == GuestExecutionSessionEventKind::kSynchronization) {
+        const auto payload = validated.blobs.find(event.payload_sha256);
+        if (!event.payload_size || payload == validated.blobs.end()) {
+          return Fail(error, "scheduler event payload blob is not present");
+        }
+        uint32_t subject_ordinal = kGuestExecutionSessionNoThread;
+        if (!GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
+                event.kind, payload->second->bytes,
+                bundle.manifest.participants, &subject_ordinal, error)) {
+          return false;
+        }
+        scheduler_event_subjects.insert(subject_ordinal);
+        continue;
+      }
+      if (event.thread_ordinal != kGuestExecutionSessionNoThread) {
         guest_execution_actors.insert(event.thread_ordinal);
       }
     }
@@ -636,6 +650,11 @@ bool ValidateSchedulerTopologyCheckpointBindings(
                                 "changed between boundaries: ") +
                         topology_difference);
       }
+    }
+    if (initial_outside &&
+        scheduler_event_subjects.contains(static_cast<uint32_t>(ordinal))) {
+      return Fail(error,
+                  "scheduler event subjects an outside-guest participant");
     }
   }
   return true;

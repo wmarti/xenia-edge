@@ -34,6 +34,8 @@ constexpr std::array<uint8_t, 8> kClosureMagic = {'X', 'E', 'G', 'C',
                                                   'L', 'O', 'S', 'E'};
 constexpr std::array<uint8_t, 8> kSchedulerTopologyMagic = {'X', 'E', 'G', 'T',
                                                             'O', 'P', 'O', 0};
+constexpr std::array<uint8_t, 8> kSchedulerEventPayloadMagic = {
+    'X', 'E', 'G', 'S', 'C', 'E', '1', 0};
 constexpr uint32_t kManifestEnvelopeKind = 1;
 constexpr uint32_t kManifestOrdinal = UINT32_MAX;
 constexpr uint32_t kKnownEnvelopeFlags = 0;
@@ -2521,6 +2523,81 @@ bool GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
   }
   *output = std::move(chunk);
   return true;
+}
+
+bool GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
+    GuestExecutionSessionEventKind kind, const uint8_t* data, size_t data_size,
+    const std::vector<GuestExecutionSessionParticipant>& participants,
+    uint32_t* subject_ordinal, std::string* error) {
+  if (!subject_ordinal) {
+    return Fail(error, "scheduler event subject output is null");
+  }
+  *subject_ordinal = kGuestExecutionSessionNoThread;
+  if (error) {
+    error->clear();
+  }
+  if (kind != GuestExecutionSessionEventKind::kThreadDispatch &&
+      kind != GuestExecutionSessionEventKind::kSynchronization) {
+    return Fail(error, "scheduler event subject kind is not a scheduler kind");
+  }
+  if (!data || data_size != kSchedulerEventPayloadSize || data[47] ||
+      data[62] || data[63] ||
+      std::any_of(data + 176, data + kSchedulerEventPayloadSize,
+                  [](uint8_t value) { return value != 0; })) {
+    return Fail(error, "scheduler event payload envelope is invalid");
+  }
+  Reader reader(data, data_size);
+  std::array<uint8_t, 8> magic = {};
+  uint32_t version = 0;
+  uint32_t record_kind = 0;
+  uint64_t sequence = 0;
+  uint64_t capture_instance_id = 0;
+  uint32_t guest_thread_id = 0;
+  if (!reader.ReadBytes(magic.data(), magic.size()) ||
+      magic != kSchedulerEventPayloadMagic || !reader.ReadU32(&version) ||
+      version != kSchedulerEventPayloadVersion ||
+      !reader.ReadU32(&record_kind) || !reader.ReadU64(&sequence) ||
+      !reader.ReadU64(&capture_instance_id) ||
+      !reader.ReadU32(&guest_thread_id) || !sequence || !capture_instance_id ||
+      !guest_thread_id) {
+    return Fail(error, "scheduler event payload envelope is invalid");
+  }
+  // Durable kernel::GuestSchedulerCaptureEventKind tape identifiers; the
+  // declaring header is compiled out of capture-disabled builds.
+  GuestExecutionSessionEventKind canonical_kind;
+  switch (record_kind) {
+    case 7:   // kSafepoint
+    case 8:   // kBlock
+    case 9:   // kReready
+    case 10:  // kParkSuspended
+    case 11:  // kResume
+      canonical_kind = GuestExecutionSessionEventKind::kSynchronization;
+      break;
+    case 1:   // kEnqueueReady
+    case 2:   // kDequeueReady
+    case 3:   // kDispatch
+    case 4:   // kSwitchOut
+    case 5:   // kYield
+    case 6:   // kPreemptRequest
+    case 12:  // kPriorityChange
+    case 13:  // kMigrate
+      canonical_kind = GuestExecutionSessionEventKind::kThreadDispatch;
+      break;
+    default:
+      return Fail(error, "scheduler event payload kind is unsupported");
+  }
+  if (canonical_kind != kind) {
+    return Fail(
+        error, "scheduler event payload kind differs from its canonical event");
+  }
+  for (const GuestExecutionSessionParticipant& participant : participants) {
+    if (participant.capture_instance_id == capture_instance_id &&
+        participant.guest_thread_id == guest_thread_id) {
+      *subject_ordinal = participant.ordinal;
+      return true;
+    }
+  }
+  return Fail(error, "scheduler event subject is not a session participant");
 }
 
 bool GuestExecutionSessionCodec::ValidateSession(

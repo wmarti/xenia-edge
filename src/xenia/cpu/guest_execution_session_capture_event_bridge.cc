@@ -35,6 +35,28 @@ using CaptureReason = kernel::GuestSchedulerCaptureReason;
 
 constexpr std::array<uint8_t, 8> kSchedulerPayloadMagic = {'X', 'E', 'G', 'S',
                                                            'C', 'E', '1', 0};
+
+// GuestExecutionSessionCodec::ResolveSchedulerEventSubject reads this payload
+// without the kernel header; these anchor the values it hardcodes.
+static_assert(GuestExecutionSessionCaptureSchedulerEventBridge::
+                  kSchedulerPayloadVersion ==
+              GuestExecutionSessionCodec::kSchedulerEventPayloadVersion);
+static_assert(
+    GuestExecutionSessionCaptureSchedulerEventBridge::kSchedulerPayloadSize ==
+    GuestExecutionSessionCodec::kSchedulerEventPayloadSize);
+static_assert(static_cast<uint32_t>(CaptureKind::kEnqueueReady) == 1 &&
+              static_cast<uint32_t>(CaptureKind::kDequeueReady) == 2 &&
+              static_cast<uint32_t>(CaptureKind::kDispatch) == 3 &&
+              static_cast<uint32_t>(CaptureKind::kSwitchOut) == 4 &&
+              static_cast<uint32_t>(CaptureKind::kYield) == 5 &&
+              static_cast<uint32_t>(CaptureKind::kPreemptRequest) == 6 &&
+              static_cast<uint32_t>(CaptureKind::kSafepoint) == 7 &&
+              static_cast<uint32_t>(CaptureKind::kBlock) == 8 &&
+              static_cast<uint32_t>(CaptureKind::kReready) == 9 &&
+              static_cast<uint32_t>(CaptureKind::kParkSuspended) == 10 &&
+              static_cast<uint32_t>(CaptureKind::kResume) == 11 &&
+              static_cast<uint32_t>(CaptureKind::kPriorityChange) == 12 &&
+              static_cast<uint32_t>(CaptureKind::kMigrate) == 13);
 constexpr uint16_t kKnownCaptureFlags =
     kernel::kGuestSchedulerCaptureFlagAtHead |
     kernel::kGuestSchedulerCaptureFlagYieldToOther |

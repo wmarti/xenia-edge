@@ -932,6 +932,27 @@ bool BuildGuestExecutionContinuousReplayPlan(
     plan.events.push_back(std::move(event));
   }
 
+  std::set<uint32_t> scheduler_event_subjects;
+  for (const GuestExecutionContinuousReplayEvent& event : plan.events) {
+    if (event.canonical.kind !=
+            GuestExecutionSessionEventKind::kThreadDispatch &&
+        event.canonical.kind !=
+            GuestExecutionSessionEventKind::kSynchronization) {
+      continue;
+    }
+    if (!event.payload) {
+      return fail("continuous scheduler event has no payload");
+    }
+    uint32_t subject_ordinal = kGuestExecutionSessionNoThread;
+    if (!GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
+            event.canonical.kind, *event.payload, manifest.participants,
+            &subject_ordinal, error)) {
+      *output = {};
+      return false;
+    }
+    scheduler_event_subjects.insert(subject_ordinal);
+  }
+
   if (plan.initial_session_checkpoint.thread_states.size() !=
           manifest.participants.size() ||
       plan.final_session_checkpoint.thread_states.size() !=
@@ -1109,6 +1130,11 @@ bool BuildGuestExecutionContinuousReplayPlan(
                                 "scheduler topology changes between "
                                 "boundaries: ") +
                     topology_difference);
+      }
+      if (scheduler_event_subjects.contains(participant.ordinal)) {
+        return fail(
+            "continuous scheduler event subjects an outside-guest "
+            "participant");
       }
     } else {
       if (final_scheduler_unowned || !final_routes[i]) {

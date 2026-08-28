@@ -889,6 +889,303 @@ void MutateFinalSchedulerTopology(
       static_cast<uint32_t>(topology.participants.size()), bundle->chunks[5]);
 }
 
+constexpr uint32_t kSchedulerRecordDispatch = 3;
+constexpr uint32_t kSchedulerRecordResume = 11;
+
+std::vector<uint8_t> EncodeSchedulerEventPayload(uint32_t record_kind,
+                                                 uint64_t capture_instance_id,
+                                                 uint32_t guest_thread_id,
+                                                 uint32_t version) {
+  std::vector<uint8_t> payload(
+      GuestExecutionSessionCodec::kSchedulerEventPayloadSize, 0);
+  constexpr std::array<uint8_t, 8> kMagic = {'X', 'E', 'G', 'S',
+                                             'C', 'E', '1', 0};
+  std::copy(kMagic.cbegin(), kMagic.cend(), payload.begin());
+  const auto write_u32 = [&payload](size_t offset, uint32_t value) {
+    for (size_t i = 0; i < 4; ++i) {
+      payload[offset + i] = static_cast<uint8_t>(value >> (i * 8));
+    }
+  };
+  write_u32(8, version);
+  write_u32(12, record_kind);
+  write_u32(16, 1);
+  write_u32(24, static_cast<uint32_t>(capture_instance_id));
+  write_u32(28, static_cast<uint32_t>(capture_instance_id >> 32));
+  write_u32(32, guest_thread_id);
+  return payload;
+}
+
+GuestExecutionSessionBundle MakePassiveContinuousSessionBundle(
+    uint32_t host_page_size, uint32_t scheduler_record_kind,
+    uint32_t scheduler_subject_ordinal,
+    uint32_t scheduler_payload_version =
+        GuestExecutionSessionCodec::kSchedulerEventPayloadVersion) {
+  GuestExecutionSessionBundle bundle;
+  constexpr uint32_t kParticipantCount = 2;
+  const std::array<uint32_t, kParticipantCount> guest_thread_ids = {0x101,
+                                                                    0x202};
+  ppc::GuestPPCThreadCheckpoint passive;
+  passive.participant_ordinal = 1;
+  passive.guest_thread_id = guest_thread_ids[1];
+  passive.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+  passive.resume_pc = 0;
+  passive.registers.gpr[8] = 2;
+  const std::array<ppc::GuestPPCThreadCheckpoint, kParticipantCount> initial = {
+      MakeContinuousThreadCheckpoint(0, guest_thread_ids[0],
+                                     kCodeAddress + 0x40, kReturnAddress, 1),
+      passive};
+  const std::array<ppc::GuestPPCThreadCheckpoint, kParticipantCount> final = {
+      MakeContinuousThreadCheckpoint(0, guest_thread_ids[0],
+                                     kCodeAddress + 0x44, kReturnAddress, 11),
+      passive};
+
+  std::array<GuestExecutionSessionSha256, kParticipantCount> initial_digests;
+  std::array<GuestExecutionSessionSha256, kParticipantCount> final_digests;
+  for (uint32_t i = 0; i < kParticipantCount; ++i) {
+    initial_digests[i] =
+        AddBlob(&bundle, EncodeContinuousThreadCheckpoint(initial[i]));
+    final_digests[i] =
+        AddBlob(&bundle, EncodeContinuousThreadCheckpoint(final[i]));
+  }
+
+  ExecutionJitCorpusBuilder corpus_builder(JitCorpus::kConfigGuestScheduler);
+  GuestExecutionSessionCheckpointChunk initial_chunk;
+  initial_chunk.session_epoch = kEpoch;
+  initial_chunk.ordinal = 0;
+  for (uint32_t i = 0; i < kParticipantCount; ++i) {
+    initial_chunk.checkpoint.thread_states.push_back(
+        {i, ppc::GuestPPCThreadCheckpointCodec::kEncodedSize,
+         initial_digests[i]});
+  }
+  const uint32_t page_count = host_page_size / kGuestPageSize;
+  std::string error;
+  for (uint32_t i = 0; i < page_count; ++i) {
+    std::vector<uint8_t> code(kGuestPageSize, static_cast<uint8_t>(0x30 + i));
+    REQUIRE(corpus_builder.AddCodePage(kCodeAddress + i * kGuestPageSize,
+                                       code.data(), code.size(), &error));
+    initial_chunk.checkpoint.content.push_back(
+        {GuestExecutionSessionContentKind::kGuestCode,
+         kCodeAddress + i * kGuestPageSize, kGuestPageSize,
+         AddBlob(&bundle, std::move(code))});
+  }
+  REQUIRE(corpus_builder.AddFunction({kCodeAddress, kCodeAddress + 0xFC, 64, 0},
+                                     &error));
+  std::vector<uint8_t> corpus_bytes;
+  REQUIRE(corpus_builder.Encode(&corpus_bytes, &error));
+  const GuestExecutionSessionSha256 corpus_digest =
+      AddBlob(&bundle, std::move(corpus_bytes));
+
+  std::vector<GuestExecutionSessionSha256> initial_page_digests;
+  std::vector<GuestExecutionSessionSha256> final_page_digests;
+  for (uint32_t i = 0; i < page_count; ++i) {
+    std::vector<uint8_t> initial_page(kGuestPageSize,
+                                      static_cast<uint8_t>(0x60 + i));
+    std::vector<uint8_t> final_page = initial_page;
+    if (!i) {
+      final_page[0] ^= 0xFF;
+    }
+    initial_page_digests.push_back(AddBlob(&bundle, std::move(initial_page)));
+    final_page_digests.push_back(AddBlob(&bundle, std::move(final_page)));
+    initial_chunk.checkpoint.content.push_back(
+        {GuestExecutionSessionContentKind::kGuestPage,
+         kDataAddress + i * kGuestPageSize, kGuestPageSize,
+         initial_page_digests.back()});
+  }
+  std::sort(initial_chunk.checkpoint.content.begin(),
+            initial_chunk.checkpoint.content.end(),
+            [](const GuestExecutionSessionContentReference& left,
+               const GuestExecutionSessionContentReference& right) {
+              return std::tie(left.kind, left.guest_address) <
+                     std::tie(right.kind, right.guest_address);
+            });
+
+  GuestExecutionSessionCodeCorpusChunk corpus_chunk;
+  corpus_chunk.session_epoch = kEpoch;
+  corpus_chunk.ordinal = 1;
+  corpus_chunk.code_corpus_sha256 = corpus_digest;
+
+  GuestExecutionSessionEventChunk event_chunk;
+  event_chunk.session_epoch = kEpoch;
+  event_chunk.ordinal = 2;
+  auto push = [&](uint32_t owner, GuestExecutionSessionEventKind kind) {
+    GuestExecutionSessionEvent event = ControlEvent(owner, kind);
+    event.global_sequence = event_chunk.events.size() + 1;
+    event_chunk.events.push_back(event);
+  };
+  push(0, GuestExecutionSessionEventKind::kOuterHostCallBegin);
+  push(0, GuestExecutionSessionEventKind::kInstructionCoverage);
+  event_chunk.events.back().guest_instruction_delta = 10;
+  const bool synchronization_record =
+      scheduler_record_kind >= 7 && scheduler_record_kind <= 11;
+  push(kGuestExecutionSessionNoThread,
+       synchronization_record
+           ? GuestExecutionSessionEventKind::kSynchronization
+           : GuestExecutionSessionEventKind::kThreadDispatch);
+  {
+    GuestExecutionSessionEvent& scheduler_event = event_chunk.events.back();
+    std::vector<uint8_t> payload = EncodeSchedulerEventPayload(
+        scheduler_record_kind, 0x1000 + scheduler_subject_ordinal,
+        guest_thread_ids[scheduler_subject_ordinal], scheduler_payload_version);
+    scheduler_event.payload_kind =
+        GuestExecutionSessionPayloadKind::kGuestBytes;
+    scheduler_event.payload_size = payload.size();
+    scheduler_event.payload_sha256 = AddBlob(&bundle, std::move(payload));
+  }
+  push(kGuestExecutionSessionNoThread,
+       GuestExecutionSessionEventKind::kBoundaryRequest);
+  push(0, GuestExecutionSessionEventKind::kJitSafepointArrival);
+  push(kGuestExecutionSessionNoThread,
+       GuestExecutionSessionEventKind::kBoundaryHeld);
+
+  GuestExecutionSessionCheckpointChunk final_chunk;
+  final_chunk.session_epoch = kEpoch;
+  final_chunk.ordinal = 6;
+  final_chunk.checkpoint.global_sequence = event_chunk.events.size();
+  for (uint32_t i = 0; i < kParticipantCount; ++i) {
+    final_chunk.checkpoint.thread_states.push_back(
+        {i, ppc::GuestPPCThreadCheckpointCodec::kEncodedSize,
+         final_digests[i]});
+  }
+  for (const GuestExecutionSessionContentReference& content :
+       initial_chunk.checkpoint.content) {
+    GuestExecutionSessionContentReference final_content = content;
+    if (content.kind == GuestExecutionSessionContentKind::kGuestPage) {
+      const uint32_t page_index = static_cast<uint32_t>(
+          (content.guest_address - kDataAddress) / kGuestPageSize);
+      final_content.sha256 = final_page_digests[page_index];
+    }
+    final_chunk.checkpoint.content.push_back(final_content);
+  }
+
+  std::vector<GuestExecutionContinuousEvent> control_events;
+  for (const GuestExecutionSessionEvent& event : event_chunk.events) {
+    GuestExecutionContinuousEvent control;
+    control.global_sequence = event.global_sequence;
+    control.kind = event.kind;
+    if (event.thread_ordinal != kGuestExecutionSessionNoThread) {
+      control.actor = {event.thread_ordinal,
+                       guest_thread_ids[event.thread_ordinal]};
+    }
+    control_events.push_back(control);
+  }
+  control_events[2].subject = {scheduler_subject_ordinal,
+                               guest_thread_ids[scheduler_subject_ordinal]};
+  GuestExecutionContinuousEvent& arrival = control_events[4];
+  arrival.subject = {0, guest_thread_ids[0]};
+  arrival.checkpoint.kind =
+      GuestExecutionContinuousCheckpointReferenceKind::kThreadState;
+  arrival.checkpoint.checkpoint_global_sequence =
+      final_chunk.checkpoint.global_sequence;
+  arrival.checkpoint.state_size =
+      ppc::GuestPPCThreadCheckpointCodec::kEncodedSize;
+  arrival.checkpoint.state_sha256 = final_digests[0];
+  arrival.checkpoint.binding = ContinuousBinding(final[0]);
+
+  GuestExecutionSessionSchedulerTopologyChunk start_topology =
+      MakeSchedulerTopology(
+          GuestExecutionSessionSchedulerTopologyBoundary::kStart, 0, 4,
+          guest_thread_ids, initial);
+  GuestExecutionSessionSchedulerTopologyChunk final_topology =
+      MakeSchedulerTopology(
+          GuestExecutionSessionSchedulerTopologyBoundary::kFinal,
+          final_chunk.checkpoint.global_sequence, 5, guest_thread_ids, final);
+  for (auto* topology : {&start_topology, &final_topology}) {
+    GuestExecutionSessionSchedulerTopologyParticipant& participant =
+        topology->participants[1];
+    participant.resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kNotYetRun;
+    participant.restorable = false;
+    participant.guest_pc = 0;
+  }
+
+  bundle.chunks.resize(7);
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      initial_chunk, &bundle.chunks[0], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCodeCorpusChunk(
+      corpus_chunk, &bundle.chunks[1], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
+      event_chunk, &bundle.chunks[2], &error));
+  REQUIRE(GuestExecutionContinuousEventCodec::Encode(
+      control_events, &bundle.chunks[3], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      start_topology, &bundle.chunks[4], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      final_topology, &bundle.chunks[5], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_chunk, &bundle.chunks[6], &error));
+
+  GuestExecutionSessionManifest& manifest = bundle.manifest;
+  manifest.session_epoch = kEpoch;
+  manifest.first_event_sequence = 1;
+  manifest.last_event_sequence = event_chunk.events.size();
+  manifest.capture_start_tick = 100;
+  manifest.capture_end_tick = 800;
+  manifest.capture_tick_frequency = 1000000000;
+  manifest.capture_build_sha256 = Identity(0x10);
+  manifest.replay_config_sha256 = Identity(0x20);
+  manifest.title_identity_sha256 = Identity(0x30);
+  manifest.module_identity_sha256 = Identity(0x40);
+  manifest.accepted_event_count = event_chunk.events.size();
+  manifest.stop_reason = GuestExecutionSessionStopReason::kManualRequest;
+  manifest.stop_request_event_sequence = 4;
+  manifest.stop_request_tick = 500;
+  manifest.stop_request_guest_instruction_count = 10;
+  manifest.maximum_stop_tail_event_count = 4;
+  manifest.maximum_stop_tail_guest_instruction_count = 1;
+  manifest.maximum_stop_tail_ticks = 400;
+  GuestExecutionSessionParticipant executable;
+  executable.ordinal = 0;
+  executable.guest_thread_id = guest_thread_ids[0];
+  executable.capture_instance_id = 0x1000;
+  executable.boundary_arrival_kind =
+      GuestExecutionSessionBoundaryArrivalKind::kJitSafepoint;
+  executable.first_event_sequence = 1;
+  executable.last_event_sequence = 5;
+  executable.held_after_event_sequence = 5;
+  executable.initial_state_size =
+      ppc::GuestPPCThreadCheckpointCodec::kEncodedSize;
+  executable.initial_state_sha256 = initial_digests[0];
+  manifest.participants.push_back(executable);
+  GuestExecutionSessionParticipant passive_participant;
+  passive_participant.ordinal = 1;
+  passive_participant.guest_thread_id = guest_thread_ids[1];
+  passive_participant.capture_instance_id = 0x1001;
+  passive_participant.boundary_arrival_kind =
+      GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside;
+  passive_participant.held_after_event_sequence =
+      manifest.stop_request_event_sequence;
+  passive_participant.initial_state_size =
+      ppc::GuestPPCThreadCheckpointCodec::kEncodedSize;
+  passive_participant.initial_state_sha256 = initial_digests[1];
+  manifest.participants.push_back(passive_participant);
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                bundle.chunks[0]));
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kCodeCorpus, 1, 0, 0, 1,
+                bundle.chunks[1]));
+  manifest.chunks.push_back(Reference(
+      GuestExecutionSessionChunkKind::kEvents, 2, 1, event_chunk.events.size(),
+      static_cast<uint32_t>(event_chunk.events.size()), bundle.chunks[2]));
+  manifest.chunks.push_back(Reference(
+      GuestExecutionSessionChunkKind::kContinuousEvents, 3, 1,
+      control_events.size(), static_cast<uint32_t>(control_events.size()),
+      bundle.chunks[3]));
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kSchedulerTopology, 4, 0, 0,
+                kParticipantCount, bundle.chunks[4]));
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kSchedulerTopology, 5,
+                final_chunk.checkpoint.global_sequence,
+                final_chunk.checkpoint.global_sequence, kParticipantCount,
+                bundle.chunks[5]));
+  manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 6,
+                final_chunk.checkpoint.global_sequence,
+                final_chunk.checkpoint.global_sequence, 1, bundle.chunks[6]));
+  return bundle;
+}
+
 }  // namespace
 
 TEST_CASE("continuous replay planner binds exact participant continuations",
@@ -1131,6 +1428,61 @@ TEST_CASE("continuous replay planner rejects ambiguous continuation routes",
   REQUIRE(plan.participants.empty());
   REQUIRE(plan.events.empty());
   REQUIRE(plan.pages.empty());
+}
+
+TEST_CASE("continuous validation rejects passive scheduler event subjects",
+          "[guest-execution-session-runner][continuous]"
+          "[guest-execution-scheduler-topology]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  GuestExecutionContinuousReplayPlan plan;
+  std::string error;
+
+  SECTION("a dispatch record subjecting the passive participant rejects") {
+    const GuestExecutionSessionBundle bundle =
+        MakePassiveContinuousSessionBundle(kHostPageSize,
+                                           kSchedulerRecordDispatch, 1);
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(error == "scheduler event subjects an outside-guest participant");
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+    REQUIRE(error == "scheduler event subjects an outside-guest participant");
+    REQUIRE(plan.participants.empty());
+  }
+
+  SECTION("a resume record subjecting the passive participant rejects") {
+    const GuestExecutionSessionBundle bundle =
+        MakePassiveContinuousSessionBundle(kHostPageSize,
+                                           kSchedulerRecordResume, 1);
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(error == "scheduler event subjects an outside-guest participant");
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+    REQUIRE(plan.participants.empty());
+  }
+
+  SECTION("a record subjecting only the executable participant validates") {
+    const GuestExecutionSessionBundle bundle =
+        MakePassiveContinuousSessionBundle(kHostPageSize,
+                                           kSchedulerRecordDispatch, 0);
+    REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(error.empty());
+    REQUIRE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                    &plan, &error));
+    REQUIRE(error.empty());
+    REQUIRE(plan.participants.size() == 2);
+    REQUIRE(plan.events.size() == 6);
+  }
+
+  SECTION("an unknown scheduler payload version fails closed") {
+    const GuestExecutionSessionBundle bundle =
+        MakePassiveContinuousSessionBundle(kHostPageSize,
+                                           kSchedulerRecordDispatch, 0, 3);
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(error == "scheduler event payload envelope is invalid");
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+    REQUIRE(plan.participants.empty());
+  }
 }
 
 TEST_CASE("guest execution session planner resolves segments and event roles",
