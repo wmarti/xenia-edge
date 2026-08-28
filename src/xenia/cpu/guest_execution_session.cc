@@ -37,6 +37,8 @@ constexpr std::array<uint8_t, 8> kClosureMagic = {'X', 'E', 'G', 'C',
                                                   'L', 'O', 'S', 'E'};
 constexpr std::array<uint8_t, 8> kSchedulerTopologyMagic = {'X', 'E', 'G', 'T',
                                                             'O', 'P', 'O', 0};
+constexpr std::array<uint8_t, 8> kSignalWitnessMagic = {'X', 'E', 'G', 'S',
+                                                        'I', 'G', 'W', 0};
 static_assert(GuestExecutionSessionCodec::kSchedulerEventPayloadVersion ==
               GuestSchedulerRecordCodec::kPayloadVersion);
 static_assert(GuestExecutionSessionCodec::kSchedulerEventPayloadSize ==
@@ -482,6 +484,19 @@ bool IsKnownChunkKind(GuestExecutionSessionChunkKind kind) {
     case GuestExecutionSessionChunkKind::kContinuousEvents:
     case GuestExecutionSessionChunkKind::kCodeCorpus:
     case GuestExecutionSessionChunkKind::kSchedulerTopology:
+    case GuestExecutionSessionChunkKind::kSignalWitness:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsKnownSignalWitnessSource(
+    GuestExecutionSessionSignalWitnessSource source) {
+  switch (source) {
+    case GuestExecutionSessionSignalWitnessSource::kParticipant:
+    case GuestExecutionSessionSignalWitnessSource::kOffRoster:
+    case GuestExecutionSessionSignalWitnessSource::kHost:
       return true;
     default:
       return false;
@@ -687,6 +702,50 @@ bool IsBlockedParityWait(
   // state, so the deadline is the only durable statement of how near this wait
   // is to its own timeout.
   return !wait.deadline_ms || wait.deadline_ms > wait.observed_uptime_ms;
+}
+
+bool ValidateSignalWitnesses(
+    const GuestExecutionSessionSignalWitnessChunk& chunk,
+    const GuestExecutionSessionLimits& limits, std::string* error) {
+  if (!chunk.session_epoch ||
+      chunk.witnesses.size() > limits.maximum_signal_witnesses) {
+    return Fail(error, "signal witness envelope is invalid");
+  }
+  uint64_t previous_sequence = 0;
+  std::set<std::pair<uint32_t, uint32_t>> object_epochs;
+  for (const GuestExecutionSessionSignalWitness& witness : chunk.witnesses) {
+    if (!IsKnownSignalWitnessSource(witness.source) || !witness.signal_epoch) {
+      return Fail(error, "signal witness provenance is invalid");
+    }
+    switch (witness.source) {
+      case GuestExecutionSessionSignalWitnessSource::kHost:
+        if (witness.capture_instance_id || witness.guest_thread_id) {
+          return Fail(error, "signal witness identity contradicts its source");
+        }
+        break;
+      case GuestExecutionSessionSignalWitnessSource::kOffRoster:
+        if (!witness.guest_thread_id) {
+          return Fail(error, "signal witness identity contradicts its source");
+        }
+        break;
+      default:
+        if (!witness.capture_instance_id || !witness.guest_thread_id) {
+          return Fail(error, "signal witness identity contradicts its source");
+        }
+        break;
+    }
+    // The table is appended under the scheduler lock that assigns the tape
+    // sequence, so an anchor may repeat but can never move backwards.
+    if (witness.after_scheduler_sequence < previous_sequence) {
+      return Fail(error, "signal witness table is not in tape order");
+    }
+    previous_sequence = witness.after_scheduler_sequence;
+    if (!object_epochs.emplace(witness.object_handle, witness.signal_epoch)
+             .second) {
+      return Fail(error, "signal witness repeats an object signal epoch");
+    }
+  }
+  return true;
 }
 
 bool ValidateSchedulerTopology(
@@ -1056,6 +1115,7 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
   uint64_t total_checkpoint_thread_states = 0;
   uint32_t code_corpus_chunk_count = 0;
   uint32_t scheduler_topology_chunk_count = 0;
+  uint32_t signal_witness_chunk_count = 0;
   uint64_t chunk_bytes = 0;
   // Segmented version-2 sessions are checkpoint, canonical events, optional
   // continuous overlay, checkpoint. Zero-segment continuous sessions insert
@@ -1125,6 +1185,17 @@ bool ValidateManifest(const GuestExecutionSessionManifest& manifest,
       }
       ++scheduler_topology_chunk_count;
       has_scheduler_topology = true;
+    } else if (chunk.kind == GuestExecutionSessionChunkKind::kSignalWitness) {
+      // One table for the whole interval, after both topology boundaries and
+      // before the final checkpoint. Its records carry scheduler tape
+      // sequences, so the chunk itself spans no session event range.
+      if (!continuous_instruction_coverage || !has_scheduler_topology ||
+          scheduler_topology_chunk_count != 2 ||
+          i + 1 >= manifest.chunks.size() || chunk.record_count != 1 ||
+          chunk.first_event_sequence || chunk.last_event_sequence ||
+          ++signal_witness_chunk_count != 1) {
+        return Fail(error, "manifest signal witness table is misplaced");
+      }
     } else if (chunk.kind == GuestExecutionSessionChunkKind::kCheckpoint) {
       if (!CheckedAdd(total_checkpoint_thread_states,
                       manifest.participants.size(),
@@ -2669,6 +2740,200 @@ bool GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
   return true;
 }
 
+bool GuestExecutionSessionCodec::EncodeSignalWitnessChunk(
+    const GuestExecutionSessionSignalWitnessChunk& chunk,
+    std::vector<uint8_t>* output, std::string* error,
+    GuestExecutionSessionLimits limits) {
+  if (!output) {
+    return Fail(error, "signal witness encoded output is null");
+  }
+  output->clear();
+  if (error) {
+    error->clear();
+  }
+  if (!ValidateSignalWitnesses(chunk, limits, error)) {
+    return false;
+  }
+  uint64_t record_bytes = 0;
+  uint64_t payload_size = kSignalWitnessPayloadHeaderSize;
+  if (!CheckedMultiply(chunk.witnesses.size(), kSignalWitnessRecordSize,
+                       &record_bytes) ||
+      !CheckedAdd(payload_size, record_bytes, &payload_size) ||
+      payload_size > limits.maximum_chunk_bytes ||
+      payload_size > std::numeric_limits<size_t>::max()) {
+    return Fail(error, "signal witness payload byte count is invalid");
+  }
+
+  Writer payload_writer(static_cast<size_t>(payload_size));
+  payload_writer.WriteBytes(kSignalWitnessMagic.data(),
+                            kSignalWitnessMagic.size());
+  payload_writer.WriteU32(kSignalWitnessVersion);
+  payload_writer.WriteU32(kSignalWitnessPayloadHeaderSize);
+  payload_writer.WriteU32(kSignalWitnessRecordSize);
+  payload_writer.WriteU32(static_cast<uint32_t>(chunk.witnesses.size()));
+  payload_writer.WriteU64(0);
+  for (const GuestExecutionSessionSignalWitness& witness : chunk.witnesses) {
+    payload_writer.WriteU64(witness.after_scheduler_sequence);
+    payload_writer.WriteU64(witness.capture_instance_id);
+    payload_writer.WriteU32(witness.guest_thread_id);
+    payload_writer.WriteU32(witness.object_handle);
+    payload_writer.WriteU32(witness.signal_epoch);
+    payload_writer.WriteU32(witness.object_type);
+    payload_writer.WriteU32(static_cast<uint32_t>(witness.source));
+    payload_writer.WriteU32(0);
+    payload_writer.WriteU64(0);
+  }
+
+  EnvelopeMetadata metadata;
+  metadata.kind =
+      static_cast<uint32_t>(GuestExecutionSessionChunkKind::kSignalWitness);
+  metadata.session_epoch = chunk.session_epoch;
+  metadata.ordinal = chunk.ordinal;
+  metadata.record_count = 1;
+  return EncodeEnvelope(metadata, payload_writer.TakeData(),
+                        limits.maximum_chunk_bytes, output, error);
+}
+
+bool GuestExecutionSessionCodec::DecodeSignalWitnessChunk(
+    const uint8_t* data, size_t data_size,
+    GuestExecutionSessionSignalWitnessChunk* output, std::string* error,
+    GuestExecutionSessionLimits limits) {
+  if (!output) {
+    return Fail(error, "signal witness decoded output is null");
+  }
+  *output = {};
+  if (error) {
+    error->clear();
+  }
+  DecodedEnvelope envelope;
+  if (!DecodeEnvelope(
+          data, data_size,
+          static_cast<uint32_t>(GuestExecutionSessionChunkKind::kSignalWitness),
+          limits.maximum_chunk_bytes, &envelope, error)) {
+    return false;
+  }
+  if (!envelope.metadata.session_epoch || envelope.metadata.record_count != 1 ||
+      envelope.metadata.first_event_sequence ||
+      envelope.metadata.last_event_sequence ||
+      envelope.payload_size < kSignalWitnessPayloadHeaderSize) {
+    return Fail(error, "signal witness envelope metadata is invalid");
+  }
+
+  Reader reader(envelope.payload, envelope.payload_size);
+  std::array<uint8_t, 8> magic = {};
+  uint32_t version = 0;
+  uint32_t header_size = 0;
+  uint32_t record_size = 0;
+  uint32_t witness_count = 0;
+  uint64_t reserved = 0;
+  if (!reader.ReadBytes(magic.data(), magic.size()) ||
+      !reader.ReadU32(&version) || !reader.ReadU32(&header_size) ||
+      !reader.ReadU32(&record_size) || !reader.ReadU32(&witness_count) ||
+      !reader.ReadU64(&reserved) || magic != kSignalWitnessMagic ||
+      version != kSignalWitnessVersion ||
+      header_size != kSignalWitnessPayloadHeaderSize ||
+      record_size != kSignalWitnessRecordSize || reserved ||
+      witness_count > limits.maximum_signal_witnesses) {
+    return Fail(error, "signal witness payload version is unsupported");
+  }
+  uint64_t record_bytes = 0;
+  uint64_t expected_payload_size = kSignalWitnessPayloadHeaderSize;
+  if (!CheckedMultiply(witness_count, kSignalWitnessRecordSize,
+                       &record_bytes) ||
+      !CheckedAdd(expected_payload_size, record_bytes,
+                  &expected_payload_size) ||
+      expected_payload_size != envelope.payload_size) {
+    return Fail(error, "signal witness payload byte count is invalid");
+  }
+
+  GuestExecutionSessionSignalWitnessChunk chunk;
+  chunk.session_epoch = envelope.metadata.session_epoch;
+  chunk.ordinal = envelope.metadata.ordinal;
+  chunk.witnesses.resize(witness_count);
+  for (GuestExecutionSessionSignalWitness& witness : chunk.witnesses) {
+    uint32_t raw_source = 0;
+    uint32_t record_reserved = 0;
+    uint64_t record_reserved_tail = 0;
+    if (!reader.ReadU64(&witness.after_scheduler_sequence) ||
+        !reader.ReadU64(&witness.capture_instance_id) ||
+        !reader.ReadU32(&witness.guest_thread_id) ||
+        !reader.ReadU32(&witness.object_handle) ||
+        !reader.ReadU32(&witness.signal_epoch) ||
+        !reader.ReadU32(&witness.object_type) || !reader.ReadU32(&raw_source) ||
+        !reader.ReadU32(&record_reserved) ||
+        !reader.ReadU64(&record_reserved_tail) || record_reserved ||
+        record_reserved_tail) {
+      return Fail(error, "signal witness record is truncated");
+    }
+    witness.source =
+        static_cast<GuestExecutionSessionSignalWitnessSource>(raw_source);
+  }
+  if (reader.remaining() || !ValidateSignalWitnesses(chunk, limits, error)) {
+    return false;
+  }
+  *output = std::move(chunk);
+  return true;
+}
+
+GuestExecutionSessionSignalWitnessDisposition
+GuestExecutionSessionAuthorizeSignalEpochWake(
+    const DecodedSchedulerRecord& wake,
+    const std::vector<GuestExecutionSessionParticipant>& participants,
+    const std::vector<GuestExecutionSessionSignalWitness>& witnesses,
+    const GuestExecutionSessionSignalWitness** authorizing,
+    uint32_t* signaller_ordinal) {
+  if (authorizing) {
+    *authorizing = nullptr;
+  }
+  if (signaller_ordinal) {
+    *signaller_ordinal = kGuestExecutionSessionNoThread;
+  }
+  if (wake.kind != GuestSchedulerCaptureEventKind::kReready ||
+      wake.reason != GuestSchedulerCaptureReason::kSignalEpoch) {
+    return GuestExecutionSessionSignalWitnessDisposition::kNotSignalEpoch;
+  }
+  const size_t handle_count = std::min<size_t>(
+      wake.wait.handle_count, kGuestSchedulerCaptureMaximumWaitHandles);
+  const GuestExecutionSessionSignalWitness* latest = nullptr;
+  for (const GuestExecutionSessionSignalWitness& witness : witnesses) {
+    for (size_t index = 0; index < handle_count; ++index) {
+      if (witness.object_handle != wake.wait.handles[index] ||
+          witness.signal_epoch <= wake.wait.signal_epochs_before[index] ||
+          witness.signal_epoch > wake.wait.signal_epochs_observed[index]) {
+        continue;
+      }
+      if (!latest ||
+          witness.after_scheduler_sequence > latest->after_scheduler_sequence) {
+        latest = &witness;
+      }
+      break;
+    }
+  }
+  if (!latest) {
+    return GuestExecutionSessionSignalWitnessDisposition::kMissing;
+  }
+  if (authorizing) {
+    *authorizing = latest;
+  }
+  if (latest->after_scheduler_sequence >= wake.sequence) {
+    return GuestExecutionSessionSignalWitnessDisposition::kNotEarlier;
+  }
+  if (latest->source !=
+      GuestExecutionSessionSignalWitnessSource::kParticipant) {
+    return GuestExecutionSessionSignalWitnessDisposition::kUnrostered;
+  }
+  for (const GuestExecutionSessionParticipant& participant : participants) {
+    if (participant.capture_instance_id == latest->capture_instance_id &&
+        participant.guest_thread_id == latest->guest_thread_id) {
+      if (signaller_ordinal) {
+        *signaller_ordinal = participant.ordinal;
+      }
+      return GuestExecutionSessionSignalWitnessDisposition::kAuthorized;
+    }
+  }
+  return GuestExecutionSessionSignalWitnessDisposition::kUnrostered;
+}
+
 bool GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
     GuestExecutionSessionEventKind kind, const uint8_t* data, size_t data_size,
     const std::vector<GuestExecutionSessionParticipant>& participants,
@@ -2803,6 +3068,7 @@ bool GuestExecutionSessionCodec::ValidateSession(
   bool saw_final_checkpoint = false;
   bool saw_start_scheduler_topology = false;
   bool saw_final_scheduler_topology = false;
+  bool saw_signal_witnesses = false;
   const bool manifest_has_continuous_events = std::any_of(
       manifest.chunks.cbegin(), manifest.chunks.cend(),
       [](const GuestExecutionSessionChunkReference& chunk) {
@@ -3159,6 +3425,40 @@ bool GuestExecutionSessionCodec::ValidateSession(
         saw_start_scheduler_topology = true;
       } else {
         saw_final_scheduler_topology = true;
+      }
+    } else if (reference.kind ==
+               GuestExecutionSessionChunkKind::kSignalWitness) {
+      GuestExecutionSessionSignalWitnessChunk chunk;
+      if (!DecodeSignalWitnessChunk(encoded, &chunk, error, limits)) {
+        return false;
+      }
+      GuestExecutionSessionChunkReference derived;
+      derived.kind = GuestExecutionSessionChunkKind::kSignalWitness;
+      derived.ordinal = chunk.ordinal;
+      derived.record_count = 1;
+      derived.encoded_size = encoded.size();
+      derived.encoded_sha256 = HashBytes(encoded);
+      if (chunk.session_epoch != manifest.session_epoch ||
+          derived != reference || saw_signal_witnesses) {
+        return Fail(error,
+                    "signal witness table does not match its manifest "
+                    "reference");
+      }
+      saw_signal_witnesses = true;
+      for (const GuestExecutionSessionSignalWitness& witness :
+           chunk.witnesses) {
+        const bool rostered = std::any_of(
+            manifest.participants.cbegin(), manifest.participants.cend(),
+            [&witness](const GuestExecutionSessionParticipant& participant) {
+              return participant.capture_instance_id ==
+                         witness.capture_instance_id &&
+                     participant.guest_thread_id == witness.guest_thread_id;
+            });
+        if (rostered !=
+            (witness.source ==
+             GuestExecutionSessionSignalWitnessSource::kParticipant)) {
+          return Fail(error, "signal witness source disagrees with the roster");
+        }
       }
     } else if (reference.kind == GuestExecutionSessionChunkKind::kCheckpoint) {
       GuestExecutionSessionCheckpointChunk chunk;

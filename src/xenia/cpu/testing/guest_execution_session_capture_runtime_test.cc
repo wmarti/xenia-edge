@@ -555,6 +555,19 @@ class CanonicalEventBridge final
     return Action::kContinue;
   }
 
+  GuestExecutionSessionAssemblerAction OnSchedulerSignalWitness(
+      const kernel::GuestSchedulerCaptureSignalWitness& witness,
+      std::string*) noexcept override {
+    observed_signal_witnesses_.fetch_add(1, std::memory_order_relaxed);
+    last_signal_witness_epoch_.store(witness.signal_epoch,
+                                     std::memory_order_relaxed);
+    return GuestExecutionSessionAssemblerAction::kContinue;
+  }
+
+  uint64_t observed_signal_witness_count() const {
+    return observed_signal_witnesses_.load(std::memory_order_relaxed);
+  }
+
   bool SealSession(GuestExecutionSessionAssembler&, const CheckpointSnapshot&,
                    std::string*) noexcept override {
     return true;
@@ -659,7 +672,8 @@ class CanonicalEventBridge final
       const uint32_t overlay_ordinal = static_cast<uint32_t>(final_index);
       const uint32_t start_topology_ordinal = overlay_ordinal + 1;
       const uint32_t final_topology_ordinal = overlay_ordinal + 2;
-      final_checkpoint.ordinal = overlay_ordinal + 3;
+      const uint32_t signal_witness_ordinal = overlay_ordinal + 3;
+      final_checkpoint.ordinal = overlay_ordinal + 4;
       auto make_topology =
           [&](const ppc::GuestPPCThreadCheckpoint& state,
               GuestExecutionSessionSchedulerTopologyBoundary boundary_kind,
@@ -695,13 +709,19 @@ class CanonicalEventBridge final
           final_thread_state,
           GuestExecutionSessionSchedulerTopologyBoundary::kFinal,
           final_topology_ordinal, bundle->manifest.last_event_sequence);
+      GuestExecutionSessionSignalWitnessChunk signal_witnesses;
+      signal_witnesses.session_epoch = bundle->manifest.session_epoch;
+      signal_witnesses.ordinal = signal_witness_ordinal;
       std::vector<uint8_t> start_topology_bytes;
       std::vector<uint8_t> final_topology_bytes;
+      std::vector<uint8_t> signal_witness_bytes;
       std::vector<uint8_t> final_bytes;
       if (!GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
               start_topology, &start_topology_bytes, error) ||
           !GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
               final_topology, &final_topology_bytes, error) ||
+          !GuestExecutionSessionCodec::EncodeSignalWitnessChunk(
+              signal_witnesses, &signal_witness_bytes, error) ||
           !GuestExecutionSessionCodec::EncodeCheckpointChunk(
               final_checkpoint, &final_bytes, error)) {
         return false;
@@ -712,6 +732,8 @@ class CanonicalEventBridge final
                             std::move(start_topology_bytes));
       bundle->chunks.insert(bundle->chunks.end() - 1,
                             std::move(final_topology_bytes));
+      bundle->chunks.insert(bundle->chunks.end() - 1,
+                            std::move(signal_witness_bytes));
       bundle->chunks.back() = std::move(final_bytes);
       bundle->manifest.chunks.insert(
           bundle->manifest.chunks.begin() + final_index,
@@ -733,6 +755,11 @@ class CanonicalEventBridge final
                        final_topology.ordinal, final_topology.global_sequence,
                        final_topology.global_sequence, 1,
                        bundle->chunks[final_topology_ordinal]));
+      bundle->manifest.chunks.insert(
+          bundle->manifest.chunks.end() - 1,
+          ReferenceFor(GuestExecutionSessionChunkKind::kSignalWitness,
+                       signal_witnesses.ordinal, 0, 0, 1,
+                       bundle->chunks[signal_witness_ordinal]));
       bundle->manifest.chunks.back() = ReferenceFor(
           GuestExecutionSessionChunkKind::kCheckpoint, final_checkpoint.ordinal,
           final_checkpoint.checkpoint.global_sequence,
@@ -796,6 +823,8 @@ class CanonicalEventBridge final
 
   std::atomic<bool> record_next_event_as_segment_only_{false};
   std::atomic<uint64_t> observed_scheduler_event_count_{0};
+  std::atomic<uint64_t> observed_signal_witnesses_{0};
+  std::atomic<uint32_t> last_signal_witness_epoch_{0};
 };
 
 class CountingPublisher final : public GuestExecutionSessionAssemblerPublisher {

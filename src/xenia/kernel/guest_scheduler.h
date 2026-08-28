@@ -261,6 +261,13 @@ class GuestScheduler {
                             uint16_t request_flags, uint32_t declined_count,
                             uint32_t guest_pc);
 
+  // Bumps |epoch| for a cooperative signal on |object_handle| and reports the
+  // scheduler tape position the calling thread had reached. Both happen in one
+  // lock section, so a reready that sees the bump is sequenced after the
+  // witness; callers must not hold the scheduler lock.
+  void NoteCooperativeSignal(uint32_t object_handle, uint32_t object_type,
+                             std::atomic<uint32_t>* epoch);
+
   // True once an observer callback returned false and delivery stopped.
   bool capture_rejected() const;
 #endif
@@ -444,6 +451,9 @@ class GuestScheduler {
   bool capture_dispatch_seen_ = false;
   bool capture_closed_ = false;
   bool capture_rejected_ = false;
+  // Written with the others but read without the lock, so an unobserved signal
+  // keeps its lock-free epoch bump.
+  std::atomic<bool> capture_signal_witness_armed_{false};
 
   // Set only after all dispatch host-thread handles have been published.
   std::atomic<bool> checkpoint_dispatch_ready_{false};

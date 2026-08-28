@@ -111,6 +111,9 @@ std::filesystem::path ChunkFileName(
     case GuestExecutionSessionChunkKind::kSchedulerTopology:
       kind = "scheduler-topology";
       break;
+    case GuestExecutionSessionChunkKind::kSignalWitness:
+      kind = "signal-witness";
+      break;
     default:
       kind = "unknown";
       break;
@@ -362,7 +365,9 @@ bool CollectRequiredBlobs(
                GuestExecutionSessionChunkKind::kContinuousEvents) {
       continue;
     } else if (manifest.chunks[i].kind ==
-               GuestExecutionSessionChunkKind::kSchedulerTopology) {
+                   GuestExecutionSessionChunkKind::kSchedulerTopology ||
+               manifest.chunks[i].kind ==
+                   GuestExecutionSessionChunkKind::kSignalWitness) {
       continue;
     } else if (manifest.chunks[i].kind ==
                GuestExecutionSessionChunkKind::kCheckpoint) {
@@ -896,6 +901,64 @@ bool ValidateSchedulerTopologyCheckpointBindings(
       start_topology, final_topology, scheduler_event_subjects, error);
 }
 
+// A witness claims a signal ran before the wakes that observed it. The claim
+// is checkable from the tape alone: a signal covering a wake's own epoch
+// transition must sit at an earlier scheduler position than the wake. The
+// converse is deliberately not an error here - a wake whose signal predates
+// the interval carries no witness, and the bundle still publishes.
+bool ValidateSignalWitnessOrdering(
+    const GuestExecutionSessionBundle& bundle,
+    const GuestExecutionSessionBundleLimits& limits,
+    const ValidatedBundle& validated, std::string* error) {
+  GuestExecutionSessionSignalWitnessChunk witnesses;
+  bool has_witnesses = false;
+  for (size_t index = 0; index < bundle.chunks.size(); ++index) {
+    if (bundle.manifest.chunks[index].kind !=
+        GuestExecutionSessionChunkKind::kSignalWitness) {
+      continue;
+    }
+    if (!GuestExecutionSessionCodec::DecodeSignalWitnessChunk(
+            bundle.chunks[index], &witnesses, error, limits.session)) {
+      return false;
+    }
+    has_witnesses = true;
+  }
+  if (!has_witnesses || witnesses.witnesses.empty()) {
+    return true;
+  }
+  for (size_t index = 0; index < bundle.chunks.size(); ++index) {
+    if (bundle.manifest.chunks[index].kind !=
+        GuestExecutionSessionChunkKind::kEvents) {
+      continue;
+    }
+    GuestExecutionSessionEventChunk events;
+    if (!GuestExecutionSessionCodec::DecodeEventChunk(
+            bundle.chunks[index], &events, error, limits.session)) {
+      return false;
+    }
+    for (const GuestExecutionSessionEvent& event : events.events) {
+      if (event.kind != GuestExecutionSessionEventKind::kSynchronization) {
+        continue;
+      }
+      const auto payload = validated.blobs.find(event.payload_sha256);
+      DecodedSchedulerRecord record;
+      if (payload == validated.blobs.end() ||
+          !GuestSchedulerRecordCodec::Decode(payload->second->bytes, &record,
+                                             error)) {
+        return false;
+      }
+      if (GuestExecutionSessionAuthorizeSignalEpochWake(
+              record, bundle.manifest.participants, witnesses.witnesses) ==
+          GuestExecutionSessionSignalWitnessDisposition::kNotEarlier) {
+        return Fail(error,
+                    "signal witness is not earlier than the wake it "
+                    "authorizes");
+      }
+    }
+  }
+  return true;
+}
+
 bool ValidateContinuousCodeClosure(
     const GuestExecutionSessionBundle& bundle,
     const std::map<GuestExecutionSessionSha256,
@@ -1071,6 +1134,7 @@ bool ValidateBundle(const GuestExecutionSessionBundle& bundle,
   if (!ValidateContinuousCheckpointBlobs(bundle, limits, *output, error) ||
       !ValidateSchedulerTopologyCheckpointBindings(bundle, limits, *output,
                                                    error) ||
+      !ValidateSignalWitnessOrdering(bundle, limits, *output, error) ||
       !ValidateContinuousCodeClosure(bundle, output->blobs, limits.session,
                                      error)) {
     return false;

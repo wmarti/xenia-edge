@@ -849,6 +849,7 @@ bool BuildGuestExecutionContinuousReplayPlan(
   std::vector<GuestExecutionContinuousEvent> control_events;
   bool saw_start_scheduler_topology = false;
   bool saw_final_scheduler_topology = false;
+  bool saw_signal_witnesses = false;
   for (size_t i = 2; i + 1 < bundle.chunks.size(); ++i) {
     switch (manifest.chunks[i].kind) {
       case GuestExecutionSessionChunkKind::kEvents: {
@@ -899,6 +900,20 @@ bool BuildGuestExecutionContinuousReplayPlan(
         } else {
           return fail("continuous scheduler topology boundary is unknown");
         }
+        break;
+      }
+      case GuestExecutionSessionChunkKind::kSignalWitness: {
+        GuestExecutionSessionSignalWitnessChunk witnesses;
+        if (!GuestExecutionSessionCodec::DecodeSignalWitnessChunk(
+                bundle.chunks[i], &witnesses, error)) {
+          *output = {};
+          return false;
+        }
+        if (saw_signal_witnesses) {
+          return fail("continuous signal witness table is duplicated");
+        }
+        saw_signal_witnesses = true;
+        plan.signal_witnesses = std::move(witnesses.witnesses);
         break;
       }
       default:

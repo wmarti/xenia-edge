@@ -3066,6 +3066,7 @@ bool GuestScheduler::AttachCaptureObserverTransactionally(
   capture_observer_ = std::move(observer);
   capture_sequence_ = 0;
   capture_rejected_ = false;
+  capture_signal_witness_armed_.store(true, std::memory_order_release);
   return true;
 }
 
@@ -3078,6 +3079,7 @@ bool GuestScheduler::DetachCaptureObserver(
         capture_closed_ || !capture_observer_->CanDetach()) {
       return false;
     }
+    capture_signal_witness_armed_.store(false, std::memory_order_release);
     released = std::move(capture_observer_);
   }
   released.reset();
@@ -3102,6 +3104,42 @@ void GuestScheduler::NoteCaptureSafepoint(XThread* thread,
   EmitCapture(CaptureKind::kSafepoint, thread, t_current_cpu, -1, outcome,
               request_flags, static_cast<uint8_t>(kpcr->current_irql),
               declined_count, guest_pc);
+}
+
+void GuestScheduler::NoteCooperativeSignal(uint32_t object_handle,
+                                           uint32_t object_type,
+                                           std::atomic<uint32_t>* epoch) {
+  if (!epoch) {
+    return;
+  }
+  if (!capture_signal_witness_armed_.load(std::memory_order_acquire)) {
+    epoch->fetch_add(1, std::memory_order_acq_rel);
+    return;
+  }
+  GuestSchedulerCaptureSignalWitness witness;
+  witness.object_handle = object_handle;
+  witness.object_type = object_type;
+  if (auto* thread = XThread::GetCurrentThread()) {
+    witness.guest_thread_id = thread->thread_id();
+    if (auto* thread_state = thread->thread_state()) {
+      witness.capture_instance_id =
+          thread_state->guest_execution_capture_instance_id();
+    }
+  }
+  std::lock_guard<std::mutex> lock(lock_);
+  witness.signal_epoch =
+      epoch->fetch_add(1, std::memory_order_acq_rel) + uint32_t(1);
+  if (!capture_observer_ || capture_rejected_) {
+    return;
+  }
+  witness.after_scheduler_sequence = capture_sequence_;
+  if (!capture_observer_->OnSchedulerSignalWitness(witness)) {
+    capture_rejected_ = true;
+    XELOGE(
+        "GuestScheduler: capture observer rejected the signal witness for "
+        "handle {:08X}, scheduler capture delivery has stopped",
+        object_handle);
+  }
 }
 
 void GuestScheduler::EmitCaptureLocked(
@@ -3177,6 +3215,7 @@ void GuestScheduler::ReleaseCaptureObserverForShutdown() {
   {
     std::lock_guard<std::mutex> lock(lock_);
     capture_closed_ = true;
+    capture_signal_witness_armed_.store(false, std::memory_order_release);
     EmitCaptureLocked(CaptureKind::kShutdown, nullptr, -1, -1,
                       CaptureReason::kNone, 0, 0);
     released = std::move(capture_observer_);

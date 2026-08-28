@@ -473,6 +473,7 @@ bool ValidateRuntimePublicationBundle(
   }
   bool saw_canonical_events = false;
   bool saw_continuous_events = false;
+  bool saw_signal_witnesses = false;
   uint32_t scheduler_topology_count = 0;
   for (size_t index = 2; index + 1 < bundle.manifest.chunks.size(); ++index) {
     const GuestExecutionSessionChunkKind kind =
@@ -503,18 +504,21 @@ bool ValidateRuntimePublicationBundle(
                     "capture runtime scheduler topology order is invalid");
       }
       ++scheduler_topology_count;
+    } else if (kind == GuestExecutionSessionChunkKind::kSignalWitness &&
+               scheduler_topology_count == 2 && !saw_signal_witnesses) {
+      saw_signal_witnesses = true;
     } else {
       return Fail(error,
                   "capture runtime publication chunk order is not initial "
                   "checkpoint, corpus, canonical events, overlay, scheduler "
-                  "topologies, final checkpoint");
+                  "topologies, signal witnesses, final checkpoint");
     }
   }
   if (!saw_canonical_events || !saw_continuous_events ||
-      scheduler_topology_count != 2) {
+      scheduler_topology_count != 2 || !saw_signal_witnesses) {
     return Fail(error,
                 "capture runtime publication lacks its authenticated event "
-                "overlay or scheduler topology boundaries");
+                "overlay, scheduler topology boundaries or signal witnesses");
   }
   if (!ValidateGuestExecutionSessionBundle(bundle, error, limits)) {
     return false;
@@ -855,6 +859,7 @@ enum class RuntimeEventKind : uint8_t {
   kHostCallBegin,
   kHostCallEnd,
   kScheduler,
+  kSignalWitness,
   kGuestMarker,
   kModeledExport,
 };
@@ -871,6 +876,7 @@ struct RuntimeEvent {
   uint32_t function_end_address = 0;
   uint32_t return_address = 0;
   kernel::GuestSchedulerCaptureEvent scheduler;
+  kernel::GuestSchedulerCaptureSignalWitness signal_witness;
   GuestExecutionSessionMarkerSource marker_source =
       GuestExecutionSessionMarkerSource::kNone;
   uint64_t marker_identity = 0;
@@ -955,6 +961,7 @@ enum class AsyncFailure : uint8_t {
   kInstructionCounter,
   kUnexpectedJitSafepoint,
   kSourceAfterSeal,
+  kSignalWitnessAnchor,
 };
 
 enum class ArmAttemptDisposition : uint8_t {
@@ -1041,6 +1048,7 @@ RuntimeRejection MapAsyncFailure(AsyncFailure failure) {
     case AsyncFailure::kInstructionCounter:
     case AsyncFailure::kUnexpectedJitSafepoint:
     case AsyncFailure::kSourceAfterSeal:
+    case AsyncFailure::kSignalWitnessAnchor:
       return RuntimeRejection::kSourceRejected;
     case AsyncFailure::kNone:
       break;
@@ -1064,6 +1072,9 @@ const char* AsyncFailureMessage(AsyncFailure failure) {
     case AsyncFailure::kSourceAfterSeal:
       return "capture runtime observed a source mutation while a checkpoint "
              "boundary was sealed";
+    case AsyncFailure::kSignalWitnessAnchor:
+      return "capture runtime signal witness does not name the scheduler tape "
+             "position it was delivered at";
     case AsyncFailure::kNone:
       break;
   }
@@ -2398,6 +2409,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
         scheduler_event_count.fetch_add(1, std::memory_order_relaxed);
         return action;
       }
+      case RuntimeEventKind::kSignalWitness:
+        return dependencies.event_bridge->OnSchedulerSignalWitness(
+            event.signal_witness, error);
       case RuntimeEventKind::kGuestMarker:
         return assembler->OnGuestMarker(std::nullopt, event.marker_source,
                                         event.marker_identity);
@@ -3346,6 +3360,21 @@ bool GuestExecutionSessionCaptureRuntime::OnSchedulerEvent(
   RuntimeEvent runtime_event;
   runtime_event.kind = RuntimeEventKind::kScheduler;
   runtime_event.scheduler = event;
+  return impl_->ForwardIfActive(runtime_event);
+}
+
+bool GuestExecutionSessionCaptureRuntime::OnSchedulerSignalWitness(
+    const kernel::GuestSchedulerCaptureSignalWitness& witness) noexcept {
+  // Delivered under the same lock as the events, so the anchor is exactly the
+  // sequence this runtime has already accounted for.
+  if (witness.after_scheduler_sequence !=
+      impl_->last_scheduler_sequence.load(std::memory_order_relaxed)) {
+    impl_->LatchAsyncFailure(AsyncFailure::kSignalWitnessAnchor);
+    return false;
+  }
+  RuntimeEvent runtime_event;
+  runtime_event.kind = RuntimeEventKind::kSignalWitness;
+  runtime_event.signal_witness = witness;
   return impl_->ForwardIfActive(runtime_event);
 }
 

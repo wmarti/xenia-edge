@@ -1635,10 +1635,10 @@ namespace {
 // One canonical XEGSCE1 version-2 scheduler payload. The capture-side encoder
 // owns this layout and the validator decodes it without the kernel
 // enumerations, so the fixture writes the durable bytes directly.
-std::vector<uint8_t> SchedulerPayload(uint32_t raw_kind, uint64_t sequence,
-                                      uint64_t capture_instance_id,
-                                      uint32_t guest_thread_id,
-                                      uint8_t raw_reason) {
+std::vector<uint8_t> SchedulerPayload(
+    uint32_t raw_kind, uint64_t sequence, uint64_t capture_instance_id,
+    uint32_t guest_thread_id, uint8_t raw_reason, uint32_t wait_handle = 0,
+    uint32_t signal_epoch_before = 0, uint32_t signal_epoch_observed = 0) {
   std::vector<uint8_t> payload(192, 0);
   static constexpr char kMagic[8] = {'X', 'E', 'G', 'S', 'C', 'E', '1', '\0'};
   std::copy(std::begin(kMagic), std::end(kMagic), payload.begin());
@@ -1658,6 +1658,16 @@ std::vector<uint8_t> SchedulerPayload(uint32_t raw_kind, uint64_t sequence,
   write_u64(24, capture_instance_id);
   write_u32(32, guest_thread_id);
   payload[42] = raw_reason;
+  if (wait_handle) {
+    write_u32(52, signal_epoch_before);
+    write_u32(56, signal_epoch_observed);
+    payload[46] = 1;  // kSingle
+    payload[60] = 1;  // one handle
+    payload[61] = 1;  // gated
+    write_u32(80, wait_handle);
+    write_u32(112, signal_epoch_before);
+    write_u32(144, signal_epoch_observed);
+  }
   return payload;
 }
 
@@ -1670,6 +1680,11 @@ struct PendingExportOptions {
   uint32_t witness_kind = 9;    // kReready
   uint8_t witness_reason = 11;  // kSignalEpoch
   uint32_t witness_thread_id = 7;
+  // Nonzero gives the wake a gated single-object wait a signal witness can
+  // cover; zero leaves it handle-free and unauthorizable.
+  uint32_t wake_wait_handle = 0;
+  uint32_t wake_signal_epoch_before = 0;
+  uint32_t wake_signal_epoch_observed = 0;
   bool witness_payload_is_v1 = false;
   // A reready normally has no participant actor; owning one lets the fixture
   // give the participant an earlier event than its export.
@@ -1727,9 +1742,10 @@ GuestExecutionSessionBundle MakePendingExportBundle(
       AddBlob(&bundle, final_state_bytes);
   const std::vector<uint8_t> corpus_page = Bytes(JitCorpus::kPageSize, 0x30);
   const GuestExecutionSessionSha256 code = AddBlob(&bundle, corpus_page);
-  std::vector<uint8_t> witness_payload =
-      SchedulerPayload(options.witness_kind, 1, kInstanceId,
-                       options.witness_thread_id, options.witness_reason);
+  std::vector<uint8_t> witness_payload = SchedulerPayload(
+      options.witness_kind, 1, kInstanceId, options.witness_thread_id,
+      options.witness_reason, options.wake_wait_handle,
+      options.wake_signal_epoch_before, options.wake_signal_epoch_observed);
   if (options.witness_payload_is_v1) {
     witness_payload.resize(48);
     witness_payload[8] = 1;
@@ -1976,6 +1992,52 @@ GuestExecutionSessionBundle MakePendingExportBundle(
   return bundle;
 }
 
+// Splices a witness table in front of the final checkpoint, which is where the
+// format places it, without disturbing the fixture the other sections use.
+void AttachSignalWitnesses(
+    GuestExecutionSessionBundle* bundle,
+    std::vector<GuestExecutionSessionSignalWitness> witnesses) {
+  GuestExecutionSessionCheckpointChunk final_checkpoint;
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+      bundle->chunks.back(), &final_checkpoint, &error));
+  GuestExecutionSessionSignalWitnessChunk chunk;
+  chunk.session_epoch = bundle->manifest.session_epoch;
+  chunk.ordinal = final_checkpoint.ordinal;
+  chunk.witnesses = std::move(witnesses);
+  final_checkpoint.ordinal += 1;
+  std::vector<uint8_t> witness_bytes;
+  std::vector<uint8_t> final_bytes;
+  REQUIRE(GuestExecutionSessionCodec::EncodeSignalWitnessChunk(
+      chunk, &witness_bytes, &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_checkpoint, &final_bytes, &error));
+  const GuestExecutionSessionChunkReference previous_final =
+      bundle->manifest.chunks.back();
+  bundle->manifest.chunks.back() =
+      ReferenceFor(GuestExecutionSessionChunkKind::kSignalWitness,
+                   chunk.ordinal, 0, 0, 1, witness_bytes);
+  bundle->manifest.chunks.push_back(ReferenceFor(
+      GuestExecutionSessionChunkKind::kCheckpoint, final_checkpoint.ordinal,
+      previous_final.first_event_sequence, previous_final.last_event_sequence,
+      1, final_bytes));
+  bundle->chunks.back() = std::move(witness_bytes);
+  bundle->chunks.push_back(std::move(final_bytes));
+}
+
+GuestExecutionSessionSignalWitness ParticipantSignalWitness(
+    uint64_t after_scheduler_sequence, uint32_t object_handle,
+    uint32_t signal_epoch) {
+  GuestExecutionSessionSignalWitness witness;
+  witness.after_scheduler_sequence = after_scheduler_sequence;
+  witness.capture_instance_id = 0x100;
+  witness.guest_thread_id = 7;
+  witness.object_handle = object_handle;
+  witness.signal_epoch = signal_epoch;
+  witness.source = GuestExecutionSessionSignalWitnessSource::kParticipant;
+  return witness;
+}
+
 }  // namespace
 
 TEST_CASE("session bundle admits a blocked export replay route",
@@ -1986,6 +2048,99 @@ TEST_CASE("session bundle admits a blocked export replay route",
                                                       bundle.chunks, &error));
   REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
   REQUIRE(error.empty());
+}
+
+TEST_CASE("session bundle binds signal-epoch wakes to their signal witnesses",
+          "[guest-execution-session-bundle]") {
+  BlockedExportOptions options;
+  options.wake_wait_handle = 0x2000;
+  options.wake_signal_epoch_before = 4;
+  options.wake_signal_epoch_observed = 5;
+  std::string error;
+  const auto require_rejected = [&error](
+                                    const GuestExecutionSessionBundle& bundle,
+                                    std::string_view text) {
+    error.clear();
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(error.find(text) != std::string::npos);
+  };
+
+  SECTION("a signal recorded before the wake is admitted") {
+    GuestExecutionSessionBundle bundle = MakeBlockedExportBundle(options);
+    AttachSignalWitnesses(&bundle, {ParticipantSignalWitness(0, 0x2000, 5)});
+    REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                        bundle.chunks, &error));
+    REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(error.empty());
+  }
+
+  SECTION("a signal at or after the wake's own tape position rejects") {
+    GuestExecutionSessionBundle bundle = MakeBlockedExportBundle(options);
+    AttachSignalWitnesses(&bundle, {ParticipantSignalWitness(1, 0x2000, 5)});
+    require_rejected(bundle,
+                     "signal witness is not earlier than the wake it "
+                     "authorizes");
+  }
+
+  SECTION("a signal claimed for a participant off the roster rejects") {
+    GuestExecutionSessionBundle bundle = MakeBlockedExportBundle(options);
+    GuestExecutionSessionSignalWitness witness =
+        ParticipantSignalWitness(0, 0x2000, 5);
+    witness.guest_thread_id = 0x999;
+    AttachSignalWitnesses(&bundle, {witness});
+    require_rejected(bundle, "signal witness source disagrees with the roster");
+  }
+
+  SECTION("a signal by an off-roster thread publishes and authorizes nothing") {
+    GuestExecutionSessionBundle bundle = MakeBlockedExportBundle(options);
+    GuestExecutionSessionSignalWitness witness =
+        ParticipantSignalWitness(0, 0x2000, 5);
+    witness.guest_thread_id = 0x999;
+    witness.source = GuestExecutionSessionSignalWitnessSource::kOffRoster;
+    AttachSignalWitnesses(&bundle, {witness});
+    REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    GuestExecutionSessionSignalWitnessChunk table;
+    REQUIRE(GuestExecutionSessionCodec::DecodeSignalWitnessChunk(
+        bundle.chunks[bundle.chunks.size() - 2], &table, &error));
+    REQUIRE(table.witnesses.size() == 1);
+    DecodedSchedulerRecord wake;
+    wake.sequence = 1;
+    wake.capture_instance_id = 0x100;
+    wake.guest_thread_id = 7;
+    wake.kind = GuestSchedulerCaptureEventKind::kReready;
+    wake.reason = GuestSchedulerCaptureReason::kSignalEpoch;
+    wake.wait.handle_count = 1;
+    wake.wait.handles[0] = 0x2000;
+    wake.wait.signal_epochs_before[0] = 4;
+    wake.wait.signal_epochs_observed[0] = 5;
+    REQUIRE(GuestExecutionSessionAuthorizeSignalEpochWake(
+                wake, bundle.manifest.participants, table.witnesses) ==
+            GuestExecutionSessionSignalWitnessDisposition::kUnrostered);
+  }
+
+  SECTION(
+      "a wake with no witness table at all publishes and stays detectable") {
+    const GuestExecutionSessionBundle bundle = MakeBlockedExportBundle(options);
+    REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(std::none_of(
+        bundle.manifest.chunks.cbegin(), bundle.manifest.chunks.cend(),
+        [](const GuestExecutionSessionChunkReference& chunk) {
+          return chunk.kind == GuestExecutionSessionChunkKind::kSignalWitness;
+        }));
+    DecodedSchedulerRecord wake;
+    wake.sequence = 1;
+    wake.capture_instance_id = 0x100;
+    wake.guest_thread_id = 7;
+    wake.kind = GuestSchedulerCaptureEventKind::kReready;
+    wake.reason = GuestSchedulerCaptureReason::kSignalEpoch;
+    wake.wait.handle_count = 1;
+    wake.wait.handles[0] = 0x2000;
+    wake.wait.signal_epochs_before[0] = 4;
+    wake.wait.signal_epochs_observed[0] = 5;
+    REQUIRE(GuestExecutionSessionAuthorizeSignalEpochWake(
+                wake, bundle.manifest.participants, {}) ==
+            GuestExecutionSessionSignalWitnessDisposition::kMissing);
+  }
 }
 
 TEST_CASE("session bundle proves every blocked export obligation",

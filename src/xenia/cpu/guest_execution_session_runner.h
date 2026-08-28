@@ -206,6 +206,10 @@ struct GuestExecutionContinuousReplayPlan {
   // than inferring queue state from the first observed scheduler event.
   GuestExecutionSessionSchedulerTopologyChunk initial_scheduler_topology;
   GuestExecutionSessionSchedulerTopologyChunk final_scheduler_topology;
+  // Provenance of every cooperative signal the interval recorded. Empty when
+  // the bundle carries no witness table, which no consumer may read as
+  // evidence that a signal-epoch wake had no cause.
+  std::vector<GuestExecutionSessionSignalWitness> signal_witnesses;
   std::vector<GuestExecutionContinuousReplayParticipant> participants;
   std::vector<GuestExecutionContinuousReplayEvent> events;
   std::vector<GuestExecutionContinuousReplayResumeEntry> resume_entries;

@@ -89,6 +89,23 @@ struct GuestSchedulerCaptureEvent {
   bool operator==(const GuestSchedulerCaptureEvent&) const = default;
 };
 
+// One cooperative signal, anchored to the scheduler tape rather than given a
+// sequence of its own: after_scheduler_sequence is the last event sequence
+// assigned when the signalling thread bumped the object's epoch. The bump and
+// this anchor read happen in one scheduler lock section, so a reready that
+// observes the bump is always assigned a strictly greater sequence. The
+// identity fields are zero when no guest thread ran the signal.
+struct GuestSchedulerCaptureSignalWitness {
+  uint64_t after_scheduler_sequence = 0;
+  uint64_t capture_instance_id = 0;
+  uint32_t guest_thread_id = 0;
+  uint32_t object_handle = 0;
+  uint32_t signal_epoch = 0;
+  uint32_t object_type = 0;
+
+  bool operator==(const GuestSchedulerCaptureSignalWitness&) const = default;
+};
+
 // Capture-build-only observer of GuestScheduler transitions. Install one
 // continuous observer before the first fiber dispatch and arm or disarm
 // capture inside it; GuestScheduler permanently rejects later attachment.
@@ -107,6 +124,12 @@ class GuestSchedulerCaptureObserver {
   virtual bool OnSchedulerEvent(
       const GuestSchedulerCaptureEvent& event) noexcept = 0;
 
+  // Delivered under the same lock and the same contract, once per cooperative
+  // signal. It consumes no sequence of its own, so a witness never appears in
+  // the event stream and never interrupts its continuity.
+  virtual bool OnSchedulerSignalWitness(
+      const GuestSchedulerCaptureSignalWitness& witness) noexcept = 0;
+
   // Queried at attachment and at a detachment request made before the first
   // dispatch.
   virtual bool CanDetach() const noexcept = 0;
@@ -119,6 +142,7 @@ enum class GuestSchedulerCaptureRecorderRejection : uint8_t {
   kSequenceRegression,
   kEventAfterShutdown,
   kOverflow,
+  kInvalidSignalWitness,
 };
 
 struct GuestSchedulerCaptureRecorderSnapshot {
@@ -130,6 +154,7 @@ struct GuestSchedulerCaptureRecorderSnapshot {
   uint64_t delivered_count = 0;
   uint64_t last_sequence = 0;
   std::vector<GuestSchedulerCaptureEvent> events;
+  std::vector<GuestSchedulerCaptureSignalWitness> signal_witnesses;
 };
 
 // Bounded, nonblocking event recorder satisfying the observer contract. The
@@ -154,6 +179,8 @@ class GuestSchedulerCaptureEventRecorder final
 
   bool OnSchedulerEvent(
       const GuestSchedulerCaptureEvent& event) noexcept override;
+  bool OnSchedulerSignalWitness(
+      const GuestSchedulerCaptureSignalWitness& witness) noexcept override;
   bool CanDetach() const noexcept override;
 
   GuestSchedulerCaptureRecorderSnapshot snapshot() const;
@@ -162,6 +189,7 @@ class GuestSchedulerCaptureEventRecorder final
   mutable std::mutex mutex_;
   const size_t capacity_;
   std::vector<GuestSchedulerCaptureEvent> events_;
+  std::vector<GuestSchedulerCaptureSignalWitness> signal_witnesses_;
   bool armed_ = false;
   bool shutdown_seen_ = false;
   uint64_t delivered_count_ = 0;

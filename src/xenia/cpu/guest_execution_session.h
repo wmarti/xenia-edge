@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include "xenia/cpu/guest_scheduler_record.h"
+
 namespace xe {
 namespace cpu {
 
@@ -106,6 +108,12 @@ enum class GuestExecutionSessionChunkKind : uint32_t {
   // bind the durable participant roster to one authoritative quiescent
   // scheduler snapshot without treating PPC register state as queue state.
   kSchedulerTopology = 6,
+  // Every cooperative signal executed inside the interval, each bound to the
+  // scheduler tape position its signaller had reached. A session that carries
+  // no such chunk witnesses no signal at all, and a consumer that needs the
+  // provenance of a signal-epoch wake must refuse the wake rather than assume
+  // one.
+  kSignalWitness = 7,
 };
 
 enum class GuestExecutionSessionEventKind : uint32_t {
@@ -511,6 +519,71 @@ enum class GuestExecutionSessionSchedulerEventReason : uint32_t {
   kBackstop = 14,
 };
 
+// Who executed a recorded cooperative signal. A wake released by anything but
+// a roster participant is caused by work no offline replay re-enacts, so the
+// distinction is durable rather than inferred from the identity fields.
+enum class GuestExecutionSessionSignalWitnessSource : uint32_t {
+  kParticipant = 1,
+  kOffRoster = 2,
+  // No guest thread ran the signal; an emulator subsystem did.
+  kHost = 3,
+};
+
+// One cooperative signal, anchored to the last scheduler record assigned when
+// the signalling thread bumped the object's epoch. Capture takes the anchor
+// and bumps the epoch in one scheduler lock section, so every reready that
+// observes this signal is assigned a strictly greater sequence.
+struct GuestExecutionSessionSignalWitness {
+  uint64_t after_scheduler_sequence = 0;
+  uint64_t capture_instance_id = 0;
+  uint32_t guest_thread_id = 0;
+  uint32_t object_handle = 0;
+  // The object's cooperative signal epoch after this signal, never zero.
+  uint32_t signal_epoch = 0;
+  uint32_t object_type = 0;
+  GuestExecutionSessionSignalWitnessSource source =
+      GuestExecutionSessionSignalWitnessSource::kParticipant;
+
+  bool operator==(const GuestExecutionSessionSignalWitness&) const = default;
+};
+
+// The whole interval's signal provenance, in emission order. The table may be
+// empty: a session whose participants signalled nothing still publishes it, so
+// its presence is the attestation that provenance was recorded at all.
+struct GuestExecutionSessionSignalWitnessChunk {
+  uint64_t session_epoch = 0;
+  uint32_t ordinal = 0;
+  std::vector<GuestExecutionSessionSignalWitness> witnesses;
+
+  bool operator==(const GuestExecutionSessionSignalWitnessChunk&) const =
+      default;
+};
+
+enum class GuestExecutionSessionSignalWitnessDisposition : uint32_t {
+  kAuthorized = 1,
+  // No recorded signal moved an epoch this wake watched.
+  kMissing = 2,
+  // A covering signal was recorded at or after the wake's own tape position.
+  kNotEarlier = 3,
+  // The covering signal was not executed by a roster participant.
+  kUnrostered = 4,
+  // The record is not a signal-epoch wake, so no witness applies to it.
+  kNotSignalEpoch = 5,
+};
+
+// Resolves the signal that released a kReready(kSignalEpoch). A wake is
+// authorized by the latest recorded signal falling inside its own observed
+// epoch transition, which the caller must have already consumed. Every other
+// disposition names why the wake carries no re-enactable provenance; the
+// refusal itself belongs to the caller.
+GuestExecutionSessionSignalWitnessDisposition
+GuestExecutionSessionAuthorizeSignalEpochWake(
+    const DecodedSchedulerRecord& wake,
+    const std::vector<GuestExecutionSessionParticipant>& participants,
+    const std::vector<GuestExecutionSessionSignalWitness>& witnesses,
+    const GuestExecutionSessionSignalWitness** authorizing = nullptr,
+    uint32_t* signaller_ordinal = nullptr);
+
 // Decoder limits are caller-selectable so capture policy can be stricter than
 // the format maxima and tests can prove that limits reject rather than slice.
 struct GuestExecutionSessionLimits {
@@ -528,6 +601,7 @@ struct GuestExecutionSessionLimits {
   uint64_t maximum_total_checkpoint_thread_states = 1u << 20;
   uint32_t maximum_checkpoint_thread_states = 4096;
   uint32_t maximum_checkpoint_content_references = 1u << 20;
+  uint32_t maximum_signal_witnesses = 1u << 20;
 };
 
 // Portable little-endian version 2 metadata format. Version 1 never produced
@@ -553,6 +627,9 @@ class GuestExecutionSessionCodec {
   static constexpr uint32_t kSchedulerTopologyVersion = 1;
   static constexpr uint32_t kSchedulerTopologyPayloadHeaderSize = 32;
   static constexpr uint32_t kSchedulerTopologyRecordSize = 200;
+  static constexpr uint32_t kSignalWitnessVersion = 1;
+  static constexpr uint32_t kSignalWitnessPayloadHeaderSize = 32;
+  static constexpr uint32_t kSignalWitnessRecordSize = 48;
   static constexpr uint32_t kSchedulerEventPayloadVersion = 2;
   static constexpr uint32_t kSchedulerEventPayloadSize = 192;
   static constexpr uint32_t kGuestPageSize = 4096;
@@ -640,6 +717,22 @@ class GuestExecutionSessionCodec {
       std::string* error = nullptr, GuestExecutionSessionLimits limits = {}) {
     return DecodeSchedulerTopologyChunk(data.data(), data.size(), output, error,
                                         limits);
+  }
+
+  static bool EncodeSignalWitnessChunk(
+      const GuestExecutionSessionSignalWitnessChunk& chunk,
+      std::vector<uint8_t>* output, std::string* error = nullptr,
+      GuestExecutionSessionLimits limits = {});
+  static bool DecodeSignalWitnessChunk(
+      const uint8_t* data, size_t data_size,
+      GuestExecutionSessionSignalWitnessChunk* output,
+      std::string* error = nullptr, GuestExecutionSessionLimits limits = {});
+  static bool DecodeSignalWitnessChunk(
+      const std::vector<uint8_t>& data,
+      GuestExecutionSessionSignalWitnessChunk* output,
+      std::string* error = nullptr, GuestExecutionSessionLimits limits = {}) {
+    return DecodeSignalWitnessChunk(data.data(), data.size(), output, error,
+                                    limits);
   }
 
   // Resolves the roster ordinal of the one participant a kThreadDispatch or

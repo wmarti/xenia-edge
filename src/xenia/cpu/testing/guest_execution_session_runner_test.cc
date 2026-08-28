@@ -1214,7 +1214,64 @@ GuestExecutionSessionBundle MakePassiveContinuousSessionBundle(
   return bundle;
 }
 
+// Splices a witness table in front of the final checkpoint, which is where the
+// format places it.
+void AttachSignalWitnesses(
+    GuestExecutionSessionBundle* bundle,
+    std::vector<GuestExecutionSessionSignalWitness> witnesses) {
+  GuestExecutionSessionCheckpointChunk final_checkpoint;
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+      bundle->chunks.back(), &final_checkpoint, &error));
+  GuestExecutionSessionSignalWitnessChunk chunk;
+  chunk.session_epoch = bundle->manifest.session_epoch;
+  chunk.ordinal = final_checkpoint.ordinal;
+  chunk.witnesses = std::move(witnesses);
+  final_checkpoint.ordinal += 1;
+  std::vector<uint8_t> witness_bytes;
+  std::vector<uint8_t> final_bytes;
+  REQUIRE(GuestExecutionSessionCodec::EncodeSignalWitnessChunk(
+      chunk, &witness_bytes, &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_checkpoint, &final_bytes, &error));
+  const GuestExecutionSessionChunkReference previous_final =
+      bundle->manifest.chunks.back();
+  bundle->manifest.chunks.back() =
+      Reference(GuestExecutionSessionChunkKind::kSignalWitness, chunk.ordinal,
+                0, 0, 1, witness_bytes);
+  bundle->manifest.chunks.push_back(
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint,
+                final_checkpoint.ordinal, previous_final.first_event_sequence,
+                previous_final.last_event_sequence, 1, final_bytes));
+  bundle->chunks.back() = std::move(witness_bytes);
+  bundle->chunks.push_back(std::move(final_bytes));
+}
+
 }  // namespace
+
+TEST_CASE("continuous replay planner carries the signal witness table",
+          "[guest-execution-session-runner][continuous]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  GuestExecutionSessionBundle bundle =
+      MakeContinuousSessionBundle(kHostPageSize);
+  GuestExecutionSessionSignalWitness witness;
+  witness.after_scheduler_sequence = 3;
+  witness.capture_instance_id = 0x1000;
+  witness.guest_thread_id = 0x101;
+  witness.object_handle = 0x2000;
+  witness.signal_epoch = 5;
+  witness.source = GuestExecutionSessionSignalWitnessSource::kParticipant;
+  AttachSignalWitnesses(&bundle, {witness});
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                      bundle.chunks, &error));
+  GuestExecutionContinuousReplayPlan plan;
+  REQUIRE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize, &plan,
+                                                  &error));
+  REQUIRE(error.empty());
+  REQUIRE(plan.signal_witnesses.size() == 1);
+  REQUIRE(plan.signal_witnesses.front() == witness);
+}
 
 TEST_CASE("continuous replay planner binds exact participant continuations",
           "[guest-execution-session-runner][continuous]") {

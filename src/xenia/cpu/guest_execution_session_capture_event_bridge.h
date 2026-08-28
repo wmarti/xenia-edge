@@ -48,6 +48,9 @@ class GuestExecutionSessionCaptureSchedulerEventBridge final
       GuestExecutionSessionAssembler& assembler,
       const kernel::GuestSchedulerCaptureEvent& event,
       std::string* error) noexcept override;
+  GuestExecutionSessionAssemblerAction OnSchedulerSignalWitness(
+      const kernel::GuestSchedulerCaptureSignalWitness& witness,
+      std::string* error) noexcept override;
   bool SealSession(
       GuestExecutionSessionAssembler& assembler,
       const kernel::GuestSchedulerCheckpointBarrierSnapshot& checkpoint,
@@ -76,6 +79,7 @@ class GuestExecutionSessionCaptureSchedulerEventBridge final
       std::string* error) const;
 
   std::vector<Participant> participants_;
+  std::vector<GuestExecutionSessionSignalWitness> signal_witnesses_;
   GuestExecutionSessionSchedulerTopologyChunk start_scheduler_topology_;
   GuestExecutionSessionSchedulerTopologyChunk final_scheduler_topology_;
   uint64_t start_checkpoint_generation_ = 0;

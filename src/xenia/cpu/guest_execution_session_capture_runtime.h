@@ -174,6 +174,11 @@ class GuestExecutionSessionCaptureRuntimeEventBridge {
       GuestExecutionSessionAssembler& assembler,
       const kernel::GuestSchedulerCaptureEvent& event,
       std::string* error) noexcept = 0;
+  // Signal provenance carries no session event of its own, so this reaches the
+  // bridge without the assembler.
+  virtual GuestExecutionSessionAssemblerAction OnSchedulerSignalWitness(
+      const kernel::GuestSchedulerCaptureSignalWitness& witness,
+      std::string* error) noexcept = 0;
   virtual bool SealSession(
       GuestExecutionSessionAssembler& assembler,
       const kernel::GuestSchedulerCheckpointBarrierSnapshot& checkpoint,
@@ -375,6 +380,9 @@ class GuestExecutionSessionCaptureRuntime final
       GuestExecutionCaptureHostCallOutcome outcome) noexcept override;
   bool OnSchedulerEvent(
       const kernel::GuestSchedulerCaptureEvent& event) noexcept override;
+  bool OnSchedulerSignalWitness(
+      const kernel::GuestSchedulerCaptureSignalWitness& witness) noexcept
+      override;
   void OnExternalEventRecorded(GuestExecutionCaptureExternalEventToken token,
                                uint64_t sequence,
                                const GuestExecutionCaptureParticipantIdentity&

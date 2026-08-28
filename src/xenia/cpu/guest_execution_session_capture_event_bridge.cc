@@ -626,6 +626,49 @@ GuestExecutionSessionCaptureSchedulerEventBridge::OnSchedulerEvent(
   return AssemblerAction::kContinue;
 }
 
+AssemblerAction
+GuestExecutionSessionCaptureSchedulerEventBridge::OnSchedulerSignalWitness(
+    const kernel::GuestSchedulerCaptureSignalWitness& witness,
+    std::string* error) noexcept {
+  if (error) {
+    error->clear();
+  }
+  if (!begun_ || sealed_ || finalized_ || rejected_) {
+    rejected_ = true;
+    Fail(error, "scheduler event bridge is not recording");
+    return AssemblerAction::kReject;
+  }
+  GuestExecutionSessionSignalWitness durable;
+  durable.after_scheduler_sequence = witness.after_scheduler_sequence;
+  durable.capture_instance_id = witness.capture_instance_id;
+  durable.guest_thread_id = witness.guest_thread_id;
+  durable.object_handle = witness.object_handle;
+  durable.signal_epoch = witness.signal_epoch;
+  durable.object_type = witness.object_type;
+  if (!witness.capture_instance_id && !witness.guest_thread_id) {
+    durable.source = GuestExecutionSessionSignalWitnessSource::kHost;
+  } else if (FindParticipant(witness.capture_instance_id,
+                             witness.guest_thread_id)) {
+    durable.source = GuestExecutionSessionSignalWitnessSource::kParticipant;
+  } else {
+    durable.source = GuestExecutionSessionSignalWitnessSource::kOffRoster;
+  }
+  const GuestExecutionSessionLimits limits;
+  if (signal_witnesses_.size() >= limits.maximum_signal_witnesses) {
+    rejected_ = true;
+    Fail(error, "scheduler event bridge signal witness table overflowed");
+    return AssemblerAction::kReject;
+  }
+  try {
+    signal_witnesses_.push_back(durable);
+  } catch (...) {
+    rejected_ = true;
+    Fail(error, "scheduler event bridge could not allocate a signal witness");
+    return AssemblerAction::kReject;
+  }
+  return AssemblerAction::kContinue;
+}
+
 bool GuestExecutionSessionCaptureSchedulerEventBridge::SealSession(
     GuestExecutionSessionAssembler& assembler,
     const kernel::GuestSchedulerCheckpointBarrierSnapshot& checkpoint,
@@ -968,7 +1011,8 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::FinalizeBundle(
 
     const uint64_t start_topology_ordinal = final_index + overlay_chunks.size();
     const uint64_t final_topology_ordinal = start_topology_ordinal + 1;
-    const uint64_t final_ordinal = final_topology_ordinal + 1;
+    const uint64_t signal_witness_ordinal = final_topology_ordinal + 1;
+    const uint64_t final_ordinal = signal_witness_ordinal + 1;
     if (final_ordinal > std::numeric_limits<uint32_t>::max()) {
       return Fail(error, "scheduler event bridge final ordinal overflows");
     }
@@ -1003,6 +1047,18 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::FinalizeBundle(
                        static_cast<uint32_t>(
                            final_scheduler_topology_.participants.size()),
                        final_topology_bytes);
+    GuestExecutionSessionSignalWitnessChunk signal_witnesses;
+    signal_witnesses.session_epoch = bundle->manifest.session_epoch;
+    signal_witnesses.ordinal = static_cast<uint32_t>(signal_witness_ordinal);
+    signal_witnesses.witnesses = signal_witnesses_;
+    std::vector<uint8_t> signal_witness_bytes;
+    if (!GuestExecutionSessionCodec::EncodeSignalWitnessChunk(
+            signal_witnesses, &signal_witness_bytes, error)) {
+      return false;
+    }
+    const GuestExecutionSessionChunkReference signal_witness_reference =
+        ChunkReference(GuestExecutionSessionChunkKind::kSignalWitness,
+                       signal_witnesses.ordinal, 0, 0, 1, signal_witness_bytes);
     final_checkpoint.ordinal = static_cast<uint32_t>(final_ordinal);
     std::vector<uint8_t> final_bytes;
     if (!GuestExecutionSessionCodec::EncodeCheckpointChunk(
@@ -1022,6 +1078,8 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::FinalizeBundle(
                           std::move(start_topology_bytes));
     bundle->chunks.insert(bundle->chunks.end() - 1,
                           std::move(final_topology_bytes));
+    bundle->chunks.insert(bundle->chunks.end() - 1,
+                          std::move(signal_witness_bytes));
     bundle->manifest.chunks.back() = std::move(final_reference);
     bundle->manifest.chunks.insert(
         bundle->manifest.chunks.end() - 1,
@@ -1031,6 +1089,8 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::FinalizeBundle(
                                    start_topology_reference);
     bundle->manifest.chunks.insert(bundle->manifest.chunks.end() - 1,
                                    final_topology_reference);
+    bundle->manifest.chunks.insert(bundle->manifest.chunks.end() - 1,
+                                   signal_witness_reference);
   } catch (...) {
     return Fail(error, "scheduler event bridge could not allocate the overlay");
   }

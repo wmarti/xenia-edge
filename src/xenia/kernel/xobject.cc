@@ -396,7 +396,15 @@ std::vector<XObject::SignalRecord> XObject::RecentCooperativeSignals(
 }
 
 void XObject::WakeCooperativeWaiters() {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // The scheduler owns the bump while capture is observing it, so the signal's
+  // tape position is fixed before any waiter can be re-readied on it.
+  kernel_state()->guest_scheduler()->NoteCooperativeSignal(
+      handle(), static_cast<uint32_t>(type()), &cooperative_signal_epoch_);
+#else
   cooperative_signal_epoch_.fetch_add(1);
+#endif
   RecordCooperativeSignal(this);
   // Wake only the CPUs that can act on this signal instead of every CPU with
   // any blocked thread - broadcast wakes on every semaphore release were most
