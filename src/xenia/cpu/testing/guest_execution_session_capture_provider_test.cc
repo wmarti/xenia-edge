@@ -1275,38 +1275,6 @@ TEST_CASE("guest execution session provider binds one woken export dispatch",
   bool nested_host_call = false;
   std::string expected;
 
-  // A wait shape the dispatch cannot bind leaves the participant in neither
-  // class: the export is real and open, so the parity route is unavailable to
-  // it as well.
-  SECTION("a wait kind the export dispatch does not model") {
-    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
-                                       kFunctionAddress, kExportThunkAddress));
-    checkpoint = harness.WokenSecondThreadCheckpoint(
-        kernel::GuestSchedulerCaptureWaitKind::kDelay);
-    expected =
-        "ready-parity participant is parked in an open modeled export "
-        "dispatch";
-  }
-  SECTION("an alertable wait") {
-    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
-                                       kFunctionAddress, kExportThunkAddress));
-    checkpoint = harness.WokenSecondThreadCheckpoint(
-        kernel::GuestSchedulerCaptureWaitKind::kSingle,
-        kernel::kGuestSchedulerCaptureWaitFlagAlertable);
-    expected =
-        "ready-parity participant is parked in an open modeled export "
-        "dispatch";
-  }
-  SECTION("a pending user APC") {
-    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
-                                       kFunctionAddress, kExportThunkAddress));
-    checkpoint = harness.WokenSecondThreadCheckpoint(
-        kernel::GuestSchedulerCaptureWaitKind::kSingle,
-        kernel::kGuestSchedulerCaptureWaitFlagUserApcPending);
-    expected =
-        "ready-parity participant is parked in an open modeled export "
-        "dispatch";
-  }
   SECTION("an unpublished link register") {
     REQUIRE(harness.OpenExportDispatch(harness.second_participant,
                                        kFunctionAddress, kExportThunkAddress));
@@ -1372,6 +1340,62 @@ TEST_CASE("guest execution session provider binds one woken export dispatch",
   REQUIRE(error.find(expected) != std::string::npos);
   REQUIRE(harness.provider->status().state ==
           GuestExecutionSessionCaptureProviderState::kRejected);
+}
+
+TEST_CASE(
+    "guest execution session provider binds a woken waiter by its dispatch",
+    "[guest-execution-session-capture-provider]") {
+  // The scheduler publishes a re-readied fiber's wait as a diagnostic only:
+  // for a ready row it copies the kind, the handle count and the flags and
+  // nothing else, and none of it reaches a durable byte. The open dispatch and
+  // the link register parked on its call site are the whole binding, so every
+  // wait shape binds the same route.
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.InstallExternalEventLog();
+  harness.second_thread->context()->lr = kFunctionAddress;
+  auto checkpoint = harness.WokenSecondThreadCheckpoint();
+
+  SECTION("a wait kind no export dispatch models") {
+    checkpoint = harness.WokenSecondThreadCheckpoint(
+        kernel::GuestSchedulerCaptureWaitKind::kDelay);
+  }
+  SECTION("an alertable wait") {
+    checkpoint = harness.WokenSecondThreadCheckpoint(
+        kernel::GuestSchedulerCaptureWaitKind::kSingle,
+        kernel::kGuestSchedulerCaptureWaitFlagAlertable);
+  }
+  SECTION("a pending user APC") {
+    checkpoint = harness.WokenSecondThreadCheckpoint(
+        kernel::GuestSchedulerCaptureWaitKind::kSingle,
+        kernel::kGuestSchedulerCaptureWaitFlagUserApcPending);
+  }
+
+  const auto dispatch = harness.OpenExportDispatch(
+      harness.second_participant, kFunctionAddress, kExportThunkAddress);
+  REQUIRE(dispatch);
+  std::string error;
+  REQUIRE(harness.provider->BeginCapture(checkpoint,
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+
+  FakeExportSequenceResolver resolver;
+  resolver.Bind(dispatch, harness.second_participant, 73);
+  harness.provider->SetModeledExportSequenceResolver(&resolver);
+  std::vector<uint8_t> state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(harness.second_participant,
+                                                   true, &state_bytes, &error));
+  harness.provider->SetModeledExportSequenceResolver(nullptr);
+  ppc::GuestPPCThreadCheckpoint state;
+  REQUIRE(
+      ppc::GuestPPCThreadCheckpointCodec::Decode(state_bytes, &state, &error));
+  REQUIRE(state.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  REQUIRE(state.resume_pc == kFunctionAddress);
+  REQUIRE(state.owning_function_address == kFunctionAddress);
+  REQUIRE(state.pending_export_guest_address == kExportThunkAddress);
+  REQUIRE(state.pending_external_event_sequence == 73);
 }
 
 TEST_CASE("guest execution session provider checkpoints a ready-parity park",
@@ -1482,8 +1506,9 @@ TEST_CASE("guest execution session provider rejects ready-parity drift",
   ProviderHarness harness;
   harness.AddSecondParticipant();
   harness.InstallExternalEventLog();
-  // A wait no modeled export dispatch binds keeps every section on the parity
-  // arm, so what the final boundary refuses is the parity claim itself.
+  // Nothing modeled is open beneath the fiber at the start boundary, which is
+  // what keeps every section on the parity arm; the wait it carries names no
+  // class of its own.
   const auto checkpoint = harness.WokenSecondThreadCheckpoint(
       kernel::GuestSchedulerCaptureWaitKind::kDelay);
   std::string error;
@@ -1512,12 +1537,15 @@ TEST_CASE("guest execution session provider rejects ready-parity drift",
     REQUIRE(error.find("changed at the boundary") != std::string::npos);
   }
   SECTION("an export dispatch opened inside the interval is not parity") {
+    // A dispatch open beneath the fiber makes it a woken waiter rather than a
+    // park, and a woken waiter at the final boundary is waiting on an export
+    // that returns after the interval, so no captured event can witness it.
     REQUIRE(harness.OpenExportDispatch(harness.second_participant,
                                        kFunctionAddress, kExportThunkAddress));
     REQUIRE_FALSE(harness.provider->SealCapture(
         checkpoint, harness.TwoThreadHostCalls(), &error));
-    REQUIRE(error.find("ready-parity participant is parked in an open modeled "
-                       "export dispatch") != std::string::npos);
+    REQUIRE(error.find("cannot encode a woken modeled export at the final "
+                       "boundary") != std::string::npos);
   }
 }
 
@@ -1723,21 +1751,39 @@ TEST_CASE(
     "[guest-execution-session-capture-provider]") {
   // The frontend finds a second entry point into code it already knows and
   // scans both to the same terminating branch, so two definitions legitimately
-  // reach one address. The nearest entry at or below it is the extent.
+  // reach one address. A link register names no function on its own -- the
+  // emitter reports one only for a safepoint it stopped at -- so the nearest
+  // entry at or below it is the extent this route is given.
   ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.InstallExternalEventLog();
   REQUIRE(harness.processor->ResolveFunction(kLateFunctionAddress));
+  constexpr uint32_t kOverlappedReturnPoint = kLateFunctionAddress + 4;
+  const auto dispatch = harness.OpenExportDispatch(
+      harness.second_participant, kOverlappedReturnPoint, kExportThunkAddress);
+  REQUIRE(dispatch);
+
   std::string error;
-  REQUIRE(harness.provider->BeginCapture(
-      harness.Checkpoint(kLateFunctionAddress + 4, kLateFunctionAddress),
-      harness.Participants(), harness.HostCalls(), &error));
+  const auto checkpoint = harness.BlockedSecondThreadCheckpoint(
+      kernel::GuestSchedulerCaptureWaitKind::kSingle, 0,
+      kOverlappedReturnPoint);
+  REQUIRE(harness.provider->BeginCapture(checkpoint,
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
   REQUIRE(error.empty());
+
+  FakeExportSequenceResolver resolver;
+  resolver.Bind(dispatch, harness.second_participant, 57);
+  harness.provider->SetModeledExportSequenceResolver(&resolver);
   std::vector<uint8_t> state_bytes;
-  REQUIRE(harness.provider->EncodeParticipantState(harness.participant, true,
-                                                   &state_bytes, &error));
+  REQUIRE(harness.provider->EncodeParticipantState(harness.second_participant,
+                                                   true, &state_bytes, &error));
+  harness.provider->SetModeledExportSequenceResolver(nullptr);
   ppc::GuestPPCThreadCheckpoint state;
   REQUIRE(
       ppc::GuestPPCThreadCheckpointCodec::Decode(state_bytes, &state, &error));
-  REQUIRE(state.resume_pc == kLateFunctionAddress + 4);
+  REQUIRE(state.resume_pc == kOverlappedReturnPoint);
+  // The leaf definition reaches the PC too; the nearer entry is the owner.
   REQUIRE(state.owning_function_address == kLateFunctionAddress);
   REQUIRE(state.owning_function_end_address == kLateFunctionEndAddress);
 }
@@ -2061,54 +2107,38 @@ TEST_CASE("guest execution session classifies a woken-in-wait checkpoint",
     REQUIRE_FALSE(
         IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
   }
-  SECTION("no wait at all") {
+  // The wait a ready row carries is a diagnostic, not a class: the scheduler
+  // copies the kind, the handle count and the flags for a re-readied fiber and
+  // nothing else, and none of it reaches a durable byte. So no wait shape
+  // classifies this row; the export dispatch open beneath the fiber is what
+  // separates a re-readied waiter from a plain yield.
+  SECTION("no wait shape classifies the row") {
     participant.blocked_wait_kind =
         kernel::GuestSchedulerCaptureWaitKind::kNone;
     participant.blocked_wait = {};
-    REQUIRE_FALSE(
-        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
-  }
-  SECTION("a wait kind the export dispatch does not model") {
-    participant.blocked_wait_kind =
-        kernel::GuestSchedulerCaptureWaitKind::kIoCompletion;
-    REQUIRE_FALSE(
-        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
-    participant.blocked_wait_kind =
-        kernel::GuestSchedulerCaptureWaitKind::kDelay;
-    REQUIRE_FALSE(
-        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
-  }
-  SECTION("the other modeled wait kinds") {
-    participant.blocked_wait_kind =
-        kernel::GuestSchedulerCaptureWaitKind::kMultiAny;
     REQUIRE(
         IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
-    participant.blocked_wait_kind =
-        kernel::GuestSchedulerCaptureWaitKind::kMultiAll;
-    REQUIRE(
-        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
-  }
-  SECTION("a wait naming no object") {
+    for (const kernel::GuestSchedulerCaptureWaitKind kind :
+         {kernel::GuestSchedulerCaptureWaitKind::kSingle,
+          kernel::GuestSchedulerCaptureWaitKind::kMultiAny,
+          kernel::GuestSchedulerCaptureWaitKind::kMultiAll,
+          kernel::GuestSchedulerCaptureWaitKind::kDelay,
+          kernel::GuestSchedulerCaptureWaitKind::kIoCompletion}) {
+      participant.blocked_wait_kind = kind;
+      REQUIRE(
+          IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
+    }
     participant.blocked_wait.handle_count = 0;
-    REQUIRE_FALSE(
+    REQUIRE(
         IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
-  }
-  SECTION("more handles than the binding holds") {
     participant.blocked_wait.handle_count = static_cast<uint8_t>(
         kernel::kGuestSchedulerCaptureMaximumWaitHandles + 1);
-    REQUIRE_FALSE(
+    REQUIRE(
         IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
-  }
-  SECTION("an alertable wait") {
     participant.blocked_wait.flags |=
-        kernel::kGuestSchedulerCaptureWaitFlagAlertable;
-    REQUIRE_FALSE(
-        IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
-  }
-  SECTION("a pending user APC") {
-    participant.blocked_wait.flags |=
+        kernel::kGuestSchedulerCaptureWaitFlagAlertable |
         kernel::kGuestSchedulerCaptureWaitFlagUserApcPending;
-    REQUIRE_FALSE(
+    REQUIRE(
         IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant));
   }
 }
@@ -2196,8 +2226,10 @@ TEST_CASE("guest execution session provider still gates a woken waiter",
   REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitCheckpointParticipant(
       harness.BlockedSecondThreadCheckpoint().participants.back()));
 
+  // A re-readied waiter and a plain yield publish the same row, so the wait it
+  // carries does not separate them and the classifier admits both.
   auto woken = harness.PassiveSecondThreadCheckpoint().participants.back();
-  REQUIRE_FALSE(IsGuestExecutionSessionWokenInWaitCheckpointParticipant(woken));
+  REQUIRE(IsGuestExecutionSessionWokenInWaitCheckpointParticipant(woken));
   woken.blocked_wait_kind = kernel::GuestSchedulerCaptureWaitKind::kSingle;
   woken.blocked_wait.handle_count = 1;
   woken.blocked_wait.handles[0] = kWaitHandle;
@@ -2208,6 +2240,20 @@ TEST_CASE("guest execution session provider still gates a woken waiter",
   std::string error;
   REQUIRE(harness.provider->SupportsCheckpointParticipant(woken, &error));
   REQUIRE(error.empty());
+
+  // The gate is the dispatch, not the row: with nothing modeled open beneath
+  // it the provider carries the fiber as the park it is and publishes no
+  // woken-export route for it.
+  REQUIRE(harness.provider->BeginCapture(
+      harness.PassiveSecondThreadCheckpoint(), harness.TwoThreadParticipants(),
+      harness.HostCalls(), &error));
+  std::vector<uint8_t> state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(harness.second_participant,
+                                                   true, &state_bytes, &error));
+  ppc::GuestPPCThreadCheckpoint state;
+  REQUIRE(
+      ppc::GuestPPCThreadCheckpointCodec::Decode(state_bytes, &state, &error));
+  REQUIRE(state.resume_kind == ppc::GuestPPCThreadResumeKind::kOutsideGuest);
 
   const auto dormant =
       harness
