@@ -283,6 +283,7 @@ struct GuestExecutionSessionAssembler::Impl {
     uint32_t ordinal = 0;
     uint32_t host_call_depth = 0;
     bool arrived = false;
+    bool parked_below_outer_call = false;
     bool held = false;
     GuestExecutionSessionInitialOuterCallState initial_outer_call_state =
         GuestExecutionSessionInitialOuterCallState::kOutside;
@@ -643,6 +644,10 @@ struct GuestExecutionSessionAssembler::Impl {
     return true;
   }
 
+  static bool AtStartBarrier(const Participant& participant) {
+    return participant.arrived || participant.parked_below_outer_call;
+  }
+
   void HoldParticipantLocked(Participant& participant,
                              GuestExecutionSessionBoundaryArrivalKind kind,
                              uint64_t held_after_event_sequence) {
@@ -906,7 +911,9 @@ struct GuestExecutionSessionAssembler::Impl {
 
   void TryCompleteStartLocked(uint64_t now) {
     if (state != State::kStartRendezvous ||
-        arrived_participant_count != participants.size() ||
+        static_cast<size_t>(arrived_participant_count) +
+                parked_participant_count !=
+            participants.size() ||
         held_sink_count != external_sinks.size()) {
       return;
     }
@@ -1120,6 +1127,7 @@ struct GuestExecutionSessionAssembler::Impl {
   bool seeded = false;
   std::vector<ExternalSink> external_sinks;
   uint32_t arrived_participant_count = 0;
+  uint32_t parked_participant_count = 0;
   uint32_t held_participant_count = 0;
   uint32_t held_sink_count = 0;
   const Participant* outer_return_in_flight = nullptr;
@@ -1464,8 +1472,10 @@ bool GuestExecutionSessionAssembler::RequestStart(std::string* error) {
   }
   impl_->start_request_tick = now;
   impl_->arrived_participant_count = 0;
+  impl_->parked_participant_count = 0;
   for (Impl::Participant& participant : impl_->participants) {
     participant.arrived = participant.host_call_depth == 0;
+    participant.parked_below_outer_call = false;
     if (participant.arrived) {
       participant.initial_outer_call_state =
           GuestExecutionSessionInitialOuterCallState::kOutside;
@@ -1637,7 +1647,7 @@ Action GuestExecutionSessionAssembler::ArriveAtSafepoint(
   }
   switch (impl_->state) {
     case State::kStartRendezvous:
-      if (participant->arrived) {
+      if (Impl::AtStartBarrier(*participant)) {
         return impl_->RejectLocked(
             Rejection::kParticipantNotHeld,
             "capture session parked participant reached a safepoint");
@@ -1693,6 +1703,80 @@ Action GuestExecutionSessionAssembler::ArriveAtSafepoint(
   }
 }
 
+Action GuestExecutionSessionAssembler::ParkBelowOuterCall(
+    const GuestExecutionCaptureParticipantIdentity& identity) {
+  Impl::Scope scope(*impl_);
+  uint64_t now = 0;
+  if (!impl_->BeginCallLocked(scope, &now)) {
+    return impl_->TerminalAction();
+  }
+  Impl::Participant* participant = impl_->FindParticipantLocked(identity);
+  if (!participant) {
+    return Action::kReject;
+  }
+  switch (impl_->state) {
+    case State::kStartRendezvous:
+      if (Impl::AtStartBarrier(*participant)) {
+        return impl_->RejectLocked(Rejection::kParticipantNotHeld,
+                                   "capture session parked participant claims "
+                                   "an unarrived outer call");
+      }
+      if (!participant->host_call_depth) {
+        return impl_->RejectLocked(
+            Rejection::kInvalidCall,
+            "capture session outer call park is outside guest code");
+      }
+      // The participant never reached the barrier, so it is not an arrival.
+      participant->parked_below_outer_call = true;
+      participant->initial_outer_call_state =
+          GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
+      ++impl_->parked_participant_count;
+      impl_->TryCompleteStartLocked(now);
+      return impl_->RendezvousActionLocked();
+    case State::kStopRequested:
+      if (participant->held) {
+        return impl_->RejectLocked(Rejection::kParticipantNotHeld,
+                                   "capture session held participant claims "
+                                   "an unarrived outer call");
+      }
+      if (!participant->host_call_depth) {
+        return impl_->RejectLocked(
+            Rejection::kInvalidCall,
+            "capture session outer call park is outside guest code");
+      }
+      if (!participant->parked_below_outer_call) {
+        return impl_->RejectLocked(
+            Rejection::kInvalidCall,
+            "capture session participant was not parked below an outer call");
+      }
+      if (participant->last_event_sequence >
+          impl_->stop_request_event_sequence) {
+        return impl_->RejectLocked(
+            Rejection::kInvalidCall,
+            "capture session parked participant recorded stop-tail work");
+      }
+      if (impl_->open_segment && impl_->open_segment->participant_index ==
+                                     impl_->IndexOf(participant)) {
+        return impl_->RejectLocked(
+            Rejection::kInvalidCall,
+            "capture session participant parked inside an open segment");
+      }
+      impl_->HoldParticipantLocked(
+          *participant,
+          GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside,
+          impl_->stop_request_event_sequence);
+      impl_->TryCompleteStopLocked(now);
+      return impl_->RendezvousActionLocked();
+    case State::kStopRendezvous:
+    case State::kPublishing:
+      return impl_->RejectLocked(Rejection::kParticipantNotHeld,
+                                 "capture session held participant claims an "
+                                 "unarrived outer call");
+    default:
+      return Action::kContinue;
+  }
+}
+
 Action GuestExecutionSessionAssembler::OnOuterHostCallBegin(
     const GuestExecutionCaptureParticipantIdentity& identity, uint32_t,
     uint32_t, uint32_t) {
@@ -1711,7 +1795,7 @@ Action GuestExecutionSessionAssembler::OnOuterHostCallBegin(
   }
   switch (impl_->state) {
     case State::kStartRendezvous:
-      if (participant->arrived) {
+      if (Impl::AtStartBarrier(*participant)) {
         if (!participant->host_call_depth) {
           return Action::kHold;
         }
@@ -1802,7 +1886,7 @@ Action GuestExecutionSessionAssembler::OnOuterHostCallEnd(
   }
   switch (impl_->state) {
     case State::kStartRendezvous:
-      if (participant->arrived) {
+      if (Impl::AtStartBarrier(*participant)) {
         return impl_->RejectLocked(
             Rejection::kParticipantNotHeld,
             "capture session parked participant returned to host");
@@ -1905,7 +1989,7 @@ Action GuestExecutionSessionAssembler::OnSegmentBegin(
           Rejection::kParticipantNotHeld,
           "capture session held participant began a segment");
     default:
-      return participant->arrived
+      return Impl::AtStartBarrier(*participant)
                  ? impl_->RejectLocked(
                        Rejection::kParticipantNotHeld,
                        "capture session parked participant began a segment")
@@ -2094,7 +2178,7 @@ Action GuestExecutionSessionAssembler::OnInstructionCoverage(
           Rejection::kParticipantNotHeld,
           "capture session held participant executed instructions");
     default:
-      return participant->arrived
+      return Impl::AtStartBarrier(*participant)
                  ? impl_->RejectLocked(Rejection::kParticipantNotHeld,
                                        "capture session parked participant "
                                        "executed instructions")
@@ -2168,7 +2252,7 @@ Action GuestExecutionSessionAssembler::OnGuestMarker(
                       : Rejection::kExternalSinkNotHeld,
           "capture session guest marker after the session was held");
     default:
-      return participant && participant->arrived
+      return participant && Impl::AtStartBarrier(*participant)
                  ? impl_->RejectLocked(
                        Rejection::kParticipantNotHeld,
                        "capture session parked participant reached a marker")
@@ -2280,7 +2364,7 @@ Action GuestExecutionSessionAssembler::OnExternalEvent(
                       : Rejection::kExternalSinkNotHeld,
           "capture session external event after the session was held");
     default:
-      return participant && participant->arrived
+      return participant && Impl::AtStartBarrier(*participant)
                  ? impl_->RejectLocked(Rejection::kParticipantNotHeld,
                                        "capture session parked participant "
                                        "observed an external event")
@@ -2384,13 +2468,13 @@ Action GuestExecutionSessionAssembler::OnMemoryMutation(
             Rejection::kExternalSinkNotHeld,
             "capture session held external sink mutated memory");
       }
-      return participant && participant->arrived
+      return participant && Impl::AtStartBarrier(*participant)
                  ? impl_->RejectLocked(
                        Rejection::kParticipantNotHeld,
                        "capture session parked participant mutated memory")
                  : Action::kContinue;
     default:
-      return participant && participant->arrived
+      return participant && Impl::AtStartBarrier(*participant)
                  ? impl_->RejectLocked(
                        Rejection::kParticipantNotHeld,
                        "capture session parked participant mutated memory")
@@ -2578,6 +2662,7 @@ GuestExecutionSessionAssemblerStatus GuestExecutionSessionAssembler::status()
     entry.ordinal = participant.ordinal;
     entry.host_call_depth = participant.host_call_depth;
     entry.arrived = participant.arrived;
+    entry.parked_below_outer_call = participant.parked_below_outer_call;
     entry.held = participant.held;
     entry.initial_outer_call_state = participant.initial_outer_call_state;
     entry.boundary_arrival_kind = participant.boundary_arrival_kind;

@@ -231,6 +231,7 @@ struct GuestExecutionSessionAssemblerParticipantStatus {
   uint32_t ordinal = 0;
   uint32_t host_call_depth = 0;
   bool arrived = false;
+  bool parked_below_outer_call = false;
   bool held = false;
   GuestExecutionSessionInitialOuterCallState initial_outer_call_state =
       GuestExecutionSessionInitialOuterCallState::kOutside;
@@ -283,20 +284,21 @@ struct GuestExecutionSessionAssemblerStatus {
 // collector, the stop-tail maxima and the bundle limits; a bound that cannot
 // be met rejects rather than truncates. Start and stop wait for every
 // participant to be reported by the adapter as already outside guest code,
-// arrived at a JIT safepoint or returning from its outer host call, and for
-// every external sink to be held, before any checkpoint is taken. The class
-// never parks a thread itself. Outside participants are not parked, so any
-// host-side write between hold and checkpoint must arrive through a
-// registered kHost sink. Invocation coverage requires exactly one segment per
-// admitted outer dispatch. Continuous coverage rejects segments and requires
-// participant instruction progress. A segment straddling the start rejects.
-// The adapter must snapshot roster depth, seed and start forwarding host-call
-// callbacks atomically under its own lock. kHold has no wake-up: parked
-// callers poll status(). There is one global open segment, so concurrent root
-// invocations on two participants reject with kInvalidCall by design. A live
-// XThread sits at host-call depth one or more for its whole life, so kOutside
-// auto-arrival covers only never-dispatched or fully-returned threads and a
-// blocked thread arrives only through a safepoint. std::bad_alloc through the
+// arrived at a JIT safepoint, returning from its outer host call or parked
+// below an outer host call it never arrived at, and for every external sink to
+// be held, before any checkpoint is taken. The class never parks a thread
+// itself. Outside participants are not parked, so any host-side write between
+// hold and checkpoint must arrive through a registered kHost sink. Invocation
+// coverage requires exactly one segment per admitted outer dispatch. Continuous
+// coverage rejects segments and requires participant instruction progress. A
+// segment straddling the start rejects. The adapter must snapshot roster depth,
+// seed and start forwarding host-call callbacks atomically under its own lock.
+// kHold has no wake-up: parked callers poll status(). There is one global open
+// segment, so concurrent root invocations on two participants reject with
+// kInvalidCall by design. A live XThread sits at host-call depth one or more
+// for its whole life, so kOutside auto-arrival covers only never-dispatched or
+// fully-returned threads and a blocked thread either arrives through a
+// safepoint or is parked below its outer call. std::bad_alloc through the
 // noexcept adapters terminates, so configure tight bundle_limits. Nothing is
 // published before Publish() succeeds and a rejected session never publishes.
 // This class has been exercised only with a fake clock, fake providers and a
@@ -336,6 +338,10 @@ class GuestExecutionSessionAssembler final {
   GuestExecutionSessionAssemblerAction OnExternalSinkHeld(
       uint32_t sink_ordinal);
   GuestExecutionSessionAssemblerAction ArriveAtSafepoint(
+      const GuestExecutionCaptureParticipantIdentity& participant);
+  // Holds either barrier for a participant the adapter proved is parked below
+  // an outer host call it never arrived at; it is not an arrival.
+  GuestExecutionSessionAssemblerAction ParkBelowOuterCall(
       const GuestExecutionCaptureParticipantIdentity& participant);
   GuestExecutionSessionAssemblerAction OnOuterHostCallBegin(
       const GuestExecutionCaptureParticipantIdentity& participant,

@@ -1397,6 +1397,134 @@ TEST_CASE("session assembler holds three participants through mixed arrivals",
   REQUIRE(manifest.segments[1].first_event_sequence == 6);
 }
 
+TEST_CASE(
+    "session assembler publishes a participant parked below an outer call",
+    "[guest-execution-session-assembler]") {
+  Harness harness;
+  harness.Seed({{kA, 0}, {kB, 1}});
+  REQUIRE(harness.assembler->Arm(&harness.error));
+  REQUIRE(harness.assembler->RequestStart(&harness.error));
+  REQUIRE(harness.state() == State::kStartRendezvous);
+  REQUIRE(harness.status().participants[0].arrived);
+  REQUIRE_FALSE(harness.status().participants[1].arrived);
+
+  // The park completes the barrier without counting as an arrival.
+  REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kContinue);
+  REQUIRE(harness.state() == State::kRecording);
+  REQUIRE_FALSE(harness.status().participants[1].arrived);
+  REQUIRE(harness.status().participants[1].parked_below_outer_call);
+  REQUIRE(harness.status().participants[1].host_call_depth == 1);
+  REQUIRE(harness.status().participants[0].initial_outer_call_state ==
+          GuestExecutionSessionInitialOuterCallState::kOutside);
+  REQUIRE(harness.status().participants[1].initial_outer_call_state ==
+          GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall);
+
+  ++harness.clock.now;
+  harness.Dispatch(kA);
+  harness.clock.now += 10;
+  REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+  REQUIRE(harness.state() == State::kStopRequested);
+  REQUIRE(harness.status().participants[0].held);
+  REQUIRE_FALSE(harness.status().participants[1].held);
+
+  harness.states.generation = 1;
+  REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kHold);
+  REQUIRE(harness.state() == State::kPublishing);
+
+  const GuestExecutionSessionBundle& bundle = harness.PublishedBundle();
+  const GuestExecutionSessionManifest& manifest = bundle.manifest;
+  REQUIRE(manifest.participants.size() == 2);
+  REQUIRE(manifest.participants[1].initial_outer_call_state ==
+          GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall);
+  REQUIRE(manifest.participants[1].boundary_arrival_kind ==
+          GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside);
+  REQUIRE(manifest.participants[1].first_event_sequence == 0);
+  REQUIRE(manifest.participants[1].last_event_sequence == 0);
+  REQUIRE(manifest.participants[1].held_after_event_sequence ==
+          manifest.stop_request_event_sequence);
+}
+
+TEST_CASE("session assembler refuses an unproven start-boundary park",
+          "[guest-execution-session-assembler]") {
+  Harness harness;
+  harness.Seed({{kA, 0}, {kB, 1}, {kC, 1}});
+  REQUIRE(harness.assembler->Arm(&harness.error));
+  REQUIRE(harness.assembler->RequestStart(&harness.error));
+  REQUIRE(harness.state() == State::kStartRendezvous);
+
+  SECTION("a participant already at the barrier cannot park") {
+    REQUIRE(harness.assembler->ParkBelowOuterCall(kA) == Action::kReject);
+    REQUIRE(harness.status().message ==
+            "capture session parked participant claims an unarrived outer "
+            "call");
+  }
+
+  SECTION("a parked participant cannot park twice") {
+    REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kHold);
+    REQUIRE(harness.state() == State::kStartRendezvous);
+    REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kReject);
+    REQUIRE(harness.status().message ==
+            "capture session parked participant claims an unarrived outer "
+            "call");
+  }
+
+  SECTION("a parked participant cannot arrive") {
+    REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kHold);
+    REQUIRE(harness.assembler->ArriveAtSafepoint(kB) == Action::kReject);
+    REQUIRE(harness.status().message ==
+            "capture session parked participant reached a safepoint");
+  }
+
+  SECTION("a parked participant cannot enter guest code") {
+    REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kHold);
+    REQUIRE(harness.Enter(kB) == Action::kReject);
+    REQUIRE(harness.status().message ==
+            "capture session parked participant entered guest code");
+  }
+
+  SECTION("a parked participant cannot return to host") {
+    REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kHold);
+    REQUIRE(harness.Leave(kB) == Action::kReject);
+    REQUIRE(harness.status().message ==
+            "capture session parked participant returned to host");
+  }
+}
+
+TEST_CASE("session assembler refuses an unproven stop-boundary park",
+          "[guest-execution-session-assembler]") {
+  Harness harness;
+  harness.Seed({{kA, 0}, {kB, 1}});
+  REQUIRE(harness.assembler->Arm(&harness.error));
+  REQUIRE(harness.assembler->RequestStart(&harness.error));
+  REQUIRE(harness.state() == State::kStartRendezvous);
+
+  SECTION("a participant that never parked cannot park at the stop") {
+    REQUIRE(harness.assembler->ArriveAtSafepoint(kB) == Action::kContinue);
+    REQUIRE(harness.state() == State::kRecording);
+    ++harness.clock.now;
+    harness.Dispatch(kA);
+    harness.clock.now += 10;
+    REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+    REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kReject);
+    REQUIRE(harness.status().message ==
+            "capture session participant was not parked below an outer call");
+  }
+
+  SECTION("a parked participant that ran in the stop tail cannot park") {
+    REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kContinue);
+    REQUIRE(harness.state() == State::kRecording);
+    ++harness.clock.now;
+    harness.Dispatch(kA);
+    harness.clock.now += 10;
+    REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+    REQUIRE(harness.assembler->OnInstructionCoverage(kB, 2) ==
+            Action::kContinue);
+    REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kReject);
+    REQUIRE(harness.status().message ==
+            "capture session parked participant recorded stop-tail work");
+  }
+}
+
 TEST_CASE("session assembler stops exactly at event-driven boundaries",
           "[guest-execution-session-assembler]") {
   SECTION("instruction boundary stops on the exact delta") {

@@ -1853,7 +1853,7 @@ TEST_CASE("Guest execution asynchronous rendezvous is fail closed", "[cpu]") {
                                                            &output, &error));
   }
 
-  SECTION("parked-below-outer-call state round trips unadmitted") {
+  SECTION("parked-below-outer-call state round trips and validates") {
     fixture.manifest.participants[0].initial_outer_call_state =
         GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
     REQUIRE(GuestExecutionSessionCodec::EncodeManifest(fixture.manifest,
@@ -1866,10 +1866,36 @@ TEST_CASE("Guest execution asynchronous rendezvous is fail closed", "[cpu]") {
     CHECK(decoded == fixture.manifest);
     CHECK(decoded.participants[0].initial_outer_call_state ==
           GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall);
-    // The class holds an outer host call it never arrived at, so the request
-    // reconciliation still refuses it.
+    // The call stays open for the whole session because the participant never
+    // reaches the barrier and never returns from it.
+    CHECK(GuestExecutionSessionCodec::ValidateSession(decoded, fixture.chunks,
+                                                      &error));
+  }
+
+  SECTION("a parked participant that left its outer call is rejected") {
+    fixture.manifest.participants[0].initial_outer_call_state =
+        GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
+    fixture.manifest.participants[0].first_event_sequence = 2;
+    fixture.manifest.participants[0].last_event_sequence = 2;
+    fixture.manifest.participants[2].initial_outer_call_state =
+        GuestExecutionSessionInitialOuterCallState::kActive;
+    fixture.manifest.participants[2].first_event_sequence = 3;
+    GuestExecutionSessionEvent& call_end = fixture.events.events[1];
+    call_end.thread_ordinal = 0;
+    call_end.kind = GuestExecutionSessionEventKind::kOuterHostCallEnd;
+    ReplaceEventChunk(&fixture);
     CHECK_FALSE(GuestExecutionSessionCodec::ValidateSession(
-        decoded, fixture.chunks, &error));
+        fixture.manifest, fixture.chunks, &error));
+    CHECK(error ==
+          "participant left its unarrived outer call before the request");
+  }
+
+  SECTION("a parked participant that arrived is rejected") {
+    fixture.manifest.participants[1].initial_outer_call_state =
+        GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
+    CHECK_FALSE(GuestExecutionSessionCodec::ValidateSession(
+        fixture.manifest, fixture.chunks, &error));
+    CHECK(error == "participant did not stay below its unarrived outer call");
   }
 
   SECTION("arrival disposition and held sequence are canonical") {

@@ -2964,14 +2964,24 @@ bool GuestExecutionSessionCodec::ValidateSession(
           for (size_t participant_index = 0;
                participant_index < manifest.participants.size();
                ++participant_index) {
+            const GuestExecutionSessionParticipant& held_participant =
+                manifest.participants[participant_index];
+            const bool parked_below_outer_call =
+                held_participant.initial_outer_call_state ==
+                GuestExecutionSessionInitialOuterCallState::
+                    kParkedBelowOuterCall;
             const bool expected_active =
-                manifest.participants[participant_index]
-                    .boundary_arrival_kind !=
-                GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside;
+                parked_below_outer_call ||
+                held_participant.boundary_arrival_kind !=
+                    GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside;
             if (observed_participant_ranges[participant_index]
                     .outer_host_call_active != expected_active) {
               return Fail(
-                  error, "participant outer-call state differs at the request");
+                  error,
+                  parked_below_outer_call
+                      ? "participant left its unarrived outer call before the "
+                        "request"
+                      : "participant outer-call state differs at the request");
             }
           }
           saw_boundary_request = true;
@@ -3354,14 +3364,27 @@ bool GuestExecutionSessionCodec::ValidateSession(
         manifest.participants[i];
     const ObservedParticipantRange& observed = observed_participant_ranges[i];
     const bool has_no_events = !participant.first_event_sequence;
+    const bool parked_below_outer_call =
+        participant.initial_outer_call_state ==
+        GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
+    // The class claims the participant never reached the barrier and never
+    // left the call it is parked below, so both must still hold at the end.
+    if (parked_below_outer_call &&
+        (participant.boundary_arrival_kind !=
+             GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside ||
+         !observed.outer_host_call_active)) {
+      return Fail(error,
+                  "participant did not stay below its unarrived outer call");
+    }
     const uint32_t expected_arrival_count =
         participant.boundary_arrival_kind ==
                 GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside
             ? 0
             : 1;
     const bool expected_outer_call_active =
+        parked_below_outer_call ||
         participant.boundary_arrival_kind ==
-        GuestExecutionSessionBoundaryArrivalKind::kJitSafepoint;
+            GuestExecutionSessionBoundaryArrivalKind::kJitSafepoint;
     if ((has_no_events ? observed.has_event
                        : (!observed.has_event ||
                           observed.first_event_sequence !=
