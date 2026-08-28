@@ -65,14 +65,32 @@ struct GuestExecutionCaptureExternalEventToken {
 struct GuestExecutionCaptureExternalEventLimits {
   uint64_t max_active_calls = 256;
   uint64_t max_recorded_events = 1u << 20;
+  // Ranges per event, and bytes summed across them.
+  uint32_t max_effect_ranges = 16;
   uint32_t max_effect_bytes = 64u * 1024u;
   uint64_t max_total_payload_bytes = 64ull * 1024ull * 1024ull;
 };
 
-// Opens one external event. The declared guest-memory effect range is the
-// contiguous region the export is expected to write; its exact preimage bytes
-// are supplied separately and snapshotted before the export body runs. An
-// empty preimage means the event declares no guest-memory effect.
+// One contiguous guest-memory region an external event declares it writes. A
+// range list is canonical: every range is non-empty, the list ascends by
+// address, and no two ranges overlap or abut, so one declared write region has
+// exactly one representation and two records compare field by field.
+struct GuestExecutionCaptureExternalEventEffectRange {
+  uint32_t address = 0;
+  uint32_t byte_count = 0;
+
+  bool operator==(const GuestExecutionCaptureExternalEventEffectRange&) const =
+      default;
+};
+
+// Opens one external event. The declared guest-memory effect is a list of
+// canonical ranges the export is expected to write; their exact preimage bytes
+// are supplied separately, concatenated in range order, and snapshotted before
+// the export body runs. An empty range list means the event declares no
+// guest-memory effect. The ranges stay separate rather than collapsing to one
+// hull because a modeled blocking export writes the guest thread structure,
+// each waited dispatch header and an output status word, and a hull would
+// claim bytes the export never wrote.
 struct GuestExecutionCaptureExternalEventBegin {
   GuestExecutionCaptureParticipantIdentity participant;
   GuestExecutionCaptureExternalEventKind kind =
@@ -81,15 +99,16 @@ struct GuestExecutionCaptureExternalEventBegin {
   uint32_t export_ordinal = 0;
   // Guest return address at the dispatch boundary, for provenance only.
   uint32_t call_site_address = 0;
-  // Base of the declared guest-memory effect range; meaningful only when the
-  // preimage span is non-empty.
-  uint32_t effect_address = 0;
+  // Declared guest-memory effect ranges; the preimage span is exactly their
+  // byte counts concatenated in this order.
+  std::span<const GuestExecutionCaptureExternalEventEffectRange> effect_ranges;
 };
 
 // Closes one external event with its observed result and postimage. The
 // postimage span must be empty when the begin declared no effect, and
-// otherwise exactly as long as the preimage. mutation_source must be
-// kActiveGuestThread exactly when an effect is present.
+// otherwise exactly as long as the preimage, in the same range order.
+// mutation_source must be kActiveGuestThread exactly when an effect is
+// present.
 struct GuestExecutionCaptureExternalEventEnd {
   GuestExecutionCaptureExternalEventDisposition disposition =
       GuestExecutionCaptureExternalEventDisposition::kReplayCaptured;
@@ -102,7 +121,7 @@ struct GuestExecutionCaptureExternalEventEnd {
 
 // One finished external event. Payload bytes are canonical: the return value
 // is little-endian, and the guest-memory pre/postimages are the exact guest
-// bytes for the recorded address and range.
+// bytes for the recorded ranges, concatenated in range order.
 struct GuestExecutionCaptureExternalEventRecord {
   uint64_t sequence = 0;
   GuestExecutionCaptureParticipantIdentity participant;
@@ -116,7 +135,8 @@ struct GuestExecutionCaptureExternalEventRecord {
   uint32_t call_site_address = 0;
   bool has_returned_value = false;
   std::array<uint8_t, 8> returned_value_le = {};
-  uint32_t effect_address = 0;
+  std::vector<GuestExecutionCaptureExternalEventEffectRange> effect_ranges;
+  // Summed range bytes, which is also each image's length.
   uint32_t effect_byte_count = 0;
   std::vector<uint8_t> preimage;
   std::vector<uint8_t> postimage;
@@ -145,7 +165,7 @@ struct GuestExecutionCaptureExternalEventActiveCall {
       GuestExecutionCaptureExternalEventKind::kKernelExport;
   uint32_t export_ordinal = 0;
   uint32_t call_site_address = 0;
-  uint32_t effect_address = 0;
+  std::vector<GuestExecutionCaptureExternalEventEffectRange> effect_ranges;
   uint32_t effect_byte_count = 0;
   uint32_t participant_depth = 0;
 
@@ -197,8 +217,8 @@ class GuestExecutionCaptureExternalEventLog final {
   GuestExecutionCaptureExternalEventLog& operator=(
       const GuestExecutionCaptureExternalEventLog&) = delete;
 
-  // Opens an event, snapshotting the declared effect preimage. Returns an empty
-  // token on rejection.
+  // Opens an event, snapshotting the declared effect ranges' preimage. Returns
+  // an empty token on rejection.
   GuestExecutionCaptureExternalEventToken OnExternalEventBegin(
       const GuestExecutionCaptureExternalEventBegin& begin,
       std::span<const uint8_t> effect_preimage) noexcept;

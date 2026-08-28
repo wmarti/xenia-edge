@@ -44,6 +44,34 @@ bool IsKnownMutationSource(
                        kActiveGuestThread;
 }
 
+// Canonical form: non-empty ranges, ascending by address, separated by at
+// least one byte, and none wrapping the guest address space. Overlapping or
+// abutting ranges would let one byte reach the images twice and would give a
+// single write region more than one representation.
+bool AreCanonicalEffectRanges(
+    std::span<const GuestExecutionCaptureExternalEventEffectRange> ranges,
+    uint64_t* total_byte_count) {
+  constexpr uint64_t kGuestAddressSpaceEnd =
+      uint64_t(std::numeric_limits<uint32_t>::max()) + 1;
+  uint64_t total = 0;
+  uint64_t previous_end = 0;
+  bool have_previous = false;
+  for (const GuestExecutionCaptureExternalEventEffectRange& range : ranges) {
+    const uint64_t end = uint64_t(range.address) + range.byte_count;
+    if (!range.byte_count || end > kGuestAddressSpaceEnd) {
+      return false;
+    }
+    if (have_previous && uint64_t(range.address) <= previous_end) {
+      return false;
+    }
+    previous_end = end;
+    have_previous = true;
+    total += range.byte_count;
+  }
+  *total_byte_count = total;
+  return true;
+}
+
 std::array<uint8_t, 8> EncodeLittleEndian(uint64_t value) {
   std::array<uint8_t, 8> bytes = {};
   for (size_t i = 0; i < bytes.size(); ++i) {
@@ -93,22 +121,23 @@ GuestExecutionCaptureExternalEventLog::OnExternalEventBegin(
     return {};
   }
   if (!begin.participant.capture_instance_id || !IsKnownKind(begin.kind) ||
+      begin.effect_ranges.size() > impl_->limits.max_effect_ranges ||
       effect_preimage.size() > impl_->limits.max_effect_bytes) {
+    impl_->RejectLocked(
+        GuestExecutionCaptureExternalEventRejection::kInvalidBegin);
+    return {};
+  }
+  uint64_t declared_byte_count = 0;
+  // The preimage must account for every declared byte and no others, so a
+  // range list can never claim guest memory the images do not carry.
+  if (!AreCanonicalEffectRanges(begin.effect_ranges, &declared_byte_count) ||
+      declared_byte_count != effect_preimage.size()) {
     impl_->RejectLocked(
         GuestExecutionCaptureExternalEventRejection::kInvalidBegin);
     return {};
   }
   const uint32_t effect_byte_count =
       static_cast<uint32_t>(effect_preimage.size());
-  if (effect_byte_count) {
-    const uint64_t last_byte =
-        uint64_t(begin.effect_address) + effect_byte_count - 1;
-    if (last_byte > std::numeric_limits<uint32_t>::max()) {
-      impl_->RejectLocked(
-          GuestExecutionCaptureExternalEventRejection::kInvalidBegin);
-      return {};
-    }
-  }
   if (impl_->active_calls.size() >= impl_->limits.max_active_calls) {
     impl_->RejectLocked(
         GuestExecutionCaptureExternalEventRejection::kActiveCallLimit);
@@ -131,12 +160,19 @@ GuestExecutionCaptureExternalEventLog::OnExternalEventBegin(
 
   const GuestExecutionCaptureExternalEventToken token = {impl_->next_token};
   try {
+    GuestExecutionCaptureExternalEventActiveCall active_call;
+    active_call.token = token;
+    active_call.participant = begin.participant;
+    active_call.kind = begin.kind;
+    active_call.export_ordinal = begin.export_ordinal;
+    active_call.call_site_address = begin.call_site_address;
+    active_call.effect_ranges.assign(begin.effect_ranges.begin(),
+                                     begin.effect_ranges.end());
+    active_call.effect_byte_count = effect_byte_count;
+    active_call.participant_depth = participant_depth;
     impl_->active_preimages.emplace_back(effect_preimage.begin(),
                                          effect_preimage.end());
-    impl_->active_calls.push_back(
-        {token, begin.participant, begin.kind, begin.export_ordinal,
-         begin.call_site_address, begin.effect_address, effect_byte_count,
-         participant_depth});
+    impl_->active_calls.push_back(std::move(active_call));
   } catch (...) {
     // Keep the two side arrays balanced before latching the failure.
     if (impl_->active_preimages.size() > impl_->active_calls.size()) {
@@ -226,9 +262,9 @@ bool GuestExecutionCaptureExternalEventLog::OnExternalEventEnd(
   if (end.has_returned_value) {
     record.returned_value_le = EncodeLittleEndian(end.returned_value);
   }
-  record.effect_address = active_call.effect_address;
   record.effect_byte_count = active_call.effect_byte_count;
   try {
+    record.effect_ranges = active_call.effect_ranges;
     record.preimage = impl_->active_preimages[active_index];
     record.postimage.assign(effect_postimage.begin(), effect_postimage.end());
     impl_->events.push_back(std::move(record));

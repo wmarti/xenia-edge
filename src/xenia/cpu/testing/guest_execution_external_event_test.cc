@@ -33,12 +33,29 @@ using MutationSource = GuestExecutionCaptureExternalEventMutationSource;
 using Rejection = GuestExecutionCaptureExternalEventRejection;
 using Begin = GuestExecutionCaptureExternalEventBegin;
 using End = GuestExecutionCaptureExternalEventEnd;
+using Range = GuestExecutionCaptureExternalEventEffectRange;
 
 constexpr std::span<const uint8_t> kNoEffect = {};
 
 GuestExecutionCaptureParticipantIdentity Participant(uint64_t instance_id,
                                                      uint32_t thread_id) {
   return {instance_id, thread_id};
+}
+
+// A range list the images cannot exactly account for must latch on begin, so
+// no event ever claims guest bytes it did not snapshot.
+void RequireInvalidBegin(
+    const std::vector<Range>& ranges, const std::vector<uint8_t>& preimage,
+    const GuestExecutionCaptureExternalEventLimits& limits = {}) {
+  Log log(limits);
+  Begin begin;
+  begin.participant = Participant(0xB1, 0xB1B);
+  begin.effect_ranges = ranges;
+  REQUIRE_FALSE(log.OnExternalEventBegin(begin, preimage));
+  const GuestExecutionCaptureExternalEventSnapshot snapshot = log.snapshot();
+  REQUIRE(snapshot.rejection == Rejection::kInvalidBegin);
+  REQUIRE(snapshot.active_calls.empty());
+  REQUIRE(snapshot.events.empty());
 }
 
 }  // namespace
@@ -78,6 +95,7 @@ TEST_CASE("External event log records a canonical returned scalar",
   const std::array<uint8_t, 8> expected = {0x34, 0x00, 0x00, 0xC0,
                                            0x00, 0x00, 0x00, 0x00};
   REQUIRE(record.returned_value_le == expected);
+  REQUIRE(record.effect_ranges.empty());
   REQUIRE(record.effect_byte_count == 0);
   REQUIRE(record.preimage.empty());
   REQUIRE(record.postimage.empty());
@@ -90,7 +108,8 @@ TEST_CASE("External event log snapshots the guest buffer pre/postimage",
   Begin begin;
   begin.participant = Participant(0x22, 0x202);
   begin.kind = Kind::kKernelExport;
-  begin.effect_address = 0x30001000;
+  const std::vector<Range> ranges = {{0x30001000, 4}};
+  begin.effect_ranges = ranges;
 
   const std::vector<uint8_t> preimage = {0xAA, 0xBB, 0xCC, 0xDD};
   const GuestExecutionCaptureExternalEventToken token =
@@ -106,12 +125,92 @@ TEST_CASE("External event log snapshots the guest buffer pre/postimage",
   REQUIRE(snapshot.events.size() == 1);
   const auto& record = snapshot.events[0];
   REQUIRE(record.mutation_source == MutationSource::kActiveGuestThread);
-  REQUIRE(record.effect_address == 0x30001000);
+  REQUIRE(record.effect_ranges == ranges);
   REQUIRE(record.effect_byte_count == 4);
   REQUIRE(record.preimage == preimage);
   REQUIRE(record.postimage == postimage);
   REQUIRE_FALSE(record.has_returned_value);
   REQUIRE(snapshot.total_payload_bytes == 8);
+}
+
+TEST_CASE("External event log snapshots disjoint guest effect ranges",
+          "[guest-external-event]") {
+  Log log;
+  Begin begin;
+  begin.participant = Participant(0x23, 0x203);
+  begin.kind = Kind::kKernelExport;
+  begin.call_site_address = 0x82081740;
+  // One modeled blocking export writes the guest thread structure, a waited
+  // dispatch header and an output status word, which are not contiguous.
+  const std::vector<Range> ranges = {
+      {0x30001000, 4}, {0x30002000, 2}, {0x30002010, 1}};
+  begin.effect_ranges = ranges;
+
+  const std::vector<uint8_t> preimage = {0xAA, 0xBB, 0xCC, 0xDD,
+                                         0x10, 0x11, 0x20};
+  const GuestExecutionCaptureExternalEventToken token =
+      log.OnExternalEventBegin(begin, preimage);
+  REQUIRE(token);
+
+  const GuestExecutionCaptureExternalEventSnapshot open = log.snapshot();
+  REQUIRE(open.active_calls.size() == 1);
+  REQUIRE(open.active_calls[0].effect_ranges == ranges);
+  REQUIRE(open.active_calls[0].effect_byte_count == 7);
+
+  const std::vector<uint8_t> postimage = {0x01, 0x02, 0x03, 0x04,
+                                          0x12, 0x13, 0x21};
+  End end;
+  end.mutation_source = MutationSource::kActiveGuestThread;
+  end.has_returned_value = true;
+  end.returned_value = 0;
+  REQUIRE(log.OnExternalEventEnd(token, end, postimage));
+
+  const GuestExecutionCaptureExternalEventSnapshot snapshot = log.snapshot();
+  REQUIRE(snapshot.rejection == Rejection::kNone);
+  REQUIRE(snapshot.events.size() == 1);
+  const auto& record = snapshot.events[0];
+  REQUIRE(record.call_site_address == 0x82081740);
+  REQUIRE(record.effect_ranges == ranges);
+  REQUIRE(record.effect_byte_count == 7);
+  REQUIRE(record.preimage == preimage);
+  REQUIRE(record.postimage == postimage);
+  // Range order is payload order: the second range's bytes follow the first
+  // range's four, with no padding between regions.
+  REQUIRE(record.postimage[4] == 0x12);
+  REQUIRE(record.postimage[6] == 0x21);
+  REQUIRE(snapshot.total_payload_bytes == 7 * 2 + 8);
+}
+
+TEST_CASE("External event log rejects a non-canonical effect range list",
+          "[guest-external-event]") {
+  SECTION("ranges overlap") {
+    RequireInvalidBegin({{0x30001000, 8}, {0x30001004, 4}},
+                        std::vector<uint8_t>(12, 0x00));
+  }
+  SECTION("ranges abut") {
+    RequireInvalidBegin({{0x30001000, 4}, {0x30001004, 4}},
+                        std::vector<uint8_t>(8, 0x00));
+  }
+  SECTION("ranges descend") {
+    RequireInvalidBegin({{0x30002000, 4}, {0x30001000, 4}},
+                        std::vector<uint8_t>(8, 0x00));
+  }
+  SECTION("a range is empty") { RequireInvalidBegin({{0x30001000, 0}}, {}); }
+  SECTION("a range wraps the guest address space") {
+    RequireInvalidBegin({{0xFFFFFFFC, 8}}, std::vector<uint8_t>(8, 0x00));
+  }
+  SECTION("the preimage is shorter than the declared bytes") {
+    RequireInvalidBegin({{0x30001000, 4}}, std::vector<uint8_t>(3, 0x00));
+  }
+  SECTION("the preimage carries undeclared bytes") {
+    RequireInvalidBegin({}, std::vector<uint8_t>(4, 0x00));
+  }
+  SECTION("ranges exceed the per-event range limit") {
+    GuestExecutionCaptureExternalEventLimits limits;
+    limits.max_effect_ranges = 2;
+    RequireInvalidBegin({{0x30001000, 1}, {0x30001002, 1}, {0x30001004, 1}},
+                        std::vector<uint8_t>(3, 0x00), limits);
+  }
 }
 
 TEST_CASE("External event log rejects mislabeled mutation sources",
@@ -120,6 +219,8 @@ TEST_CASE("External event log rejects mislabeled mutation sources",
     Log log;
     Begin begin;
     begin.participant = Participant(0x33, 0x303);
+    const std::vector<Range> ranges = {{0x30001000, 2}};
+    begin.effect_ranges = ranges;
     const std::vector<uint8_t> preimage = {0x00, 0x11};
     const auto token = log.OnExternalEventBegin(begin, preimage);
     REQUIRE(token);
@@ -144,6 +245,8 @@ TEST_CASE("External event log rejects mislabeled mutation sources",
     Log log;
     Begin begin;
     begin.participant = Participant(0x33, 0x303);
+    const std::vector<Range> ranges = {{0x30001000, 3}};
+    begin.effect_ranges = ranges;
     const std::vector<uint8_t> preimage = {0x00, 0x11, 0x22};
     const auto token = log.OnExternalEventBegin(begin, preimage);
     REQUIRE(token);
@@ -336,6 +439,8 @@ TEST_CASE("External event log bounds effect size, buffering and payload",
     Log log(limits);
     Begin begin;
     begin.participant = Participant(0x99, 0x909);
+    const std::vector<Range> ranges = {{0x30001000, 5}};
+    begin.effect_ranges = ranges;
     const std::vector<uint8_t> preimage(5, 0x00);
     REQUIRE_FALSE(log.OnExternalEventBegin(begin, preimage));
     REQUIRE(log.snapshot().rejection == Rejection::kInvalidBegin);
@@ -372,7 +477,8 @@ TEST_CASE("External event log bounds effect size, buffering and payload",
     Log log(limits);
     Begin begin;
     begin.participant = Participant(0x99, 0x909);
-    begin.effect_address = 0x40000000;
+    const std::vector<Range> ranges = {{0x40000000, 3}};
+    begin.effect_ranges = ranges;
     const std::vector<uint8_t> preimage = {0x00, 0x11, 0x22};
     const std::vector<uint8_t> postimage = {0x33, 0x44, 0x55};
     const auto token = log.OnExternalEventBegin(begin, preimage);
