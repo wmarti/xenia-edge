@@ -45,6 +45,7 @@ DECLARE_bool(guest_scheduler);
 #if XE_PLATFORM_MAC
 #include <mach/mach.h>
 #include <mach/thread_info.h>
+#include <pthread/qos.h>
 #include <time.h>
 #endif
 
@@ -1192,6 +1193,17 @@ bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
         "configuration provenance",
         "runtime replay configuration SHA-256 does not match the artifact");
   }
+
+#if XE_PLATFORM_MAC
+  // Apple documents quality of service as a scheduling bias rather than a
+  // guarantee, and documents no affinity control on Apple silicon, so this
+  // only makes an efficiency-core placement less likely. Raise it before
+  // warmup so code placement and the timed batch see one scheduling class.
+  if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) != 0) {
+    return Reject("thread scheduling",
+                  "failed to raise the replay thread quality of service");
+  }
+#endif  // XE_PLATFORM_MAC
 
   if (!runner->WarmAndVerify(&error)) {
     return Reject("warm verification", error);
