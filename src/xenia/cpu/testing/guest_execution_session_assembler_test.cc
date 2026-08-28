@@ -2578,7 +2578,7 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
   REQUIRE(harness.assembler->SeedParticipants(seeds, roster));
 
   GuestExecutionSessionCaptureSchedulerEventBridge bridge;
-  REQUIRE(bridge.BeginSession(*harness.assembler, BridgeCheckpoint(1, {kA}),
+  REQUIRE(bridge.BeginSession(*harness.assembler, BridgeCheckpoint(1, {kA, kB}),
                               seeds, &harness.error));
   REQUIRE(harness.assembler->Arm(&harness.error));
   REQUIRE(harness.assembler->RequestStart(&harness.error));
@@ -2632,7 +2632,10 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
   const bool finalized = bridge.FinalizeBundle(&bundle, 4, &harness.error);
   INFO(harness.error);
   REQUIRE(finalized);
-  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &harness.error));
+  const bool validated =
+      ValidateGuestExecutionSessionBundle(bundle, &harness.error);
+  INFO(harness.error);
+  REQUIRE(validated);
   std::vector<GuestExecutionSessionSchedulerTopologyChunk> scheduler_topologies;
   for (size_t chunk_index = 0; chunk_index < bundle.manifest.chunks.size();
        ++chunk_index) {
@@ -2658,7 +2661,9 @@ TEST_CASE("scheduler event bridge closes the canonical continuous tape",
           GuestExecutionSessionSchedulerResumeKind::kJitSafepoint);
   REQUIRE(scheduler_topologies[0].participants[0].guest_pc == 0x82000040);
   REQUIRE(scheduler_topologies[0].participants[1].state ==
-          GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned);
+          GuestExecutionSessionSchedulerParticipantState::kReady);
+  REQUIRE(scheduler_topologies[0].participants[1].ready_queue_fifo_ordinal ==
+          1);
   REQUIRE(scheduler_topologies[1].boundary ==
           GuestExecutionSessionSchedulerTopologyBoundary::kFinal);
   REQUIRE(scheduler_topologies[1].participants[0].state ==
