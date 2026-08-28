@@ -659,6 +659,19 @@ struct GuestInvocationRecorder::Impl {
     return true;
   }
 
+  // A tail call replaces the current frame rather than nesting under it. The
+  // target inherits this frame's return boundary and reports its own entry, so
+  // dropping the frame here leaves that entry to push it at the same depth.
+  bool TakeTailCall(uint32_t from_address) {
+    if (call_stack.empty() || call_stack.back().address != from_address) {
+      return Reject(GuestInvocationRecorderRejection::kUnbalancedReturn,
+                    "tail call does not match the recorded call stack",
+                    kGuestInvocationDependencyUnbalancedReturn);
+    }
+    call_stack.pop_back();
+    return true;
+  }
+
   bool IsRecordingAttempt() const {
     return state == GuestInvocationRecorderState::kRecordingDiscovery ||
            state == GuestInvocationRecorderState::kRecordingFinalAttempt;
@@ -1261,11 +1274,10 @@ bool GuestInvocationRecorder::OnFunctionExit(
                          kGuestInvocationDependencyUnbalancedReturn);
   }
   impl_->call_stack.pop_back();
-  if (address != impl_->selection.root_address) {
+  if (!impl_->call_stack.empty()) {
     return true;
   }
-  if (!impl_->call_stack.empty() ||
-      return_address != impl_->attempt_return_address) {
+  if (return_address != impl_->attempt_return_address) {
     return impl_->Reject(GuestInvocationRecorderRejection::kUnbalancedReturn,
                          "root exit does not match its normal return boundary",
                          kGuestInvocationDependencyUnbalancedReturn);
@@ -1412,9 +1424,7 @@ bool GuestInvocationRecorder::OnTailCall(
     return impl_->Reject(GuestInvocationRecorderRejection::kInvalidEvent,
                          "tail-call event has an invalid address");
   }
-  return impl_->Reject(GuestInvocationRecorderRejection::kUnbalancedReturn,
-                       "tail calls are unsupported in invocation recording",
-                       kGuestInvocationDependencyUnbalancedReturn);
+  return impl_->TakeTailCall(from_address);
 }
 
 bool GuestInvocationRecorder::OnUnwindOrLongjmp(

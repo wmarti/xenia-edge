@@ -985,11 +985,46 @@ TEST_CASE("guest invocation recorder rejects abnormal control flow",
                     GuestInvocationRecorderRejection::kUnbalancedReturn,
                     kGuestInvocationDependencyUnbalancedReturn);
   }
-  SECTION("tail call") {
+  SECTION("tail call replaces the calling frame") {
+    reader.AddPage(kDataPageA, 1);
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
+    Define(*recorder, kNestedAddress, kNestedEndAddress);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      EnterRoot(*recorder);
+      REQUIRE(recorder->OnTailCall(kOwner, kRootAddress, kNestedAddress));
+      REQUIRE(recorder->OnFunctionEntry(kOwner, kNestedAddress,
+                                        kNestedEndAddress, MakeState(2)));
+      Access(*recorder, kDataPageA);
+      REQUIRE(recorder->OnFunctionExit(kOwner, kNestedAddress, kReturnAddress,
+                                       MakeState(3)));
+    }
+    REQUIRE(recorder->state() ==
+            GuestInvocationRecorderState::kWaitingForFinalAttempt);
     EnterRoot(*recorder);
-    REQUIRE_FALSE(recorder->OnTailCall(kOwner, kRootAddress, kNestedAddress));
+    REQUIRE(recorder->OnTailCall(kOwner, kRootAddress, kNestedAddress));
+    REQUIRE(recorder->OnFunctionEntry(kOwner, kNestedAddress, kNestedEndAddress,
+                                      MakeState(2)));
+    Access(*recorder, kDataPageA);
+    REQUIRE(recorder->OnFunctionExit(kOwner, kNestedAddress, kReturnAddress,
+                                     MakeState(3)));
+    REQUIRE(recorder->state() == GuestInvocationRecorderState::kComplete);
+    const GuestInvocationRecorderResult* result = recorder->result();
+    REQUIRE(result);
+    REQUIRE(result->invocation.function_address == kRootAddress);
+    REQUIRE(result->invocation.expected_return_address == kReturnAddress);
+    REQUIRE((result->entered_functions ==
+             std::vector<GuestInvocationRecorderFunction>{
+                 {kRootAddress, kRootEndAddress},
+                 {kNestedAddress, kNestedEndAddress}}));
+  }
+  SECTION("tail call must leave the recorded call stack") {
+    std::unique_ptr<GuestInvocationRecorder> recorder =
+        MakeRecorder(reader, clock);
+    Define(*recorder, kNestedAddress, kNestedEndAddress);
+    EnterRoot(*recorder);
+    REQUIRE_FALSE(
+        recorder->OnTailCall(kOwner, kNestedAddress, kUnrelatedAddress));
     RequireRejected(*recorder,
                     GuestInvocationRecorderRejection::kUnbalancedReturn,
                     kGuestInvocationDependencyUnbalancedReturn);
