@@ -2038,17 +2038,22 @@ GuestExecutionSessionSignalWitness ParticipantSignalWitness(
   return witness;
 }
 
-struct ReadyParityOptions {
+struct ParityParkOptions {
+  bool blocked_row = false;
   bool executable_boundary_state = false;
+  bool parked_route_state = false;
   bool suspended_row = false;
   bool overlay_names_participant = false;
+  bool final_deadline_reached = false;
+  bool final_deadline_differs = false;
+  bool final_signal_epoch_moved = false;
 };
 
 // Adds a second participant to the pending-export fixture: a fiber the
-// barrier caught on a ready queue below the root dispatch it never arrived
-// at, byte identical at both boundaries and named by no record on the tape.
-GuestExecutionSessionBundle MakeReadyParityBundle(
-    ReadyParityOptions options = {}) {
+// barrier caught below the root dispatch it never arrived at, byte identical
+// at both boundaries and named by no record on the tape. It is caught on a
+// ready queue, or blocked in a wait no modeled dispatch owns.
+GuestExecutionSessionBundle MakeParityParkBundle(ParityParkOptions options) {
   constexpr uint32_t kParkedThreadId = 8;
   constexpr uint64_t kParkedInstanceId = 0x101;
   GuestExecutionSessionBundle bundle = MakePendingExportBundle();
@@ -2066,6 +2071,13 @@ GuestExecutionSessionBundle MakeReadyParityBundle(
     parked.outer_guest_return_address = 0x82000100;
   } else {
     parked.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+  }
+  if (options.parked_route_state) {
+    parked.resume_kind = ppc::GuestPPCThreadResumeKind::kGuestBlockHead;
+    parked.resume_pc = 0x82000040;
+    parked.owning_function_address = 0x82000000;
+    parked.owning_function_end_address = 0x820000FC;
+    parked.outer_guest_return_address = 0x82000100;
   }
   const std::vector<uint8_t> parked_bytes = EncodeThreadCheckpoint(parked);
   const GuestExecutionSessionSha256 parked_state =
@@ -2113,6 +2125,44 @@ GuestExecutionSessionBundle MakeReadyParityBundle(
     row.ready_queue_level = kGuestExecutionSessionSchedulerNoValue;
     row.ready_queue_fifo_ordinal = kGuestExecutionSessionSchedulerNoValue;
   }
+  if (options.blocked_row) {
+    row.state = GuestExecutionSessionSchedulerParticipantState::kBlocked;
+    row.ready_queue_level = kGuestExecutionSessionSchedulerNoValue;
+    row.ready_queue_fifo_ordinal = kGuestExecutionSessionSchedulerNoValue;
+    row.resume_kind =
+        GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport;
+    row.guest_pc = 0x82000200;
+    row.restorable = false;
+    row.blocked_wait.kind = GuestExecutionSessionSchedulerWaitKind::kSingle;
+    row.blocked_wait.deadline_ms = 5000;
+    row.blocked_wait.observed_uptime_ms = 1000;
+    row.blocked_wait.wait_epoch = 3;
+    row.blocked_wait.observed_wait_epoch = 3;
+    row.blocked_wait.handle_count = 1;
+    row.blocked_wait.flags =
+        kGuestExecutionSessionSchedulerWaitFlagGated |
+        kGuestExecutionSessionSchedulerWaitFlagInterruptible;
+    row.blocked_wait.handles[0] = 0x00110001u;
+    row.blocked_wait.signal_epochs_before[0] = 3;
+    row.blocked_wait.signal_epochs_observed[0] = 3;
+  }
+  GuestExecutionSessionSchedulerTopologyParticipant final_row = row;
+  if (options.blocked_row) {
+    // A per-snapshot host clock read: the two boundaries are expected to
+    // disagree on it and on nothing else.
+    final_row.blocked_wait.observed_uptime_ms = 1200;
+  }
+  if (options.final_deadline_reached) {
+    final_row.blocked_wait.observed_uptime_ms =
+        final_row.blocked_wait.deadline_ms;
+  }
+  if (options.final_deadline_differs) {
+    final_row.blocked_wait.deadline_ms += 1000;
+  }
+  if (options.final_signal_epoch_moved) {
+    final_row.blocked_wait.signal_epochs_observed[0] += 1;
+    final_row.blocked_wait.observed_wait_epoch += 1;
+  }
   GuestExecutionSessionSchedulerTopologyChunk start_topology;
   GuestExecutionSessionSchedulerTopologyChunk final_topology;
   REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
@@ -2120,7 +2170,7 @@ GuestExecutionSessionBundle MakeReadyParityBundle(
   REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
       bundle.chunks[5], &final_topology, &error));
   start_topology.participants.push_back(row);
-  final_topology.participants.push_back(row);
+  final_topology.participants.push_back(final_row);
   REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
       start_topology, &bundle.chunks[4], &error));
   REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
@@ -2173,7 +2223,19 @@ GuestExecutionSessionBundle MakeReadyParityBundle(
 
 TEST_CASE("session bundle admits a ready-parity park at both boundaries",
           "[guest-execution-session-bundle]") {
-  const GuestExecutionSessionBundle bundle = MakeReadyParityBundle();
+  const GuestExecutionSessionBundle bundle = MakeParityParkBundle({});
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                      bundle.chunks, &error));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  REQUIRE(error.empty());
+}
+
+TEST_CASE("session bundle admits a blocked-parity park at both boundaries",
+          "[guest-execution-session-bundle]") {
+  ParityParkOptions options;
+  options.blocked_row = true;
+  const GuestExecutionSessionBundle bundle = MakeParityParkBundle(options);
   std::string error;
   REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
                                                       bundle.chunks, &error));
@@ -2194,25 +2256,63 @@ TEST_CASE("session bundle proves every ready-parity obligation",
   };
 
   SECTION("a park claimed by an executable boundary state") {
-    ReadyParityOptions options;
+    ParityParkOptions options;
     options.executable_boundary_state = true;
-    require_rejected(MakeReadyParityBundle(options),
+    require_rejected(MakeParityParkBundle(options),
                      "scheduler parked participant has no parity boundary "
                      "row");
   }
   SECTION("a park claimed by a suspended row") {
-    ReadyParityOptions options;
+    ParityParkOptions options;
     options.suspended_row = true;
-    require_rejected(MakeReadyParityBundle(options),
+    require_rejected(MakeParityParkBundle(options),
                      "scheduler parked participant has no parity boundary "
                      "row");
   }
   SECTION("a park claimed by a scheduler record's subject") {
-    ReadyParityOptions options;
+    ParityParkOptions options;
     options.overlay_names_participant = true;
-    require_rejected(MakeReadyParityBundle(options),
+    require_rejected(MakeParityParkBundle(options),
                      "scheduler parked participant is named by a tape record");
   }
+}
+
+TEST_CASE("session bundle proves every blocked-parity obligation",
+          "[guest-execution-session-bundle]") {
+  std::string error;
+  ParityParkOptions options;
+  options.blocked_row = true;
+  std::string expected;
+
+  SECTION("a park claimed alongside a published route") {
+    options.parked_route_state = true;
+    expected = "scheduler start parked topology has an executable PPC route";
+  }
+  SECTION("a park claimed by a wait whose deadline the boundary reached") {
+    options.final_deadline_reached = true;
+    expected = "scheduler parked participant has no parity boundary row";
+  }
+  SECTION("a wait whose deadline moved between the boundaries") {
+    options.final_deadline_differs = true;
+    expected =
+        "outside-guest participant scheduler topology changed between "
+        "boundaries: blocked_wait.deadline_ms";
+  }
+  SECTION("a wait whose signal epoch moved between the boundaries") {
+    options.final_signal_epoch_moved = true;
+    expected =
+        "outside-guest participant scheduler topology changed between "
+        "boundaries: blocked_wait.observed_wait_epoch";
+  }
+  SECTION("a park claimed by a scheduler record's subject") {
+    options.overlay_names_participant = true;
+    expected = "scheduler parked participant is named by a tape record";
+  }
+
+  REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(
+      MakeParityParkBundle(options), &error));
+  INFO(error);
+  REQUIRE(error.find(expected) != std::string::npos);
 }
 
 TEST_CASE("session bundle admits a blocked export replay route",

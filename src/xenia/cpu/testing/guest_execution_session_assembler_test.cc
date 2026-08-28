@@ -136,10 +136,16 @@ class FakeStateProvider final
       checkpoint.participant_ordinal = static_cast<uint32_t>(
           participant_it - checkpoint_participants.cbegin());
       checkpoint.guest_thread_id = participant.guest_thread_id;
-      checkpoint.resume_pc = 0x82000040;
-      checkpoint.owning_function_address = 0x82000000;
-      checkpoint.owning_function_end_address = 0x820000FC;
-      checkpoint.outer_guest_return_address = 0x82001000;
+      if (std::find(outside_guest_participants.cbegin(),
+                    outside_guest_participants.cend(),
+                    participant) != outside_guest_participants.cend()) {
+        checkpoint.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+      } else {
+        checkpoint.resume_pc = 0x82000040;
+        checkpoint.owning_function_address = 0x82000000;
+        checkpoint.owning_function_end_address = 0x820000FC;
+        checkpoint.outer_guest_return_address = 0x82001000;
+      }
       return ppc::GuestPPCThreadCheckpointCodec::Encode(checkpoint, output,
                                                         error);
     }
@@ -154,6 +160,8 @@ class FakeStateProvider final
   bool fail = false;
   bool encode_thread_checkpoint = false;
   std::vector<GuestExecutionCaptureParticipantIdentity> checkpoint_participants;
+  std::vector<GuestExecutionCaptureParticipantIdentity>
+      outside_guest_participants;
   uint32_t calls = 0;
   uint32_t initial_calls = 0;
   GuestExecutionSessionAssembler* reenter_target = nullptr;
@@ -3218,6 +3226,112 @@ TEST_CASE("scheduler event bridge accepts only complete modeled source tapes",
                 &harness.error) == Action::kReject);
     REQUIRE(harness.error.find("not recording") != std::string::npos);
   }
+}
+
+// A waiter the scheduler blocked in a wait no modeled export dispatch owns,
+// parked below the one root call its fiber has held since it started running.
+// It publishes no route: the two boundaries carry the same bytes and the same
+// wait, and the tape names it in no role.
+TEST_CASE("scheduler event bridge publishes a blocked-parity park",
+          "[guest-execution-session-capture-event-bridge]") {
+  Harness harness(MakeContinuousConfig());
+  REQUIRE(harness.Create());
+  harness.states.encode_thread_checkpoint = true;
+  harness.states.checkpoint_participants = {kA, kB};
+  harness.states.outside_guest_participants = {kB};
+  std::vector<GuestExecutionCaptureThreadStateLifecycleEvent> seeds;
+  GuestExecutionCaptureHostCallRosterSnapshot roster;
+  MakeSeeds({{kA, 1}, {kB, 1}}, &seeds, &roster);
+  REQUIRE(harness.assembler->SeedParticipants(seeds, roster));
+
+  // observed_uptime_ms is the only field the two boundaries may disagree on:
+  // it is a per-snapshot host clock read rather than thread state.
+  const auto blocked_parity = [](uint64_t generation,
+                                 uint64_t observed_uptime_ms) {
+    kernel::GuestSchedulerCheckpointBarrierSnapshot checkpoint =
+        BridgeCheckpoint(generation, {kA, kB});
+    kernel::GuestSchedulerCheckpointParticipant& waiter =
+        checkpoint.participants.back();
+    waiter.state = kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
+    waiter.resume_kind =
+        kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
+    waiter.restorable = false;
+    waiter.blocked_wait_kind = kernel::GuestSchedulerCaptureWaitKind::kSingle;
+    waiter.blocked_wait.deadline_ms = 5000;
+    waiter.blocked_wait.observed_uptime_ms = observed_uptime_ms;
+    waiter.blocked_wait.wait_epoch = 7;
+    waiter.blocked_wait.observed_wait_epoch = 7;
+    waiter.blocked_wait.handle_count = 1;
+    waiter.blocked_wait.flags =
+        kernel::kGuestSchedulerCaptureWaitFlagGated |
+        kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
+    waiter.blocked_wait.handles[0] = 0x24;
+    waiter.blocked_wait.signal_epochs_before[0] = 7;
+    waiter.blocked_wait.signal_epochs_observed[0] = 7;
+    return checkpoint;
+  };
+
+  GuestExecutionSessionCaptureSchedulerEventBridge bridge;
+  REQUIRE(bridge.BeginSession(*harness.assembler, blocked_parity(1, 1000),
+                              seeds, &harness.error));
+  REQUIRE(harness.assembler->Arm(&harness.error));
+  REQUIRE(harness.assembler->RequestStart(&harness.error));
+  REQUIRE(harness.state() == State::kStartRendezvous);
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kHold);
+  REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kContinue);
+  REQUIRE(harness.state() == State::kRecording);
+  REQUIRE(harness.status().participants[1].initial_outer_call_state ==
+          GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall);
+  REQUIRE(harness.assembler->OnInstructionCoverage(kA, 10) ==
+          Action::kContinue);
+
+  kernel::GuestSchedulerCaptureEvent dispatch = BridgeSchedulerEvent(
+      40, kernel::GuestSchedulerCaptureEventKind::kDispatch);
+  dispatch.flags = kernel::kGuestSchedulerCaptureFlagFreshQuantum;
+  REQUIRE(bridge.OnSchedulerEvent(*harness.assembler, dispatch,
+                                  &harness.error) == Action::kContinue);
+  REQUIRE(harness.assembler->RequestStop() == Action::kHold);
+  REQUIRE(harness.state() == State::kStopRequested);
+  REQUIRE(harness.assembler->ArriveAtSafepoint(kA) == Action::kHold);
+  REQUIRE(harness.assembler->ParkBelowOuterCall(kB) == Action::kHold);
+  REQUIRE(harness.state() == State::kPublishing);
+  REQUIRE(bridge.SealSession(*harness.assembler, blocked_parity(2, 1200),
+                             &harness.error));
+  const bool published = harness.assembler->Publish(&harness.error);
+  INFO(harness.error);
+  REQUIRE(published);
+  REQUIRE(harness.publisher.bundles.size() == 1);
+
+  GuestExecutionSessionBundle bundle = harness.publisher.bundles.front();
+  const bool finalized = bridge.FinalizeBundle(&bundle, 1, &harness.error);
+  INFO(harness.error);
+  REQUIRE(finalized);
+  const bool validated =
+      ValidateGuestExecutionSessionBundle(bundle, &harness.error);
+  INFO(harness.error);
+  REQUIRE(validated);
+  REQUIRE(bundle.manifest.participants[1].initial_outer_call_state ==
+          GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall);
+  REQUIRE(bundle.manifest.participants[1].first_event_sequence == 0);
+
+  std::vector<GuestExecutionSessionSchedulerTopologyChunk> topologies;
+  for (size_t index = 0; index < bundle.manifest.chunks.size(); ++index) {
+    if (bundle.manifest.chunks[index].kind !=
+        GuestExecutionSessionChunkKind::kSchedulerTopology) {
+      continue;
+    }
+    GuestExecutionSessionSchedulerTopologyChunk topology;
+    REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+        bundle.chunks[index], &topology, &harness.error));
+    topologies.push_back(std::move(topology));
+  }
+  REQUIRE(topologies.size() == 2);
+  REQUIRE(IsGuestExecutionSessionBlockedParityParticipant(
+      topologies[0].participants[1]));
+  REQUIRE(IsGuestExecutionSessionBlockedParityParticipant(
+      topologies[1].participants[1]));
+  REQUIRE(topologies[0].participants[1].blocked_wait.observed_uptime_ms !=
+          topologies[1].participants[1].blocked_wait.observed_uptime_ms);
 }
 
 TEST_CASE("scheduler event bridge authenticates every cooperative wait kind",

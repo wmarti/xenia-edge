@@ -551,6 +551,13 @@ bool ValidateBlockedExportRoutes(
     }
     const GuestExecutionSessionParticipant& durable =
         bundle.manifest.participants[participant.ordinal];
+    // A participant that declares the durable park publishes no route at all,
+    // so there is no pending export for the tape to witness. Its own
+    // obligations are proved where the park is.
+    if (durable.initial_outer_call_state ==
+        GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall) {
+      continue;
+    }
     const GuestExecutionSessionThreadStateReference& reference =
         initial_checkpoint.checkpoint.thread_states[participant.ordinal];
     const auto blob = validated.blobs.find(reference.sha256);
@@ -776,6 +783,11 @@ bool ValidateSchedulerTopologyCheckpointBindings(
         return Fail(error, std::string("scheduler ") + std::string(boundary) +
                                " topology PPC checkpoint identity differs");
       }
+      const bool parked_below_outer_call =
+          participant.ordinal < bundle.manifest.participants.size() &&
+          bundle.manifest.participants[participant.ordinal]
+                  .initial_outer_call_state ==
+              GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
       if (participant.state ==
           GuestExecutionSessionSchedulerParticipantState::kSchedulerUnowned) {
         if (decoded.resume_kind !=
@@ -797,6 +809,19 @@ bool ValidateSchedulerTopologyCheckpointBindings(
           }
           break;
         case GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport:
+          // A blocked row that declares the durable park is carried rather
+          // than resumed, so it publishes no route and neither boundary owes
+          // one. Everything the park does claim is proved below.
+          if (parked_below_outer_call) {
+            if (decoded.resume_kind !=
+                ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+              return Fail(error, std::string("scheduler ") +
+                                     std::string(boundary) +
+                                     " parked topology has an executable PPC "
+                                     "route");
+            }
+            break;
+          }
           // Start boundary only. A participant still parked at the final
           // boundary waits for an export that returns after the interval, so
           // no captured event can witness its route.

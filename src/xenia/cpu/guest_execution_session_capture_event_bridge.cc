@@ -889,13 +889,23 @@ bool GuestExecutionSessionCaptureSchedulerEventBridge::FinalizeBundle(
                                      .participants[checkpoint_subject.ordinal];
       if (boundary_checkpoint.resume_kind ==
           ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
+        // A blocked waiter that declares the durable park is carried rather
+        // than resumed, so it publishes no route either; the park and the
+        // parity row together are what say so.
+        const bool parked_blocked_parity =
+            checkpoint_subject.initial_outer_call_state ==
+                GuestExecutionSessionInitialOuterCallState::
+                    kParkedBelowOuterCall &&
+            IsGuestExecutionSessionBlockedParityParticipant(
+                topology_participant);
         const bool passive_scheduler_owned =
             !scheduler_unowned && !topology_participant.restorable &&
             (topology_participant.resume_kind ==
                  GuestExecutionSessionSchedulerResumeKind::
                      kNativeContinuation ||
              topology_participant.resume_kind ==
-                 GuestExecutionSessionSchedulerResumeKind::kNotYetRun);
+                 GuestExecutionSessionSchedulerResumeKind::kNotYetRun ||
+             parked_blocked_parity);
         if ((!scheduler_unowned && !passive_scheduler_owned) ||
             checkpoint_subject.boundary_arrival_kind !=
                 GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside) {
