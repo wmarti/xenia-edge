@@ -189,18 +189,32 @@ bool IncrementShapeCounter(uint64_t* value, std::string* error) {
   return true;
 }
 
+// Every mapped guest view, matching Memory::LookupHeap. The emulator reserves
+// the first 64 KiB for itself, so replay must not allocate into it.
 bool IsSupportedDataPageAddress(uint32_t address) {
-  return (address >= 0x00001000u && address <= 0x7EFFF000u) ||
-         (address >= 0x80000000u && address <= 0x9FFFF000u);
+  return (address >= 0x00010000u && address < 0x7F000000u) ||
+         (address >= 0x80000000u && address < 0xFFD00000u);
 }
 
 bool IsSupportedCodePageAddress(uint32_t address) {
   return address >= 0x80040000u && address <= 0x9FFFE000u;
 }
 
+// Physical memory is reachable through the 0xA0000000, 0xC0000000 and
+// 0xE0000000 views and the XEX range through 0x80000000 and 0x90000000, so a
+// page is keyed by the lowest view that reaches it. PhysicalHeap places the
+// 0xE0000000 view 4 KiB further into physical memory than the others.
 uint32_t XexBackingPageAddress(uint32_t address) {
-  return address >= 0x90000000u && address < 0xA0000000u ? address - 0x10000000u
-                                                         : address;
+  if (address >= 0xE0000000u && address < 0xFFD00000u) {
+    return address - 0xE0000000u + 0xA0001000u;
+  }
+  if (address >= 0xC0000000u && address < 0xE0000000u) {
+    return address - 0x20000000u;
+  }
+  if (address >= 0x90000000u && address < 0xA0000000u) {
+    return address - 0x10000000u;
+  }
+  return address;
 }
 
 const ppc::GuestInvocationPage* FindInvocationPage(
