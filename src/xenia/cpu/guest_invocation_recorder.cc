@@ -142,13 +142,17 @@ struct GuestInvocationRecorder::Impl {
     bool owns_callback = false;
   };
 
-  // How far the capture got before a bound ended it. An attempt is spent per
-  // root occurrence, while the deadline runs in wall time from construction,
-  // so the two bounds are not commensurable and only this says which bound
-  // the run was actually near.
+  // How far the capture got before a bound ended it. Every attempt begins on
+  // its own root entry, so the attempt count is also the number of times the
+  // title called the root since the owner was claimed. The page counts say
+  // whether discovery was converging: an attempt whose page set keeps
+  // differing from the previous one is a root that never settles.
   std::string BudgetDetail() const {
-    return fmt::format("attempt {} of {} occurrence {} state {}", attempt_count,
-                       limits.max_attempts, root_occurrence_count,
+    return fmt::format("attempt {} of {} pages {} previous {} state {}",
+                       attempt_count, limits.max_attempts, attempt_pages.size(),
+                       previous_discovery_pages.has_value()
+                           ? std::to_string(previous_discovery_pages->size())
+                           : std::string("none"),
                        static_cast<uint32_t>(state));
   }
 
