@@ -24,6 +24,9 @@ namespace cpu {
 namespace {
 
 constexpr uint32_t kKnownConfigFlags = JitCorpus::kConfigGuestScheduler;
+// Save/restore declarations arrived in v4 as a new record tag, so a v3
+// stream is a v4 stream that carries none of them.
+constexpr uint32_t kMinSupportedVersion = 3;
 constexpr uint32_t kSupportedVersion = 4;
 constexpr uint32_t kSupportedPageSize = 4096;
 constexpr size_t kHeaderSize = 4 * sizeof(uint32_t);
@@ -280,7 +283,7 @@ bool ExecutionJitCorpus::Decode(const uint8_t* data, size_t data_size,
   if (magic != JitCorpus::kMagic) {
     return Fail(output, error, "corpus magic is invalid");
   }
-  if (version != kSupportedVersion) {
+  if (version < kMinSupportedVersion || version > kSupportedVersion) {
     return Fail(output, error, "corpus version is unsupported for execution");
   }
   if (page_size != kSupportedPageSize) {
@@ -331,6 +334,10 @@ bool ExecutionJitCorpus::Decode(const uint8_t* data, size_t data_size,
       }
       functions.push_back(function);
     } else if (tag == JitCorpus::kTagSaverest) {
+      if (version < 4) {
+        return Fail(output, error,
+                    "corpus version does not carry save/restore declarations");
+      }
       ExecutionJitCorpus::SaverestRecord saverest = {};
       if (!reader.ReadU32(&saverest.address) ||
           !reader.ReadU32(&saverest.end_address) ||
