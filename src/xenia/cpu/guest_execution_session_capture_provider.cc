@@ -1351,8 +1351,13 @@ bool GuestExecutionSessionCaptureProvider::SupportsCheckpointParticipant(
       participant.resume_kind !=
           kernel::GuestSchedulerCheckpointResumeKind::kJitSafepoint) {
     return Fail(error,
-                "capture provider supports only restorable exact-PC JIT "
-                "safepoint participants");
+                fmt::format("capture provider supports only restorable "
+                            "exact-PC JIT safepoint participants: tid={:08X} "
+                            "state={} resume_kind={} restorable={} pc={:08X}",
+                            participant.thread_id,
+                            static_cast<uint32_t>(participant.state),
+                            static_cast<uint32_t>(participant.resume_kind),
+                            participant.restorable, participant.guest_pc));
   }
   return true;
 }
