@@ -502,29 +502,31 @@ inline XReg AddGuestMemoryOffset(A64Emitter& e, const XReg& base,
   // Guest address arithmetic wraps at 32 bits before the host membase is
   // applied. Keep the add in W registers so stale high bits can't escape into
   // the final host pointer.
-  if (base.getIdx() != 0) {
-    e.mov(e.w0, WReg(base.getIdx()));
-  }
+  // The displacement is applied straight off the base register, so the copy
+  // into the scratch is the arithmetic rather than a step before it.
+  const WReg src = WReg(base.getIdx());
   if (offset.is_constant) {
     const uint32_t imm = static_cast<uint32_t>(offset.constant());
     const uint32_t neg = 0u - imm;
     if (imm == 0) {
-      // Nothing to add.
+      if (base.getIdx() != 0) {
+        e.mov(e.w0, src);
+      }
     } else if (imm <= 0xFFF) {
-      e.add(e.w0, e.w0, imm);
+      e.add(e.w0, src, imm);
     } else if (!(imm & 0xFFF) && (imm >> 12) <= 0xFFF) {
-      e.add(e.w0, e.w0, imm >> 12, 12);
+      e.add(e.w0, src, imm >> 12, 12);
     } else if (neg <= 0xFFF) {
       // Adding a small negative offset wraps identically to subtracting.
-      e.sub(e.w0, e.w0, neg);
+      e.sub(e.w0, src, neg);
     } else if (!(neg & 0xFFF) && (neg >> 12) <= 0xFFF) {
-      e.sub(e.w0, e.w0, neg >> 12, 12);
+      e.sub(e.w0, src, neg >> 12, 12);
     } else {
       e.mov(e.w17, static_cast<uint64_t>(imm));
-      e.add(e.w0, e.w0, e.w17);
+      e.add(e.w0, src, e.w17);
     }
   } else {
-    e.add(e.w0, e.w0, WReg(offset.reg().getIdx()));
+    e.add(e.w0, src, WReg(offset.reg().getIdx()));
   }
   return e.x0;
 }
@@ -580,10 +582,10 @@ inline XReg ComputeMemoryAddressOffset(A64Emitter& e, const I64Op& guest,
   }
   if (guest.is_constant) {
     e.mov(e.w0, static_cast<uint64_t>(static_cast<uint32_t>(guest.constant())));
+    AddGuestMemoryOffset(e, e.x0, offset);
   } else {
-    e.mov(e.w0, WReg(guest.reg().getIdx()));
+    AddGuestMemoryOffset(e, guest.reg(), offset);
   }
-  AddGuestMemoryOffset(e, e.x0, offset);
   if (NeedsPhysicalRemap()) {
     ApplyPhysicalRemapW0(e);
   }
