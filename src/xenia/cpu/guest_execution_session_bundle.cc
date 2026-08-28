@@ -493,8 +493,10 @@ bool ScanPendingExportTransitions(
         !GuestExecutionSessionCodec::ResolveSchedulerEventSubject(
             event.kind, payload->second->bytes, bundle.manifest.participants,
             &subject_ordinal, nullptr, &raw_kind, &raw_reason)) {
-      return Fail(error,
-                  "scheduler blocked-export witness payload is unreadable");
+      // The tape-wide scheduler event census resolves every dispatch and
+      // synchronization payload before this scan, so this keeps the lookup
+      // total rather than reporting a condition it can reach.
+      return Fail(error, "scheduler event payload blob is not present");
     }
     if (subject_ordinal != participant_ordinal) {
       continue;
