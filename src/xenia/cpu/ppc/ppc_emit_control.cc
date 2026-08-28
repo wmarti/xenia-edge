@@ -10,6 +10,7 @@
 #include "xenia/cpu/ppc/ppc_emit-private.h"
 
 #include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
@@ -82,10 +83,22 @@ int InstrEmit_branch(PPCHIRBuilder& f, const char* src, uint64_t cia,
     } else {
       // Call function.
       auto function = f.LookupFunction(nia_value);
-      if (cond) {
-        if (!expect_true) {
-          cond = f.IsFalse(cond);
+      if (cond && !expect_true) {
+        cond = f.IsFalse(cond);
+      }
+      if (!function) {
+        // No loaded module owns the target, so there is no symbol to call.
+        // Emit the indirect form the computed-branch path already uses, which
+        // resolves at the call site, rather than handing a null symbol to the
+        // backend, where the first thing every call does is dereference it.
+        XELOGE("Unresolved direct call target {:08X} from {:08X}", nia_value,
+               static_cast<uint32_t>(cia));
+        if (cond) {
+          f.CallIndirectTrue(cond, nia, call_flags);
+        } else {
+          f.CallIndirect(nia, call_flags);
         }
+      } else if (cond) {
         f.CallTrue(cond, function, call_flags);
       } else {
         f.Call(function, call_flags);

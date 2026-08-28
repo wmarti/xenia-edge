@@ -942,7 +942,15 @@ void EmitInlineSaverestCaptureAccesses(
 #endif
 
 void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
+  // Release builds drop the assert, and every path below dereferences this
+  // before anything else, so a null arrives as a fault at a field offset with
+  // no diagnostic at all.
   assert_not_null(function);
+  if (!function) {
+    XELOGE("Call to an unresolved function symbol from {:08X}",
+           current_guest_function_);
+    return;
+  }
   EnsureFpuFpcrModeForTransition();
   if (TryInlinePPCGprLrSaveRestore(instr, function)) {
     return;
