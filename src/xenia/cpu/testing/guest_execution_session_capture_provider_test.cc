@@ -901,6 +901,31 @@ TEST_CASE(
           std::string::npos);
 }
 
+TEST_CASE(
+    "guest execution session provider admits a blocked waiter no dispatch owns",
+    "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.InstallExternalEventLog();
+  std::string error;
+
+  SECTION("no open dispatch at all") {
+    // A waiter no modeled dispatch owns cannot be resumed from the tape, so it
+    // is carried unchanged instead. The root-call and parity obligations are
+    // the encode arm's, not the roster gate's.
+    REQUIRE(harness.provider->SupportsCheckpointParticipant(
+        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
+    REQUIRE(error.empty());
+  }
+  SECTION("only another participant's dispatch is open") {
+    REQUIRE(harness.OpenExportDispatch(harness.participant, kFunctionAddress,
+                                       kExportThunkAddress));
+    REQUIRE(harness.provider->SupportsCheckpointParticipant(
+        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
+    REQUIRE(error.empty());
+  }
+}
+
 TEST_CASE("guest execution session provider binds one blocking export dispatch",
           "[guest-execution-session-capture-provider]") {
   ProviderHarness harness;
@@ -915,16 +940,6 @@ TEST_CASE("guest execution session provider binds one blocking export dispatch",
     REQUIRE(error.find(" export=nolog wait=1/1/0/00110001/0") !=
             std::string::npos);
   }
-  SECTION("no open dispatch") {
-    harness.InstallExternalEventLog();
-    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
-        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
-    REQUIRE(error.find("no open modeled export dispatch") != std::string::npos);
-    // The refusal that dominates the live roster names the wait it refused, so
-    // an unwired wait is separable from a wired one that failed a later check.
-    REQUIRE(error.find(" export=none wait=1/1/0/00110001/0") !=
-            std::string::npos);
-  }
   SECTION("refusal after an open dispatch still names it") {
     harness.InstallExternalEventLog();
     REQUIRE(harness.OpenExportDispatch(harness.second_participant,
@@ -936,14 +951,6 @@ TEST_CASE("guest execution session provider binds one blocking export dispatch",
             std::string::npos);
     REQUIRE(error.find(" export=475/8270D724/82040040 "
                        "wait=1/1/0/00110001/0") != std::string::npos);
-  }
-  SECTION("dispatch belongs to another participant") {
-    harness.InstallExternalEventLog();
-    REQUIRE(harness.OpenExportDispatch(harness.participant, kFunctionAddress,
-                                       kExportThunkAddress));
-    REQUIRE_FALSE(harness.provider->SupportsCheckpointParticipant(
-        harness.BlockedSecondThreadCheckpoint().participants.back(), &error));
-    REQUIRE(error.find("no open modeled export dispatch") != std::string::npos);
   }
   SECTION("two open dispatches") {
     harness.InstallExternalEventLog();
@@ -1029,17 +1036,28 @@ TEST_CASE("guest execution session provider binds one blocking export dispatch",
   REQUIRE(error.find("resume_kind=2") != std::string::npos);
 }
 
-TEST_CASE(
-    "guest execution session provider rejects an unbindable blocked export",
-    "[guest-execution-session-capture-provider]") {
+TEST_CASE("guest execution session provider proves a blocked-parity park",
+          "[guest-execution-session-capture-provider]") {
   ProviderHarness harness;
   harness.AddSecondParticipant();
   harness.InstallExternalEventLog();
   std::string error;
+  // The park claims the fiber sat below one call for the whole interval, so a
+  // second call beneath it is a claim the participant cannot make.
+  GuestExecutionCaptureHostCallRosterSnapshot roster =
+      harness.TwoThreadHostCalls();
+  roster.active_calls.push_back({{3},
+                                 harness.second_participant,
+                                 kMiddleFunctionAddress,
+                                 kFunctionEndAddress,
+                                 kOuterReturnAddress,
+                                 2});
   REQUIRE_FALSE(harness.provider->BeginCapture(
       harness.BlockedSecondThreadCheckpoint(), harness.TwoThreadParticipants(),
-      harness.TwoThreadHostCalls(), &error));
-  REQUIRE(error.find("no open modeled export dispatch") != std::string::npos);
+      roster, &error));
+  INFO(error);
+  REQUIRE(error.find("blocked-parity participant does not own exactly one "
+                     "root host call") != std::string::npos);
   REQUIRE(harness.provider->status().state ==
           GuestExecutionSessionCaptureProviderState::kRejected);
 }
@@ -2187,19 +2205,29 @@ TEST_CASE("guest execution session classifies a blocked-parity topology row",
   }
 }
 
-TEST_CASE("guest execution session provider still gates blocked parity",
+TEST_CASE("guest execution session provider admits blocked parity",
           "[guest-execution-session-capture-provider]") {
   ProviderHarness harness;
   harness.AddSecondParticipant();
   harness.InstallExternalEventLog();
-  const auto participant =
+  auto participant =
       harness.BlockedSecondThreadCheckpoint().participants.back();
   REQUIRE(
       IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
   std::string error;
+  REQUIRE(harness.provider->SupportsCheckpointParticipant(participant, &error));
+  REQUIRE(error.empty());
+
+  // An alertable wait can run guest code on the waiting thread's stack, so it
+  // states nothing about whether the participant ran and cannot claim parity.
+  participant.blocked_wait.flags |=
+      kernel::kGuestSchedulerCaptureWaitFlagAlertable;
+  REQUIRE_FALSE(
+      IsGuestExecutionSessionBlockedParityCheckpointParticipant(participant));
   REQUIRE_FALSE(
       harness.provider->SupportsCheckpointParticipant(participant, &error));
-  REQUIRE(error.find("no open modeled export dispatch") != std::string::npos);
+  REQUIRE(error.find("outside the modeled blocking-export wait allowlist") !=
+          std::string::npos);
 }
 
 }  // namespace testing

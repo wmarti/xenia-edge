@@ -2197,22 +2197,21 @@ TEST_CASE("session bundle proves every ready-parity obligation",
     ReadyParityOptions options;
     options.executable_boundary_state = true;
     require_rejected(MakeReadyParityBundle(options),
-                     "scheduler parked participant has no ready-parity "
-                     "boundary row");
+                     "scheduler parked participant has no parity boundary "
+                     "row");
   }
   SECTION("a park claimed by a suspended row") {
     ReadyParityOptions options;
     options.suspended_row = true;
     require_rejected(MakeReadyParityBundle(options),
-                     "scheduler parked participant has no ready-parity "
-                     "boundary row");
+                     "scheduler parked participant has no parity boundary "
+                     "row");
   }
   SECTION("a park claimed by a scheduler record's subject") {
     ReadyParityOptions options;
     options.overlay_names_participant = true;
-    require_rejected(
-        MakeReadyParityBundle(options),
-        "scheduler ready-parity participant is named by a tape record");
+    require_rejected(MakeReadyParityBundle(options),
+                     "scheduler parked participant is named by a tape record");
   }
 }
 

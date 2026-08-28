@@ -943,21 +943,21 @@ bool ValidateSchedulerTopologyCheckpointBindings(
     }
     // The class publishes no route at all. It claims a fiber sat below a call
     // it never arrived at for the whole interval, so it must be outside guest
-    // code at both boundaries, carry the ready-parity row at both, and be
-    // named by nothing the tape recorded in any role.
-    if (!initial_outside ||
-        !IsGuestExecutionSessionReadyParityParticipant(
-            start_topology.participants[ordinal]) ||
-        !IsGuestExecutionSessionReadyParityParticipant(
-            final_topology.participants[ordinal])) {
+    // code at both boundaries, carry a parity row at both, and be named by
+    // nothing the tape recorded in any role.
+    const auto parity_row =
+        [](const GuestExecutionSessionSchedulerTopologyParticipant& row) {
+          return IsGuestExecutionSessionReadyParityParticipant(row) ||
+                 IsGuestExecutionSessionBlockedParityParticipant(row);
+        };
+    if (!initial_outside || !parity_row(start_topology.participants[ordinal]) ||
+        !parity_row(final_topology.participants[ordinal])) {
       return Fail(error,
-                  "scheduler parked participant has no ready-parity boundary "
-                  "row");
+                  "scheduler parked participant has no parity boundary row");
     }
     if (tape_named_participants.contains(static_cast<uint32_t>(ordinal))) {
       return Fail(error,
-                  "scheduler ready-parity participant is named by a tape "
-                  "record");
+                  "scheduler parked participant is named by a tape record");
     }
   }
   return GuestExecutionSessionSchedulerReadyOrderIsStable(

@@ -367,19 +367,22 @@ bool ValidateRuntimeCheckpointStateBindings(
     const CheckpointParticipant* scheduler_participant =
         FindCheckpointParticipant(scheduler_checkpoint,
                                   decoded.guest_thread_id);
-    // Only a fiber the scheduler still holds on a ready queue with no durable
-    // route can be parked below a call it never arrived at; any other row
-    // claiming the park is claiming a parity it cannot have.
+    // Only a fiber with no durable route can be parked below a call it never
+    // arrived at: one the scheduler still holds on a ready queue, or one
+    // blocked in a wait no modeled dispatch owns. Any other row claiming the
+    // park is claiming a parity it cannot have.
     const bool parked_below_outer_call =
         participant.initial_outer_call_state ==
         GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
     if (parked_below_outer_call &&
         (!scheduler_participant ||
-         !IsGuestExecutionSessionReadyParityCheckpointParticipant(
-             *scheduler_participant))) {
+         (!IsGuestExecutionSessionReadyParityCheckpointParticipant(
+              *scheduler_participant) &&
+          !IsGuestExecutionSessionBlockedParityCheckpointParticipant(
+              *scheduler_participant)))) {
       return Fail(error, std::string("capture runtime ") + boundary +
-                             " parked participant is not a ready-parity "
-                             "scheduler row");
+                             " parked participant is not a parity scheduler "
+                             "row");
     }
     if (!scheduler_participant) {
       if (decoded.resume_kind != ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
@@ -732,6 +735,37 @@ bool IsReadyParityRootCallParticipant(
     }
   }
   return owned_calls == 1 && depth == 1;
+}
+
+// Whether a participant is parked below its root dispatch alone or is still
+// inside a kernel call no modeled export owns is what a parity route turns on,
+// and neither the scheduler row nor the export log states it.
+std::string DescribeOwnedHostCalls(
+    const GuestExecutionCaptureParticipantIdentity& identity,
+    const GuestExecutionCaptureHostCallRosterSnapshot& host_calls) {
+  size_t owned = 0;
+  uint32_t outer_depth = 0;
+  uint32_t inner_depth = 0;
+  uint32_t function_address = 0;
+  uint32_t return_address = 0;
+  for (const GuestExecutionCaptureActiveHostCall& call :
+       host_calls.active_calls) {
+    if (call.participant != identity) {
+      continue;
+    }
+    ++owned;
+    if (!outer_depth || call.participant_depth < outer_depth) {
+      outer_depth = call.participant_depth;
+      function_address = call.function_address;
+      return_address = call.return_address;
+    }
+    if (call.participant_depth > inner_depth) {
+      inner_depth = call.participant_depth;
+    }
+  }
+  return fmt::format(
+      "hostcalls=owned={},outer={},inner={},fn={:08X},ret={:08X}", owned,
+      outer_depth, inner_depth, function_address, return_address);
 }
 
 // kind/handles/flags/handle0/deadline. A ready or suspended participant carries
@@ -1861,6 +1895,9 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
                   ? "capture runtime provider cannot encode a durable "
                     "continuation for a checkpoint participant"
                   : std::move(capability_error);
+          unsupported_diagnostic.push_back(' ');
+          unsupported_diagnostic.append(
+              DescribeOwnedHostCalls(lifecycle.participant, host_calls));
         } else if (unsupported_count < kMaxReportedUnsupportedParticipants) {
           unsupported_diagnostic.append("; also: ");
           unsupported_diagnostic.append(

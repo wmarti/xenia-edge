@@ -868,6 +868,25 @@ struct GuestExecutionSessionCaptureProvider::Impl {
            !calls.empty();
   }
 
+  // A blocked waiter no modeled dispatch owns. The absence is part of the
+  // parity claim, so a log that cannot answer refuses the class rather than
+  // being read as an absence.
+  bool IsBlockedParityParkParticipant(
+      const CheckpointParticipant& participant) const {
+    if (!IsGuestExecutionSessionBlockedParityCheckpointParticipant(
+            participant)) {
+      return false;
+    }
+    const std::shared_ptr<GuestExecutionCaptureExternalEventLog> log =
+        processor.guest_execution_capture_external_event_log();
+    std::vector<GuestExecutionCaptureExternalEventActiveCall> calls;
+    return log &&
+           log->CopyParticipantActiveCalls(
+               {participant.capture_instance_id, participant.thread_id},
+               &calls) &&
+           calls.empty();
+  }
+
   // The participant owns one open host call and it is the root dispatch its
   // fiber has been parked below since it started running.
   bool OwnsOnlyItsRootHostCall(
@@ -1156,6 +1175,34 @@ struct GuestExecutionSessionCaptureProvider::Impl {
             root_host_call_tokens.emplace(identity.capture_instance_id,
                                           root_call->token.value);
           }
+          state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
+          outside_guest_participants.insert(identity.capture_instance_id);
+        } else if (IsBlockedParityParkParticipant(*scheduler_participant)) {
+          // A waiter parked below its root dispatch with nothing modeled
+          // beneath it publishes no route. It is carried at both boundaries and
+          // never resumed, which claims it did not run; the claim holds only if
+          // it owns that one call and nothing else.
+          if (!OwnsOnlyItsRootHostCall(identity, host_calls)) {
+            return RejectLocked(
+                "capture provider blocked-parity participant does not own "
+                "exactly one root host call: " +
+                DescribeParticipant(*scheduler_participant));
+          }
+          const GuestExecutionCaptureActiveHostCall* root_call = nullptr;
+          for (const GuestExecutionCaptureActiveHostCall& call :
+               host_calls.active_calls) {
+            if (call.participant == identity) {
+              root_call = &call;
+            }
+          }
+          if (!root_call) {
+            return RejectLocked(
+                "capture provider blocked-parity participant has no root host "
+                "call: " +
+                DescribeParticipant(*scheduler_participant));
+          }
+          root_host_call_tokens.emplace(identity.capture_instance_id,
+                                        root_call->token.value);
           state_blob.resume_kind = ppc::GuestPPCThreadResumeKind::kOutsideGuest;
           outside_guest_participants.insert(identity.capture_instance_id);
         } else if (IsBlockedExportParticipant(*scheduler_participant)) {
@@ -1785,6 +1832,12 @@ bool GuestExecutionSessionCaptureProvider::SupportsCheckpointParticipant(
               participant, "blocked participant", "PC",
               IsBlockedExportWaitInAllowlist(participant), participant.guest_pc,
               nullptr, &reason)) {
+        return true;
+      }
+      // A waiter no modeled dispatch owns cannot be resumed from the tape, but
+      // it can be carried unchanged if it provably did not run. The root-call
+      // and parity obligations are the encode arm's to enforce.
+      if (impl_->IsBlockedParityParkParticipant(participant)) {
         return true;
       }
       return Fail(error, reason);
