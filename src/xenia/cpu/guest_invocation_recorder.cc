@@ -142,6 +142,16 @@ struct GuestInvocationRecorder::Impl {
     bool owns_callback = false;
   };
 
+  // How far the capture got before a bound ended it. An attempt is spent per
+  // root occurrence, while the deadline runs in wall time from construction,
+  // so the two bounds are not commensurable and only this says which bound
+  // the run was actually near.
+  std::string BudgetDetail() const {
+    return fmt::format("attempt {} of {} occurrence {} state {}", attempt_count,
+                       limits.max_attempts, root_occurrence_count,
+                       static_cast<uint32_t>(state));
+  }
+
   bool CheckDeadline() {
     if (state == GuestInvocationRecorderState::kRejected) {
       return false;
@@ -155,7 +165,8 @@ struct GuestInvocationRecorder::Impl {
     }
     if (now >= deadline) {
       return Reject(GuestInvocationRecorderRejection::kDeadlineExceeded,
-                    "invocation recording deadline exceeded");
+                    fmt::format("invocation recording deadline exceeded: {}",
+                                BudgetDetail()));
     }
     return true;
   }
@@ -647,8 +658,10 @@ struct GuestInvocationRecorder::Impl {
 
   bool BeginAttempt(const GuestPPCRegisterState& entry_state) {
     if (attempt_count >= limits.max_attempts) {
-      return Reject(GuestInvocationRecorderRejection::kAttemptLimit,
-                    "invocation recording attempt limit exceeded");
+      return Reject(
+          GuestInvocationRecorderRejection::kAttemptLimit,
+          fmt::format("invocation recording attempt limit exceeded: {}",
+                      BudgetDetail()));
     }
     uint32_t return_address = 0;
     if (!ValidateReturnBoundary(selection.root_address,
@@ -723,8 +736,9 @@ struct GuestInvocationRecorder::Impl {
       if (attempt_count >= limits.max_attempts) {
         return Reject(
             GuestInvocationRecorderRejection::kPageReadFailure,
-            "guest data snapshot was contended at the final exit and no "
-            "attempt remains",
+            fmt::format("guest data snapshot was contended at the final exit "
+                        "and no attempt remains: {}",
+                        BudgetDetail()),
             kGuestInvocationDependencyUnsupportedMappingOrProtection);
       }
       // Take the final attempt again rather than losing the capture.
@@ -818,9 +832,11 @@ struct GuestInvocationRecorder::Impl {
       state = GuestInvocationRecorderState::kWaitingForDiscoveryAttempt;
     }
     if (attempt_count >= limits.max_attempts) {
-      return Reject(GuestInvocationRecorderRejection::kAttemptLimit,
-                    "invocation recording attempts did not leave room for a "
-                    "final attempt");
+      return Reject(
+          GuestInvocationRecorderRejection::kAttemptLimit,
+          fmt::format("invocation recording attempts did not leave room for a "
+                      "final attempt: {}",
+                      BudgetDetail()));
     }
     return true;
   }
