@@ -1123,7 +1123,7 @@ bool BuildGuestExecutionContinuousReplayPlan(
             "byte-stable");
       }
       const char* topology_difference =
-          GuestExecutionSessionSchedulerTopologyFirstDifference(
+          GuestExecutionSessionSchedulerTopologyPassiveRowFirstDifference(
               initial_topology, final_topology);
       if (topology_difference) {
         return fail(std::string("continuous outside-guest participant "
@@ -1162,6 +1162,12 @@ bool BuildGuestExecutionContinuousReplayPlan(
       }
     }
     plan.participants.push_back(std::move(planned));
+  }
+  std::string ready_order_error;
+  if (!GuestExecutionSessionSchedulerReadyOrderIsStable(
+          plan.initial_scheduler_topology, plan.final_scheduler_topology,
+          scheduler_event_subjects, &ready_order_error)) {
+    return fail(ready_order_error);
   }
   for (const auto& entry : resume_entries) {
     plan.resume_entries.push_back(entry.second);

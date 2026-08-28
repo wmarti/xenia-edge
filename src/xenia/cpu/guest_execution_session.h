@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -446,6 +447,14 @@ const char* GuestExecutionSessionSchedulerTopologyFirstDifference(
     const GuestExecutionSessionSchedulerTopologyParticipant& initial,
     const GuestExecutionSessionSchedulerTopologyParticipant& final_row);
 
+// The same comparison across a boundary pair, where the ready FIFO position is
+// not a statement about this row: a queue mate inserted at the head or dequeued
+// renumbers a row the interval never touched. Ready order is instead carried by
+// GuestExecutionSessionSchedulerReadyOrderIsStable.
+const char* GuestExecutionSessionSchedulerTopologyPassiveRowFirstDifference(
+    const GuestExecutionSessionSchedulerTopologyParticipant& initial,
+    const GuestExecutionSessionSchedulerTopologyParticipant& final_row);
+
 // The row-side counterpart of the woken-in-wait checkpoint classifier: a
 // participant this boundary carries as ready with no durable resume route, at
 // a densified queue position. The wait itself is not serialized for a row that
@@ -465,6 +474,16 @@ struct GuestExecutionSessionSchedulerTopologyChunk {
   bool operator==(const GuestExecutionSessionSchedulerTopologyChunk&) const =
       default;
 };
+
+// Ready FIFO order across a boundary pair, over the participants no scheduler
+// record names as its subject. A ready queue is only ever inserted at one of
+// its ends or unlinked one node at a time, and every unlink is recorded, so two
+// unnamed rows sharing a queue cannot change places however far either absolute
+// ordinal moved. A ready-list mutator that splices or sorts would break this.
+bool GuestExecutionSessionSchedulerReadyOrderIsStable(
+    const GuestExecutionSessionSchedulerTopologyChunk& initial,
+    const GuestExecutionSessionSchedulerTopologyChunk& final_topology,
+    const std::set<uint32_t>& scheduler_event_subjects, std::string* error);
 
 // A thread parked in a blocking export whose wait this row alone witnesses as
 // unsatisfied. Holding at both boundaries of an interval is a separate

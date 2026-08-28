@@ -890,6 +890,23 @@ void MutateFinalSchedulerTopology(
       static_cast<uint32_t>(topology.participants.size()), bundle->chunks[5]);
 }
 
+void MutateStartSchedulerTopology(
+    GuestExecutionSessionBundle* bundle,
+    const std::function<void(GuestExecutionSessionSchedulerTopologyChunk*)>&
+        mutate) {
+  GuestExecutionSessionSchedulerTopologyChunk topology;
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::DecodeSchedulerTopologyChunk(
+      bundle->chunks[4], &topology, &error));
+  mutate(&topology);
+  REQUIRE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+      topology, &bundle->chunks[4], &error));
+  bundle->manifest.chunks[4] = Reference(
+      GuestExecutionSessionChunkKind::kSchedulerTopology, 4,
+      topology.global_sequence, topology.global_sequence,
+      static_cast<uint32_t>(topology.participants.size()), bundle->chunks[4]);
+}
+
 constexpr uint32_t kSchedulerRecordDispatch = 3;
 constexpr uint32_t kSchedulerRecordResume = 11;
 
@@ -1367,8 +1384,9 @@ TEST_CASE("continuous replay planner enforces passive topology parity",
           topology->participants[1].ready_queue_fifo_ordinal = 0;
         });
     REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
-    REQUIRE(error.find("scheduler topology changed between boundaries: "
-                       "ready_queue_fifo_ordinal") != std::string::npos);
+    REQUIRE(error ==
+            "scheduler ready FIFO order changed between boundaries on cpu 0 "
+            "level 8: thread 00000202 overtook thread 00000101");
   }
 
   SECTION("a ready participant suspended between boundaries rejects") {
@@ -1493,6 +1511,66 @@ TEST_CASE("continuous validation rejects passive scheduler event subjects",
     REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
                                                           &plan, &error));
     REQUIRE(plan.participants.empty());
+  }
+}
+
+TEST_CASE("continuous validation admits ready FIFO renumbering",
+          "[guest-execution-session-runner][continuous]"
+          "[guest-execution-scheduler-topology]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  GuestExecutionContinuousReplayPlan plan;
+  std::string error;
+  const auto requeue_at_head =
+      [](GuestExecutionSessionSchedulerTopologyChunk* topology) {
+        GuestExecutionSessionSchedulerTopologyParticipant& dispatched =
+            topology->participants[0];
+        dispatched.state =
+            GuestExecutionSessionSchedulerParticipantState::kReady;
+        dispatched.ready_queue_level = 8;
+        dispatched.ready_queue_fifo_ordinal = 0;
+        topology->participants[1].ready_queue_fifo_ordinal = 1;
+      };
+
+  SECTION("a dispatched row inserted at the head renumbers the passive row") {
+    GuestExecutionSessionBundle bundle = MakePassiveContinuousSessionBundle(
+        kHostPageSize, kSchedulerRecordDispatch, 0);
+    MutateFinalSchedulerTopology(&bundle, requeue_at_head);
+    REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                    &plan, &error));
+    REQUIRE(error.empty());
+    REQUIRE(plan.participants.size() == 2);
+  }
+
+  SECTION("a running row requeued at the head renumbers the passive row") {
+    GuestExecutionSessionBundle bundle = MakePassiveContinuousSessionBundle(
+        kHostPageSize, kSchedulerRecordDispatch, 0);
+    MutateStartSchedulerTopology(
+        &bundle, [](GuestExecutionSessionSchedulerTopologyChunk* topology) {
+          GuestExecutionSessionSchedulerTopologyParticipant& running =
+              topology->participants[0];
+          running.state =
+              GuestExecutionSessionSchedulerParticipantState::kRunning;
+          running.ready_queue_level = kGuestExecutionSessionSchedulerNoValue;
+          running.ready_queue_fifo_ordinal =
+              kGuestExecutionSessionSchedulerNoValue;
+        });
+    MutateFinalSchedulerTopology(&bundle, requeue_at_head);
+    REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                    &plan, &error));
+    REQUIRE(error.empty());
+    REQUIRE(plan.participants.size() == 2);
+  }
+
+  SECTION("a dequeued neighbour renumbers the passive row") {
+    const GuestExecutionSessionBundle bundle =
+        MakePassiveContinuousSessionBundle(kHostPageSize,
+                                           kSchedulerRecordDispatch, 0);
+    REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                    &plan, &error));
+    REQUIRE(error.empty());
   }
 }
 

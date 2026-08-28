@@ -759,6 +759,94 @@ TEST_CASE("Guest execution scheduler topology is versioned and fail closed",
   }
 }
 
+TEST_CASE("Guest execution ready FIFO order outlives boundary renumbering",
+          "[cpu][guest-execution-scheduler-topology]") {
+  const GuestExecutionSessionSchedulerTopologyChunk start =
+      MakeSchedulerTopologyFixture();
+  GuestExecutionSessionSchedulerTopologyChunk final_topology = start;
+  final_topology.boundary =
+      GuestExecutionSessionSchedulerTopologyBoundary::kFinal;
+  final_topology.global_sequence = 9;
+  std::string error;
+
+  SECTION("an untouched pair keeps its order") {
+    REQUIRE(GuestExecutionSessionSchedulerReadyOrderIsStable(
+        start, final_topology, {}, &error));
+    REQUIRE(error.empty());
+  }
+
+  SECTION("two unnamed rows that change places reject") {
+    final_topology.participants[2].ready_queue_fifo_ordinal = 0;
+    final_topology.participants[3].ready_queue_fifo_ordinal = 1;
+    REQUIRE_FALSE(GuestExecutionSessionSchedulerReadyOrderIsStable(
+        start, final_topology, {}, &error));
+    REQUIRE(error ==
+            "scheduler ready FIFO order changed between boundaries on cpu 0 "
+            "level 8: thread 00000102 overtook thread 00000103");
+  }
+
+  SECTION("a named row requeued at the head renumbers without reordering") {
+    GuestExecutionSessionSchedulerTopologyParticipant& requeued =
+        final_topology.participants[1];
+    requeued.state = GuestExecutionSessionSchedulerParticipantState::kReady;
+    requeued.cpu = 0;
+    requeued.ready_queue_level = 8;
+    requeued.ready_queue_fifo_ordinal = 0;
+    final_topology.participants[3].ready_queue_fifo_ordinal = 1;
+    final_topology.participants[2].ready_queue_fifo_ordinal = 2;
+    REQUIRE(GuestExecutionSessionSchedulerReadyOrderIsStable(
+        start, final_topology, {1}, &error));
+    REQUIRE(error.empty());
+  }
+
+  SECTION("a transposition behind a head insertion still rejects") {
+    GuestExecutionSessionSchedulerTopologyParticipant& requeued =
+        final_topology.participants[1];
+    requeued.state = GuestExecutionSessionSchedulerParticipantState::kReady;
+    requeued.cpu = 0;
+    requeued.ready_queue_level = 8;
+    requeued.ready_queue_fifo_ordinal = 0;
+    final_topology.participants[2].ready_queue_fifo_ordinal = 1;
+    final_topology.participants[3].ready_queue_fifo_ordinal = 2;
+    REQUIRE_FALSE(GuestExecutionSessionSchedulerReadyOrderIsStable(
+        start, final_topology, {1}, &error));
+    REQUIRE(error ==
+            "scheduler ready FIFO order changed between boundaries on cpu 0 "
+            "level 8: thread 00000102 overtook thread 00000103");
+  }
+
+  SECTION("a named row may be requeued anywhere in its queue") {
+    final_topology.participants[2].ready_queue_fifo_ordinal = 0;
+    final_topology.participants[3].ready_queue_fifo_ordinal = 1;
+    REQUIRE(GuestExecutionSessionSchedulerReadyOrderIsStable(
+        start, final_topology, {2}, &error));
+    REQUIRE(error.empty());
+  }
+
+  SECTION("a row that changes queue carries no order into the new one") {
+    final_topology.participants[2].cpu = 1;
+    final_topology.participants[2].ready_queue_fifo_ordinal = 0;
+    REQUIRE(GuestExecutionSessionSchedulerReadyOrderIsStable(
+        start, final_topology, {}, &error));
+    REQUIRE(error.empty());
+  }
+
+  SECTION("a lone ready row outside the dense range still rejects") {
+    GuestExecutionSessionSchedulerTopologyChunk chunk = start;
+    GuestExecutionSessionSchedulerTopologyParticipant& parked =
+        chunk.participants[2];
+    parked.state = GuestExecutionSessionSchedulerParticipantState::kSuspended;
+    parked.suspension_count = 1;
+    parked.ready_queue_level = kGuestExecutionSessionSchedulerNoValue;
+    parked.ready_queue_fifo_ordinal = kGuestExecutionSessionSchedulerNoValue;
+    chunk.participants[3].ready_queue_fifo_ordinal = 3;
+    std::vector<uint8_t> encoded;
+    REQUIRE_FALSE(GuestExecutionSessionCodec::EncodeSchedulerTopologyChunk(
+        chunk, &encoded, &error));
+    REQUIRE(error == "scheduler ready FIFO order is not dense");
+  }
+}
+
 TEST_CASE("Guest execution session metadata round trips and binds all chunks",
           "[cpu]") {
   const SessionFixture fixture = MakeSessionFixture();

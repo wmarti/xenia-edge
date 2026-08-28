@@ -10,6 +10,7 @@
 #include "xenia/cpu/guest_execution_session.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -1787,11 +1788,10 @@ bool ReadContentReference(Reader* reader,
   return true;
 }
 
-}  // namespace
-
-const char* GuestExecutionSessionSchedulerTopologyFirstDifference(
+const char* SchedulerTopologyFirstDifference(
     const GuestExecutionSessionSchedulerTopologyParticipant& initial,
-    const GuestExecutionSessionSchedulerTopologyParticipant& final_row) {
+    const GuestExecutionSessionSchedulerTopologyParticipant& final_row,
+    bool compare_ready_fifo_ordinal) {
   if (initial.ordinal != final_row.ordinal) {
     return "ordinal";
   }
@@ -1822,7 +1822,8 @@ const char* GuestExecutionSessionSchedulerTopologyFirstDifference(
   if (initial.ready_queue_level != final_row.ready_queue_level) {
     return "ready_queue_level";
   }
-  if (initial.ready_queue_fifo_ordinal != final_row.ready_queue_fifo_ordinal) {
+  if (compare_ready_fifo_ordinal &&
+      initial.ready_queue_fifo_ordinal != final_row.ready_queue_fifo_ordinal) {
     return "ready_queue_fifo_ordinal";
   }
   if (initial.resume_kind != final_row.resume_kind) {
@@ -1838,6 +1839,78 @@ const char* GuestExecutionSessionSchedulerTopologyFirstDifference(
     return "blocked_wait";
   }
   return nullptr;
+}
+
+std::string HexGuestThreadId(uint32_t guest_thread_id) {
+  char text[9];
+  std::snprintf(text, sizeof(text), "%08X", guest_thread_id);
+  return text;
+}
+
+}  // namespace
+
+const char* GuestExecutionSessionSchedulerTopologyFirstDifference(
+    const GuestExecutionSessionSchedulerTopologyParticipant& initial,
+    const GuestExecutionSessionSchedulerTopologyParticipant& final_row) {
+  return SchedulerTopologyFirstDifference(initial, final_row, true);
+}
+
+const char* GuestExecutionSessionSchedulerTopologyPassiveRowFirstDifference(
+    const GuestExecutionSessionSchedulerTopologyParticipant& initial,
+    const GuestExecutionSessionSchedulerTopologyParticipant& final_row) {
+  return SchedulerTopologyFirstDifference(initial, final_row, false);
+}
+
+bool GuestExecutionSessionSchedulerReadyOrderIsStable(
+    const GuestExecutionSessionSchedulerTopologyChunk& initial,
+    const GuestExecutionSessionSchedulerTopologyChunk& final_topology,
+    const std::set<uint32_t>& scheduler_event_subjects, std::string* error) {
+  using ReadyBucket = std::map<uint32_t, uint32_t>;
+  std::map<std::pair<uint32_t, uint32_t>, std::pair<ReadyBucket, ReadyBucket>>
+      ready_orders;
+  const size_t participant_count =
+      std::min(initial.participants.size(), final_topology.participants.size());
+  for (size_t index = 0; index < participant_count; ++index) {
+    const auto& initial_row = initial.participants[index];
+    const auto& final_row = final_topology.participants[index];
+    // A row a scheduler record names may have been unlinked and relinked
+    // anywhere, so only rows no record names carry an order across the pair.
+    if (initial_row.state !=
+            GuestExecutionSessionSchedulerParticipantState::kReady ||
+        final_row.state !=
+            GuestExecutionSessionSchedulerParticipantState::kReady ||
+        initial_row.guest_thread_id != final_row.guest_thread_id ||
+        initial_row.cpu != final_row.cpu ||
+        initial_row.ready_queue_level != final_row.ready_queue_level ||
+        scheduler_event_subjects.contains(static_cast<uint32_t>(index))) {
+      continue;
+    }
+    auto& ready_order =
+        ready_orders[{initial_row.cpu, initial_row.ready_queue_level}];
+    ready_order.first[initial_row.ready_queue_fifo_ordinal] =
+        initial_row.guest_thread_id;
+    ready_order.second[final_row.ready_queue_fifo_ordinal] =
+        final_row.guest_thread_id;
+  }
+  for (const auto& ready_order : ready_orders) {
+    auto initial_entry = ready_order.second.first.cbegin();
+    auto final_entry = ready_order.second.second.cbegin();
+    for (; initial_entry != ready_order.second.first.cend() &&
+           final_entry != ready_order.second.second.cend();
+         ++initial_entry, ++final_entry) {
+      if (initial_entry->second == final_entry->second) {
+        continue;
+      }
+      return Fail(
+          error,
+          "scheduler ready FIFO order changed between boundaries on cpu " +
+              std::to_string(ready_order.first.first) + " level " +
+              std::to_string(ready_order.first.second) + ": thread " +
+              HexGuestThreadId(final_entry->second) + " overtook thread " +
+              HexGuestThreadId(initial_entry->second));
+    }
+  }
+  return true;
 }
 
 bool IsGuestExecutionSessionWokenInWaitParticipant(

@@ -808,7 +808,7 @@ bool ValidateSchedulerTopologyCheckpointBindings(
                     "boundaries");
       }
       const char* topology_difference =
-          GuestExecutionSessionSchedulerTopologyFirstDifference(
+          GuestExecutionSessionSchedulerTopologyPassiveRowFirstDifference(
               start_topology.participants[ordinal],
               final_topology.participants[ordinal]);
       if (topology_difference) {
@@ -824,7 +824,8 @@ bool ValidateSchedulerTopologyCheckpointBindings(
                   "scheduler event subjects an outside-guest participant");
     }
   }
-  return true;
+  return GuestExecutionSessionSchedulerReadyOrderIsStable(
+      start_topology, final_topology, scheduler_event_subjects, error);
 }
 
 bool ValidateContinuousCodeClosure(
