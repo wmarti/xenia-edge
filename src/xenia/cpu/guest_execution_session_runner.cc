@@ -292,8 +292,12 @@ bool BuildGuestExecutionSessionReplayPlan(
   plan.participants.reserve(manifest.participants.size());
   for (const GuestExecutionSessionParticipant& participant :
        manifest.participants) {
+    // A participant parked below a call it never arrived at is carried, not
+    // resumed: it publishes no route and owns nothing on the tape.
     if (participant.initial_outer_call_state !=
-        GuestExecutionSessionInitialOuterCallState::kOutside) {
+            GuestExecutionSessionInitialOuterCallState::kOutside &&
+        participant.initial_outer_call_state !=
+            GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall) {
       return FailPlan(output, error,
                       "participant begins inside an outer host call; "
                       "mid-function resumption is not implemented");
@@ -739,6 +743,17 @@ bool BuildGuestExecutionSessionReplayPlan(
                       "participant ends inside a segment or outer host call");
     }
   }
+  for (size_t i = 0; i < plan.participants.size(); ++i) {
+    if (manifest.participants[i].initial_outer_call_state !=
+        GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall) {
+      continue;
+    }
+    if (plan.participants[i].segment_count ||
+        !plan.participants[i].event_indices.empty()) {
+      return FailPlan(output, error,
+                      "parked participant owns a segment or a recorded event");
+    }
+  }
   if (plan.events.size() != manifest.accepted_event_count) {
     return FailPlan(output, error,
                     "planned events do not cover the accepted event count");
@@ -1111,10 +1126,27 @@ bool BuildGuestExecutionContinuousReplayPlan(
                 topology.resume_kind ==
                     GuestExecutionSessionSchedulerResumeKind::kNotYetRun);
       };
+      // The park is carried in a scheduler queue for the whole interval
+      // rather than resumed, so a queue row is what it publishes instead of a
+      // resume route. A blocked one carries the return address its wait will
+      // come back to, which is an identity and not a route.
+      const auto is_parity_row = [](const auto& topology) {
+        return IsGuestExecutionSessionReadyParityParticipant(topology) ||
+               IsGuestExecutionSessionBlockedParityParticipant(topology);
+      };
+      const bool parked_below_outer_call =
+          participant.initial_outer_call_state ==
+          GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
       const auto& initial_topology =
           plan.initial_scheduler_topology.participants[i];
       const auto& final_topology =
           plan.final_scheduler_topology.participants[i];
+      const bool rows_carry_participant =
+          parked_below_outer_call ? (is_parity_row(initial_topology) &&
+                                     is_parity_row(final_topology))
+                                  : (initial_scheduler_unowned ||
+                                     (is_passive_resume(initial_topology) &&
+                                      is_passive_resume(final_topology)));
       const bool has_guest_execution_event = std::any_of(
           plan.events.cbegin(), plan.events.cend(), [&](const auto& event) {
             return event.canonical.thread_ordinal == participant.ordinal &&
@@ -1125,14 +1157,12 @@ bool BuildGuestExecutionContinuousReplayPlan(
           });
       if (final_routes[i] || initial_state != final_state ||
           planned.initial_checkpoint != planned.final_checkpoint ||
-          participant.initial_outer_call_state !=
-              GuestExecutionSessionInitialOuterCallState::kOutside ||
+          (!parked_below_outer_call &&
+           participant.initial_outer_call_state !=
+               GuestExecutionSessionInitialOuterCallState::kOutside) ||
           participant.boundary_arrival_kind !=
               GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside ||
-          (!initial_scheduler_unowned &&
-           (!is_passive_resume(initial_topology) ||
-            !is_passive_resume(final_topology))) ||
-          has_guest_execution_event) {
+          !rows_carry_participant || has_guest_execution_event) {
         return fail(
             "continuous outside-guest participant is not passive and "
             "byte-stable");

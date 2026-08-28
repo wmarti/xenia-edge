@@ -445,6 +445,54 @@ GuestExecutionSessionBundle MakeSessionBundle(const BundleOptions& options) {
   return bundle;
 }
 
+// Adds a participant that declares the durable park to the segmented fixture:
+// byte-stable at both checkpoints, owning no segment and no event.
+void AppendParkedSegmentedParticipant(GuestExecutionSessionBundle* bundle) {
+  std::string error;
+  GuestExecutionSessionCheckpointChunk initial;
+  GuestExecutionSessionCheckpointChunk final_chunk;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(bundle->chunks[0],
+                                                            &initial, &error));
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+      bundle->chunks[2], &final_chunk, &error));
+  ppc::GuestPPCRegisterState state;
+  state.link_register = kReturnAddress;
+  state.gpr[3] = kDataAddress;
+  state.gpr[9] = 0x5150;
+  const std::vector<uint8_t> bytes = EncodeState(state);
+  const GuestExecutionSessionSha256 digest = AddBlob(bundle, bytes);
+  const uint32_t ordinal =
+      static_cast<uint32_t>(bundle->manifest.participants.size());
+  const GuestExecutionSessionThreadStateReference reference = {
+      ordinal, bytes.size(), digest};
+  initial.checkpoint.thread_states.push_back(reference);
+  final_chunk.checkpoint.thread_states.push_back(reference);
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      initial, &bundle->chunks[0], &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_chunk, &bundle->chunks[2], &error));
+  bundle->manifest.chunks[0] =
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 0, 0, 0, 1,
+                bundle->chunks[0]);
+  bundle->manifest.chunks[2] =
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, 2,
+                final_chunk.checkpoint.global_sequence,
+                final_chunk.checkpoint.global_sequence, 1, bundle->chunks[2]);
+  GuestExecutionSessionParticipant participant;
+  participant.ordinal = ordinal;
+  participant.guest_thread_id = 0x100 + ordinal;
+  participant.capture_instance_id = 0x1000 + ordinal;
+  participant.initial_outer_call_state =
+      GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
+  participant.boundary_arrival_kind =
+      GuestExecutionSessionBoundaryArrivalKind::kAlreadyOutside;
+  participant.held_after_event_sequence =
+      bundle->manifest.stop_request_event_sequence;
+  participant.initial_state_size = bytes.size();
+  participant.initial_state_sha256 = digest;
+  bundle->manifest.participants.push_back(participant);
+}
+
 ppc::GuestPPCThreadCheckpoint MakeContinuousThreadCheckpoint(
     uint32_t ordinal, uint32_t guest_thread_id, uint32_t resume_pc,
     uint32_t outer_return, uint64_t seed) {
@@ -1247,6 +1295,141 @@ void AttachSignalWitnesses(
   bundle->chunks.push_back(std::move(final_bytes));
 }
 
+enum class ContinuousParkKind {
+  kReadyParity,
+  kBlockedParity,
+};
+
+// Turns the passive fixture's second participant into a fiber the barrier
+// caught below the root dispatch it never arrived at: held on a ready queue,
+// or blocked in a wait no modeled dispatch owns.
+GuestExecutionSessionBundle MakeParkedContinuousSessionBundle(
+    uint32_t host_page_size, ContinuousParkKind park) {
+  GuestExecutionSessionBundle bundle = MakePassiveContinuousSessionBundle(
+      host_page_size, kSchedulerRecordDispatch, 0);
+  bundle.manifest.participants[1].initial_outer_call_state =
+      GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
+  const auto park_row =
+      [park](GuestExecutionSessionSchedulerTopologyChunk* topology) {
+        GuestExecutionSessionSchedulerTopologyParticipant& row =
+            topology->participants[1];
+        row.restorable = false;
+        row.guest_pc = 0;
+        if (park == ContinuousParkKind::kReadyParity) {
+          row.state = GuestExecutionSessionSchedulerParticipantState::kReady;
+          row.resume_kind =
+              GuestExecutionSessionSchedulerResumeKind::kNativeContinuation;
+          return;
+        }
+        row.state = GuestExecutionSessionSchedulerParticipantState::kBlocked;
+        row.ready_queue_level = kGuestExecutionSessionSchedulerNoValue;
+        row.ready_queue_fifo_ordinal = kGuestExecutionSessionSchedulerNoValue;
+        row.resume_kind =
+            GuestExecutionSessionSchedulerResumeKind::kAfterBlockingExport;
+        // The return address the wait comes back to, which the emulator reads
+        // from the link register rather than from a durable route.
+        row.guest_pc = kReturnAddress + 8;
+        row.blocked_wait.kind = GuestExecutionSessionSchedulerWaitKind::kSingle;
+        row.blocked_wait.wait_epoch = 3;
+        row.blocked_wait.observed_wait_epoch = 3;
+        row.blocked_wait.handle_count = 1;
+        row.blocked_wait.flags =
+            kGuestExecutionSessionSchedulerWaitFlagGated |
+            kGuestExecutionSessionSchedulerWaitFlagInterruptible;
+        row.blocked_wait.handles[0] = 0x00110001u;
+        row.blocked_wait.signal_epochs_before[0] = 3;
+        row.blocked_wait.signal_epochs_observed[0] = 3;
+        // The queue the park leaves has to stay dense behind it.
+        GuestExecutionSessionSchedulerTopologyParticipant& mate =
+            topology->participants[0];
+        if (mate.state ==
+            GuestExecutionSessionSchedulerParticipantState::kReady) {
+          mate.ready_queue_fifo_ordinal = 0;
+        }
+      };
+  MutateStartSchedulerTopology(&bundle, park_row);
+  MutateFinalSchedulerTopology(&bundle, park_row);
+  return bundle;
+}
+
+// Rewrites the state both boundaries of one byte-stable participant share.
+void ReplaceParkedBoundaryCheckpoints(
+    GuestExecutionSessionBundle* bundle, uint32_t ordinal,
+    const ppc::GuestPPCThreadCheckpoint& checkpoint) {
+  std::string error;
+  GuestExecutionSessionCheckpointChunk initial;
+  GuestExecutionSessionCheckpointChunk final_chunk;
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+      bundle->chunks.front(), &initial, &error));
+  REQUIRE(GuestExecutionSessionCodec::DecodeCheckpointChunk(
+      bundle->chunks.back(), &final_chunk, &error));
+  const GuestExecutionSessionSha256 old_digest =
+      initial.checkpoint.thread_states[ordinal].sha256;
+  const bool boundaries_share_state =
+      final_chunk.checkpoint.thread_states[ordinal].sha256 == old_digest;
+  REQUIRE(boundaries_share_state);
+  std::vector<uint8_t> bytes = EncodeContinuousThreadCheckpoint(checkpoint);
+  const GuestExecutionSessionSha256 digest =
+      GuestExecutionSessionCodec::HashBytes(bytes);
+  auto blob =
+      std::find_if(bundle->content_blobs.begin(), bundle->content_blobs.end(),
+                   [&old_digest](const GuestExecutionSessionContentBlob& c) {
+                     return c.sha256 == old_digest;
+                   });
+  REQUIRE(blob != bundle->content_blobs.end());
+  blob->bytes = bytes;
+  blob->sha256 = digest;
+  for (GuestExecutionSessionCheckpointChunk* chunk : {&initial, &final_chunk}) {
+    chunk->checkpoint.thread_states[ordinal].byte_size = bytes.size();
+    chunk->checkpoint.thread_states[ordinal].sha256 = digest;
+  }
+  bundle->manifest.participants[ordinal].initial_state_size = bytes.size();
+  bundle->manifest.participants[ordinal].initial_state_sha256 = digest;
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      initial, &bundle->chunks.front(), &error));
+  REQUIRE(GuestExecutionSessionCodec::EncodeCheckpointChunk(
+      final_chunk, &bundle->chunks.back(), &error));
+  bundle->manifest.chunks.front() =
+      Reference(GuestExecutionSessionChunkKind::kCheckpoint, initial.ordinal, 0,
+                0, 1, bundle->chunks.front());
+  bundle->manifest.chunks.back() = Reference(
+      GuestExecutionSessionChunkKind::kCheckpoint, final_chunk.ordinal,
+      final_chunk.checkpoint.global_sequence,
+      final_chunk.checkpoint.global_sequence, 1, bundle->chunks.back());
+}
+
+// Moves the record at |index| onto |ordinal| in the canonical tape and in the
+// control overlay, and gives that participant the range it now owns.
+void RetargetContinuousEvent(GuestExecutionSessionBundle* bundle, size_t index,
+                             uint32_t ordinal, uint32_t guest_thread_id) {
+  std::string error;
+  GuestExecutionSessionEventChunk events;
+  REQUIRE(GuestExecutionSessionCodec::DecodeEventChunk(bundle->chunks[2],
+                                                       &events, &error));
+  const uint64_t sequence = events.events[index].global_sequence;
+  events.events[index].thread_ordinal = ordinal;
+  REQUIRE(GuestExecutionSessionCodec::EncodeEventChunk(
+      events, &bundle->chunks[2], &error));
+  bundle->manifest.chunks[2] =
+      Reference(GuestExecutionSessionChunkKind::kEvents, 2,
+                events.events.front().global_sequence,
+                events.events.back().global_sequence,
+                static_cast<uint32_t>(events.events.size()), bundle->chunks[2]);
+  GuestExecutionContinuousEventLimits limits;
+  std::vector<GuestExecutionContinuousEvent> control;
+  REQUIRE(GuestExecutionContinuousEventCodec::Decode(bundle->chunks[3],
+                                                     &control, &error, limits));
+  control[index].actor = {ordinal, guest_thread_id};
+  REQUIRE(GuestExecutionContinuousEventCodec::Encode(
+      control, &bundle->chunks[3], &error));
+  bundle->manifest.chunks[3] =
+      Reference(GuestExecutionSessionChunkKind::kContinuousEvents, 3,
+                control.front().global_sequence, control.back().global_sequence,
+                static_cast<uint32_t>(control.size()), bundle->chunks[3]);
+  bundle->manifest.participants[ordinal].first_event_sequence = sequence;
+  bundle->manifest.participants[ordinal].last_event_sequence = sequence;
+}
+
 }  // namespace
 
 TEST_CASE("continuous replay planner carries the signal witness table",
@@ -1631,6 +1814,131 @@ TEST_CASE("continuous validation admits ready FIFO renumbering",
   }
 }
 
+TEST_CASE("continuous replay planner plans a ready-parity park",
+          "[guest-execution-session-runner][continuous]"
+          "[guest-execution-scheduler-topology]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  const GuestExecutionSessionBundle bundle = MakeParkedContinuousSessionBundle(
+      kHostPageSize, ContinuousParkKind::kReadyParity);
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                      bundle.chunks, &error));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  GuestExecutionContinuousReplayPlan plan;
+  REQUIRE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize, &plan,
+                                                  &error));
+  REQUIRE(error.empty());
+  REQUIRE(plan.participants.size() == 2);
+  REQUIRE(plan.participants[1].initial_outer_call_state ==
+          GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall);
+  REQUIRE(plan.participants[1].initial_checkpoint ==
+          plan.participants[1].final_checkpoint);
+  REQUIRE(plan.participants[1].initial_checkpoint.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kOutsideGuest);
+  REQUIRE(IsGuestExecutionSessionReadyParityParticipant(
+      plan.initial_scheduler_topology.participants[1]));
+  REQUIRE(IsGuestExecutionSessionReadyParityParticipant(
+      plan.final_scheduler_topology.participants[1]));
+  // Only the executable participant seeds one; the park seeds none.
+  REQUIRE(plan.resume_entries.size() == 1);
+}
+
+TEST_CASE("continuous replay planner plans a blocked-parity park",
+          "[guest-execution-session-runner][continuous]"
+          "[guest-execution-scheduler-topology]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  const GuestExecutionSessionBundle bundle = MakeParkedContinuousSessionBundle(
+      kHostPageSize, ContinuousParkKind::kBlockedParity);
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                      bundle.chunks, &error));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  GuestExecutionContinuousReplayPlan plan;
+  REQUIRE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize, &plan,
+                                                  &error));
+  REQUIRE(error.empty());
+  REQUIRE(plan.participants.size() == 2);
+  REQUIRE(plan.participants[1].initial_outer_call_state ==
+          GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall);
+  REQUIRE(plan.participants[1].initial_checkpoint.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kOutsideGuest);
+  // The row carries the link register the wait returns to, and the planner
+  // must not read that as a route it could resume.
+  REQUIRE(plan.initial_scheduler_topology.participants[1].guest_pc ==
+          kReturnAddress + 8);
+  REQUIRE_FALSE(plan.initial_scheduler_topology.participants[1].restorable);
+  REQUIRE(IsGuestExecutionSessionBlockedParityParticipant(
+      plan.initial_scheduler_topology.participants[1]));
+  REQUIRE(IsGuestExecutionSessionBlockedParityParticipant(
+      plan.final_scheduler_topology.participants[1]));
+  // Only the executable participant seeds one; the park seeds none.
+  REQUIRE(plan.resume_entries.size() == 1);
+}
+
+TEST_CASE("continuous replay planner refuses a park that claims work",
+          "[guest-execution-session-runner][continuous]"
+          "[guest-execution-scheduler-topology]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  GuestExecutionContinuousReplayPlan plan;
+  std::string error;
+
+  SECTION("a parked row that publishes an executable route") {
+    GuestExecutionSessionBundle bundle = MakeParkedContinuousSessionBundle(
+        kHostPageSize, ContinuousParkKind::kReadyParity);
+    const auto restorable_route =
+        [](GuestExecutionSessionSchedulerTopologyChunk* topology) {
+          GuestExecutionSessionSchedulerTopologyParticipant& row =
+              topology->participants[1];
+          row.resume_kind =
+              GuestExecutionSessionSchedulerResumeKind::kJitSafepoint;
+          row.guest_pc = kCodeAddress + 0x40;
+          row.restorable = true;
+        };
+    MutateStartSchedulerTopology(&bundle, restorable_route);
+    MutateFinalSchedulerTopology(&bundle, restorable_route);
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+    INFO(error);
+    REQUIRE(error.find("JIT route differs from PPC") != std::string::npos);
+  }
+
+  SECTION("a parked state that leaves a modeled export dispatch open") {
+    GuestExecutionSessionBundle bundle = MakeParkedContinuousSessionBundle(
+        kHostPageSize, ContinuousParkKind::kBlockedParity);
+    ppc::GuestPPCThreadCheckpoint pending = MakeContinuousThreadCheckpoint(
+        1, 0x202, kCodeAddress + 0x40, kReturnAddress + 4, 2);
+    pending.resume_kind =
+        ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern;
+    pending.pending_external_event_sequence = 2;
+    pending.pending_export_guest_address = kCodeAddress + 0x40;
+    ReplaceParkedBoundaryCheckpoints(&bundle, 1, pending);
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+    INFO(error);
+    REQUIRE(error.find("parked topology has an executable PPC route") !=
+            std::string::npos);
+  }
+
+  SECTION("a parked participant that owns a guest execution record") {
+    GuestExecutionSessionBundle bundle = MakeParkedContinuousSessionBundle(
+        kHostPageSize, ContinuousParkKind::kReadyParity);
+    RetargetContinuousEvent(&bundle, 1, 1, 0x202);
+    REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                        bundle.chunks, &error));
+    REQUIRE_FALSE(ValidateGuestExecutionSessionBundle(bundle, &error));
+    REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                          &plan, &error));
+    INFO(error);
+    REQUIRE(error.find("outside-guest participant changed or executed") !=
+            std::string::npos);
+  }
+
+  REQUIRE(plan.participants.empty());
+  REQUIRE(plan.resume_entries.empty());
+}
+
 TEST_CASE("guest execution session planner resolves segments and event roles",
           "[guest-execution-session-runner]") {
   const BundleOptions options;
@@ -1709,6 +2017,41 @@ TEST_CASE("guest execution session planner resolves segments and event roles",
     REQUIRE(plan.coordinator_event_indices == std::vector<uint32_t>{2, 5, 6});
     REQUIRE(plan.reset_page_addresses == std::vector<uint32_t>{kDataAddress});
   }
+}
+
+TEST_CASE("guest execution session planner carries a park that runs nothing",
+          "[guest-execution-session-runner]") {
+  BundleOptions options;
+  GuestExecutionSessionBundle bundle = MakeSessionBundle(options);
+  AppendParkedSegmentedParticipant(&bundle);
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                      bundle.chunks, &error));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  GuestExecutionSessionReplayPlan plan;
+  REQUIRE(BuildGuestExecutionSessionReplayPlan(bundle, options.host_page_size,
+                                               &plan, &error));
+  REQUIRE(error.empty());
+  REQUIRE(plan.participants.size() == 3);
+  REQUIRE(plan.participants[2].segment_count == 0);
+  REQUIRE(plan.participants[2].event_indices.empty());
+}
+
+TEST_CASE("guest execution session planner refuses a park that owns work",
+          "[guest-execution-session-runner]") {
+  BundleOptions options;
+  GuestExecutionSessionBundle bundle = MakeSessionBundle(options);
+  bundle.manifest.participants[0].initial_outer_call_state =
+      GuestExecutionSessionInitialOuterCallState::kParkedBelowOuterCall;
+  std::string error;
+  REQUIRE(GuestExecutionSessionCodec::ValidateSession(bundle.manifest,
+                                                      bundle.chunks, &error));
+  REQUIRE(ValidateGuestExecutionSessionBundle(bundle, &error));
+  GuestExecutionSessionReplayPlan plan;
+  REQUIRE_FALSE(BuildGuestExecutionSessionReplayPlan(
+      bundle, options.host_page_size, &plan, &error));
+  REQUIRE(error == "parked participant owns a segment or a recorded event");
+  REQUIRE(plan.participants.empty());
 }
 
 TEST_CASE("guest execution session planner rejects sessions without a hook",

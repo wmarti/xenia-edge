@@ -101,9 +101,10 @@ struct GuestExecutionSessionReplayPage {
 //
 // Accepted session shape (anything else rejects, naming the reason):
 // - exactly one exact code corpus across all segments;
-// - every participant starts outside an outer host call with a non-safepoint
-//   boundary arrival, and its state blob round-trips byte-exactly through
-//   ppc::GuestPPCRegisterStateCodec;
+// - every participant starts outside an outer host call, or is parked below
+//   one it never arrived at and then owns no segment and no event, with a
+//   non-safepoint boundary arrival, and its state blob round-trips
+//   byte-exactly through ppc::GuestPPCRegisterStateCodec;
 // - every segment input page, every later-checkpoint page and every
 //   asynchronous-mutation page is supplied by the initial checkpoint; corpus
 //   pages are the only code source and checkpoint code references must equal
@@ -121,7 +122,8 @@ struct GuestExecutionSessionReplayPage {
 // kSynchronization, kernel/extern, MMIO, clock, atomic, interrupt and guest-
 // defined marker events, kActive initial outer-call state and kJitSafepoint
 // arrival all reject, so a real title session cannot replay through this
-// runner until those hooks exist.
+// runner until those hooks exist. A parked participant is restored once and
+// compared unchanged, which is the whole of what its class claims happened.
 struct GuestExecutionSessionReplayPlan {
   GuestExecutionSessionReplayPlan() = default;
   GuestExecutionSessionReplayPlan(GuestExecutionSessionReplayPlan&&) = default;
