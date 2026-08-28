@@ -21,6 +21,7 @@
 
 #include "xenia/base/memory.h"
 #include "xenia/base/platform.h"
+#include "xenia/cpu/guest_invocation_replay_cli.h"
 #include "xenia/cpu/testing/util.h"
 
 #include "third_party/catch/include/catch.hpp"
@@ -1726,6 +1727,100 @@ TEST_CASE("guest execution session runner replays persistent participants",
     REQUIRE(error == "segment input page differs from live guest memory");
   }
 #endif  // !XE_PLATFORM_MAC || !XE_ARCH_ARM64
+}
+
+// Stage E0 of the continuous executor: the replay CLI's plan attempt is the
+// only non-test caller of the continuous planner, so its gate order and its
+// verdict records are asserted against the same synthetic bundles.
+TEST_CASE("continuous replay CLI reports a planned session",
+          "[guest-execution-session-runner][continuous]"
+          "[guest-invocation-replay-cli]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  const GuestExecutionSessionBundle bundle =
+      MakeContinuousSessionBundle(kHostPageSize);
+  GuestExecutionContinuousReplayPlan plan;
+  std::string error;
+  REQUIRE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize, &plan,
+                                                  &error));
+  REQUIRE(plan.participants.size() == 2);
+  REQUIRE(plan.events.size() == 8);
+
+  GuestSessionContinuousReplayVerdict verdict;
+  REQUIRE(AttemptGuestSessionContinuousReplayPlan(
+      bundle, kHostPageSize, false, bundle.manifest.replay_config_sha256,
+      &verdict));
+  REQUIRE(verdict.planned);
+  REQUIRE(verdict.plan_line ==
+          "XENIA_GUEST_SESSION_CONTINUOUS_PLAN_V1 status=planned "
+          "participants=" +
+              std::to_string(plan.participants.size()) +
+              " events=" + std::to_string(plan.events.size()) +
+              " pages=" + std::to_string(plan.pages.size()) +
+              " resume_entries=" + std::to_string(plan.resume_entries.size()));
+  REQUIRE(verdict.exec_line ==
+          "XENIA_GUEST_SESSION_CONTINUOUS_EXEC_V1 status=rejected "
+          "reason=\"continuous executor is not implemented\"");
+}
+
+TEST_CASE("continuous replay CLI gates configuration before planning",
+          "[guest-execution-session-runner][continuous]"
+          "[guest-invocation-replay-cli]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  GuestSessionContinuousReplayVerdict verdict;
+
+  SECTION("a segmented session rejects with the zero-segment reason") {
+    const BundleOptions options;
+    const GuestExecutionSessionBundle bundle = MakeSessionBundle(options);
+    REQUIRE_FALSE(AttemptGuestSessionContinuousReplayPlan(
+        bundle, kHostPageSize, false, bundle.manifest.replay_config_sha256,
+        &verdict));
+    REQUIRE(verdict.plan_line ==
+            FormatGuestSessionContinuousPlanRejection(
+                "continuous replay requires a zero-segment session"));
+  }
+
+  SECTION("a mismatched configuration hash rejects before the plan") {
+    const GuestExecutionSessionBundle bundle =
+        MakeContinuousSessionBundle(kHostPageSize);
+    GuestInvocationReplaySha256 other_config_sha256 =
+        bundle.manifest.replay_config_sha256;
+    other_config_sha256[0] = static_cast<uint8_t>(other_config_sha256[0] + 1);
+    REQUIRE_FALSE(AttemptGuestSessionContinuousReplayPlan(
+        bundle, kHostPageSize, false, other_config_sha256, &verdict));
+    REQUIRE(verdict.plan_line ==
+            FormatGuestSessionContinuousPlanRejection(
+                "continuous replay configuration SHA-256 does not match the "
+                "session"));
+  }
+
+  SECTION("a corpus recorded under another scheduler setting rejects first") {
+    const GuestExecutionSessionBundle bundle =
+        MakeContinuousSessionBundle(kHostPageSize);
+    // Both gates would fire; the named scheduler reason has to win, because it
+    // is the one that explains why a matching hash would still never poll.
+    GuestInvocationReplaySha256 other_config_sha256 =
+        bundle.manifest.replay_config_sha256;
+    other_config_sha256[0] = static_cast<uint8_t>(other_config_sha256[0] + 1);
+    REQUIRE_FALSE(AttemptGuestSessionContinuousReplayPlan(
+        bundle, kHostPageSize, true, other_config_sha256, &verdict));
+    REQUIRE(verdict.plan_line ==
+            FormatGuestSessionContinuousPlanRejection(
+                "continuous replay corpus guest_scheduler does not match the "
+                "runtime"));
+  }
+
+  SECTION("an unsupported host page size rejects at the plan") {
+    const GuestExecutionSessionBundle bundle =
+        MakeContinuousSessionBundle(kHostPageSize);
+    REQUIRE_FALSE(AttemptGuestSessionContinuousReplayPlan(
+        bundle, 1024, false, bundle.manifest.replay_config_sha256, &verdict));
+    REQUIRE(verdict.plan_line ==
+            FormatGuestSessionContinuousPlanRejection(
+                "host page size is unsupported for continuous replay"));
+  }
+
+  REQUIRE_FALSE(verdict.planned);
+  REQUIRE(verdict.exec_line.empty());
 }
 
 }  // namespace test

@@ -10,7 +10,13 @@
 #include "xenia/cpu/guest_invocation_replay_cli.h"
 
 #include <array>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
 #include <string>
+#include <system_error>
+#include <vector>
 
 #include "third_party/catch/include/catch.hpp"
 
@@ -24,6 +30,43 @@ GuestInvocationReplaySha256 RepeatedHash(uint8_t value) {
   hash.fill(value);
   return hash;
 }
+
+class ScopedTestDirectory {
+ public:
+  ScopedTestDirectory() {
+    std::error_code filesystem_error;
+    const std::filesystem::path temporary_root =
+        std::filesystem::temp_directory_path(filesystem_error);
+    if (filesystem_error) {
+      throw std::runtime_error("temporary directory is unavailable");
+    }
+    const uint64_t nonce = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    for (uint32_t attempt = 0; attempt < 100; ++attempt) {
+      path_ = temporary_root /
+              ("xenia-continuous-cli-test-" + std::to_string(nonce) + "-" +
+               std::to_string(attempt));
+      filesystem_error.clear();
+      if (std::filesystem::create_directory(path_, filesystem_error)) {
+        return;
+      }
+      if (filesystem_error) {
+        throw std::runtime_error("temporary directory could not be created");
+      }
+    }
+    throw std::runtime_error("unique temporary directory could not be created");
+  }
+
+  ~ScopedTestDirectory() {
+    std::error_code filesystem_error;
+    std::filesystem::remove_all(path_, filesystem_error);
+  }
+
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
 
 TEST_CASE("Guest invocation benchmark marker is canonical",
           "[guest-invocation-replay-cli]") {
@@ -76,6 +119,70 @@ TEST_CASE("Guest invocation benchmark marker is canonical",
               "\twarm_verified=1"
               "\ttimed_exit_verified=1"
               "\tfinal_verified=1");
+}
+
+TEST_CASE("Continuous session plan rejection is one greppable record",
+          "[guest-invocation-replay-cli][continuous]") {
+  REQUIRE(FormatGuestSessionContinuousPlanRejection(
+              "continuous replay requires a zero-segment session") ==
+          "XENIA_GUEST_SESSION_CONTINUOUS_PLAN_V1 status=rejected "
+          "reason=\"continuous replay requires a zero-segment session\"");
+
+  SECTION("a quote or backslash cannot end the record early") {
+    REQUIRE(FormatGuestSessionContinuousPlanRejection("say \"a\\b\"") ==
+            "XENIA_GUEST_SESSION_CONTINUOUS_PLAN_V1 status=rejected "
+            "reason=\"say \\\"a\\\\b\\\"\"");
+  }
+
+  SECTION("a newline cannot split the record") {
+    REQUIRE(FormatGuestSessionContinuousPlanRejection("first\nsecond") ==
+            "XENIA_GUEST_SESSION_CONTINUOUS_PLAN_V1 status=rejected "
+            "reason=\"first second\"");
+  }
+
+  SECTION("an empty reason still names the gap") {
+    REQUIRE(FormatGuestSessionContinuousPlanRejection("") ==
+            "XENIA_GUEST_SESSION_CONTINUOUS_PLAN_V1 status=rejected "
+            "reason=\"continuous replay rejected without a reason\"");
+  }
+}
+
+TEST_CASE("Continuous session replay rejects input that is not a bundle",
+          "[guest-invocation-replay-cli][continuous]") {
+  const GuestInvocationReplaySha256 config_sha256 = RepeatedHash(0x20);
+  GuestSessionContinuousReplayVerdict verdict;
+
+  SECTION("an empty path rejects without touching the filesystem") {
+    REQUIRE_FALSE(AttemptGuestSessionContinuousReplay(
+        std::filesystem::path(), 16 * 1024, false, config_sha256, &verdict));
+    REQUIRE(verdict.plan_line ==
+            FormatGuestSessionContinuousPlanRejection(
+                "continuous session bundle path is empty"));
+    REQUIRE(verdict.exec_line.empty());
+    REQUIRE_FALSE(verdict.planned);
+  }
+
+  SECTION("a corrupt bundle directory rejects with the reader's reason") {
+    const ScopedTestDirectory directory;
+    {
+      std::ofstream manifest(
+          directory.path() / kGuestExecutionSessionBundleManifestFileName,
+          std::ios::binary);
+      REQUIRE(manifest.is_open());
+      const std::string garbage(64, '\x7F');
+      manifest.write(garbage.data(),
+                     static_cast<std::streamsize>(garbage.size()));
+    }
+    REQUIRE_FALSE(AttemptGuestSessionContinuousReplay(
+        directory.path(), 16 * 1024, false, config_sha256, &verdict));
+    REQUIRE(
+        verdict.plan_line.rfind(std::string(kGuestSessionContinuousPlanMarker) +
+                                    " status=rejected reason=\"",
+                                0) == 0);
+    REQUIRE(verdict.plan_line.back() == '"');
+    REQUIRE(verdict.exec_line.empty());
+    REQUIRE_FALSE(verdict.planned);
+  }
 }
 
 }  // namespace

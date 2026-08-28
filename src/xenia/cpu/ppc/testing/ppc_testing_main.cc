@@ -92,6 +92,14 @@ DEFINE_path(guest_invocation_synthetic_fixture_out, "",
             "into a new explicit output directory.",
             "CPU");
 
+DEFINE_path(guest_session_in, "",
+            "Attempt a continuous guest execution session replay plan for the "
+            "published session bundle directory at this path. Prints one "
+            "machine-readable plan verdict and exits nonzero: no continuous "
+            "executor exists yet, so a planned session still rejects at "
+            "execution.",
+            "CPU");
+
 DEFINE_path(jit_corpus_in, "",
             "Recompile a guest code corpus captured by --jit_corpus_out and "
             "report emitted host code size. Measures a codegen change against "
@@ -1005,7 +1013,8 @@ std::unique_ptr<backend::Backend> CreateHostBackend() {
 }
 
 bool WriteSyntheticFixture(const std::filesystem::path& executable_path) {
-  if (!cvars::guest_invocation_in.empty() || !cvars::jit_corpus_in.empty()) {
+  if (!cvars::guest_invocation_in.empty() || !cvars::jit_corpus_in.empty() ||
+      !cvars::guest_session_in.empty()) {
     return Reject("synthetic fixture input validation",
                   "fixture generation cannot be combined with replay input");
   }
@@ -1203,6 +1212,66 @@ bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
   fprintf(stdout, "%s\n", marker.c_str());
   fflush(stdout);
   return true;
+}
+
+// Stage E0 of the continuous executor: load a published session bundle, apply
+// the construct-time configuration gates and attempt the continuous plan. No
+// executor exists yet, so this always exits nonzero -- the plan verdict is the
+// deliverable, and it is what makes a real bundle's first rejection visible.
+bool RunGuestSessionContinuousReplay() {
+  const auto reject = [](std::string_view reason) {
+    fprintf(stdout, "%s\n",
+            FormatGuestSessionContinuousPlanRejection(reason).c_str());
+    fflush(stdout);
+    return false;
+  };
+
+  if (!cvars::guest_invocation_in.empty() || !cvars::jit_corpus_in.empty()) {
+    return reject(
+        "continuous session replay cannot be combined with another replay "
+        "input");
+  }
+  const size_t native_page_size = xe::memory::page_size();
+  if (native_page_size > std::numeric_limits<uint32_t>::max()) {
+    return reject("native host page size does not fit the replay format");
+  }
+  std::unique_ptr<backend::Backend> backend = CreateHostBackend();
+  if (!backend) {
+    return reject("no backend exists for this host and --cpu selection");
+  }
+  // The configuration snapshot reads the code cache, the mapping mode and the
+  // guest membase, so it needs a set-up processor even though nothing runs.
+  auto memory = std::make_unique<Memory>();
+  if (!memory->Initialize()) {
+    return reject("guest memory could not be initialized");
+  }
+  auto processor = std::make_unique<Processor>(memory.get(), nullptr);
+  if (!processor->Setup(std::move(backend)) || !processor->backend()) {
+    return reject("processor setup failed");
+  }
+
+  GuestInvocationReplayConfig replay_config;
+  std::string error;
+  if (!CaptureCurrentGuestInvocationReplayConfig(*processor->backend(),
+                                                 &replay_config, &error)) {
+    return reject(error);
+  }
+  GuestInvocationReplaySha256 replay_config_sha256 = {};
+  if (!HashGuestInvocationReplayConfig(replay_config, &replay_config_sha256,
+                                       &error)) {
+    return reject(error);
+  }
+
+  GuestSessionContinuousReplayVerdict verdict;
+  const bool planned = AttemptGuestSessionContinuousReplay(
+      cvars::guest_session_in, static_cast<uint32_t>(native_page_size),
+      cvars::guest_scheduler, replay_config_sha256, &verdict);
+  fprintf(stdout, "%s\n", verdict.plan_line.c_str());
+  if (planned) {
+    fprintf(stdout, "%s\n", verdict.exec_line.c_str());
+  }
+  fflush(stdout);
+  return false;
 }
 
 }  // namespace invocation
@@ -1819,6 +1888,9 @@ int main(const std::vector<std::string>& args) {
     const std::filesystem::path executable_path =
         args.empty() ? std::filesystem::path() : std::filesystem::path(args[0]);
     return invocation::WriteSyntheticFixture(executable_path) ? 0 : 1;
+  }
+  if (!cvars::guest_session_in.empty()) {
+    return invocation::RunGuestSessionContinuousReplay() ? 0 : 1;
   }
   if (!cvars::guest_invocation_in.empty()) {
     const std::filesystem::path executable_path =

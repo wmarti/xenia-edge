@@ -14,8 +14,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "xenia/cpu/guest_execution_session_bundle.h"
 #include "xenia/cpu/guest_invocation_runner.h"
 
 namespace xe {
@@ -60,6 +62,42 @@ struct GuestInvocationReplayBenchmarkProvenance {
 std::string FormatGuestInvocationReplayBenchmarkMarker(
     const GuestInvocationReplayBenchmarkProvenance& provenance,
     const GuestInvocationReplayMetrics& metrics);
+
+// One grep-addressable record per verdict. The plan record is emitted for
+// every outcome so a rejected run is as findable as a planned one.
+inline constexpr char kGuestSessionContinuousPlanMarker[] =
+    "XENIA_GUEST_SESSION_CONTINUOUS_PLAN_V1";
+inline constexpr char kGuestSessionContinuousExecMarker[] =
+    "XENIA_GUEST_SESSION_CONTINUOUS_EXEC_V1";
+
+struct GuestSessionContinuousReplayVerdict {
+  bool planned = false;
+  // Always populated. Quoting is applied to the reason so a decoder message
+  // can never end the record early.
+  std::string plan_line;
+  // Populated only when the plan succeeded.
+  std::string exec_line;
+};
+
+std::string FormatGuestSessionContinuousPlanRejection(std::string_view reason);
+
+// Applies the continuous lane's two construct-time configuration gates in the
+// order the single-invocation lane uses them, then attempts the continuous
+// plan. Nothing partial is ever reported: any unexpected state is a rejection
+// naming its own reason.
+bool AttemptGuestSessionContinuousReplayPlan(
+    const GuestExecutionSessionBundle& bundle, uint32_t host_page_size,
+    bool runtime_guest_scheduler,
+    const GuestInvocationReplaySha256& runtime_replay_config_sha256,
+    GuestSessionContinuousReplayVerdict* output);
+
+// Reads a published session bundle directory before applying the same gates.
+// A directory that is not a complete bundle rejects with the reader's message.
+bool AttemptGuestSessionContinuousReplay(
+    const std::filesystem::path& bundle_directory, uint32_t host_page_size,
+    bool runtime_guest_scheduler,
+    const GuestInvocationReplaySha256& runtime_replay_config_sha256,
+    GuestSessionContinuousReplayVerdict* output);
 
 }  // namespace cpu
 }  // namespace xe

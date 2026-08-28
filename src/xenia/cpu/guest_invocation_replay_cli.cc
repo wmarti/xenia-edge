@@ -14,8 +14,13 @@
 #include <fstream>
 #include <limits>
 #include <string_view>
+#include <utility>
 
 #include "third_party/crypto/sha256.h"
+#include "xenia/cpu/execution_jit_corpus.h"
+#include "xenia/cpu/guest_execution_session.h"
+#include "xenia/cpu/guest_execution_session_runner.h"
+#include "xenia/cpu/jit_corpus.h"
 
 namespace xe {
 namespace cpu {
@@ -50,14 +55,55 @@ void AppendField(std::string* marker, std::string_view name,
   marker->append(value);
 }
 
-void AppendUint64Field(std::string* marker, std::string_view name,
-                       uint64_t value) {
-  std::array<char, std::numeric_limits<uint64_t>::digits10 + 1> digits = {};
+std::string Uint64Text(uint64_t value) {
+  std::array<char, std::numeric_limits<uint64_t>::digits10 + 2> digits = {};
   const auto result =
       std::to_chars(digits.data(), digits.data() + digits.size(), value);
-  AppendField(marker, name,
-              std::string_view(digits.data(), static_cast<size_t>(
-                                                  result.ptr - digits.data())));
+  return std::string(digits.data(),
+                     static_cast<size_t>(result.ptr - digits.data()));
+}
+
+// The record is one line of space-separated fields, so a quote, backslash or
+// control byte from a decoder message must not be able to end it early.
+std::string QuoteVerdictReason(std::string_view reason) {
+  std::string quoted;
+  quoted.reserve(reason.size() + 8);
+  for (const char raw : reason) {
+    const auto byte = static_cast<unsigned char>(raw);
+    if (raw == '"' || raw == '\\') {
+      quoted.push_back('\\');
+      quoted.push_back(raw);
+    } else if (byte < 0x20 || byte == 0x7F) {
+      quoted.push_back(' ');
+    } else {
+      quoted.push_back(raw);
+    }
+  }
+  return quoted;
+}
+
+bool RejectContinuousSession(GuestSessionContinuousReplayVerdict* output,
+                             std::string_view reason) {
+  output->planned = false;
+  output->plan_line = FormatGuestSessionContinuousPlanRejection(reason);
+  output->exec_line.clear();
+  return false;
+}
+
+const std::vector<uint8_t>* FindContentBlob(
+    const GuestExecutionSessionBundle& bundle,
+    const GuestExecutionSessionSha256& sha256) {
+  for (const GuestExecutionSessionContentBlob& blob : bundle.content_blobs) {
+    if (blob.sha256 == sha256) {
+      return &blob.bytes;
+    }
+  }
+  return nullptr;
+}
+
+void AppendUint64Field(std::string* marker, std::string_view name,
+                       uint64_t value) {
+  AppendField(marker, name, Uint64Text(value));
 }
 
 }  // namespace
@@ -217,6 +263,130 @@ std::string FormatGuestInvocationReplayBenchmarkMarker(
   AppendField(&marker, "timed_exit_verified", "1");
   AppendField(&marker, "final_verified", "1");
   return marker;
+}
+
+std::string FormatGuestSessionContinuousPlanRejection(std::string_view reason) {
+  // An empty reason would leave an unfalsifiable record, so name the gap.
+  constexpr std::string_view kUnnamedReason =
+      "continuous replay rejected without a reason";
+  std::string line = kGuestSessionContinuousPlanMarker;
+  line += " status=rejected reason=\"";
+  line += QuoteVerdictReason(reason.empty() ? kUnnamedReason : reason);
+  line += '"';
+  return line;
+}
+
+bool AttemptGuestSessionContinuousReplayPlan(
+    const GuestExecutionSessionBundle& bundle, uint32_t host_page_size,
+    bool runtime_guest_scheduler,
+    const GuestInvocationReplaySha256& runtime_replay_config_sha256,
+    GuestSessionContinuousReplayVerdict* output) {
+  if (!output) {
+    return false;
+  }
+  *output = {};
+
+  const GuestExecutionSessionManifest& manifest = bundle.manifest;
+  if (bundle.chunks.size() != manifest.chunks.size()) {
+    return RejectContinuousSession(
+        output, "continuous session chunk count does not match its manifest");
+  }
+
+  size_t corpus_chunk_index = manifest.chunks.size();
+  for (size_t i = 0; i < manifest.chunks.size(); ++i) {
+    if (manifest.chunks[i].kind !=
+        GuestExecutionSessionChunkKind::kCodeCorpus) {
+      continue;
+    }
+    if (corpus_chunk_index != manifest.chunks.size()) {
+      return RejectContinuousSession(
+          output, "continuous session code corpus chunk is duplicated");
+    }
+    corpus_chunk_index = i;
+  }
+  std::string error;
+  // guest_scheduler is already inside the configuration hash, but it is named
+  // separately because a corpus built without safepoint polls would otherwise
+  // run to the tape timeout instead of rejecting. A session with no corpus
+  // chunk cannot plan at all, so the planner's own closure rejection speaks.
+  if (corpus_chunk_index != manifest.chunks.size()) {
+    GuestExecutionSessionCodeCorpusChunk corpus_chunk;
+    if (!GuestExecutionSessionCodec::DecodeCodeCorpusChunk(
+            bundle.chunks[corpus_chunk_index], &corpus_chunk, &error)) {
+      return RejectContinuousSession(output, error);
+    }
+    const std::vector<uint8_t>* corpus_bytes =
+        FindContentBlob(bundle, corpus_chunk.code_corpus_sha256);
+    ExecutionJitCorpus corpus;
+    if (!corpus_bytes ||
+        !ExecutionJitCorpus::Decode(*corpus_bytes, &corpus, &error)) {
+      return RejectContinuousSession(
+          output, "continuous session code corpus failed to decode");
+    }
+    const bool corpus_guest_scheduler =
+        (corpus.config_flags() & JitCorpus::kConfigGuestScheduler) != 0;
+    if (corpus_guest_scheduler != runtime_guest_scheduler) {
+      return RejectContinuousSession(
+          output,
+          "continuous replay corpus guest_scheduler does not match the "
+          "runtime");
+    }
+  }
+
+  if (manifest.replay_config_sha256 != runtime_replay_config_sha256) {
+    return RejectContinuousSession(
+        output,
+        "continuous replay configuration SHA-256 does not match the session");
+  }
+
+  GuestExecutionContinuousReplayPlan plan;
+  if (!BuildGuestExecutionContinuousReplayPlan(bundle, host_page_size, &plan,
+                                               &error)) {
+    return RejectContinuousSession(output, error);
+  }
+
+  std::string plan_line = kGuestSessionContinuousPlanMarker;
+  plan_line += " status=planned participants=";
+  plan_line += Uint64Text(plan.participants.size());
+  plan_line += " events=";
+  plan_line += Uint64Text(plan.events.size());
+  plan_line += " pages=";
+  plan_line += Uint64Text(plan.pages.size());
+  plan_line += " resume_entries=";
+  plan_line += Uint64Text(plan.resume_entries.size());
+
+  std::string exec_line = kGuestSessionContinuousExecMarker;
+  exec_line +=
+      " status=rejected reason=\"continuous executor is not "
+      "implemented\"";
+
+  output->planned = true;
+  output->plan_line = std::move(plan_line);
+  output->exec_line = std::move(exec_line);
+  return true;
+}
+
+bool AttemptGuestSessionContinuousReplay(
+    const std::filesystem::path& bundle_directory, uint32_t host_page_size,
+    bool runtime_guest_scheduler,
+    const GuestInvocationReplaySha256& runtime_replay_config_sha256,
+    GuestSessionContinuousReplayVerdict* output) {
+  if (!output) {
+    return false;
+  }
+  *output = {};
+  if (bundle_directory.empty()) {
+    return RejectContinuousSession(output,
+                                   "continuous session bundle path is empty");
+  }
+  GuestExecutionSessionBundle bundle;
+  std::string error;
+  if (!ReadGuestExecutionSessionBundle(bundle_directory, &bundle, &error)) {
+    return RejectContinuousSession(output, error);
+  }
+  return AttemptGuestSessionContinuousReplayPlan(
+      bundle, host_page_size, runtime_guest_scheduler,
+      runtime_replay_config_sha256, output);
 }
 
 }  // namespace cpu
