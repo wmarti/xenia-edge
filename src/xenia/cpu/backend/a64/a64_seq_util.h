@@ -382,7 +382,11 @@ inline bool NeedsPhysicalRemap() {
 // understates a rate measurement but never adds a fence to the hot path.
 extern "C" volatile uint64_t xe_a64_physical_remap_hits;
 
-inline void ApplyPhysicalRemapW0(A64Emitter& e) {
+// Apply the remap to `src`, leaving the result in w0. The selecting form
+// reads its source directly, so a caller whose address is already in a
+// register does not have to copy it into w0 first.
+inline void ApplyPhysicalRemapW0(A64Emitter& e,
+                                 const Xbyak_aarch64::WReg& src) {
   using namespace Xbyak_aarch64;
   // Addresses at or above 0xE0000000 are exactly those whose top three bits
   // are all set, which is the same as ~address having none of them set, and
@@ -394,11 +398,14 @@ inline void ApplyPhysicalRemapW0(A64Emitter& e) {
     // it costs branch density rather than mispredictions: measured 0.65%
     // faster on a replayed title function than the branching form, in both
     // orderings of the A/B.
-    e.mvn(e.w17, e.w0);
+    e.mvn(e.w17, src);
     e.tst(e.w17, 0xE0000000u);
-    e.add(e.w17, e.w0, 1, 12);
-    e.csel(e.w0, e.w17, e.w0, EQ);
+    e.add(e.w17, src, 1, 12);
+    e.csel(e.w0, e.w17, src, EQ);
     return;
+  }
+  if (src.getIdx() != e.w0.getIdx()) {
+    e.mov(e.w0, src);
   }
   Xbyak_aarch64::Label skip;
   // The counter has to sit on the taken path, so this form keeps the branch.
@@ -419,6 +426,10 @@ inline void ApplyPhysicalRemapW0(A64Emitter& e) {
     e.str(e.x17, ptr(e.x16));
   }
   e.L(skip);
+}
+
+inline void ApplyPhysicalRemapW0(A64Emitter& e) {
+  ApplyPhysicalRemapW0(e, e.w0);
 }
 
 // Compute a guest memory address, returning the XReg for [x21, xN] addressing.
@@ -442,11 +453,15 @@ inline XReg ComputeMemoryAddress(A64Emitter& e, const I64Op& guest) {
       // The producing AND emitted nothing; its mask and this truncation are
       // the same W-form instruction.
       e.and_(e.w0, WReg(mask_src_reg), static_cast<uint64_t>(mask));
+      if (NeedsPhysicalRemap()) {
+        ApplyPhysicalRemapW0(e);
+      }
+    } else if (NeedsPhysicalRemap()) {
+      // The remap writes w0 itself, so the truncation it performs is the only
+      // copy this needs.
+      ApplyPhysicalRemapW0(e, WReg(src.getIdx()));
     } else {
       e.mov(e.w0, WReg(src.getIdx()));
-    }
-    if (NeedsPhysicalRemap()) {
-      ApplyPhysicalRemapW0(e);
     }
     return e.x0;
   }
