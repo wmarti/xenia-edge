@@ -1349,7 +1349,11 @@ TEST_CASE("session capture runtime rejects a retained export event log",
   harness.runtime->Shutdown();
   const auto status = harness.runtime->status();
   REQUIRE(status.state == RuntimeState::kRejected);
-  REQUIRE(status.rejection == RuntimeRejection::kSourceAttachment);
+  // The control worker joins before the log is released, and its shutdown
+  // epilogue has already cancelled this still-idle session; first rejection
+  // wins, so the retained log appends its diagnostic without displacing the
+  // boundary code that named the failure first.
+  REQUIRE(status.rejection == RuntimeRejection::kCancelled);
   REQUIRE(status.message.find("retained its modeled export event log") !=
           std::string::npos);
   // The log stays installed rather than dropping an event it already promised.
