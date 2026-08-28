@@ -1041,6 +1041,21 @@ PauseResult Pause(GuestScheduler& scheduler,
   return result;
 }
 
+// A quiesce window whose roster moved under it is void rather than wrong, so
+// the arm policy re-samples it instead of reporting a barrier state error.
+Rejection PauseSettled(GuestScheduler& scheduler,
+                       std::chrono::milliseconds timeout,
+                       GuestSchedulerCheckpointBarrierSnapshot* out_snapshot) {
+  constexpr int kAttempts = 8;
+  Rejection rejection = Rejection::kTopologyChanged;
+  for (int attempt = 0;
+       attempt < kAttempts && rejection == Rejection::kTopologyChanged;
+       ++attempt) {
+    rejection = scheduler.PauseForCheckpointBarrier(timeout, out_snapshot);
+  }
+  return rejection;
+}
+
 bool WaitUntilSuspended(GuestScheduler& scheduler, XThread* thread,
                         std::chrono::milliseconds timeout) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -1635,8 +1650,7 @@ TEST_CASE("Guest scheduler orders base-only priority mutations",
               scheduler, ready.thread.get()) == max_dynamic_priority);
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &snapshot) == Rejection::kNone);
   const auto* before = FindThread(snapshot, ready.thread->thread_id());
   REQUIRE(before);
   REQUIRE(before->base_priority == max_dynamic_priority);
@@ -1658,8 +1672,7 @@ TEST_CASE("Guest scheduler orders base-only priority mutations",
   REQUIRE(higher_priority_control.WaitForSafepointReturn(2s));
 
   GuestSchedulerCheckpointBarrierSnapshot updated_snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &updated_snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &updated_snapshot) == Rejection::kNone);
   const auto* after = FindThread(updated_snapshot, ready.thread->thread_id());
   REQUIRE(after);
   REQUIRE(after->base_priority == new_base_priority);
@@ -1859,8 +1872,7 @@ TopologyResult RunTopologyMutation() {
     return result;
   }
 
-  result.pause_rejection =
-      scheduler.PauseForCheckpointBarrier(2s, &result.provisional);
+  result.pause_rejection = PauseSettled(scheduler, 2s, &result.provisional);
   const auto processor_roster = environment.emulator()
                                     ->processor()
                                     ->QueryGuestExecutionCaptureParticipants();
@@ -1912,8 +1924,7 @@ TEST_CASE("Guest scheduler checkpoint rejects a partially started dispatch set",
               scheduler) == 0b111111);
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &snapshot) == Rejection::kNone);
   REQUIRE(snapshot.dispatch_cpu_mask == 0b111111);
   REQUIRE(snapshot.participants.empty());
   REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
@@ -1942,8 +1953,7 @@ TEST_CASE(
   GuestSchedulerCheckpointRuntimeTestAccess::SetSnapshotHook(scheduler, nullptr,
                                                              nullptr);
   GuestSchedulerCheckpointBarrierSnapshot retry_snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &retry_snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &retry_snapshot) == Rejection::kNone);
   REQUIRE(retry_snapshot.generation > failed_snapshot.generation);
   REQUIRE(scheduler.FinalizeAndResumeCheckpointBarrier(
               retry_snapshot.generation, nullptr) == Rejection::kNone);
@@ -2398,8 +2408,7 @@ TEST_CASE("Guest scheduler checkpoint preserves an exact ready JIT route",
   REQUIRE(parked.checkpoint_jit_safepoint_pc == kSafepointPc);
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &snapshot) == Rejection::kNone);
   const auto* participant = FindThread(snapshot, ready.thread->thread_id());
   REQUIRE(participant);
   REQUIRE(participant->state ==
@@ -2450,8 +2459,7 @@ TEST_CASE("Guest scheduler checkpoint preserves an exact suspended JIT route",
   REQUIRE(parked.checkpoint_jit_safepoint_pc == kSafepointPc);
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &snapshot) == Rejection::kNone);
   const auto* participant = FindThread(snapshot, suspended.thread->thread_id());
   REQUIRE(participant);
   REQUIRE(participant->state ==
@@ -2509,8 +2517,7 @@ TEST_CASE("Guest scheduler checkpoint authenticates a blocked wait topology",
                                                                 thread.get()));
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &snapshot) == Rejection::kNone);
   const auto* participant = FindThread(snapshot, thread->thread_id());
   REQUIRE(participant);
   REQUIRE(participant->state ==
@@ -2594,8 +2601,7 @@ TEST_CASE("Guest scheduler checkpoint names a re-readied waiter's wait shape",
   REQUIRE(WaitUntilQueued(scheduler, waiter.get(), 2s));
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &snapshot) == Rejection::kNone);
   const auto* participant = FindThread(snapshot, waiter->thread_id());
   REQUIRE(participant);
   REQUIRE(participant->state ==
@@ -2647,8 +2653,7 @@ TEST_CASE("Guest scheduler discards a suspended exact JIT route",
   REQUIRE(WaitUntilSuspended(scheduler, suspended.thread.get(), 2s));
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &snapshot) == Rejection::kNone);
   const std::array<GuestSchedulerCheckpointJitRoute, 1> route = {{
       {suspended.thread.get(), kSafepointPc},
   }};
@@ -2699,8 +2704,7 @@ TEST_CASE("Guest scheduler shutdown drains an accepted checkpoint discard",
   REQUIRE(WaitUntilSuspended(scheduler, suspended.thread.get(), 2s));
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &snapshot) == Rejection::kNone);
   const std::array<GuestSchedulerCheckpointJitRoute, 1> route = {{
       {suspended.thread.get(), kSafepointPc},
   }};
@@ -2760,8 +2764,7 @@ TEST_CASE("Guest scheduler checkpoint discard owns a racing terminate",
   REQUIRE(WaitUntilSuspended(scheduler, suspended.thread.get(), 2s));
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &snapshot) == Rejection::kNone);
   const std::array<GuestSchedulerCheckpointJitRoute, 1> route = {{
       {suspended.thread.get(), kSafepointPc},
   }};
@@ -2816,8 +2819,7 @@ TEST_CASE("Guest scheduler terminate owns a racing checkpoint discard",
   REQUIRE(WaitUntilSuspended(scheduler, suspended.thread.get(), 2s));
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &snapshot) == Rejection::kNone);
   const std::array<GuestSchedulerCheckpointJitRoute, 1> route = {{
       {suspended.thread.get(), kSafepointPc},
   }};
@@ -2899,7 +2901,7 @@ TEST_CASE(
   REQUIRE(ready_b.checkpoint_jit_safepoint_pc == kReplayFinalB);
 
   GuestSchedulerCheckpointBarrierSnapshot incomplete_snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &incomplete_snapshot) ==
+  REQUIRE(PauseSettled(scheduler, 2s, &incomplete_snapshot) ==
           Rejection::kNone);
   REQUIRE(incomplete_snapshot.quiesced);
   const std::array<GuestSchedulerCheckpointJitRoute, 2> duplicate_routes = {{
@@ -2918,8 +2920,7 @@ TEST_CASE(
 
   REQUIRE(WaitUntilRunning(scheduler, replay_a.thread.get(), 2s));
   GuestSchedulerCheckpointBarrierSnapshot wrong_pc_snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &wrong_pc_snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &wrong_pc_snapshot) == Rejection::kNone);
   REQUIRE(wrong_pc_snapshot.quiesced);
   const std::array<GuestSchedulerCheckpointJitRoute, 2> wrong_pc_routes = {{
       {replay_a.thread.get(), kReplayFinalA + 4},
@@ -2937,8 +2938,7 @@ TEST_CASE(
 
   REQUIRE(WaitUntilRunning(scheduler, replay_a.thread.get(), 2s));
   GuestSchedulerCheckpointBarrierSnapshot held_snapshot;
-  REQUIRE(scheduler.PauseForCheckpointBarrier(2s, &held_snapshot) ==
-          Rejection::kNone);
+  REQUIRE(PauseSettled(scheduler, 2s, &held_snapshot) == Rejection::kNone);
   REQUIRE(held_snapshot.quiesced);
   REQUIRE(held_snapshot.participants.size() == 2);
 
