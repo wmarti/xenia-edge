@@ -34,10 +34,14 @@ class GuestInvocationCapturePageReader final
   bool last_read_was_retryable() const override {
     return last_read_was_retryable_;
   }
+  // Which guard refused the page. A failed snapshot is otherwise
+  // indistinguishable from an unmapped address at the call site.
+  uint32_t last_read_failure_site() const { return last_read_failure_site_; }
 
  private:
   Memory& memory_;
   bool last_read_was_retryable_ = false;
+  uint32_t last_read_failure_site_ = 0;
 };
 
 }  // namespace cpu

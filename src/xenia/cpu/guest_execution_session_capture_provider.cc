@@ -531,11 +531,19 @@ struct GuestExecutionSessionCaptureProvider::Impl {
       return CodeReadResult::kRetry;
     }
     if (!first || !second) {
-      RejectLocked("capture provider could not read a guest code page");
+      // Which of the two reads failed separates a page that is not mapped from
+      // one that stopped being readable while it was being sampled.
+      RejectLocked(fmt::format(
+          "capture provider could not read a guest code page: page={:08X} "
+          "first={} second={} retryable={} site={}",
+          page_address, first, second, page_reader.last_read_was_retryable(),
+          page_reader.last_read_failure_site()));
       return CodeReadResult::kFailure;
     }
     if (*output != verification) {
-      RejectLocked("capture provider guest code changed while sampled");
+      RejectLocked(fmt::format(
+          "capture provider guest code changed while sampled: page={:08X}",
+          page_address));
       return CodeReadResult::kFailure;
     }
     return CodeReadResult::kSuccess;

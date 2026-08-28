@@ -184,11 +184,13 @@ bool ValidateGuestInvocationCaptureCodePageClosure(
 bool GuestInvocationCapturePageReader::ReadPage(
     uint32_t page_address, std::array<uint8_t, 4096>* output) {
   last_read_was_retryable_ = false;
+  last_read_failure_site_ = 0;
   static_assert(JitCorpus::kPageSize == 4096);
   if (!output || (page_address & (JitCorpus::kPageSize - 1)) ||
       page_address >
           std::numeric_limits<uint32_t>::max() - (JitCorpus::kPageSize - 1) ||
       !memory_.virtual_membase()) {
+    last_read_failure_site_ = 1;
     return false;
   }
 
@@ -207,6 +209,7 @@ bool GuestInvocationCapturePageReader::ReadPage(
   BaseHeap* const last_heap =
       memory_.LookupHeap(page_address + JitCorpus::kPageSize - 1);
   if (!first_heap || first_heap != last_heap) {
+    last_read_failure_site_ = 2;
     return false;
   }
 
@@ -215,6 +218,7 @@ bool GuestInvocationCapturePageReader::ReadPage(
   // query and memcpy.
   HeapAllocationInfo allocation_info = {};
   if (!first_heap->QueryRegionInfo(page_address, &allocation_info)) {
+    last_read_failure_site_ = 3;
     return false;
   }
 
@@ -222,6 +226,7 @@ bool GuestInvocationCapturePageReader::ReadPage(
   if (allocation_info.state || allocation_info.protect) {
     if (!(allocation_info.state & kMemoryAllocationCommit) ||
         !(allocation_info.protect & kMemoryProtectRead)) {
+      last_read_failure_site_ = 4;
       return false;
     }
   } else {
@@ -229,6 +234,7 @@ bool GuestInvocationCapturePageReader::ReadPage(
     constexpr uint32_t kLastReplayCodePage = 0x9FFFE000u;
     if (page_address < kFirstReplayCodePage ||
         page_address > kLastReplayCodePage) {
+      last_read_failure_site_ = 5;
       return false;
     }
     const uint32_t alias_address = page_address ^ 0x10000000u;
@@ -240,6 +246,7 @@ bool GuestInvocationCapturePageReader::ReadPage(
         !alias_heap->QueryRegionInfo(alias_address, &alias_info) ||
         !(alias_info.state & kMemoryAllocationCommit) ||
         !(alias_info.protect & kMemoryProtectRead)) {
+      last_read_failure_site_ = 6;
       return false;
     }
     size_t readable_length = 0;
@@ -248,6 +255,7 @@ bool GuestInvocationCapturePageReader::ReadPage(
                                   readable_length, host_access) ||
         readable_length < JitCorpus::kPageSize ||
         host_access == xe::memory::PageAccess::kNoAccess) {
+      last_read_failure_site_ = 7;
       return false;
     }
   }
