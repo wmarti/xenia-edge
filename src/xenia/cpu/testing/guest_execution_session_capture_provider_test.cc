@@ -190,7 +190,8 @@ class ProviderHarness final {
   }
 
   kernel::GuestSchedulerCheckpointBarrierSnapshot Checkpoint(
-      uint32_t guest_pc = kFunctionAddress) const {
+      uint32_t guest_pc = kFunctionAddress,
+      uint32_t owning_function = kFunctionAddress) const {
     kernel::GuestSchedulerCheckpointBarrierSnapshot checkpoint;
     checkpoint.generation = 1;
     checkpoint.active = true;
@@ -204,6 +205,7 @@ class ProviderHarness final {
     checkpoint_participant.capture_instance_id =
         participant.capture_instance_id;
     checkpoint_participant.guest_pc = guest_pc;
+    checkpoint_participant.owning_function_address = owning_function;
     checkpoint_participant.cpu = 0;
     checkpoint_participant.state =
         kernel::GuestSchedulerCheckpointParticipantState::kRunning;
@@ -239,6 +241,7 @@ class ProviderHarness final {
     checkpoint_participant.capture_instance_id =
         second_participant.capture_instance_id;
     checkpoint_participant.guest_pc = kFunctionAddress;
+    checkpoint_participant.owning_function_address = kFunctionAddress;
     checkpoint_participant.cpu = 1;
     checkpoint_participant.state =
         kernel::GuestSchedulerCheckpointParticipantState::kRunning;
@@ -1607,8 +1610,8 @@ TEST_CASE("guest execution session provider authenticates nested returns",
   ProviderHarness harness;
   std::string error;
   REQUIRE(harness.provider->BeginCapture(
-      harness.Checkpoint(kLeafFunctionAddress), harness.Participants(),
-      harness.HostCalls(), &error));
+      harness.Checkpoint(kLeafFunctionAddress, kLeafFunctionAddress),
+      harness.Participants(), harness.HostCalls(), &error));
   const auto state =
       ppc::CaptureGuestPPCRegisterState(*harness.thread->context());
   REQUIRE(harness.provider->OnFunctionExit(harness.InvocationIdentity(),
@@ -1709,9 +1712,10 @@ TEST_CASE("guest execution session provider rejects inexact production inputs",
     ProviderHarness harness;
     std::string error;
     REQUIRE_FALSE(harness.provider->BeginCapture(
-        harness.Checkpoint(kFunctionAddress + 0x100), harness.Participants(),
-        harness.HostCalls(), &error));
-    REQUIRE(error.find("no successful definition") != std::string::npos);
+        harness.Checkpoint(kFunctionAddress + 0x100, kFunctionAddress + 0x100),
+        harness.Participants(), harness.HostCalls(), &error));
+    REQUIRE(error.find("checkpoint function is not in the catalog") !=
+            std::string::npos);
     REQUIRE(harness.provider->status().state ==
             GuestExecutionSessionCaptureProviderState::kRejected);
   }
@@ -1720,8 +1724,8 @@ TEST_CASE("guest execution session provider rejects inexact production inputs",
     ProviderHarness harness;
     std::string error;
     REQUIRE(harness.provider->BeginCapture(
-        harness.Checkpoint(kLeafFunctionAddress), harness.Participants(),
-        harness.HostCalls(), &error));
+        harness.Checkpoint(kLeafFunctionAddress, kLeafFunctionAddress),
+        harness.Participants(), harness.HostCalls(), &error));
     REQUIRE_FALSE(harness.provider->OnFunctionExit(
         harness.InvocationIdentity(), kLeafFunctionAddress,
         kFunctionAddress + 0x100,

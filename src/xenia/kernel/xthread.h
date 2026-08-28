@@ -708,25 +708,37 @@ class XThread : public XObject, public cpu::Thread {
     std::atomic<uint32_t> capture_declined_safepoints{0};
 
     // Durable exact-PC metadata exists only while this fiber is parked before
-    // a JIT block head. The owning function extent is separate checkpoint
-    // binding metadata; native stacks are deliberately not checkpoint state.
+    // a JIT block head. Native stacks are deliberately not checkpoint state.
     uint32_t checkpoint_jit_safepoint_pc = 0;
+    // The function whose emitted code is running. Two functions can share a
+    // block head, so the address is carried from the emitter rather than
+    // recovered from the PC.
+    uint32_t checkpoint_jit_owning_function = 0;
     // Set only when a fiber parked by the checkpoint barrier is released. An
     // ordinary scheduler yield may also retain an exact JIT route, but requests
     // raised while that fiber is off-CPU are already served by dispatch.
     bool checkpoint_held_resume_pending = false;
 
-    bool SetCheckpointJitSafepoint(uint64_t guest_pc) {
+    bool SetCheckpointJitSafepoint(uint64_t guest_pc,
+                                   uint64_t owning_function_address) {
       checkpoint_jit_safepoint_pc = 0;
+      checkpoint_jit_owning_function = 0;
       if (!guest_pc || (guest_pc >> 32) || (guest_pc & 3)) {
         return false;
       }
+      if (!owning_function_address || (owning_function_address >> 32) ||
+          (owning_function_address & 3) || owning_function_address > guest_pc) {
+        return false;
+      }
       checkpoint_jit_safepoint_pc = static_cast<uint32_t>(guest_pc);
+      checkpoint_jit_owning_function =
+          static_cast<uint32_t>(owning_function_address);
       return true;
     }
 
     void ClearCheckpointResumeRoute() {
       checkpoint_jit_safepoint_pc = 0;
+      checkpoint_jit_owning_function = 0;
       checkpoint_held_resume_pending = false;
     }
 
@@ -735,10 +747,18 @@ class XThread : public XObject, public cpu::Thread {
       if (!has_run ||
           (state != GuestSchedulerCheckpointParticipantState::kReady &&
            state != GuestSchedulerCheckpointParticipantState::kSuspended) ||
-          !checkpoint_jit_safepoint_pc || (checkpoint_jit_safepoint_pc & 3)) {
+          !checkpoint_jit_safepoint_pc || (checkpoint_jit_safepoint_pc & 3) ||
+          !checkpoint_jit_owning_function) {
         return 0;
       }
       return checkpoint_jit_safepoint_pc;
+    }
+
+    uint32_t RestorableCheckpointJitOwningFunction(
+        GuestSchedulerCheckpointParticipantState state) const {
+      return RestorableCheckpointJitSafepointPc(state)
+                 ? checkpoint_jit_owning_function
+                 : 0;
     }
 #endif
   };

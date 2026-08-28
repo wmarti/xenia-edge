@@ -150,7 +150,8 @@ class GuestScheduler {
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
                           ,
-                          uint64_t jit_safepoint_guest_address = 0
+                          uint64_t jit_safepoint_guest_address = 0,
+                          uint64_t jit_safepoint_owning_function = 0
 #endif
   );
 
@@ -230,7 +231,8 @@ class GuestScheduler {
 
   // Internal JIT-safepoint entry. Returns true when the checkpoint request
   // consumed this preemption, including when it deferred for the global lock.
-  bool TryCheckpointCurrentFiber(XThread* thread, uint32_t guest_pc);
+  bool TryCheckpointCurrentFiber(XThread* thread, uint32_t guest_pc,
+                                 uint32_t owning_function_address);
 
   // Installs the shared-owned scheduler capture observer. Rejected once any
   // thread is queued or dispatched, or after Shutdown, so the observer is
@@ -357,7 +359,8 @@ class GuestScheduler {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
       ,
       ReadyCheckpointRoute checkpoint_route = ReadyCheckpointRoute::kClear,
-      uint64_t jit_safepoint_guest_address = 0
+      uint64_t jit_safepoint_guest_address = 0,
+      uint64_t jit_safepoint_owning_function = 0
 #endif
   );
   XThread* DequeueReady(int cpu_index);

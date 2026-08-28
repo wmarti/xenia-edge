@@ -668,13 +668,15 @@ class RequestEmittedJitSafepointVisitor final
 struct SchedulerSafepointProbe {
   std::atomic<uint32_t> delivery_count = 0;
   std::atomic<uint32_t> last_guest_address = 0;
+  std::atomic<uint32_t> last_owning_function = 0;
   bool rearm_first_delivery = false;
 };
 
 std::atomic<SchedulerSafepointProbe*> active_scheduler_safepoint_probe =
     nullptr;
 
-void TestSchedulerSafepointHandler(void* raw_context, uint64_t guest_address) {
+void TestSchedulerSafepointHandler(void* raw_context, uint64_t guest_address,
+                                   uint64_t owning_function_address) {
   SchedulerSafepointProbe* probe =
       active_scheduler_safepoint_probe.load(std::memory_order_acquire);
   if (!probe) {
@@ -685,6 +687,9 @@ void TestSchedulerSafepointHandler(void* raw_context, uint64_t guest_address) {
       probe->delivery_count.fetch_add(1, std::memory_order_acq_rel) + 1;
   probe->last_guest_address.store(static_cast<uint32_t>(guest_address),
                                   std::memory_order_release);
+  probe->last_owning_function.store(
+      static_cast<uint32_t>(owning_function_address),
+      std::memory_order_release);
   if (delivery == 1 && probe->rearm_first_delivery) {
     context->preempt_requested = 1;
   } else {
@@ -711,7 +716,7 @@ class ScopedSchedulerSafepointConfiguration final {
 
  private:
   bool old_guest_scheduler_ = false;
-  void (*old_handler_)(void*, uint64_t) = nullptr;
+  void (*old_handler_)(void*, uint64_t, uint64_t) = nullptr;
 };
 
 class EmittedJitSafepointObserver final
@@ -820,6 +825,7 @@ struct EmittedJitSafepointResult {
   uint32_t scheduler_deliveries_at_capture = 0;
   uint32_t scheduler_delivery_count = 0;
   uint32_t scheduler_guest_address = 0;
+  uint32_t scheduler_owning_function = 0;
   bool request_consumed_at_capture = false;
   bool preempt_requested_at_capture = false;
   bool request_pending_after_call = false;
@@ -918,6 +924,8 @@ EmittedJitSafepointResult RunEmittedJitSafepointDelivery(
       scheduler_probe.delivery_count.load(std::memory_order_acquire);
   result.scheduler_guest_address =
       scheduler_probe.last_guest_address.load(std::memory_order_acquire);
+  result.scheduler_owning_function =
+      scheduler_probe.last_owning_function.load(std::memory_order_acquire);
   result.request_consumed_at_capture = observer->request_consumed_at_entry();
   result.preempt_requested_at_capture = observer->preempt_requested_at_entry();
   result.request_pending_after_call =
@@ -1103,6 +1111,7 @@ TEST_CASE("A64_CAPTURE_JIT_SAFEPOINT_DELIVERS_WITH_AND_WITHOUT_SCHEDULER",
     REQUIRE(result.scheduler_deliveries_at_capture == 1);
     REQUIRE(result.scheduler_delivery_count == 2);
     REQUIRE(result.scheduler_guest_address == 0x83000004);
+    REQUIRE(result.scheduler_owning_function == 0x83000000);
     REQUIRE(result.request_consumed_at_capture);
     REQUIRE(result.preempt_requested_at_capture);
     REQUIRE_FALSE(result.request_pending_after_call);

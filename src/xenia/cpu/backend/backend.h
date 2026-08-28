@@ -227,11 +227,14 @@ struct GuestTrampolineGroup
 };
 
 // Registered by the cooperative scheduler when it starts, null otherwise. A
-// JIT safepoint calls it with the PPCContext and exact guest block-head PC once
-// the scheduler has raised the context's preempt_requested flag. Keeping the PC
-// in the normal-build ABI lets deterministic offline replay authenticate a
-// recorded scheduler boundary without capture instrumentation in the runner.
-extern void (*preempt_yield_handler)(void* raw_context, uint64_t guest_address);
+// JIT safepoint calls it with the PPCContext, the exact guest block-head PC and
+// the entry address of the function being executed, once the scheduler has
+// raised the context's preempt_requested flag. Keeping the PC in the normal-
+// build ABI lets deterministic offline replay authenticate a recorded scheduler
+// boundary without capture instrumentation in the runner. Two functions may
+// share a block head, so only the emitter can say which one is running.
+extern void (*preempt_yield_handler)(void* raw_context, uint64_t guest_address,
+                                     uint64_t owning_function_address);
 
 }  // namespace backend
 }  // namespace cpu

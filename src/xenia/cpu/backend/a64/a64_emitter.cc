@@ -1513,9 +1513,11 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
                          offsetof(ppc::PPCContext, last_safepoint_pc))));
   }
 
+  const uint32_t owning_function = current_guest_function_;
   Label& do_rendezvous = AddToTail([&after, scheduler_enabled, preempt_offset,
                                     capture_offset, has_vmx, held_mode,
-                                    guest_address](A64Emitter& e, Label&) {
+                                    guest_address,
+                                    owning_function](A64Emitter& e, Label&) {
     // The hot loads and branches leave NZCV untouched. Save it before any cold
     // callback so the block-head transition cannot perturb later sequences.
     e.mrs(e.x10, 3, 3, 4, 2, 0);  // mrs x10, NZCV
@@ -1536,6 +1538,7 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
       e.ldr(e.x0, ptr(e.x0));
       e.cbz(e.x0, scheduler_done);
       e.mov(e.x1, static_cast<uint64_t>(guest_address));
+      e.mov(e.x2, static_cast<uint64_t>(owning_function));
       e.ldr(e.x9, ptr(e.GetBackendCtxReg(),
                       static_cast<uint32_t>(offsetof(
                           A64BackendContext, guest_to_host_thunk_address))));

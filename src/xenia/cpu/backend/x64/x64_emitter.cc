@@ -1951,9 +1951,10 @@ void X64Emitter::EmitPreemptCheck(uint32_t guest_address) {
         guest_address);
   }
 
+  const uint32_t owning_function = current_guest_function_;
   Xbyak::Label& do_rendezvous =
-      AddToTail([&after, scheduler_enabled, guest_address](X64Emitter& e,
-                                                           Xbyak::Label& tail) {
+      AddToTail([&after, scheduler_enabled, guest_address, owning_function](
+                    X64Emitter& e, Xbyak::Label& tail) {
         e.L(tail);
         e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 0], e.rax);
         e.mov(e.qword[e.rsp + StackLayout::GUEST_PREEMPT_SAVE + 8], e.rcx);
@@ -1974,6 +1975,7 @@ void X64Emitter::EmitPreemptCheck(uint32_t guest_address) {
           e.test(e.rcx, e.rcx);
           e.jz(scheduler_done, X64Emitter::T_NEAR);
           e.mov(e.edx, guest_address);
+          e.mov(e.r8d, owning_function);
           e.call(e.backend()->guest_to_host_thunk());
           e.L(scheduler_done);
         }

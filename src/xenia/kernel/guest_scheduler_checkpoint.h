@@ -44,6 +44,9 @@ struct GuestSchedulerCheckpointParticipant {
   uint32_t thread_id = 0;
   uint64_t capture_instance_id = 0;
   uint32_t guest_pc = 0;
+  // Entry address of the function whose emitted code holds guest_pc. Two
+  // functions can share a block head, so it is carried, not derived.
+  uint32_t owning_function_address = 0;
   int8_t cpu = -1;
   uint8_t effective_priority = 0;
   int8_t ready_queue_level = -1;

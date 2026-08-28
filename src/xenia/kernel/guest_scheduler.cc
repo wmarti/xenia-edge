@@ -200,7 +200,8 @@ inline void RequestCheckpointSafepoint(XThread* thread) {
 
 // JIT safepoint handler. The cold path cleared the flag, so the deferred
 // cases re-set it to retry at the next safepoint.
-static void PreemptCurrentFiber(void* /*raw_context*/, uint64_t guest_address) {
+static void PreemptCurrentFiber(void* /*raw_context*/, uint64_t guest_address,
+                                uint64_t owning_function_address) {
   XThread* self = XThread::GetCurrentFiberThread();
   if (!self) {
     return;
@@ -218,8 +219,13 @@ static void PreemptCurrentFiber(void* /*raw_context*/, uint64_t guest_address) {
       guest_address && !(guest_address >> 32) && !(guest_address & 3)
           ? static_cast<uint32_t>(guest_address)
           : 0;
-  const bool checkpoint_consumed =
-      scheduler->TryCheckpointCurrentFiber(self, exact_guest_pc);
+  const uint32_t owning_function =
+      owning_function_address && !(owning_function_address >> 32) &&
+              !(owning_function_address & 3)
+          ? static_cast<uint32_t>(owning_function_address)
+          : 0;
+  const bool checkpoint_consumed = scheduler->TryCheckpointCurrentFiber(
+      self, exact_guest_pc, owning_function);
   checkpoint_requested |= checkpoint_consumed;
   // A scheduler request may arrive after the first exchange while a checkpoint
   // keeps this exact JIT safepoint parked. Consume it before returning to guest
@@ -322,12 +328,12 @@ static void PreemptCurrentFiber(void* /*raw_context*/, uint64_t guest_address) {
       links.capture_declined_safepoints.exchange(0, std::memory_order_relaxed),
       exact_guest_pc);
 #endif
-  self->kernel_state()->guest_scheduler()->YieldCurrentThread(true,
-                                                              forced_at_irql
+  self->kernel_state()->guest_scheduler()->YieldCurrentThread(
+      true, forced_at_irql
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
-                                                              ,
-                                                              guest_address
+      ,
+      guest_address, owning_function
 #endif
   );
 }
@@ -424,6 +430,8 @@ void GuestScheduler::AppendCheckpointListLocked(
     } else if (uint32_t guest_pc =
                    links.RestorableCheckpointJitSafepointPc(state)) {
       participant.guest_pc = guest_pc;
+      participant.owning_function_address =
+          links.RestorableCheckpointJitOwningFunction(state);
       participant.resume_kind =
           GuestSchedulerCheckpointResumeKind::kJitSafepoint;
       participant.restorable = true;
@@ -922,8 +930,8 @@ GuestScheduler::CancelCheckpointBarrier(
   return rejection;
 }
 
-bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
-                                               uint32_t guest_pc) {
+bool GuestScheduler::TryCheckpointCurrentFiber(
+    XThread* thread, uint32_t guest_pc, uint32_t owning_function_address) {
   if (!checkpoint_barrier_.active()) {
     return false;
   }
@@ -954,7 +962,8 @@ bool GuestScheduler::TryCheckpointCurrentFiber(XThread* thread,
             QuantumRemainingUsLocked(thread, Clock::host_tick_count_raw()))) {
       return true;
     }
-    if (!thread->scheduler_links().SetCheckpointJitSafepoint(guest_pc)) {
+    if (!thread->scheduler_links().SetCheckpointJitSafepoint(
+            guest_pc, owning_function_address)) {
       checkpoint_barrier_.Reject(
           GuestSchedulerCheckpointBarrierRejection::kInvalidGuestPc);
       return true;
@@ -1217,7 +1226,8 @@ void GuestScheduler::EnqueueReady(XThread* thread, int cpu_index,
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
                                   ,
                                   ReadyCheckpointRoute checkpoint_route,
-                                  uint64_t jit_safepoint_guest_address
+                                  uint64_t jit_safepoint_guest_address,
+                                  uint64_t jit_safepoint_owning_function
 #endif
 ) {
   {
@@ -1247,7 +1257,8 @@ void GuestScheduler::EnqueueReady(XThread* thread, int cpu_index,
       case ReadyCheckpointRoute::kPreserve:
         break;
       case ReadyCheckpointRoute::kJitSafepoint:
-        links.SetCheckpointJitSafepoint(jit_safepoint_guest_address);
+        links.SetCheckpointJitSafepoint(jit_safepoint_guest_address,
+                                        jit_safepoint_owning_function);
         break;
     }
 #endif
@@ -2044,7 +2055,8 @@ bool GuestScheduler::YieldCurrentThread(bool quantum_end, bool to_lower
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
                                         ,
-                                        uint64_t jit_safepoint_guest_address
+                                        uint64_t jit_safepoint_guest_address,
+                                        uint64_t jit_safepoint_owning_function
 #endif
 ) {
   if (!OnDispatchThread("YieldCurrentThread")) {
@@ -2080,9 +2092,10 @@ bool GuestScheduler::YieldCurrentThread(bool quantum_end, bool to_lower
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
                ,
-               jit_safepoint_guest_address ? ReadyCheckpointRoute::kJitSafepoint
-                                           : ReadyCheckpointRoute::kClear,
-               jit_safepoint_guest_address
+               jit_safepoint_guest_address && jit_safepoint_owning_function
+                   ? ReadyCheckpointRoute::kJitSafepoint
+                   : ReadyCheckpointRoute::kClear,
+               jit_safepoint_guest_address, jit_safepoint_owning_function
 #endif
   );
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \

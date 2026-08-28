@@ -30,8 +30,8 @@ void* Backend::AllocThreadData() { return nullptr; }
 
 void Backend::FreeThreadData(void* thread_data) {}
 
-void (*preempt_yield_handler)(void* raw_context,
-                              uint64_t guest_address) = nullptr;
+void (*preempt_yield_handler)(void* raw_context, uint64_t guest_address,
+                              uint64_t owning_function_address) = nullptr;
 
 uint32_t Backend::ReservedLoad32(ppc::PPCContext* context, uint32_t address) {
   return xe::byte_swap(*context->TranslateVirtual<uint32_t*>(address));

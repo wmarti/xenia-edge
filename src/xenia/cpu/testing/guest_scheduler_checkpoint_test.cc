@@ -402,7 +402,7 @@ TEST_CASE("Scheduler checkpoint route accepts only exact PPC block heads",
   XThread::SchedulerLinks links;
   links.has_run = true;
 
-  REQUIRE(links.SetCheckpointJitSafepoint(4));
+  REQUIRE(links.SetCheckpointJitSafepoint(4, 4));
   REQUIRE(links.RestorableCheckpointJitSafepointPc(ParticipantState::kReady) ==
           4);
   REQUIRE(links.RestorableCheckpointJitSafepointPc(
@@ -412,15 +412,15 @@ TEST_CASE("Scheduler checkpoint route accepts only exact PPC block heads",
   REQUIRE(links.RestorableCheckpointJitSafepointPc(
               ParticipantState::kBlocked) == 0);
 
-  REQUIRE(links.SetCheckpointJitSafepoint(0xFFFFFFFCull));
+  REQUIRE(links.SetCheckpointJitSafepoint(0xFFFFFFFCull, 0xFFFFFFFCull));
   REQUIRE(links.RestorableCheckpointJitSafepointPc(ParticipantState::kReady) ==
           0xFFFFFFFCu);
 
   for (uint64_t invalid_pc :
        {uint64_t{0}, uint64_t{1}, uint64_t{2}, uint64_t{3},
         uint64_t{0x82001002}, uint64_t{0x100000000}}) {
-    REQUIRE(links.SetCheckpointJitSafepoint(0x82001000));
-    REQUIRE_FALSE(links.SetCheckpointJitSafepoint(invalid_pc));
+    REQUIRE(links.SetCheckpointJitSafepoint(0x82001000, 0x82001000));
+    REQUIRE_FALSE(links.SetCheckpointJitSafepoint(invalid_pc, 0x82001000));
     REQUIRE(links.RestorableCheckpointJitSafepointPc(
                 ParticipantState::kReady) == 0);
   }
@@ -429,7 +429,7 @@ TEST_CASE("Scheduler checkpoint route accepts only exact PPC block heads",
 TEST_CASE("Scheduler checkpoint route clears and never claims unrun fibers",
           "[guest_scheduler_checkpoint]") {
   XThread::SchedulerLinks links;
-  REQUIRE(links.SetCheckpointJitSafepoint(0x82001000));
+  REQUIRE(links.SetCheckpointJitSafepoint(0x82001000, 0x82001000));
 
   REQUIRE(links.RestorableCheckpointJitSafepointPc(ParticipantState::kReady) ==
           0);

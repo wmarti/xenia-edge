@@ -712,6 +712,30 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     return true;
   }
 
+  // The emitter names the function it is running. Resolving it by entry
+  // address is what the processor itself does; a guest PC can sit inside more
+  // than one catalogued extent, so it cannot name a function on its own.
+  const DefinitionRecord* FindDeclaredDefinitionLocked(uint32_t address,
+                                                       uint32_t guest_pc) {
+    if (!address || (address & 3) || guest_pc < address) {
+      RejectLocked(fmt::format(
+          "capture provider checkpoint PC is outside the function the emitter "
+          "reported: pc={:08X} fn={:08X}",
+          guest_pc, address));
+      return nullptr;
+    }
+    const auto definition = definitions.find(address);
+    if (definition == definitions.cend() || !definition->second.defined ||
+        guest_pc > definition->second.end_address) {
+      RejectLocked(fmt::format(
+          "capture provider checkpoint function is not in the catalog: "
+          "pc={:08X} fn={:08X}",
+          guest_pc, address));
+      return nullptr;
+    }
+    return &definition->second;
+  }
+
   const DefinitionRecord* FindOwningDefinitionLocked(uint32_t guest_pc) {
     const DefinitionRecord* owner = nullptr;
     for (const auto& [address, definition] : definitions) {
@@ -1285,13 +1309,14 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           }
           outer_return_addresses.emplace(identity.capture_instance_id,
                                          outer_return);
-          const DefinitionRecord* owner =
-              FindOwningDefinitionLocked(scheduler_participant->guest_pc);
+          const uint32_t owner_address =
+              scheduler_participant->owning_function_address;
+          const DefinitionRecord* owner = FindDeclaredDefinitionLocked(
+              owner_address, scheduler_participant->guest_pc);
           if (!owner) {
             return false;
           }
-          const uint32_t owner_address = FindDefinitionAddressLocked(owner);
-          if (!owner_address || !owner->code_pages_snapshotted ||
+          if (!owner->code_pages_snapshotted ||
               !AddClosureSeedLocked(owner_address, owner->end_address)) {
             return false;
           }

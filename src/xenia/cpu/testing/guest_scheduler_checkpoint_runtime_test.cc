@@ -262,6 +262,8 @@ using ResumeKind = GuestSchedulerCheckpointResumeKind;
 using RosterScope = GuestSchedulerCheckpointRosterScope;
 
 constexpr uint32_t kSafepointPc = 0x82001000;
+// The emitter names the function holding the safepoint; a PC cannot name it.
+constexpr uint32_t kSafepointFunction = 0x82000000;
 constexpr uint32_t kCpu0CreationFlags = uint32_t{1} << 24;
 constexpr uint32_t kCpu1CreationFlags = uint32_t{2} << 24;
 
@@ -656,7 +658,8 @@ class DeferredInstructionCoverageRuntimeThread final : public XThread {
         true, std::memory_order_release);
     {
       auto global_lock = xe::global_critical_region::AcquireDirect();
-      cpu::backend::preempt_yield_handler(context, kSafepointPc);
+      cpu::backend::preempt_yield_handler(context, kSafepointPc,
+                                          kSafepointFunction);
     }
 
     std::atomic_ref<uint64_t>(
@@ -664,7 +667,8 @@ class DeferredInstructionCoverageRuntimeThread final : public XThread {
         .fetch_add(7, std::memory_order_relaxed);
     std::atomic_ref<uint8_t>(context->preempt_requested)
         .store(0, std::memory_order_release);
-    cpu::backend::preempt_yield_handler(context, kSafepointPc);
+    cpu::backend::preempt_yield_handler(context, kSafepointPc,
+                                        kSafepointFunction);
     control_->Complete();
     Exit(0);
   }
@@ -908,7 +912,7 @@ class CheckpointRuntimeThread final : public XThread {
         control_->missing_handler.store(true, std::memory_order_release);
         break;
       }
-      handler(context, kSafepointPc);
+      handler(context, kSafepointPc, kSafepointFunction);
       control_->safepoint_returns.fetch_add(1, std::memory_order_release);
       control_->Notify();
     }
