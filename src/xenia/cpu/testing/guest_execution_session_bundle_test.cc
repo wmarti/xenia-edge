@@ -1713,6 +1713,7 @@ GuestExecutionSessionBundle MakeBlockedExportBundle(
                        options.witness_thread_id, options.witness_reason);
   if (options.witness_payload_is_v1) {
     witness_payload.resize(48);
+    witness_payload[8] = 1;
   }
   const uint64_t witness_payload_size = witness_payload.size();
   const GuestExecutionSessionSha256 witness =
@@ -2039,11 +2040,11 @@ TEST_CASE("session bundle proves every blocked export obligation",
     require_rejected(MakeBlockedExportBundle(options),
                      "wake has no kReready witness before its export event");
   }
-  SECTION("a wake witnessing another participant rejects") {
+  SECTION("a wake witnessing a thread off the roster rejects") {
     BlockedExportOptions options;
     options.witness_thread_id = 9;
     require_rejected(MakeBlockedExportBundle(options),
-                     "wake has no kReready witness before its export event");
+                     "scheduler event subject is not a session participant");
   }
   SECTION("a polled wake reason is not modeled") {
     BlockedExportOptions options;
@@ -2061,7 +2062,7 @@ TEST_CASE("session bundle proves every blocked export obligation",
     BlockedExportOptions options;
     options.witness_payload_is_v1 = true;
     require_rejected(MakeBlockedExportBundle(options),
-                     "witness payload is unreadable");
+                     "version 1 is not deterministic-replayable");
   }
   SECTION("a deadline wake is modeled") {
     BlockedExportOptions options;

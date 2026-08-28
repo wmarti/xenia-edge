@@ -2587,6 +2587,10 @@ TEST_CASE("Guest scheduler checkpoint names a re-readied waiter's wait shape",
   REQUIRE(higher_priority_control.WaitForStart(2s));
 
   event->Set(0, false);
+  // No timeslice here: only a safepoint returns this CPU to the re-ready poll.
+  GuestSchedulerCheckpointRuntimeTestAccess::RequestSchedulerSafepoint(
+      scheduler, higher_priority.thread.get(), true);
+  REQUIRE(higher_priority_control.WaitForSafepointReturn(2s));
   REQUIRE(WaitUntilQueued(scheduler, waiter.get(), 2s));
 
   GuestSchedulerCheckpointBarrierSnapshot snapshot;

@@ -1747,7 +1747,7 @@ TEST_CASE("continuous replay CLI reports a planned session",
 
   GuestSessionContinuousReplayVerdict verdict;
   REQUIRE(AttemptGuestSessionContinuousReplayPlan(
-      bundle, kHostPageSize, false, bundle.manifest.replay_config_sha256,
+      bundle, kHostPageSize, true, bundle.manifest.replay_config_sha256,
       &verdict));
   REQUIRE(verdict.planned);
   REQUIRE(verdict.plan_line ==
@@ -1786,7 +1786,7 @@ TEST_CASE("continuous replay CLI gates configuration before planning",
         bundle.manifest.replay_config_sha256;
     other_config_sha256[0] = static_cast<uint8_t>(other_config_sha256[0] + 1);
     REQUIRE_FALSE(AttemptGuestSessionContinuousReplayPlan(
-        bundle, kHostPageSize, false, other_config_sha256, &verdict));
+        bundle, kHostPageSize, true, other_config_sha256, &verdict));
     REQUIRE(verdict.plan_line ==
             FormatGuestSessionContinuousPlanRejection(
                 "continuous replay configuration SHA-256 does not match the "
@@ -1802,7 +1802,7 @@ TEST_CASE("continuous replay CLI gates configuration before planning",
         bundle.manifest.replay_config_sha256;
     other_config_sha256[0] = static_cast<uint8_t>(other_config_sha256[0] + 1);
     REQUIRE_FALSE(AttemptGuestSessionContinuousReplayPlan(
-        bundle, kHostPageSize, true, other_config_sha256, &verdict));
+        bundle, kHostPageSize, false, other_config_sha256, &verdict));
     REQUIRE(verdict.plan_line ==
             FormatGuestSessionContinuousPlanRejection(
                 "continuous replay corpus guest_scheduler does not match the "
@@ -1813,7 +1813,7 @@ TEST_CASE("continuous replay CLI gates configuration before planning",
     const GuestExecutionSessionBundle bundle =
         MakeContinuousSessionBundle(kHostPageSize);
     REQUIRE_FALSE(AttemptGuestSessionContinuousReplayPlan(
-        bundle, 1024, false, bundle.manifest.replay_config_sha256, &verdict));
+        bundle, 1024, true, bundle.manifest.replay_config_sha256, &verdict));
     REQUIRE(verdict.plan_line ==
             FormatGuestSessionContinuousPlanRejection(
                 "host page size is unsupported for continuous replay"));
