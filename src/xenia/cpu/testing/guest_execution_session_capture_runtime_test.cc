@@ -914,6 +914,17 @@ class FakeCheckpointController final
         row.blocked_wait.handle_count = blocked_wait_handle_count;
         row.blocked_wait.flags = blocked_wait_flags;
       }
+      if (current_pause == 1 ? woken_at_start : woken_at_stop) {
+        auto& row = held_snapshot.participants.front();
+        row.state = kernel::GuestSchedulerCheckpointParticipantState::kReady;
+        row.resume_kind =
+            kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+        row.restorable = false;
+        row.guest_pc = 0;
+        row.blocked_wait_kind = blocked_wait_kind;
+        row.blocked_wait.handle_count = blocked_wait_handle_count;
+        row.blocked_wait.flags = blocked_wait_flags;
+      }
     }
     const uint32_t failure_limit = pause_failure_limit.load();
     if (pause_result != CheckpointRejection::kNone &&
@@ -999,6 +1010,8 @@ class FakeCheckpointController final
   uint32_t stop_guest_pc = kResumePc;
   bool blocked_at_start = false;
   bool blocked_at_stop = false;
+  bool woken_at_start = false;
+  bool woken_at_stop = false;
   kernel::GuestSchedulerCaptureWaitKind blocked_wait_kind =
       kernel::GuestSchedulerCaptureWaitKind::kSingle;
   uint8_t blocked_wait_handle_count = 1;
@@ -1536,6 +1549,59 @@ TEST_CASE("session capture runtime refuses a final blocked export",
   // captured event can witness its route.
   REQUIRE(status.message.find("final blocked-export participant has no "
                               "durable replay route") != std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime binds initial state to a woken export",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.woken_at_start = true;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kBundleValidation);
+  // A block-head route is not the pending-extern route this class needs.
+  REQUIRE(status.message.find(
+              "initial PPC continuation differs from the held scheduler woken "
+              "export") != std::string::npos);
+  REQUIRE_FALSE(status.canonical_output_published);
+  REQUIRE(harness.publisher.calls.load() == 0);
+
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime refuses a final woken export",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  harness.checkpoint.woken_at_stop = true;
+
+  REQUIRE(harness.runtime->RequestStart());
+  REQUIRE(WaitForState(*harness.runtime, RuntimeState::kRecording));
+  REQUIRE(RecordCanonicalDispatch(*harness.runtime, *thread));
+  REQUIRE(harness.runtime->RequestStop());
+  REQUIRE(harness.runtime->WaitForTerminal(2s));
+  const auto status = harness.runtime->status();
+  REQUIRE(status.state == RuntimeState::kRejected);
+  // The export this waiter has not returned from completes after the interval,
+  // so no captured event can witness its route.
+  REQUIRE(status.message.find("final woken-export participant has no durable "
+                              "replay route") != std::string::npos);
   REQUIRE_FALSE(status.canonical_output_published);
   REQUIRE(harness.publisher.calls.load() == 0);
 
@@ -2226,6 +2292,130 @@ TEST_CASE("session capture runtime censuses an open modeled export dispatch",
       GuestExecutionCaptureExternalEventDisposition::kReplayCaptured;
   end.mutation_source = GuestExecutionCaptureExternalEventMutationSource::kNone;
   REQUIRE(log->OnExternalEventEnd(token, end, {}));
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+// The Halo 3 roster carries both faces of this class at the same boundary, and
+// the open dispatch is the only thing that separates them.
+TEST_CASE("session capture runtime admits a woken export participant",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  auto& participant = harness.checkpoint.provisional.participants.front();
+  participant.state = kernel::GuestSchedulerCheckpointParticipantState::kReady;
+  participant.guest_pc = 0;
+  participant.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+  participant.restorable = false;
+  participant.blocked_wait_kind =
+      kernel::GuestSchedulerCaptureWaitKind::kSingle;
+  participant.blocked_wait.handle_count = 1;
+  participant.blocked_wait.flags =
+      kernel::kGuestSchedulerCaptureWaitFlagGated |
+      kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
+  harness.checkpoint.start_guest_pc = 0;
+
+  std::shared_ptr<GuestExecutionCaptureExternalEventLog> log;
+  GuestExecutionCaptureExternalEventToken token;
+  harness.checkpoint.pause_hook = [&](uint32_t) {
+    log = environment.processor->guest_execution_capture_external_event_log();
+    if (!log) {
+      return;
+    }
+    GuestExecutionCaptureExternalEventBegin begin;
+    begin.participant = {thread->guest_execution_capture_instance_id(),
+                         thread->thread_id()};
+    begin.kind = GuestExecutionCaptureExternalEventKind::kKernelExport;
+    begin.export_ordinal = 176;
+    begin.guest_address = 0x8270D724;
+    begin.call_site_address = 0x82581BD4;
+    token = log->OnExternalEventBegin(begin, {});
+  };
+
+  BlockingGuestFunction function(0x82002000, 0x82002100);
+  bool call_result = false;
+  std::thread source(
+      [&]() { call_result = function.Call(thread.get(), 0x82003000); });
+  const bool entered = function.WaitForEntry();
+  const bool requested = entered && harness.runtime->RequestStart();
+  const bool recording =
+      requested && WaitForState(*harness.runtime, RuntimeState::kRecording);
+  const auto status = harness.runtime->status();
+  function.Release();
+  source.join();
+
+  REQUIRE(entered);
+  REQUIRE(requested);
+  INFO(status.message);
+  REQUIRE(recording);
+  REQUIRE(log);
+  REQUIRE(token);
+  REQUIRE(status.state == RuntimeState::kRecording);
+  REQUIRE(status.rejection == RuntimeRejection::kNone);
+  REQUIRE(harness.provider.begin_count.load() == 1);
+  REQUIRE(call_result);
+
+  GuestExecutionCaptureExternalEventEnd end;
+  end.disposition =
+      GuestExecutionCaptureExternalEventDisposition::kReplayCaptured;
+  end.mutation_source = GuestExecutionCaptureExternalEventMutationSource::kNone;
+  REQUIRE(log->OnExternalEventEnd(token, end, {}));
+  harness.runtime->Shutdown();
+  thread.reset();
+}
+
+TEST_CASE("session capture runtime censuses a woken waiter with no dispatch",
+          "[guest-execution-session-capture-runtime]") {
+  RuntimeEnvironment environment;
+  auto thread = environment.MakeThread(1);
+  RuntimeHarness harness(environment, *thread, 8);
+  REQUIRE(harness.runtime);
+  auto& participant = harness.checkpoint.provisional.participants.front();
+  participant.state = kernel::GuestSchedulerCheckpointParticipantState::kReady;
+  participant.guest_pc = 0;
+  participant.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+  participant.restorable = false;
+  participant.blocked_wait_kind =
+      kernel::GuestSchedulerCaptureWaitKind::kSingle;
+  participant.blocked_wait.handle_count = 1;
+  participant.blocked_wait.flags =
+      kernel::kGuestSchedulerCaptureWaitFlagInterruptible;
+  harness.checkpoint.start_guest_pc = 0;
+
+  BlockingGuestFunction function(0x82002000, 0x82002100);
+  bool call_result = false;
+  std::thread source(
+      [&]() { call_result = function.Call(thread.get(), 0x82003000); });
+  const bool entered = function.WaitForEntry();
+  const bool requested = entered && harness.runtime->RequestStart();
+  const bool terminal = requested && harness.runtime->WaitForTerminal(2s);
+  const auto status = harness.runtime->status();
+  function.Release();
+  source.join();
+
+  REQUIRE(entered);
+  REQUIRE(requested);
+  REQUIRE(terminal);
+  INFO(status.message);
+  REQUIRE(status.state == RuntimeState::kRejected);
+  REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
+  // The root guest entry-point call is the only host call this thread will ever
+  // hold, so no export dispatch can ever bind it.
+  const std::string census =
+      "capture runtime passive scheduler participant has an active outer host "
+      "call: tid=00000001 state=1 resume_kind=1 restorable=false pc=00000000 "
+      "hostcall=depth=1,fn=82002000,ret=82003000 export=none "
+      "wait=1/1/4/00000000/0"
+      "; unsupported=1/1";
+  REQUIRE(status.message.compare(0, census.size(), census) == 0);
+  REQUIRE(status.message.find('\n') == std::string::npos);
+  REQUIRE(harness.provider.begin_count.load() == 0);
+  REQUIRE(call_result);
+
   harness.runtime->Shutdown();
   thread.reset();
 }

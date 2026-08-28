@@ -338,6 +338,24 @@ class ProviderHarness final {
     return checkpoint;
   }
 
+  // The same wait the blocked checkpoint carries, published on a ready queue:
+  // the scheduler cleared the exact-PC route when it re-readied the fiber, so
+  // nothing but the wait shape separates this from a thread that just yielded.
+  kernel::GuestSchedulerCheckpointBarrierSnapshot WokenSecondThreadCheckpoint(
+      kernel::GuestSchedulerCaptureWaitKind wait_kind =
+          kernel::GuestSchedulerCaptureWaitKind::kSingle,
+      uint8_t wait_flags =
+          kernel::kGuestSchedulerCaptureWaitFlagGated |
+          kernel::kGuestSchedulerCaptureWaitFlagInterruptible) const {
+    auto checkpoint = PassiveSecondThreadCheckpoint();
+    auto& woken = checkpoint.participants.back();
+    woken.blocked_wait_kind = wait_kind;
+    woken.blocked_wait.handle_count = 1;
+    woken.blocked_wait.flags = wait_flags;
+    woken.blocked_wait.handles[0] = 0x00110001u;
+    return checkpoint;
+  }
+
   ppc::GuestInvocationRecorderIdentity InvocationIdentity() const {
     return {reinterpret_cast<uintptr_t>(thread->context()), kThreadId};
   }
@@ -1022,6 +1040,191 @@ TEST_CASE(
       harness.BlockedSecondThreadCheckpoint(), harness.TwoThreadParticipants(),
       harness.TwoThreadHostCalls(), &error));
   REQUIRE(error.find("no open modeled export dispatch") != std::string::npos);
+  REQUIRE(harness.provider->status().state ==
+          GuestExecutionSessionCaptureProviderState::kRejected);
+}
+
+TEST_CASE(
+    "guest execution session provider checkpoints a woken export participant",
+    "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  // The fiber is still parked on the branch that entered the export thunk, so
+  // the link register is the only place its return point survives.
+  harness.second_thread->context()->lr = kFunctionAddress;
+  harness.InstallExternalEventLog();
+  const auto dispatch = harness.OpenExportDispatch(
+      harness.second_participant, kFunctionAddress, kExportThunkAddress);
+  REQUIRE(dispatch);
+
+  std::string error;
+  const auto checkpoint = harness.WokenSecondThreadCheckpoint();
+  // The capability gate still reads the class as passive. What the class is
+  // bound to is decided where the dispatch and the registers are both in hand.
+  REQUIRE(harness.provider->SupportsCheckpointParticipant(
+      checkpoint.participants.back(), &error));
+  REQUIRE(harness.provider->BeginCapture(checkpoint,
+                                         harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+  REQUIRE(harness.provider->DefersInitialParticipantState(
+      harness.second_participant));
+
+  FakeExportSequenceResolver resolver;
+  resolver.Bind(dispatch, harness.second_participant, 41);
+  harness.provider->SetModeledExportSequenceResolver(&resolver);
+  std::vector<uint8_t> state_bytes;
+  REQUIRE(harness.provider->EncodeParticipantState(harness.second_participant,
+                                                   true, &state_bytes, &error));
+  ppc::GuestPPCThreadCheckpoint state;
+  REQUIRE(
+      ppc::GuestPPCThreadCheckpointCodec::Decode(state_bytes, &state, &error));
+  REQUIRE(state.participant_ordinal == 1);
+  REQUIRE(state.guest_thread_id == kSecondThreadId);
+  REQUIRE(state.resume_kind ==
+          ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern);
+  REQUIRE(state.resume_pc == kFunctionAddress);
+  REQUIRE(state.owning_function_address == kFunctionAddress);
+  REQUIRE(state.owning_function_end_address == kFunctionEndAddress);
+  REQUIRE(state.outer_guest_return_address == kOuterReturnAddress);
+  REQUIRE(state.pending_export_guest_address == kExportThunkAddress);
+  REQUIRE(state.pending_external_event_sequence == 41);
+  REQUIRE(state.pending_external_event_sequence != dispatch.value);
+  harness.provider->SetModeledExportSequenceResolver(nullptr);
+}
+
+TEST_CASE(
+    "guest execution session provider refuses a final woken export participant",
+    "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.second_thread->context()->lr = kFunctionAddress;
+  harness.InstallExternalEventLog();
+  REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                     kFunctionAddress, kExportThunkAddress));
+
+  std::string error;
+  const auto woken = harness.WokenSecondThreadCheckpoint();
+  REQUIRE(harness.provider->BeginCapture(woken, harness.TwoThreadParticipants(),
+                                         harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.empty());
+  // At the final boundary the export returns after the interval, so nothing on
+  // the tape can witness the route this participant would need.
+  REQUIRE_FALSE(harness.provider->SealCapture(
+      woken, harness.TwoThreadHostCalls(), &error));
+  REQUIRE(error.find("woken modeled export at the final boundary") !=
+          std::string::npos);
+}
+
+TEST_CASE("guest execution session provider binds one woken export dispatch",
+          "[guest-execution-session-capture-provider]") {
+  ProviderHarness harness;
+  harness.AddSecondParticipant();
+  harness.InstallExternalEventLog();
+  harness.second_thread->context()->lr = kFunctionAddress;
+  auto checkpoint = harness.WokenSecondThreadCheckpoint();
+  bool nested_host_call = false;
+  std::string expected;
+
+  SECTION("a waiter whose only host call is its root guest entry") {
+    // The other face of the class: no export is modeled beneath the root
+    // dispatch, so no captured outcome can ever name this waiter's route.
+    expected =
+        "cannot encode a passive scheduler participant with an active host "
+        "call";
+  }
+  SECTION("a wait kind the export dispatch does not model") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    checkpoint = harness.WokenSecondThreadCheckpoint(
+        kernel::GuestSchedulerCaptureWaitKind::kDelay);
+    expected =
+        "cannot encode a passive scheduler participant with an active host "
+        "call";
+  }
+  SECTION("an alertable wait") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    checkpoint = harness.WokenSecondThreadCheckpoint(
+        kernel::GuestSchedulerCaptureWaitKind::kSingle,
+        kernel::kGuestSchedulerCaptureWaitFlagAlertable);
+    expected =
+        "cannot encode a passive scheduler participant with an active host "
+        "call";
+  }
+  SECTION("a pending user APC") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    checkpoint = harness.WokenSecondThreadCheckpoint(
+        kernel::GuestSchedulerCaptureWaitKind::kSingle,
+        kernel::kGuestSchedulerCaptureWaitFlagUserApcPending);
+    expected =
+        "cannot encode a passive scheduler participant with an active host "
+        "call";
+  }
+  SECTION("an unpublished link register") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    harness.second_thread->context()->lr = 0;
+    expected =
+        "woken waiter link register is not a PPC-aligned export return point";
+  }
+  SECTION("a misaligned link register") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    harness.second_thread->context()->lr = kFunctionAddress + 1;
+    expected =
+        "woken waiter link register is not a PPC-aligned export return point";
+  }
+  SECTION("a link register away from the dispatch call site") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kMiddleFunctionAddress,
+                                       kExportThunkAddress));
+    expected =
+        "woken waiter link register differs from its modeled export return "
+        "point";
+  }
+  SECTION("two open dispatches") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    expected = "woken waiter has more than one open modeled export dispatch";
+  }
+  SECTION("a dispatch that is not a kernel export") {
+    REQUIRE(harness.OpenExportDispatch(
+        harness.second_participant, kFunctionAddress, kExportThunkAddress,
+        GuestExecutionSessionEventKind::kExternOrBuiltin));
+    expected =
+        "woken waiter is not parked in an outermost modeled kernel export";
+  }
+  SECTION("a dispatch declaring no guest-memory effect") {
+    REQUIRE(harness.OpenExportDispatch(
+        harness.second_participant, kFunctionAddress, kExportThunkAddress,
+        GuestExecutionSessionEventKind::kKernelExport, false));
+    expected = "no bindable export identity";
+  }
+  SECTION("a waiter below more than its root dispatch") {
+    REQUIRE(harness.OpenExportDispatch(harness.second_participant,
+                                       kFunctionAddress, kExportThunkAddress));
+    nested_host_call = true;
+    expected = "woken waiter does not own exactly one root host call";
+  }
+
+  auto host_calls = harness.TwoThreadHostCalls();
+  if (nested_host_call) {
+    host_calls.active_calls.push_back({{3},
+                                       harness.second_participant,
+                                       kMiddleFunctionAddress,
+                                       kMiddleFunctionEndAddress,
+                                       kOuterReturnAddress,
+                                       2});
+  }
+  std::string error;
+  REQUIRE_FALSE(harness.provider->BeginCapture(
+      checkpoint, harness.TwoThreadParticipants(), host_calls, &error));
+  INFO(error);
+  REQUIRE(error.find(expected) != std::string::npos);
   REQUIRE(harness.provider->status().state ==
           GuestExecutionSessionCaptureProviderState::kRejected);
 }

@@ -147,6 +147,16 @@ bool IsBlockedExportWaitInAllowlist(const CheckpointParticipant& participant) {
          !(participant.blocked_wait.flags & refused_flags);
 }
 
+// The ready face of the blocked-in-export shape: a waiter the scheduler put
+// back on a ready queue without unwinding its wait, so the wake cleared its
+// resume route while every frame of the wait is still standing. A suspended
+// waiter is not on a ready queue and is not this class.
+bool IsWokenExportParticipant(const CheckpointParticipant& participant) {
+  return participant.state ==
+             kernel::GuestSchedulerCheckpointParticipantState::kReady &&
+         IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant);
+}
+
 std::string DescribeParticipant(const CheckpointParticipant& participant) {
   return fmt::format(
       "tid={:08X} state={} resume_kind={} restorable={} pc={:08X}",
@@ -754,13 +764,17 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     return true;
   }
 
-  // Binds a blocked participant to the single open modeled export dispatch it
-  // is parked inside. The log is the one the capture runtime installed on this
+  // Binds a participant to the single open modeled export dispatch it is parked
+  // inside. The log is the one the capture runtime installed on this
   // Processor, so the provider and the export shims always see the same open
   // calls. Every refusal is a first-failure diagnostic in the census style; the
   // participant stays rejected exactly as it is today unless all of it holds.
-  bool BindBlockedExportDispatch(
+  // A blocked participant's return point is the PC the scheduler published for
+  // it; a woken one's is the link register its fiber is still parked on.
+  bool BindModeledExportDispatch(
       const CheckpointParticipant& participant,
+      std::string_view participant_class, std::string_view resume_point,
+      bool wait_in_allowlist, uint32_t return_point,
       GuestExecutionCaptureExternalEventActiveCall* output,
       std::string* reason) const {
     // Queried before the first refusal so every refusal names the wait it
@@ -786,10 +800,11 @@ struct GuestExecutionSessionCaptureProvider::Impl {
       }
       return false;
     };
-    if (!IsBlockedExportWaitInAllowlist(participant)) {
-      return refuse(
-          "capture provider blocked participant is outside the modeled "
-          "blocking-export wait allowlist");
+    if (!wait_in_allowlist) {
+      return refuse(fmt::format(
+          "capture provider {} is outside the modeled blocking-export wait "
+          "allowlist",
+          participant_class));
     }
     if (!log) {
       return refuse(
@@ -801,20 +816,21 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     }
     if (calls.empty()) {
       return refuse(
-          "capture provider blocked participant has no open modeled export "
-          "dispatch");
+          fmt::format("capture provider {} has no open modeled export dispatch",
+                      participant_class));
     }
     if (calls.size() != 1) {
-      return refuse(
-          "capture provider blocked participant has more than one open "
-          "modeled export dispatch");
+      return refuse(fmt::format(
+          "capture provider {} has more than one open modeled export dispatch",
+          participant_class));
     }
     const GuestExecutionCaptureExternalEventActiveCall& call = calls.front();
     if (call.kind != GuestExecutionSessionEventKind::kKernelExport ||
         !call.is_outermost()) {
-      return refuse(
-          "capture provider blocked participant is not parked in an outermost "
-          "modeled kernel export");
+      return refuse(fmt::format(
+          "capture provider {} is not parked in an outermost modeled kernel "
+          "export",
+          participant_class));
     }
     // A modeled blocking wait always declares the guest thread fields it
     // writes, so a dispatch with no declared effect cannot be one.
@@ -824,15 +840,49 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           "capture provider modeled export dispatch has no bindable export "
           "identity");
     }
-    if (call.call_site_address != participant.guest_pc) {
-      return refuse(
-          "capture provider blocked participant PC differs from its modeled "
-          "export return point");
+    if (!return_point || (return_point & 3)) {
+      return refuse(fmt::format(
+          "capture provider {} {} is not a PPC-aligned export return point",
+          participant_class, resume_point));
+    }
+    if (call.call_site_address != return_point) {
+      return refuse(fmt::format(
+          "capture provider {} {} differs from its modeled export return point",
+          participant_class, resume_point));
     }
     if (output) {
       *output = call;
     }
     return true;
+  }
+
+  // The dispatch a woken waiter is parked inside is what separates it from a
+  // waiter that came out of a wait nothing models; only the first has an
+  // outcome the tape can name.
+  bool IsParkedInOpenExportDispatch(
+      const GuestExecutionCaptureParticipantIdentity& participant) const {
+    const std::shared_ptr<GuestExecutionCaptureExternalEventLog> log =
+        processor.guest_execution_capture_external_event_log();
+    std::vector<GuestExecutionCaptureExternalEventActiveCall> calls;
+    return log && log->CopyParticipantActiveCalls(participant, &calls) &&
+           !calls.empty();
+  }
+
+  // The participant owns one open host call and it is the root dispatch its
+  // fiber has been parked below since it started running.
+  bool OwnsOnlyItsRootHostCall(
+      const GuestExecutionCaptureParticipantIdentity& participant,
+      const GuestExecutionCaptureHostCallRosterSnapshot& host_calls) const {
+    size_t owned = 0;
+    uint32_t depth = 0;
+    for (const GuestExecutionCaptureActiveHostCall& call :
+         host_calls.active_calls) {
+      if (call.participant == participant) {
+        ++owned;
+        depth = call.participant_depth;
+      }
+    }
+    return owned == 1 && depth == 1;
   }
 
   bool CaptureThreadStates(size_t expected_count,
@@ -971,6 +1021,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     std::map<std::pair<uint64_t, uint64_t>, uint64_t> execution_identities;
     std::map<uint64_t, uint32_t> outer_return_addresses;
     std::set<uint64_t> outside_guest_participants;
+    std::set<uint64_t> bound_dispatch_tokens;
     for (size_t ordinal = 0; ordinal < ordered.size(); ++ordinal) {
       const auto& identity = ordered[ordinal];
       const auto thread = std::find_if(
@@ -996,7 +1047,71 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           return RejectLocked(
               "capture provider scheduler and ThreadState identities differ");
         }
-        if (IsPassiveOutsideGuestParticipant(*scheduler_participant)) {
+        // A waiter re-readied inside a modeled export is published in the
+        // passive shape, so the dispatch it is parked inside is the only thing
+        // that separates the two and has to be asked first.
+        if (IsWokenExportParticipant(*scheduler_participant) &&
+            IsParkedInOpenExportDispatch(identity)) {
+          if (!establish_execution_identities) {
+            return RejectLocked(
+                "capture provider cannot encode a woken modeled export at the "
+                "final boundary: " +
+                DescribeParticipant(*scheduler_participant));
+          }
+          // The scheduler publishes no PC for this class, so the route is named
+          // by the dispatch's own call site, cross-checked against the link
+          // register the parked fiber still carries.
+          GuestExecutionCaptureExternalEventActiveCall dispatch;
+          std::string reason;
+          if (!BindModeledExportDispatch(
+                  *scheduler_participant, "woken waiter", "link register",
+                  IsBlockedExportWaitInAllowlist(*scheduler_participant),
+                  static_cast<uint32_t>(thread->registers.link_register),
+                  &dispatch, &reason)) {
+            return RejectLocked(reason);
+          }
+          if (!bound_dispatch_tokens.insert(dispatch.token.value).second) {
+            return RejectLocked(
+                "capture provider modeled export dispatch is bound by more "
+                "than one participant");
+          }
+          if (!OwnsOnlyItsRootHostCall(identity, host_calls)) {
+            return RejectLocked(
+                "capture provider woken waiter does not own exactly one root "
+                "host call: " +
+                DescribeParticipant(*scheduler_participant));
+          }
+          uint32_t outer_return = 0;
+          if (!FindOuterReturn(identity, host_calls, &outer_return)) {
+            return false;
+          }
+          outer_return_addresses.emplace(identity.capture_instance_id,
+                                         outer_return);
+          const DefinitionRecord* owner =
+              FindOwningDefinitionLocked(dispatch.call_site_address);
+          if (!owner) {
+            return false;
+          }
+          const uint32_t owner_address = FindDefinitionAddressLocked(owner);
+          if (!owner_address || !owner->code_pages_snapshotted ||
+              !AddClosureSeedLocked(owner_address, owner->end_address)) {
+            return false;
+          }
+          state_blob.resume_kind =
+              ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern;
+          state_blob.resume_pc = dispatch.call_site_address;
+          state_blob.owning_function_address = owner_address;
+          state_blob.owning_function_end_address = owner->end_address;
+          state_blob.outer_guest_return_address = outer_return;
+          state_blob.pending_export_guest_address = dispatch.guest_address;
+          // Provisional, and never published: the dispatch is still open, so
+          // its canonical event has no sequence yet. EncodeParticipantState
+          // resolves the token and serves the only durable form.
+          state_blob.pending_external_event_sequence = dispatch.token.value;
+          pending_exports.emplace(
+              identity.capture_instance_id,
+              PendingExportCheckpoint{state_blob, dispatch.token});
+        } else if (IsPassiveOutsideGuestParticipant(*scheduler_participant)) {
           if (std::any_of(host_calls.active_calls.cbegin(),
                           host_calls.active_calls.cend(),
                           [&](const auto& call) {
@@ -1020,9 +1135,16 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           }
           GuestExecutionCaptureExternalEventActiveCall dispatch;
           std::string reason;
-          if (!BindBlockedExportDispatch(*scheduler_participant, &dispatch,
-                                         &reason)) {
+          if (!BindModeledExportDispatch(
+                  *scheduler_participant, "blocked participant", "PC",
+                  IsBlockedExportWaitInAllowlist(*scheduler_participant),
+                  scheduler_participant->guest_pc, &dispatch, &reason)) {
             return RejectLocked(reason);
+          }
+          if (!bound_dispatch_tokens.insert(dispatch.token.value).second) {
+            return RejectLocked(
+                "capture provider modeled export dispatch is bound by more "
+                "than one participant");
           }
           uint32_t outer_return = 0;
           if (!FindOuterReturn(identity, host_calls, &outer_return)) {
@@ -1110,9 +1232,12 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     }
     const size_t executable_scheduler_participant_count = std::count_if(
         checkpoint.participants.cbegin(), checkpoint.participants.cend(),
-        [](const CheckpointParticipant& candidate) {
+        [&](const CheckpointParticipant& candidate) {
           return IsRestorableJitParticipant(candidate) ||
-                 IsBlockedExportParticipant(candidate);
+                 IsBlockedExportParticipant(candidate) ||
+                 (IsWokenExportParticipant(candidate) &&
+                  IsParkedInOpenExportDispatch(
+                      {candidate.capture_instance_id, candidate.thread_id}));
         });
     if (encoded.size() != ordered.size() ||
         execution_identities.size() != ordered.size() ||
@@ -1613,7 +1738,10 @@ bool GuestExecutionSessionCaptureProvider::SupportsCheckpointParticipant(
     }
     if (participant.thread_id && IsBlockedExportParticipant(participant)) {
       std::string reason;
-      if (impl_->BindBlockedExportDispatch(participant, nullptr, &reason)) {
+      if (impl_->BindModeledExportDispatch(
+              participant, "blocked participant", "PC",
+              IsBlockedExportWaitInAllowlist(participant), participant.guest_pc,
+              nullptr, &reason)) {
         return true;
       }
       return Fail(error, reason);

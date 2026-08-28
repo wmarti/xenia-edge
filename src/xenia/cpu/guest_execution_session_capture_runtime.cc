@@ -143,6 +143,14 @@ bool IsWokenInWaitAllowlist(
          !(wait.flags & kRefusedWaitFlags);
 }
 
+// The ready face of the blocked-in-export shape. A suspended waiter carries the
+// same registers but is not on a ready queue, so it is not this class.
+bool IsWokenExportWaiter(const CheckpointParticipant& participant) {
+  return participant.state ==
+             kernel::GuestSchedulerCheckpointParticipantState::kReady &&
+         IsGuestExecutionSessionWokenInWaitCheckpointParticipant(participant);
+}
+
 // The rejection diagnostic is one parsed log line, so its census is bounded.
 constexpr size_t kMaxReportedUnsupportedParticipants = 32;
 
@@ -372,6 +380,28 @@ bool ValidateRuntimeCheckpointStateBindings(
         participant.capture_instance_id) {
       return Fail(error, std::string("capture runtime ") + boundary +
                              " scheduler and bundle identities differ");
+    }
+    // A waiter re-readied inside a modeled export carries the same pending
+    // route as a still-blocked one, and is published in the passive shape, so
+    // it has to be recognised before the passive rule below.
+    if (IsWokenExportWaiter(*scheduler_participant)) {
+      if (!initial_boundary) {
+        return Fail(error,
+                    "capture runtime final woken-export participant has no "
+                    "durable replay route");
+      }
+      // The scheduler publishes no PC for this class, so the resume point is
+      // checkable only for the shape a pending route must carry.
+      if (decoded.resume_kind !=
+              ppc::GuestPPCThreadResumeKind::kPendingModeledBlockingExtern ||
+          !decoded.resume_pc || (decoded.resume_pc & 3) ||
+          !decoded.pending_external_event_sequence ||
+          !decoded.pending_export_guest_address) {
+        return Fail(error,
+                    "capture runtime initial PPC continuation differs from the "
+                    "held scheduler woken export");
+      }
+      continue;
     }
     if (IsPassiveOutsideGuestParticipant(*scheduler_participant)) {
       if (decoded.resume_kind != ppc::GuestPPCThreadResumeKind::kOutsideGuest) {
@@ -637,6 +667,22 @@ std::string DescribeParticipantExportDispatch(
                      outermost->guest_address, outermost->call_site_address);
 }
 
+// A woken waiter parked inside an open modeled export dispatch owns the root
+// host call its fiber sits below, so the passive roster rule does not describe
+// it. Only the class is decided here; the provider re-derives the whole
+// binding, and every participant this admits that it cannot bind is refused
+// before any state is encoded.
+bool IsWokenExportDispatchParticipant(
+    const CheckpointParticipant& participant,
+    const GuestExecutionCaptureParticipantIdentity& identity,
+    const GuestExecutionCaptureExternalEventLog* log) {
+  if (!log || !IsWokenExportWaiter(participant)) {
+    return false;
+  }
+  std::vector<GuestExecutionCaptureExternalEventActiveCall> calls;
+  return log->CopyParticipantActiveCalls(identity, &calls) && !calls.empty();
+}
+
 // kind/handles/flags/handle0/deadline. A ready or suspended participant carries
 // only the first three; the rest are a blocked participant's full wait state.
 std::string DescribeCheckpointWaitShape(
@@ -663,7 +709,9 @@ std::string CensusPassiveParticipantHostCalls(
   for (const auto& lifecycle : registry.participants) {
     const CheckpointParticipant* participant = FindCheckpointParticipant(
         checkpoint, lifecycle.participant.guest_thread_id);
-    if (!participant || !IsPassiveOutsideGuestParticipant(*participant)) {
+    if (!participant || !IsPassiveOutsideGuestParticipant(*participant) ||
+        IsWokenExportDispatchParticipant(*participant, lifecycle.participant,
+                                         external_event_log)) {
       continue;
     }
     const GuestExecutionCaptureActiveHostCall* call =
@@ -689,7 +737,9 @@ std::string CensusPassiveParticipantHostCalls(
 }
 
 bool ActiveHostCallHasDurableContinuation(
-    const CheckpointParticipant* participant) {
+    const CheckpointParticipant* participant,
+    const GuestExecutionCaptureParticipantIdentity& identity,
+    const GuestExecutionCaptureExternalEventLog* log) {
   if (!participant) {
     return false;
   }
@@ -701,7 +751,8 @@ bool ActiveHostCallHasDurableContinuation(
       !participant->restorable &&
       participant->state ==
           kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
-  return restorable_safepoint || blocked_in_export;
+  return restorable_safepoint || blocked_in_export ||
+         IsWokenExportDispatchParticipant(*participant, identity, log);
 }
 
 std::string CensusUnrepresentableActiveHostCalls(
@@ -716,7 +767,8 @@ std::string CensusUnrepresentableActiveHostCalls(
        host_calls.active_calls) {
     const CheckpointParticipant* participant =
         FindCheckpointParticipant(checkpoint, call.participant.guest_thread_id);
-    if (ActiveHostCallHasDurableContinuation(participant)) {
+    if (ActiveHostCallHasDurableContinuation(participant, call.participant,
+                                             external_event_log)) {
       continue;
     }
     if (unsupported_count < kMaxReportedUnsupportedParticipants) {
@@ -1655,6 +1707,8 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
         GuestExecutionCaptureHostCallRosterRejection::kNone) {
       return Fail(error, "capture runtime host-call roster is rejected");
     }
+    const GuestExecutionCaptureExternalEventLog* const external_event_log =
+        processor.guest_execution_capture_external_event_log().get();
     size_t scheduler_owned_count = 0;
     size_t unsupported_count = 0;
     std::string unsupported_diagnostic;
@@ -1706,10 +1760,12 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
             "preemption episode");
       }
       if (IsPassiveOutsideGuestParticipant(*checkpoint_participant) &&
-          FindOutermostActiveHostCall(host_calls, lifecycle.participant)) {
+          FindOutermostActiveHostCall(host_calls, lifecycle.participant) &&
+          !IsWokenExportDispatchParticipant(*checkpoint_participant,
+                                            lifecycle.participant,
+                                            external_event_log)) {
         return fail_participant(CensusPassiveParticipantHostCalls(
-            checkpoint, registry, host_calls,
-            processor.guest_execution_capture_external_event_log().get()));
+            checkpoint, registry, host_calls, external_event_log));
       }
       std::string capability_error;
       if (!dependencies.provider->SupportsCheckpointParticipant(
@@ -1743,14 +1799,12 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       // A thread parked inside a blocking export is always below the host-call
       // dispatch token its GuestFunction::Call opened, so its outer call is
       // expected exactly like a safepoint's. The provider has already refused
-      // any blocked participant it could not bind to a modeled export
-      // dispatch, so reaching here means this one carries a typed route.
-      if (!ActiveHostCallHasDurableContinuation(checkpoint_participant)) {
-        return Fail(
-            error,
-            CensusUnrepresentableActiveHostCalls(
-                checkpoint, host_calls,
-                processor.guest_execution_capture_external_event_log().get()));
+      // any participant it could not bind to a modeled export dispatch, so
+      // reaching here means this one carries a typed route.
+      if (!ActiveHostCallHasDurableContinuation(
+              checkpoint_participant, call.participant, external_event_log)) {
+        return Fail(error, CensusUnrepresentableActiveHostCalls(
+                               checkpoint, host_calls, external_event_log));
       }
     }
     return true;
@@ -1802,16 +1856,19 @@ struct GuestExecutionSessionCaptureRuntime::Impl {
       // At the start rendezvous the arrival records only that the outer call
       // is active, which is true of a thread parked inside a modeled export.
       // At the stop it would emit a JIT safepoint arrival for a thread that
-      // never reached one, and a participant still blocked there has no
-      // durable route either way.
-      const bool blocked_in_export =
+      // never reached one, and a participant still parked there has no durable
+      // route either way.
+      const bool parked_in_export =
           start_rendezvous && checkpoint_participant &&
-          IsBlockedExportParticipant(*checkpoint_participant) &&
-          IsBlockedExportWaitInAllowlist(*checkpoint_participant);
-      if (!blocked_in_export && (!checkpoint_participant ||
-                                 checkpoint_participant->resume_kind !=
-                                     CheckpointResumeKind::kJitSafepoint ||
-                                 !checkpoint_participant->restorable)) {
+          ((IsBlockedExportParticipant(*checkpoint_participant) &&
+            IsBlockedExportWaitInAllowlist(*checkpoint_participant)) ||
+           IsWokenExportDispatchParticipant(
+               *checkpoint_participant, participant.identity,
+               processor.guest_execution_capture_external_event_log().get()));
+      if (!parked_in_export && (!checkpoint_participant ||
+                                checkpoint_participant->resume_kind !=
+                                    CheckpointResumeKind::kJitSafepoint ||
+                                !checkpoint_participant->restorable)) {
         return Fail(error,
                     "capture runtime cannot represent a non-safepoint active "
                     "outer call");
