@@ -9,9 +9,11 @@
 
 #include "xenia/cpu/guest_execution_replay_tape.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <future>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,6 +26,8 @@ namespace test {
 namespace {
 
 using namespace std::chrono_literals;
+
+constexpr uint64_t kCoverageInstructionDelta = 96;
 
 std::vector<uint8_t> Bytes(size_t size, uint8_t seed) {
   std::vector<uint8_t> bytes(size);
@@ -77,7 +81,15 @@ GuestExecutionSessionChunkReference Reference(
   return reference;
 }
 
-GuestExecutionSessionBundle MakeTapeBundle() {
+bool PayloadEquals(std::span<const uint8_t> payload,
+                   const std::vector<uint8_t>& expected) {
+  return payload.size() == expected.size() &&
+         std::equal(payload.begin(), payload.end(), expected.begin());
+}
+
+// The coverage variant swaps only the kind of event five, so every sequence,
+// owner and count the other cases assert stays identical.
+GuestExecutionSessionBundle MakeTapeBundle(bool instruction_coverage = false) {
   GuestExecutionSessionBundle bundle;
   constexpr uint64_t kEpoch = 0x1122334455667788ull;
   const auto initial_0 = AddBlob(&bundle, Bytes(64, 1));
@@ -117,9 +129,17 @@ GuestExecutionSessionBundle MakeTapeBundle() {
   events.events.push_back(
       Event(4, 1, GuestExecutionSessionEventKind::kSegmentBegin,
             GuestExecutionSessionEventDisposition::kValidateDeterministic));
-  events.events.push_back(
-      Event(5, 1, GuestExecutionSessionEventKind::kSynchronization,
-            GuestExecutionSessionEventDisposition::kValidateDeterministic));
+  if (instruction_coverage) {
+    GuestExecutionSessionEvent coverage =
+        Event(5, 1, GuestExecutionSessionEventKind::kInstructionCoverage,
+              GuestExecutionSessionEventDisposition::kValidateDeterministic);
+    coverage.guest_instruction_delta = kCoverageInstructionDelta;
+    events.events.push_back(coverage);
+  } else {
+    events.events.push_back(
+        Event(5, 1, GuestExecutionSessionEventKind::kSynchronization,
+              GuestExecutionSessionEventDisposition::kValidateDeterministic));
+  }
   events.events.push_back(
       Event(6, 1, GuestExecutionSessionEventKind::kSegmentEnd,
             GuestExecutionSessionEventDisposition::kValidateDeterministic));
@@ -164,6 +184,8 @@ GuestExecutionSessionBundle MakeTapeBundle() {
   manifest.stop_reason = GuestExecutionSessionStopReason::kManualRequest;
   manifest.stop_request_event_sequence = 7;
   manifest.stop_request_accepted_segment_count = 2;
+  manifest.stop_request_guest_instruction_count =
+      instruction_coverage ? kCoverageInstructionDelta : 0;
   manifest.maximum_stop_tail_event_count = 4;
   manifest.maximum_stop_tail_guest_instruction_count = 4;
   manifest.maximum_stop_tail_ticks = 200;
@@ -259,7 +281,7 @@ TEST_CASE("Guest execution replay tape orders persistent participants",
   CommitExpected(*tape, turn);
   turn = Acquire(*tape, 0);
   REQUIRE(turn.event.global_sequence == 2);
-  REQUIRE(turn.payload == Bytes(8, 9));
+  REQUIRE(PayloadEquals(turn.payload, Bytes(8, 9)));
   CommitExpected(*tape, turn);
   turn = Acquire(*tape, 0);
   REQUIRE(turn.event.global_sequence == 3);
@@ -355,6 +377,181 @@ TEST_CASE("Guest execution replay tape cancellation wakes waiters",
   REQUIRE(tape->status().rejection ==
           GuestExecutionReplayTapeRejection::kCancelled);
   REQUIRE(tape->status().message == "test cancellation");
+}
+
+TEST_CASE("Guest execution replay tape borrows payloads from its own storage",
+          "[guest-execution-replay]") {
+  const std::vector<uint8_t> expected = Bytes(8, 9);
+
+  SECTION("the borrowed span aliases the tape for the whole lease") {
+    auto tape = CreateTape(MakeTapeBundle());
+    CommitExpected(*tape, Acquire(*tape, 0));
+    GuestExecutionReplayTurn turn = Acquire(*tape, 0);
+    REQUIRE(turn.event.global_sequence == 2);
+    REQUIRE(turn.payload.size() == expected.size());
+    REQUIRE(PayloadEquals(turn.payload, expected));
+    const uint8_t* borrowed = turn.payload.data();
+    REQUIRE(borrowed != nullptr);
+    REQUIRE(borrowed != expected.data());
+    REQUIRE(tape->status().has_active_lease);
+    REQUIRE(turn.payload.data() == borrowed);
+    REQUIRE(PayloadEquals(turn.payload, expected));
+    CommitExpected(*tape, turn);
+    turn = Acquire(*tape, 0);
+    REQUIRE(turn.event.global_sequence == 3);
+    REQUIRE(turn.payload.empty());
+  }
+
+  SECTION("releasing a turn drops the borrowed view and the lease") {
+    auto tape = CreateTape(MakeTapeBundle());
+    CommitExpected(*tape, Acquire(*tape, 0));
+    GuestExecutionReplayTurn turn = Acquire(*tape, 0);
+    REQUIRE_FALSE(turn.payload.empty());
+    turn.Reset();
+    REQUIRE_FALSE(turn);
+    REQUIRE(turn.payload.empty());
+    std::string error;
+    REQUIRE_FALSE(tape->CommitCaptured(turn, &error));
+    REQUIRE(tape->status().rejection ==
+            GuestExecutionReplayTapeRejection::kLeaseMismatch);
+  }
+
+  SECTION("a committed turn is stale") {
+    auto tape = CreateTape(MakeTapeBundle());
+    const GuestExecutionReplayTurn turn = Acquire(*tape, 0);
+    CommitExpected(*tape, turn);
+    std::string error;
+    REQUIRE_FALSE(tape->CommitDeterministic(turn, turn.event, &error));
+    REQUIRE(tape->status().rejection ==
+            GuestExecutionReplayTapeRejection::kLeaseMismatch);
+  }
+}
+
+TEST_CASE("Guest execution replay tape validates leases by identity",
+          "[guest-execution-replay]") {
+  SECTION("lease identifier mismatch") {
+    auto tape = CreateTape(MakeTapeBundle());
+    GuestExecutionReplayTurn turn = Acquire(*tape, 0);
+    ++turn.lease_id;
+    std::string error;
+    REQUIRE_FALSE(tape->CommitDeterministic(turn, turn.event, &error));
+    REQUIRE_FALSE(error.empty());
+    REQUIRE(tape->status().rejection ==
+            GuestExecutionReplayTapeRejection::kLeaseMismatch);
+  }
+
+  SECTION("lease identifiers are monotonic and never reused") {
+    auto tape = CreateTape(MakeTapeBundle());
+    const GuestExecutionReplayTurn first = Acquire(*tape, 0);
+    CommitExpected(*tape, first);
+    GuestExecutionReplayTurn second = Acquire(*tape, 0);
+    REQUIRE(second.lease_id > first.lease_id);
+    second.lease_id = first.lease_id;
+    std::string error;
+    REQUIRE_FALSE(tape->CommitCaptured(second, &error));
+    REQUIRE(tape->status().rejection ==
+            GuestExecutionReplayTapeRejection::kLeaseMismatch);
+  }
+
+  SECTION("a substituted payload view of equal bytes is still rejected") {
+    auto tape = CreateTape(MakeTapeBundle());
+    CommitExpected(*tape, Acquire(*tape, 0));
+    GuestExecutionReplayTurn turn = Acquire(*tape, 0);
+    const std::vector<uint8_t> forged = Bytes(8, 9);
+    REQUIRE(PayloadEquals(turn.payload, forged));
+    turn.payload = std::span<const uint8_t>(forged);
+    std::string error;
+    REQUIRE_FALSE(tape->CommitCaptured(turn, &error));
+    REQUIRE(tape->status().rejection ==
+            GuestExecutionReplayTapeRejection::kLeaseMismatch);
+  }
+}
+
+TEST_CASE("Guest execution replay tape wakes the owning waiter",
+          "[guest-execution-replay]") {
+  auto tape = CreateTape(MakeTapeBundle());
+  auto participant_1 = std::async(std::launch::async, [&]() {
+    GuestExecutionReplayTurn turn;
+    std::string error;
+    const auto result = tape->Acquire(1, 5s, &turn, &error);
+    return std::make_pair(result, std::move(turn));
+  });
+  auto coordinator = std::async(std::launch::async, [&]() {
+    GuestExecutionReplayTurn turn;
+    std::string error;
+    return tape->Acquire(kGuestExecutionSessionNoThread, 5s, &turn, &error);
+  });
+  REQUIRE(participant_1.wait_for(20ms) == std::future_status::timeout);
+  REQUIRE(coordinator.wait_for(20ms) == std::future_status::timeout);
+
+  for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
+    GuestExecutionReplayTurn turn = Acquire(*tape, 0);
+    REQUIRE(turn.event.global_sequence == sequence);
+    CommitExpected(*tape, turn);
+  }
+
+  REQUIRE(participant_1.wait_for(2s) == std::future_status::ready);
+  auto [result, owner_turn] = participant_1.get();
+  REQUIRE(result == GuestExecutionReplayAcquireResult::kAcquired);
+  REQUIRE(owner_turn.event.global_sequence == 4);
+  REQUIRE(coordinator.wait_for(50ms) == std::future_status::timeout);
+
+  tape->Cancel("test broadcast");
+  REQUIRE(coordinator.wait_for(2s) == std::future_status::ready);
+  REQUIRE(coordinator.get() == GuestExecutionReplayAcquireResult::kRejected);
+  REQUIRE(tape->status().rejection ==
+          GuestExecutionReplayTapeRejection::kCancelled);
+}
+
+TEST_CASE("Guest execution replay tape types ordering-only commits",
+          "[guest-execution-replay]") {
+  SECTION("instruction coverage advances the cursor alone") {
+    auto tape = CreateTape(MakeTapeBundle(true));
+    for (int index = 0; index < 3; ++index) {
+      CommitExpected(*tape, Acquire(*tape, 0));
+    }
+    CommitExpected(*tape, Acquire(*tape, 1));
+    GuestExecutionReplayTurn turn = Acquire(*tape, 1);
+    REQUIRE(turn.event.global_sequence == 5);
+    REQUIRE(turn.event.kind ==
+            GuestExecutionSessionEventKind::kInstructionCoverage);
+    REQUIRE(turn.payload.empty());
+    std::string error;
+    REQUIRE(tape->CommitOrderingOnly(turn, &error));
+    REQUIRE(error.empty());
+    const GuestExecutionReplayTapeStatus status = tape->status();
+    REQUIRE(status.state == GuestExecutionReplayTapeState::kRunning);
+    REQUIRE(status.rejection == GuestExecutionReplayTapeRejection::kNone);
+    REQUIRE(status.consumed_event_count == 5);
+    REQUIRE(status.next_event_sequence == 6);
+    REQUIRE_FALSE(status.has_active_lease);
+  }
+
+  SECTION("a deterministic control event is not admitted") {
+    auto tape = CreateTape(MakeTapeBundle(true));
+    const GuestExecutionReplayTurn turn = Acquire(*tape, 0);
+    REQUIRE(turn.event.kind == GuestExecutionSessionEventKind::kSegmentBegin);
+    std::string error;
+    REQUIRE_FALSE(tape->CommitOrderingOnly(turn, &error));
+    REQUIRE(error ==
+            "ordering-only commit is admitted only for instruction coverage");
+    REQUIRE(tape->status().rejection ==
+            GuestExecutionReplayTapeRejection::kOrderingOnlyMismatch);
+    REQUIRE(tape->status().consumed_event_count == 0);
+  }
+
+  SECTION("a captured event carrying a payload is not admitted") {
+    auto tape = CreateTape(MakeTapeBundle(true));
+    CommitExpected(*tape, Acquire(*tape, 0));
+    const GuestExecutionReplayTurn turn = Acquire(*tape, 0);
+    REQUIRE(turn.event.kind == GuestExecutionSessionEventKind::kKernelExport);
+    REQUIRE_FALSE(turn.payload.empty());
+    std::string error;
+    REQUIRE_FALSE(tape->CommitOrderingOnly(turn, &error));
+    REQUIRE(tape->status().rejection ==
+            GuestExecutionReplayTapeRejection::kOrderingOnlyMismatch);
+    REQUIRE(tape->status().consumed_event_count == 1);
+  }
 }
 
 TEST_CASE("Guest execution replay tape validates the complete bundle",

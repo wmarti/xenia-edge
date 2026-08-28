@@ -13,8 +13,8 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
-#include <vector>
 
 #include "xenia/cpu/guest_execution_session.h"
 #include "xenia/cpu/guest_execution_session_bundle.h"
@@ -38,6 +38,7 @@ enum class GuestExecutionReplayTapeRejection : uint8_t {
   kLeaseMismatch,
   kDispositionMismatch,
   kDeterministicMismatch,
+  kOrderingOnlyMismatch,
   kTimeout,
   kCancelled,
 };
@@ -51,9 +52,12 @@ enum class GuestExecutionReplayAcquireResult : uint8_t {
 struct GuestExecutionReplayTurn {
   uint64_t lease_id = 0;
   GuestExecutionSessionEvent event;
-  std::vector<uint8_t> payload;
+  // Borrowed from tape-owned storage and valid only while the lease is held.
+  std::span<const uint8_t> payload;
 
   explicit operator bool() const { return lease_id != 0; }
+
+  void Reset() { *this = {}; }
 };
 
 struct GuestExecutionReplayTapeStatus {
@@ -71,8 +75,9 @@ struct GuestExecutionReplayTapeStatus {
 // A strict global event cursor shared by persistent replay workers. At most one
 // event is leased at a time. A participant worker can acquire only its next
 // event, while the coordinator uses kGuestExecutionSessionNoThread. Captured
-// events expose their verified payload for injection; deterministic events
+// events borrow their verified payload for injection; deterministic events
 // advance only after the worker supplies the exact observed event record.
+// A lease is identified by its identifier and cursor index, never by bytes.
 class GuestExecutionReplayTape final {
  public:
   static std::unique_ptr<GuestExecutionReplayTape> Create(
@@ -99,6 +104,11 @@ class GuestExecutionReplayTape final {
   bool CommitDeterministic(const GuestExecutionReplayTurn& turn,
                            const GuestExecutionSessionEvent& observed,
                            std::string* error = nullptr);
+
+  // Advances a kInstructionCoverage event for its ordering alone, claiming no
+  // observation and applying no payload. Every other kind is rejected.
+  bool CommitOrderingOnly(const GuestExecutionReplayTurn& turn,
+                          std::string* error = nullptr);
 
   // Fails closed if a worker cannot finish an acquired turn.
   void Abandon(const GuestExecutionReplayTurn& turn, std::string message);
