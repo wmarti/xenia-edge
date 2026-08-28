@@ -41,9 +41,22 @@ bool GuestInstructionCoverageInjectionPass::Run(HIRBuilder* builder) {
     if (guest_instruction_count > std::numeric_limits<uint32_t>::max()) {
       return false;
     }
+    // Behind the block's leading annotations, not in front of them. The
+    // backend records a guest address's machine-code offset when it reaches
+    // the source-offset marker, and emits a pending stack repair on the first
+    // instruction that is not one; landing ahead of the marker would stamp the
+    // offset past the repair, and a longjmp would then be sent to an address
+    // that skips it. A block of nothing but annotations emits no code, so it
+    // has no offset to stamp and nothing to count.
+    Instr* first = block->instr_head;
+    for (; first && first->IsFake(); first = first->next) {
+    }
+    if (!first) {
+      continue;
+    }
     Instr* coverage = builder->GuestInstructionCoverage(
         static_cast<uint32_t>(guest_instruction_count));
-    coverage->MoveBefore(block->instr_head);
+    coverage->MoveBefore(first);
   }
   return true;
 }
