@@ -2033,16 +2033,19 @@ TEST_CASE("session capture runtime reports every unsupported participant",
 
   auto& participants = harness.checkpoint.provisional.participants;
   participants.front().restorable = false;
-  CheckpointParticipant blocked;
-  blocked.thread_id = second->thread_id();
-  blocked.capture_instance_id = second->guest_execution_capture_instance_id();
-  blocked.guest_pc = 0x82081740;
-  blocked.cpu = 0;
-  blocked.state = kernel::GuestSchedulerCheckpointParticipantState::kBlocked;
-  blocked.resume_kind =
-      kernel::GuestSchedulerCheckpointResumeKind::kAfterBlockingExport;
-  blocked.restorable = false;
-  participants.push_back(blocked);
+  // A native continuation that still claims a link register: no provider class
+  // admits it, unlike the blocked-export shape publication now carries.
+  CheckpointParticipant unroutable;
+  unroutable.thread_id = second->thread_id();
+  unroutable.capture_instance_id =
+      second->guest_execution_capture_instance_id();
+  unroutable.guest_pc = 0x82081740;
+  unroutable.cpu = 0;
+  unroutable.state = kernel::GuestSchedulerCheckpointParticipantState::kReady;
+  unroutable.resume_kind =
+      kernel::GuestSchedulerCheckpointResumeKind::kNativeContinuation;
+  unroutable.restorable = false;
+  participants.push_back(unroutable);
 
   REQUIRE(harness.runtime->RequestStart());
   REQUIRE(harness.runtime->WaitForTerminal(2s));
@@ -2051,7 +2054,7 @@ TEST_CASE("session capture runtime reports every unsupported participant",
   REQUIRE(status.state == RuntimeState::kRejected);
   REQUIRE(status.rejection == RuntimeRejection::kCheckpointRoster);
   REQUIRE(status.message.find("tid=00000001") != std::string::npos);
-  REQUIRE(status.message.find("tid=00000002 state=2 resume_kind=2 "
+  REQUIRE(status.message.find("tid=00000002 state=1 resume_kind=1 "
                               "restorable=false pc=82081740") !=
           std::string::npos);
   REQUIRE(status.message.find("; also: tid=") != std::string::npos);
