@@ -31,12 +31,55 @@ struct BRANCH : Sequence<BRANCH, I<OPCODE_BRANCH, VoidOp, LabelOp>> {
 };
 EMITTER_OPCODE_TABLE(OPCODE_BRANCH, BRANCH);
 
+inline Xbyak_aarch64::Cond InvertCond(Xbyak_aarch64::Cond cond) {
+  using namespace Xbyak_aarch64;
+  switch (cond) {
+    case EQ:
+      return NE;
+    case NE:
+      return EQ;
+    case CS:
+      return CC;
+    case CC:
+      return CS;
+    case MI:
+      return PL;
+    case PL:
+      return MI;
+    case VS:
+      return VC;
+    case VC:
+      return VS;
+    case HI:
+      return LS;
+    case LS:
+      return HI;
+    case GE:
+      return LT;
+    case LT:
+      return GE;
+    case GT:
+      return LE;
+    case LE:
+      return GT;
+    default:
+      return cond;
+  }
+}
+
 // ============================================================================
 // OPCODE_BRANCH_TRUE
 // ============================================================================
 struct BRANCH_TRUE_I8
     : Sequence<BRANCH_TRUE_I8, I<OPCODE_BRANCH_TRUE, VoidOp, I8Op, LabelOp>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    Xbyak_aarch64::Cond cond;
+    if (!i.src1.is_constant &&
+        e.ConsumeFusedCompareBranch(i.src1.reg().getIdx(), &cond)) {
+      // The compare made no boolean; its flags are still the answer.
+      e.b(cond, e.GetLabel(i.src2.value->id));
+      return;
+    }
     e.cbnz(i.src1, e.GetLabel(i.src2.value->id));
   }
 };
@@ -82,6 +125,12 @@ EMITTER_OPCODE_TABLE(OPCODE_BRANCH_TRUE, BRANCH_TRUE_I8, BRANCH_TRUE_I16,
 struct BRANCH_FALSE_I8
     : Sequence<BRANCH_FALSE_I8, I<OPCODE_BRANCH_FALSE, VoidOp, I8Op, LabelOp>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    Xbyak_aarch64::Cond cond;
+    if (!i.src1.is_constant &&
+        e.ConsumeFusedCompareBranch(i.src1.reg().getIdx(), &cond)) {
+      e.b(InvertCond(cond), e.GetLabel(i.src2.value->id));
+      return;
+    }
     e.cbz(i.src1, e.GetLabel(i.src2.value->id));
   }
 };

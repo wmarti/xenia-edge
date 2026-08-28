@@ -183,6 +183,23 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     return true;
   }
 
+  // A compare whose only consumer is the branch that immediately follows it
+  // does not have to make a boolean at all: the branch can read the flags the
+  // compare already set. One-shot, keyed on the register the cset would have
+  // written.
+  void MarkFusedCompareBranch(int dest_reg, Xbyak_aarch64::Cond cond) {
+    fused_cmp_branch_reg_ = dest_reg;
+    fused_cmp_branch_cond_ = cond;
+  }
+  bool ConsumeFusedCompareBranch(int dest_reg, Xbyak_aarch64::Cond* out_cond) {
+    if (dest_reg < 0 || fused_cmp_branch_reg_ != dest_reg) {
+      return false;
+    }
+    *out_cond = fused_cmp_branch_cond_;
+    fused_cmp_branch_reg_ = -1;
+    return true;
+  }
+
   // A guest call sets its return address twice: once into the host stack slot
   // and once into the guest link register, from the same immediate. The first
   // leaves it in x0, so the second only has to store. One-shot, like the
@@ -204,6 +221,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     flags_zero_fresh_reg_ = flags_zero_armed_reg_ = -1;
     w16_holds_fresh_ = w16_holds_armed_ = nullptr;
     fused_addr_mask_dest_reg_ = -1;
+    fused_cmp_branch_reg_ = -1;
     x0_constant_valid_ = false;
   }
   void ShiftFlagsZeroTest() {
@@ -493,6 +511,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   int fused_addr_mask_src_reg_ = -1;
   uint32_t fused_addr_mask_imm_ = 0;
   bool fused_addr_mask_stale_ = false;
+  int fused_cmp_branch_reg_ = -1;
+  Xbyak_aarch64::Cond fused_cmp_branch_cond_ = Xbyak_aarch64::EQ;
   uint64_t x0_constant_ = 0;
   bool x0_constant_valid_ = false;
   bool x0_constant_stale_ = false;
