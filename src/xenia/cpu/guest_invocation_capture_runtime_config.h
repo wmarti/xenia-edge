@@ -23,13 +23,13 @@ namespace cpu {
 // The final execution-session selector will replace the root-specific fields,
 // while the bounds and no-overwrite output contract remain reusable.
 struct GuestInvocationCaptureRuntimeConfig {
-  static constexpr uint32_t kDefaultMaxAttempts = 8;
-  static constexpr uint64_t kDefaultMaxDurationMs = 30'000;
-  static constexpr uint32_t kDefaultMaxPages = 8192;
-  static constexpr uint64_t kDefaultMaxAccesses = 1'000'000;
+  static constexpr uint32_t kDefaultMaxAttempts = 16;
+  static constexpr uint64_t kDefaultMaxDurationMs = 300'000;
+  static constexpr uint32_t kDefaultMaxPages = 32'768;
+  static constexpr uint64_t kDefaultMaxAccesses = 64'000'000;
   static constexpr uint32_t kDefaultMaxCallDepth = 256;
-  static constexpr uint64_t kDefaultMaxEvents = 2'000'000;
-  static constexpr uint32_t kDefaultMaxFunctions = 32'768;
+  static constexpr uint64_t kDefaultMaxEvents = 128'000'000;
+  static constexpr uint32_t kDefaultMaxFunctions = 262'144;
 
   std::filesystem::path output_directory;
   std::string root_address;

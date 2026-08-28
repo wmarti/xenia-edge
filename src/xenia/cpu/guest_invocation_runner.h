@@ -51,7 +51,7 @@ class Backend;
 // eager work well below the backend's 256 MiB generated-code cache. These are
 // safety ceilings for one invocation-specific compile closure, not capture
 // targets.
-constexpr uint64_t kGuestInvocationReplayMaxEagerFunctionCount = 32'768;
+constexpr uint64_t kGuestInvocationReplayMaxEagerFunctionCount = 262'144;
 constexpr uint64_t kGuestInvocationReplayMaxEagerGuestCodeBytes =
     16ull * 1024ull * 1024ull;
 constexpr uint64_t kGuestInvocationReplayMaxCapturedHostCodeBytes =

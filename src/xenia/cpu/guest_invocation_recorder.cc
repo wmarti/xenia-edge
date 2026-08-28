@@ -55,21 +55,9 @@ bool IsValidAccess(GuestInvocationRecorderMemoryAccess access) {
          access == GuestInvocationRecorderMemoryAccess::kReadWrite;
 }
 
-bool RangesSharePage(uint32_t first, uint32_t last, uint32_t other_first,
-                     uint32_t other_last) {
-  constexpr uint32_t kPageMask = ~(kGuestPageSize - 1);
-  return (first & kPageMask) <= (other_last & kPageMask) &&
-         (last & kPageMask) >= (other_first & kPageMask);
-}
-
 }  // namespace
 
 struct GuestInvocationRecorder::Impl {
-  struct AddressRange {
-    uint32_t first = 0;
-    uint32_t last = 0;
-  };
-
   struct DefinitionRecord {
     uint32_t end_address = 0;
     uint32_t definition_order = 0;
@@ -519,7 +507,13 @@ struct GuestInvocationRecorder::Impl {
   }
 
   bool AddTranslationClosureSeed(uint32_t address,
-                                 uint32_t expected_end_address) {
+                                 uint32_t expected_end_address,
+                                 bool revalidate_closure_code) {
+    if (closure_code_written) {
+      return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+                    "guest code was written after successful translation",
+                    kGuestInvocationDependencySelfModifyingCode);
+    }
     const CodePageReadResult pending_snapshot = SnapshotPendingDefinitions();
     if (pending_snapshot == CodePageReadResult::kRetry) {
       return Reject(
@@ -542,6 +536,7 @@ struct GuestInvocationRecorder::Impl {
                     "runtime function extent differs from its definition");
     }
 
+    const size_t closure_code_page_count = closure_code_pages.size();
     std::vector<uint32_t> pending = {address};
     while (!pending.empty()) {
       const uint32_t function_address = pending.back();
@@ -556,21 +551,18 @@ struct GuestInvocationRecorder::Impl {
         // Entering one later reseeds the closure from its own definition.
         continue;
       }
-      for (const AddressRange& write : owner_writes) {
-        if (RangeSharesPages(write, definition->second.code_page_addresses)) {
-          return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
-                        "a recorded write overlaps guest code",
-                        kGuestInvocationDependencySelfModifyingCode);
-        }
+      if (AnyPageWasWritten(owner_written_pages,
+                            definition->second.code_page_addresses)) {
+        return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+                      "a recorded write overlaps guest code",
+                      kGuestInvocationDependencySelfModifyingCode);
       }
-      for (const AddressRange& write : cross_thread_writes) {
-        if (RangeSharesPages(write, definition->second.code_page_addresses)) {
-          return Reject(
-              GuestInvocationRecorderRejection::kSelfModifyingCode,
-              "another thread wrote guest code in the capture closure",
-              kGuestInvocationDependencySelfModifyingCode |
-                  kGuestInvocationDependencyCrossThreadMutation);
-        }
+      if (AnyPageWasWritten(cross_thread_written_pages,
+                            definition->second.code_page_addresses)) {
+        return Reject(GuestInvocationRecorderRejection::kSelfModifyingCode,
+                      "another thread wrote guest code in the capture closure",
+                      kGuestInvocationDependencySelfModifyingCode |
+                          kGuestInvocationDependencyCrossThreadMutation);
       }
       if (!MergeDefinitionCodePages(definition->second)) {
         return false;
@@ -579,6 +571,13 @@ struct GuestInvocationRecorder::Impl {
                                 definition->second.end_address);
       pending.insert(pending.end(), definition->second.dependencies.cbegin(),
                      definition->second.dependencies.cend());
+    }
+    // Resampling the closure costs two guest page reads per code page, so an
+    // unchanged closure relies on the write generations tracked above until an
+    // attempt boundary or the final exit resamples it.
+    if (!revalidate_closure_code &&
+        closure_code_pages.size() == closure_code_page_count) {
+      return true;
     }
     return ValidateClosureCodePages();
   }
@@ -641,7 +640,7 @@ struct GuestInvocationRecorder::Impl {
     call_stack.push_back({selection.root_address, return_address});
     entered_functions.insert(selection.root_address);
     if (!AddTranslationClosureSeed(selection.root_address,
-                                   selection.root_end_address)) {
+                                   selection.root_end_address, true)) {
       return false;
     }
     attempt_entry_state = entry_state;
@@ -845,13 +844,38 @@ struct GuestInvocationRecorder::Impl {
     return true;
   }
 
-  bool RangeSharesPages(const AddressRange& range,
-                        const std::vector<uint32_t>& pages) const {
-    if (pages.empty()) {
-      return false;
+  static const uint32_t* FindBackingView(
+      const std::vector<std::pair<uint32_t, uint32_t>>& views,
+      uint32_t backing) {
+    for (const auto& view : views) {
+      if (view.first == backing) {
+        return &view.second;
+      }
     }
-    return RangesSharePage(range.first, range.last, pages.front(),
-                           pages.back() + kGuestPageSize - 1);
+    return nullptr;
+  }
+
+  static bool AnyPageWasWritten(const std::set<uint32_t>& written_pages,
+                                const std::vector<uint32_t>& pages) {
+    for (uint32_t page_address : pages) {
+      if (written_pages.contains(page_address)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // The caller has already rejected a wrapping or oversized access.
+  static void RecordWrittenPages(std::set<uint32_t>* written_pages,
+                                 uint32_t address, uint32_t size) {
+    const uint32_t first_page = address & ~(kGuestPageSize - 1);
+    const uint32_t last_page =
+        static_cast<uint32_t>(uint64_t(address) + size - 1) &
+        ~(kGuestPageSize - 1);
+    for (uint64_t page = first_page; page <= last_page;
+         page += kGuestPageSize) {
+      written_pages->insert(static_cast<uint32_t>(page));
+    }
   }
 
   bool AddOwnerPages(const std::vector<uint32_t>& pages) {
@@ -870,13 +894,17 @@ struct GuestInvocationRecorder::Impl {
             kGuestInvocationDependencyIncompletePageDiscovery);
       }
     }
-    std::vector<uint32_t> supplied_pages;
+    std::vector<uint32_t>& supplied_pages = supplied_page_scratch;
     if (!CollectHostProtectionPages(pages.front(), pages.back(),
                                     &supplied_pages)) {
       return false;
     }
 
-    std::map<uint32_t, uint32_t> new_backing_views;
+    // At most one host protection granule of pages, so a linear scan beats a
+    // node-allocating container on this per-access path.
+    std::vector<std::pair<uint32_t, uint32_t>>& new_backing_views =
+        backing_view_scratch;
+    new_backing_views.clear();
     for (uint32_t page : supplied_pages) {
       const uint32_t backing = BackingPageAddress(page);
       if (cross_thread_written_backing_pages.contains(backing)) {
@@ -894,16 +922,16 @@ struct GuestInvocationRecorder::Impl {
                       "invocation data overlaps the code closure", dependency);
       }
       const auto known = supplied_data_backing_views.find(backing);
-      const auto added = new_backing_views.find(backing);
+      const uint32_t* added = FindBackingView(new_backing_views, backing);
       if ((known != supplied_data_backing_views.cend() &&
            known->second != page) ||
-          (added != new_backing_views.cend() && added->second != page)) {
+          (added && *added != page)) {
         return Reject(GuestInvocationRecorderRejection::kUnsupportedDependency,
                       "capture touches aliased 0x8 and 0x9 guest pages",
                       kGuestInvocationDependencyPhysicalAlias);
       }
-      if (known == supplied_data_backing_views.cend()) {
-        new_backing_views.emplace(backing, page);
+      if (known == supplied_data_backing_views.cend() && !added) {
+        new_backing_views.emplace_back(backing, page);
       }
     }
     const size_t tracked_page_count = supplied_data_backing_views.size() +
@@ -961,7 +989,7 @@ struct GuestInvocationRecorder::Impl {
                     "a recorded write overlaps the code closure",
                     kGuestInvocationDependencySelfModifyingCode);
     }
-    owner_writes.push_back({address, last});
+    RecordWrittenPages(&owner_written_pages, address, size);
     return true;
   }
 
@@ -973,7 +1001,7 @@ struct GuestInvocationRecorder::Impl {
                     kGuestInvocationDependencySelfModifyingCode |
                         kGuestInvocationDependencyCrossThreadMutation);
     }
-    cross_thread_writes.push_back({address, last});
+    RecordWrittenPages(&cross_thread_written_pages, address, size);
     return true;
   }
 
@@ -1005,6 +1033,9 @@ struct GuestInvocationRecorder::Impl {
                       "definition code-page write generation overflowed");
       }
       ++page->second;
+      if (closure_code_pages.contains(page->first)) {
+        closure_code_written = true;
+      }
       ++page;
     }
     return true;
@@ -1049,9 +1080,16 @@ struct GuestInvocationRecorder::Impl {
   std::set<uint32_t> attempt_pages;
   std::optional<std::set<uint32_t>> previous_discovery_pages;
   std::set<uint32_t> cross_thread_written_backing_pages;
-  std::vector<AddressRange> owner_writes;
-  std::vector<AddressRange> cross_thread_writes;
+  std::set<uint32_t> owner_written_pages;
+  std::set<uint32_t> cross_thread_written_pages;
+  bool closure_code_written = false;
   std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> initial_pages;
+
+  // Reused by the per-access callbacks so recording a long invocation does not
+  // allocate once per guest memory access.
+  std::vector<uint32_t> access_page_scratch;
+  std::vector<uint32_t> supplied_page_scratch;
+  std::vector<std::pair<uint32_t, uint32_t>> backing_view_scratch;
 };
 
 std::unique_ptr<GuestInvocationRecorder> GuestInvocationRecorder::Create(
@@ -1226,7 +1264,7 @@ bool GuestInvocationRecorder::OnFunctionEntry(
     return impl_->Reject(GuestInvocationRecorderRejection::kCallDepthLimit,
                          "invocation recording call-depth limit exceeded");
   }
-  if (!impl_->AddTranslationClosureSeed(address, end_address)) {
+  if (!impl_->AddTranslationClosureSeed(address, end_address, false)) {
     return false;
   }
   uint32_t return_address = 0;
@@ -1341,7 +1379,7 @@ bool GuestInvocationRecorder::OnMemoryAccess(
   if (!impl_->BeginAccessEvent()) {
     return false;
   }
-  std::vector<uint32_t> pages;
+  std::vector<uint32_t>& pages = impl_->access_page_scratch;
   if (!impl_->CollectAccessPages(address, size, recording_owner, &pages)) {
     return false;
   }

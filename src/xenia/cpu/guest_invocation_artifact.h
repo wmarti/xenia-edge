@@ -305,7 +305,7 @@ class GuestInvocationArtifactCodec {
   static constexpr uint32_t kPageSize = 4096;
   static constexpr uint64_t kMaxArtifactSize = 512ull * 1024ull * 1024ull;
   static constexpr uint32_t kMaxInvocations = 65536;
-  static constexpr uint32_t kMaxDataPagesPerInvocation = 8192;
+  static constexpr uint32_t kMaxDataPagesPerInvocation = 65536;
   static constexpr uint32_t kMaxFunctionSize = 16u * 1024u * 1024u;
 
   // Public for format tests and independent readers.
