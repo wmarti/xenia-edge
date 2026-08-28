@@ -595,7 +595,8 @@ GuestExecutionSessionSchedulerTopologyChunk MakeSchedulerTopology(
 }
 
 GuestExecutionSessionBundle MakeContinuousSessionBundle(
-    uint32_t host_page_size, bool passive_second = false) {
+    uint32_t host_page_size, bool passive_second = false,
+    uint32_t data_address = kDataAddress) {
   GuestExecutionSessionBundle bundle;
   constexpr uint32_t kParticipantCount = 2;
   const std::array<uint32_t, kParticipantCount> guest_thread_ids = {0x101,
@@ -669,7 +670,7 @@ GuestExecutionSessionBundle MakeContinuousSessionBundle(
     final_page_digests.push_back(AddBlob(&bundle, std::move(final_page)));
     initial_chunk.checkpoint.content.push_back(
         {GuestExecutionSessionContentKind::kGuestPage,
-         kDataAddress + i * kGuestPageSize, kGuestPageSize,
+         data_address + i * kGuestPageSize, kGuestPageSize,
          initial_page_digests.back()});
   }
   std::sort(initial_chunk.checkpoint.content.begin(),
@@ -726,7 +727,7 @@ GuestExecutionSessionBundle MakeContinuousSessionBundle(
     GuestExecutionSessionContentReference final_content = content;
     if (content.kind == GuestExecutionSessionContentKind::kGuestPage) {
       const uint32_t page_index = static_cast<uint32_t>(
-          (content.guest_address - kDataAddress) / kGuestPageSize);
+          (content.guest_address - data_address) / kGuestPageSize);
       final_content.sha256 = final_page_digests[page_index];
     }
     final_chunk.checkpoint.content.push_back(final_content);
@@ -1525,6 +1526,37 @@ TEST_CASE("continuous replay planner binds exact participant continuations",
           std::vector<GuestInvocationReplayProtectionGranule>{
               {kDataAddress, kHostPageSize, true},
               {kCodeAddress, kHostPageSize, false}});
+}
+
+TEST_CASE("continuous replay planner plans physical-view data pages",
+          "[guest-execution-session-runner][continuous]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  constexpr uint32_t kPhysicalDataAddress = 0xA0000000u;
+  const GuestExecutionSessionBundle bundle =
+      MakeContinuousSessionBundle(kHostPageSize, false, kPhysicalDataAddress);
+  GuestExecutionContinuousReplayPlan plan;
+  std::string error;
+  REQUIRE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize, &plan,
+                                                  &error));
+  REQUIRE(error.empty());
+  REQUIRE(plan.pages.size() == 2 * (kHostPageSize / kGuestPageSize));
+  REQUIRE(plan.protection_granules ==
+          std::vector<GuestInvocationReplayProtectionGranule>{
+              {kCodeAddress, kHostPageSize, false},
+              {kPhysicalDataAddress, kHostPageSize, true}});
+}
+
+TEST_CASE("continuous replay planner rejects the reserved first 64k",
+          "[guest-execution-session-runner][continuous]") {
+  constexpr uint32_t kHostPageSize = 16 * 1024;
+  const GuestExecutionSessionBundle bundle =
+      MakeContinuousSessionBundle(kHostPageSize, false, 0x1000u);
+  GuestExecutionContinuousReplayPlan plan;
+  std::string error;
+  REQUIRE_FALSE(BuildGuestExecutionContinuousReplayPlan(bundle, kHostPageSize,
+                                                        &plan, &error));
+  REQUIRE(error == "continuous initial checkpoint page closure is invalid");
+  REQUIRE(plan.pages.empty());
 }
 
 TEST_CASE("continuous replay planner requires complete scheduler topology",

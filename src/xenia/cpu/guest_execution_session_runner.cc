@@ -61,14 +61,28 @@ bool FailPlan(GuestExecutionSessionReplayPlan* output, std::string* error,
 
 bool IsPowerOfTwo(uint32_t value) { return value && !(value & (value - 1)); }
 
-bool IsSupportedDataPageAddress(uint32_t address) {
-  return (address >= 0x00001000u && address <= 0x7EFFF000u) ||
-         (address >= 0x80000000u && address <= 0x9FFFF000u);
+// Mirrors the heaps Memory::LookupHeap resolves, less the first 64k that
+// Memory::Initialize reserves for itself.
+bool IsSupportedGuestPageAddress(uint32_t address) {
+  return (address >= 0x00010000u && address < 0x7F000000u) ||
+         (address >= 0x80000000u && address < 0xFFD00000u);
 }
 
-uint32_t XexBackingPageAddress(uint32_t address) {
-  return address >= 0x90000000u && address < 0xA0000000u ? address - 0x10000000u
-                                                         : address;
+// Physical memory is reachable through the 0xA0000000, 0xC0000000 and
+// 0xE0000000 views and the XEX range through 0x80000000 and 0x90000000, so a
+// page is keyed by the lowest view that reaches it. PhysicalHeap places the
+// 0xE0000000 view 4 KiB further into physical memory than the others.
+uint32_t BackingPageAddress(uint32_t address) {
+  if (address >= 0xE0000000u && address < 0xFFD00000u) {
+    return address - 0xE0000000u + 0xA0001000u;
+  }
+  if (address >= 0xC0000000u && address < 0xE0000000u) {
+    return address - 0x20000000u;
+  }
+  if (address >= 0x90000000u && address < 0xA0000000u) {
+    return address - 0x10000000u;
+  }
+  return address;
 }
 
 const std::vector<uint8_t>* FindBlob(
@@ -460,23 +474,27 @@ bool BuildGuestExecutionSessionReplayPlan(
       const uint32_t address = static_cast<uint32_t>(content.guest_address);
       const auto existing = pages.find(address);
       if (initial) {
-        if (!IsSupportedDataPageAddress(address)) {
-          return FailPlan(output, error,
-                          "initial checkpoint page address is unsupported");
-        }
-        if (existing != pages.end()) {
-          return FailPlan(output, error,
-                          "initial checkpoint page overlaps exact corpus code "
-                          "or repeats a page");
-        }
         const std::vector<uint8_t>* blob = FindBlob(plan.blobs, content.sha256);
         if (!blob || blob->size() != kGuestPageSize) {
           return FailPlan(output, error,
                           "initial checkpoint page blob is missing");
         }
+        if (existing != pages.end()) {
+          if (std::memcmp(existing->second.initial_data, blob->data(),
+                          kGuestPageSize)) {
+            return FailPlan(output, error,
+                            "initial checkpoint page contradicts a page the "
+                            "session already supplies");
+          }
+          continue;
+        }
+        if (!IsSupportedGuestPageAddress(address)) {
+          return FailPlan(output, error,
+                          "initial checkpoint page address is unsupported");
+        }
         pages[address] =
             GuestExecutionSessionReplayPage{address, false, blob->data()};
-      } else if (existing == pages.end() || existing->second.code) {
+      } else if (existing == pages.end()) {
         return FailPlan(
             output, error,
             "checkpoint page is absent from the initial checkpoint");
@@ -487,7 +505,7 @@ bool BuildGuestExecutionSessionReplayPlan(
     for (const ppc::GuestInvocationPage& page :
          segment.invocation.input_data_pages) {
       const auto it = pages.find(page.guest_address);
-      if (it == pages.end() || it->second.code) {
+      if (it == pages.end()) {
         return FailPlan(
             output, error,
             "segment input page is absent from the initial checkpoint");
@@ -495,14 +513,14 @@ bool BuildGuestExecutionSessionReplayPlan(
     }
   }
 
-  std::map<uint32_t, uint32_t> xex_backing_owners;
+  std::map<uint32_t, uint32_t> backing_owners;
   for (const auto& page : pages) {
-    const uint32_t backing_address = XexBackingPageAddress(page.first);
+    const uint32_t backing_address = BackingPageAddress(page.first);
     const auto [it, inserted] =
-        xex_backing_owners.emplace(backing_address, page.first);
+        backing_owners.emplace(backing_address, page.first);
     if (!inserted && it->second != page.first) {
       return FailPlan(output, error,
-                      "supplied 0x8 and 0x9 pages alias the same backing page");
+                      "supplied pages alias the same backing page");
     }
   }
   std::map<uint32_t, bool> granules;
@@ -1167,15 +1185,6 @@ bool BuildGuestExecutionContinuousReplayPlan(
             "continuous outside-guest participant is not passive and "
             "byte-stable");
       }
-      const char* topology_difference =
-          GuestExecutionSessionSchedulerTopologyPassiveRowFirstDifference(
-              initial_topology, final_topology);
-      if (topology_difference) {
-        return fail(std::string("continuous outside-guest participant "
-                                "scheduler topology changes between "
-                                "boundaries: ") +
-                    topology_difference);
-      }
       if (scheduler_event_subjects.contains(participant.ordinal)) {
         return fail(
             "continuous scheduler event subjects an outside-guest "
@@ -1241,8 +1250,20 @@ bool BuildGuestExecutionContinuousReplayPlan(
       return fail("continuous initial checkpoint page is invalid");
     }
     const uint32_t address = static_cast<uint32_t>(content.guest_address);
-    if (!IsSupportedDataPageAddress(address) || !blob ||
-        blob->size() != kGuestPageSize || pages.contains(address)) {
+    if (!blob || blob->size() != kGuestPageSize) {
+      return fail("continuous initial checkpoint page closure is invalid");
+    }
+    const auto existing = pages.find(address);
+    if (existing != pages.end()) {
+      if (std::memcmp(existing->second.initial_data, blob->data(),
+                      kGuestPageSize)) {
+        return fail(
+            "continuous initial checkpoint page contradicts a page the session "
+            "already supplies");
+      }
+      continue;
+    }
+    if (!IsSupportedGuestPageAddress(address)) {
       return fail("continuous initial checkpoint page closure is invalid");
     }
     pages.emplace(
@@ -1264,8 +1285,7 @@ bool BuildGuestExecutionContinuousReplayPlan(
       continue;
     }
     if (content.guest_address > UINT32_MAX ||
-        !pages.contains(static_cast<uint32_t>(content.guest_address)) ||
-        pages.at(static_cast<uint32_t>(content.guest_address)).code) {
+        !pages.contains(static_cast<uint32_t>(content.guest_address))) {
       return fail(
           "continuous final checkpoint page was not captured initially");
     }
@@ -1287,14 +1307,14 @@ bool BuildGuestExecutionContinuousReplayPlan(
     }
   }
 
-  std::map<uint32_t, uint32_t> xex_backing_owners;
+  std::map<uint32_t, uint32_t> backing_owners;
   std::map<uint32_t, bool> granules;
   for (const auto& [address, page] : pages) {
-    const uint32_t backing_address = XexBackingPageAddress(address);
+    const uint32_t backing_address = BackingPageAddress(address);
     const auto [owner, inserted] =
-        xex_backing_owners.emplace(backing_address, address);
+        backing_owners.emplace(backing_address, address);
     if (!inserted && owner->second != address) {
-      return fail("continuous supplied pages alias one XEX backing page");
+      return fail("continuous supplied pages alias one backing page");
     }
     bool& writable = granules[address & ~(host_page_size - 1)];
     writable |= !page.code;
