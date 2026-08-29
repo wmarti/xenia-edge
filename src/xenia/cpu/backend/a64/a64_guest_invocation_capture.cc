@@ -8,6 +8,8 @@
  */
 
 #include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
+#include <algorithm>
+#include <vector>
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
@@ -89,6 +91,65 @@ bool IsMmioAccess(const ppc::PPCContext& context, uint32_t address,
 }
 
 }  // namespace
+
+namespace {
+
+// Open addressing with a fixed table and racy increments, the same trade the
+// call-path counters make: a collision loses counts for the colder of two
+// functions, which can only reorder a ranking, never mislabel a function.
+constexpr size_t kEntryHeatSlots = 1u << 15;
+constexpr size_t kEntryHeatProbes = 4;
+struct EntryHeatSlot {
+  std::atomic<uint32_t> address{0};
+  std::atomic<uint32_t> end_address{0};
+  std::atomic<uint64_t> entries{0};
+};
+EntryHeatSlot g_entry_heat[kEntryHeatSlots];
+
+}  // namespace
+
+uint64_t* ReserveGuestFunctionEntryCounter(uint32_t address,
+                                           uint32_t end_address) {
+  size_t index = (address * 2654435761u) & (kEntryHeatSlots - 1);
+  for (size_t probe = 0; probe < kEntryHeatProbes; ++probe) {
+    auto& slot = g_entry_heat[(index + probe) & (kEntryHeatSlots - 1)];
+    uint32_t owner = slot.address.load(std::memory_order_relaxed);
+    if (!owner) {
+      slot.address.store(address, std::memory_order_relaxed);
+      slot.end_address.store(end_address, std::memory_order_relaxed);
+      owner = address;
+    }
+    if (owner == address) {
+      return reinterpret_cast<uint64_t*>(&slot.entries);
+    }
+  }
+  return nullptr;
+}
+
+std::vector<GuestFunctionEntryHeat> ReadGuestFunctionEntryHeat(size_t limit) {
+  std::vector<GuestFunctionEntryHeat> hot;
+  if (!limit) {
+    return hot;
+  }
+  for (auto& slot : g_entry_heat) {
+    const uint32_t address = slot.address.load(std::memory_order_relaxed);
+    const uint64_t entries = slot.entries.load(std::memory_order_relaxed);
+    if (!address || !entries) {
+      continue;
+    }
+    hot.push_back(
+        {address, slot.end_address.load(std::memory_order_relaxed), entries});
+  }
+  std::sort(
+      hot.begin(), hot.end(),
+      [](const GuestFunctionEntryHeat& a, const GuestFunctionEntryHeat& b) {
+        return a.entries > b.entries;
+      });
+  if (hot.size() > limit) {
+    hot.resize(limit);
+  }
+  return hot;
+}
 
 uint64_t CaptureGuestInvocationFunctionEntry(void* raw_context,
                                              uint64_t function_address,

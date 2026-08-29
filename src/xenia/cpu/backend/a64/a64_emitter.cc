@@ -77,6 +77,15 @@ void A64Emitter::EmitGuestInvocationCaptureEventGuard(
 void A64Emitter::EmitGuestInvocationCaptureFunctionEntryGuard(
     uint32_t function_address, const Xbyak_aarch64::Label& skip) {
   Label capture;
+  // Counted before the guard's own early exit, because the guard skips the
+  // call whenever nothing is armed and a ranking still needs every entry.
+  if (uint64_t* counter = ReserveGuestFunctionEntryCounter(
+          function_address, current_guest_function_end_)) {
+    mov(x9, reinterpret_cast<uint64_t>(counter));
+    ldr(x10, ptr(x9));
+    add(x10, x10, 1);
+    str(x10, ptr(x9));
+  }
   constexpr uint32_t kControlOffset = static_cast<uint32_t>(
       offsetof(ppc::PPCContext, guest_invocation_capture_control));
   static_assert(!(kControlOffset & 7) && kControlOffset <= 32760);

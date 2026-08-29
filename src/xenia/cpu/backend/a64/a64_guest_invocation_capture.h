@@ -11,6 +11,7 @@
 #define XENIA_CPU_BACKEND_A64_A64_GUEST_INVOCATION_CAPTURE_H_
 
 #include <cstdint>
+#include <vector>
 
 #if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
@@ -24,6 +25,23 @@ inline constexpr uint32_t kMaximumGuestInvocationCaptureMemoryAccessSize = 128;
 
 // Native callbacks entered through the full guest-to-host thunk. Except for
 // the tail target round trip, return values are ignored by emitted code.
+// Reserves the counter a function's entry guard increments, and returns its
+// address so the emitter can bake it in. Returns nullptr once the pool is
+// spent, which only costs a ranking entry.
+uint64_t* ReserveGuestFunctionEntryCounter(uint32_t address,
+                                           uint32_t end_address);
+
+// One guest function and how many times it has been entered since the title
+// started. Counted in the capture entry hook, which a capture build already
+// runs on every entry, so this costs no code a replay could disagree about.
+struct GuestFunctionEntryHeat {
+  uint32_t address;
+  uint32_t end_address;
+  uint64_t entries;
+};
+// Hottest first. Reads racy counters, so a tie near the tail may reorder.
+std::vector<GuestFunctionEntryHeat> ReadGuestFunctionEntryHeat(size_t limit);
+
 uint64_t CaptureGuestInvocationFunctionEntry(void* raw_context,
                                              uint64_t function_address,
                                              uint64_t function_end_address,
