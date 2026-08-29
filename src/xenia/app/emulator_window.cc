@@ -1594,6 +1594,9 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     case ui::VirtualKey::kF8: {
       ToggleDebugSettingsDialog();
     } break;
+    case ui::VirtualKey::kF9: {
+      DumpJitCorpus();
+    } break;
     case ui::VirtualKey::kF11: {
       ToggleFullscreen();
     } break;
@@ -1725,6 +1728,48 @@ void EmulatorWindow::ToggleContextMenu(bool use_cursor_position) {
 
 void EmulatorWindow::OnMouseUp(const ui::MouseEvent& e) {
   last_mouse_up = steady_clock::now();
+}
+
+// Writes what the JIT has compiled up to this moment, so a heavy scene can be
+// captured while it is on screen and profiled offline afterwards.
+void EmulatorWindow::DumpJitCorpus() {
+  auto* processor = emulator()->processor();
+  if (!processor) {
+    XELOGE("No processor to take a JIT corpus from");
+    return;
+  }
+  auto t = std::time(nullptr);
+  const std::string datetime =
+      fmt::format("{:%Y-%m-%dT%H-%M-%S}", *std::localtime(&t));
+  const std::string title_id =
+      emulator()->title_id() ? fmt::format("{:08X}", emulator()->title_id())
+                             : "unknown";
+  // The storage root, not the executable folder: on macOS the executable sits
+  // inside the .app bundle, so a capture written beside it is discarded by the
+  // next build.
+  const auto corpus_path = emulator()->storage_root() / "jit-corpus" / title_id;
+  std::error_code ec;
+  std::filesystem::create_directories(corpus_path, ec);
+  const std::string filename =
+      fmt::format("{} - {}.jcorpus", title_id, datetime);
+
+  uint32_t function_count = 0;
+  if (!processor->DumpJitCorpus(corpus_path / filename, &function_count)) {
+    XELOGE("Failed to write a JIT corpus to {}",
+           xe::path_to_utf8(corpus_path / filename));
+    return;
+  }
+  XELOGI("Wrote {} functions to {}", function_count,
+         xe::path_to_utf8(corpus_path / filename));
+
+  const std::string notification_text =
+      fmt::format("{} functions: {}", function_count, filename);
+  app_context_.CallInUIThread([this, notification_text]() {
+    if (imgui_drawer()) {
+      new ui::HostNotificationWindow(imgui_drawer(), "JIT Corpus Saved!",
+                                     notification_text, 0);
+    }
+  });
 }
 
 void EmulatorWindow::TakeScreenshot() {

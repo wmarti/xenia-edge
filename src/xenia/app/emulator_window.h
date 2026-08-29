@@ -95,6 +95,7 @@ class EmulatorWindow {
   void SetInitializingShaderStorage(bool initializing);
 
   void TakeScreenshot();
+  void DumpJitCorpus();
   void ExportScreenshot(const xe::ui::RawImage& image);
   void SaveImage(const std::filesystem::path& path,
                  const xe::ui::RawImage& image);

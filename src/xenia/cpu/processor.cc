@@ -1633,11 +1633,39 @@ Module* Processor::GetModule(const std::string_view name) {
 
 std::vector<Module*> Processor::GetModules() {
   auto global_lock = global_critical_region_.Acquire();
-  std::vector<Module*> clone(modules_.size());
+  std::vector<Module*> clone;
+  clone.reserve(modules_.size());
   for (const auto& module : modules_) {
     clone.push_back(module.get());
   }
   return clone;
+}
+
+bool Processor::DumpJitCorpus(const std::filesystem::path& path,
+                              uint32_t* out_function_count) {
+  auto writer = JitCorpusWriter::Create(path);
+  if (!writer) {
+    return false;
+  }
+  for (Module* module : GetModules()) {
+    module->ForEachFunction([&](Function* function) {
+      if (!function->is_guest()) {
+        return;
+      }
+      auto* guest_function = static_cast<GuestFunction*>(function);
+      // Externs and undefined symbols carry no emitted code to replay.
+      if (!guest_function->machine_code()) {
+        return;
+      }
+      writer->RecordFunction(
+          memory_, *guest_function,
+          static_cast<uint32_t>(guest_function->machine_code_length()));
+    });
+  }
+  if (out_function_count) {
+    *out_function_count = writer->function_count();
+  }
+  return true;
 }
 
 Function* Processor::DefineBuiltin(const std::string_view name,

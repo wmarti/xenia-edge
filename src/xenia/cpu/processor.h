@@ -16,6 +16,7 @@
 #include <condition_variable>
 #endif
 #include <cstdio>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -251,6 +252,13 @@ class Processor {
   void RemoveModule(const std::string_view name);
   Module* GetModule(const std::string_view name);
   std::vector<Module*> GetModules();
+
+  // Writes every function compiled so far as a JIT corpus. Unlike
+  // --jit_corpus_out this needs no decision before launch: a defined function
+  // keeps its code and extent on its module, so a corpus can be taken at any
+  // point in a run, including one already in progress.
+  bool DumpJitCorpus(const std::filesystem::path& path,
+                     uint32_t* out_function_count);
 
   Module* builtin_module() const { return builtin_module_; }
   Function* DefineBuiltin(const std::string_view name,
