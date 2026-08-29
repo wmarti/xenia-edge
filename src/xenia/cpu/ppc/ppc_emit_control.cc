@@ -93,10 +93,14 @@ int InstrEmit_branch(PPCHIRBuilder& f, const char* src, uint64_t cia,
         // backend, where the first thing every call does is dereference it.
         XELOGE("Unresolved direct call target {:08X} from {:08X}", nia_value,
                static_cast<uint32_t>(cia));
+        // A direct branch built its target as a 32-bit constant, and every
+        // backend matches only the 64-bit form of the indirect call.
+        Value* const target =
+            nia->type == INT64_TYPE ? nia : f.ZeroExtend(nia, INT64_TYPE);
         if (cond) {
-          f.CallIndirectTrue(cond, nia, call_flags);
+          f.CallIndirectTrue(cond, target, call_flags);
         } else {
-          f.CallIndirect(nia, call_flags);
+          f.CallIndirect(target, call_flags);
         }
       } else if (cond) {
         f.CallTrue(cond, function, call_flags);
