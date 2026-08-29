@@ -629,20 +629,19 @@ static void EmitFpBinOpWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1,
   // Slow path: first NaN by position wins, quiet if SNaN. If neither operand
   // is NaN, the result's NaN came from an invalid operation and dest already
   // holds the hardware default QNaN, which is PPC's - leave it.
+  // Adding a known NaN to itself is how it gets quieted: with FPCR.DN clear an
+  // arithmetic op returns a signalling operand quieted and a quiet one
+  // unchanged, which is the whole of what setting the mantissa's top bit did.
   auto emit_nan_walk = [dest, t1, t2, &done](A64Emitter& e) {
     auto& s1_not_nan = e.NewCachedLabel();
     e.fcmp(t1, t1);
     e.b_near(VC, s1_not_nan);
-    e.fmov(e.w0, t1);
-    e.orr(e.w0, e.w0, static_cast<uint64_t>(1u << 22));
-    e.fmov(dest, e.w0);
+    e.fadd(dest, t1, t1);
     e.b(done);
     e.L(s1_not_nan);
     e.fcmp(t2, t2);
     e.b_near(VC, done);
-    e.fmov(e.w0, t2);
-    e.orr(e.w0, e.w0, static_cast<uint64_t>(1u << 22));
-    e.fmov(dest, e.w0);
+    e.fadd(dest, t2, t2);
     e.b(done);
   };
 
@@ -714,16 +713,12 @@ static void EmitFpBinOpWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1,
     auto& s1_not_nan = e.NewCachedLabel();
     e.fcmp(t1, t1);
     e.b_near(VC, s1_not_nan);
-    e.fmov(e.x0, t1);
-    e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
-    e.fmov(dest, e.x0);
+    e.fadd(dest, t1, t1);
     e.b(done);
     e.L(s1_not_nan);
     e.fcmp(t2, t2);
     e.b_near(VC, done);
-    e.fmov(e.x0, t2);
-    e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));
-    e.fmov(dest, e.x0);
+    e.fadd(dest, t2, t2);
     e.b(done);
   };
 
@@ -811,9 +806,7 @@ static void EmitFmaWithPpcNan_F64(A64Emitter& e, DReg dest, DReg s1, DReg s2,
       auto& not_nan = e.NewCachedLabel();
       e.fcmp(order[step], order[step]);
       e.b_near(VC, not_nan);
-      e.fmov(e.x0, order[step]);
-      e.orr(e.x0, e.x0, static_cast<uint64_t>(1ull << 51));  // ensure quiet
-      e.fmov(dest, e.x0);
+      e.fadd(dest, order[step], order[step]);
       e.b(done);
       e.L(not_nan);
     }
@@ -894,9 +887,7 @@ static void EmitFmaWithPpcNan_F32(A64Emitter& e, SReg dest, SReg s1, SReg s2,
       auto& not_nan = e.NewCachedLabel();
       e.fcmp(order[step], order[step]);
       e.b_near(VC, not_nan);
-      e.fmov(e.w0, order[step]);
-      e.orr(e.w0, e.w0, static_cast<uint32_t>(1u << 22));
-      e.fmov(dest, e.w0);
+      e.fadd(dest, order[step], order[step]);
       e.b(done);
       e.L(not_nan);
     }
