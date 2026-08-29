@@ -398,10 +398,13 @@ inline void ApplyPhysicalRemapW0(A64Emitter& e,
     // it costs branch density rather than mispredictions: measured 0.65%
     // faster on a replayed title function than the branching form, in both
     // orderings of the A/B.
-    e.mvn(e.w17, src);
-    e.tst(e.w17, 0xE0000000u);
+    if (!e.PhysicalRemapBoundValid()) {
+      e.mov(e.w7, static_cast<uint64_t>(0xE0000000u));
+      e.MarkPhysicalRemapBoundValid();
+    }
+    e.cmp(src, e.w7);
     e.add(e.w17, src, 1, 12);
-    e.csel(e.w0, e.w17, src, EQ);
+    e.csel(e.w0, e.w17, src, HS);
     return;
   }
   if (src.getIdx() != e.w0.getIdx()) {

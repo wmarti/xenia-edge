@@ -1404,6 +1404,7 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
 void A64Emitter::CallNative(void* fn) { CallNativeSafe(fn); }
 
 void A64Emitter::CallNativeSafe(void* fn) {
+  DropPhysicalRemapBound();
   // The guest-to-host thunk unconditionally reinstalls fpcr_fpu on the way
   // back, so whatever mode this emitter thinks is live is stale afterwards.
   // Call, CallIndirect and CallExtern already do this; without it here a VMX
