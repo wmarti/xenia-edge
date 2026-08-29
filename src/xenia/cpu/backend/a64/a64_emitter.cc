@@ -265,9 +265,15 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
         }
       }
     }
-    near_tail_branches_safe_ = hir_instr_count * 256 < (768 * 1024);
+    // Emission measures 6 to 11 bytes per HIR instruction across the heaviest
+    // functions of two titles, so 64 leaves the estimate several times larger
+    // than anything observed while still letting a big function reach its tail.
+    constexpr uint32_t kMaxBytesPerHirInstr = 64;
+    near_tail_branches_safe_ =
+        hir_instr_count * kMaxBytesPerHirInstr < (768 * 1024);
     // tbnz reaches only +/-32 KiB, so its tail form needs a tighter bound.
-    near_tbz_branches_safe_ = hir_instr_count * 256 < (24 * 1024);
+    near_tbz_branches_safe_ =
+        hir_instr_count * kMaxBytesPerHirInstr < (24 * 1024);
   }
 
   // Calculate local variable stack offsets.
