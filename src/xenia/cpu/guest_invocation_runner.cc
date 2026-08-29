@@ -822,9 +822,24 @@ bool GuestInvocationRunner::CloseAndReopenGuestViews(std::string* error) {
     const xe::memory::PageAccess access =
         granule.writable ? xe::memory::PageAccess::kReadWrite
                          : xe::memory::PageAccess::kReadOnly;
-    if (!xe::memory::Protect(memory_->TranslateVirtual(granule.guest_address),
-                             granule.size, access)) {
-      return Fail(error, "failed to reopen a supplied protection granule");
+    // An offset view like 0xE0000000 sits 4 KiB into physical memory, so a
+    // page-aligned guest address translates to a host address that is not.
+    // Protect the host pages the granule lands in, which is what the heap
+    // does for its own unaligned offset.
+    const uintptr_t host_page_mask = uintptr_t(xe::memory::page_size()) - 1;
+    const uintptr_t host_address = reinterpret_cast<uintptr_t>(
+        memory_->TranslateVirtual(granule.guest_address));
+    const uintptr_t begin = host_address & ~host_page_mask;
+    const uintptr_t end =
+        (host_address + granule.size + host_page_mask) & ~host_page_mask;
+    if (!xe::memory::Protect(reinterpret_cast<void*>(begin), end - begin,
+                             access)) {
+      return Fail(error,
+                  fmt::format("failed to reopen a supplied protection granule: "
+                              "guest {:08X} size {:X} {} granules {}",
+                              granule.guest_address, granule.size,
+                              granule.writable ? "rw" : "ro",
+                              plan_.protection_granules.size()));
     }
   }
   return true;
