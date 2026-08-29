@@ -488,7 +488,8 @@ struct GuestInvocationRecorder::Impl {
 
   // A contended resample reports lock traffic, not guest code. Only the
   // completion sweep, which gates the result, insists on completing one.
-  bool ValidateClosureCodePages(std::string_view site, bool required) {
+  bool ValidateClosureCodePages(std::string_view site, bool required,
+                                bool* out_contended = nullptr) {
     for (const auto& [page_address, snapshot] : closure_code_pages) {
       const auto generation =
           definition_page_write_generations.find(page_address);
@@ -507,6 +508,12 @@ struct GuestInvocationRecorder::Impl {
       if (read == CodePageReadResult::kRetry) {
         if (!required) {
           return true;
+        }
+        if (out_contended) {
+          // A contended read found no change, only a racing protection state,
+          // so it is for the caller to decide whether an attempt remains.
+          *out_contended = true;
+          return false;
         }
         return Reject(
             GuestInvocationRecorderRejection::kPageReadFailure,
@@ -730,8 +737,19 @@ struct GuestInvocationRecorder::Impl {
   }
 
   bool CompleteFinalAttempt(const GuestPPCRegisterState& exit_state) {
-    if (!ValidateClosureCodePages("final-exit", true)) {
-      return false;
+    bool closure_contended = false;
+    if (!ValidateClosureCodePages("final-exit", true, &closure_contended)) {
+      if (!closure_contended) {
+        return false;
+      }
+      // Contention at the boundary is the same retryable condition it is
+      // everywhere else; only running out of attempts ends the capture.
+      if (!RetakeFinalAttempt(
+              "global memory snapshot was contended at the capture boundary "
+              "and no attempt remains")) {
+        return false;
+      }
+      return FinishDiscoveryAttempt();
     }
     std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> final_pages;
     const CodePageReadResult snapshot = SnapshotSuppliedDataPages(&final_pages);
