@@ -1108,7 +1108,7 @@ bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
     XE_ENABLE_GUEST_INVOCATION_CAPTURE
   return Reject("candidate build eligibility",
                 "timed replay requires capture instrumentation disabled");
-#endif
+#else
   if (cvars::jit_corpus_in.empty()) {
     return Reject("input validation",
                   "--guest_invocation_in requires --jit_corpus_in");
@@ -1263,6 +1263,7 @@ bool RunGuestInvocationReplay(const std::filesystem::path& executable_path) {
   fprintf(stdout, "%s\n", marker.c_str());
   fflush(stdout);
   return true;
+#endif
 }
 
 // Stage E0 of the continuous executor: load a published session bundle, apply
@@ -1478,6 +1479,17 @@ void AccumulateWideMoves(const uint8_t* code, size_t length,
 #endif  // XE_ARCH_ARM64
 
 bool RunCorpusReplay() {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  // Not built here. Capture instrumentation roughly doubles emitted code, so a
+  // count or a time taken by this build would look entirely ordinary and be
+  // silently incomparable with one taken by a benchmark build.
+  fprintf(stderr,
+          "%s is not available in a capture build; rebuild with "
+          "XENIA_ENABLE_GUEST_INVOCATION_CAPTURE=OFF\n",
+          "--jit_corpus_in");
+  return false;
+#else
   auto corpus = JitCorpus::Read(cvars::jit_corpus_in);
   if (!corpus) {
     fprintf(stderr, "Could not read a JIT corpus from %s\n",
@@ -1930,6 +1942,7 @@ bool RunCorpusReplay() {
     return false;
   }
   return clean || cvars::jit_corpus_allow_incomplete;
+#endif
 }
 
 }  // namespace corpus
