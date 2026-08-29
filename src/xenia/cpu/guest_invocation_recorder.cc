@@ -822,8 +822,14 @@ struct GuestInvocationRecorder::Impl {
     }
     accepted.touched_page_addresses.assign(known_pages.cbegin(),
                                            known_pages.cend());
-    accepted.declared_only_dependencies.assign(
-        declared_only_dependencies.cbegin(), declared_only_dependencies.cend());
+    // A target can be undefined when the closure first reaches it and defined
+    // by the time the capture completes, and only the final state decides
+    // which of the two it is.
+    for (uint32_t address : declared_only_dependencies) {
+      if (!closure_functions.contains(address)) {
+        accepted.declared_only_dependencies.push_back(address);
+      }
+    }
     result = std::move(accepted);
     state = GuestInvocationRecorderState::kComplete;
     initial_pages.clear();
