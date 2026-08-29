@@ -772,10 +772,12 @@ bool GuestInvocationRunner::CommitAndLoadPages(std::string* error) {
   };
   std::map<std::pair<uint32_t, uint32_t>, NativeHeapPage> native_pages;
 
-  for (uint32_t address : plan_.supplied_page_addresses) {
+  bool missing_heap = false;
+  const auto claim_page = [&](uint32_t address) {
     BaseHeap* heap = memory_->LookupHeap(address);
     if (!heap || address < heap->heap_base()) {
-      return Fail(error, "supplied page has no ordinary virtual/XEX heap");
+      missing_heap = true;
+      return;
     }
     const uint32_t heap_page_size = heap->page_size();
     const uint32_t heap_page_address =
@@ -784,6 +786,12 @@ bool GuestInvocationRunner::CommitAndLoadPages(std::string* error) {
     native_pages.emplace(
         std::make_pair(heap->heap_base(), heap_page_address),
         NativeHeapPage{heap, heap_page_address, heap_page_size});
+  };
+  for (uint32_t address : plan_.supplied_page_addresses) {
+    claim_page(address);
+  }
+  if (missing_heap) {
+    return Fail(error, "supplied page has no ordinary virtual/XEX heap");
   }
 
   for (const auto& native_page_entry : native_pages) {
@@ -793,6 +801,27 @@ bool GuestInvocationRunner::CommitAndLoadPages(std::string* error) {
             kMemoryAllocationReserve | kMemoryAllocationCommit,
             kMemoryProtectRead | kMemoryProtectWrite)) {
       return Fail(error, "heap-native replay page commit failed");
+    }
+  }
+
+  // A granule is opened whole, so a page inside one without supplied contents
+  // is readable but holds whatever the harness left, and the invocation reads
+  // it instead of faulting.
+  {
+    std::set<uint32_t> supplied(plan_.supplied_page_addresses.cbegin(),
+                                plan_.supplied_page_addresses.cend());
+    for (const GuestInvocationReplayProtectionGranule& granule :
+         plan_.protection_granules) {
+      for (uint32_t offset = 0; offset < granule.size;
+           offset += kGuestPageSize) {
+        const uint32_t page = granule.guest_address + offset;
+        if (!supplied.contains(page)) {
+          return Fail(error,
+                      fmt::format("protection granule {:08X} opens page {:08X} "
+                                  "with no supplied contents",
+                                  granule.guest_address, page));
+        }
+      }
     }
   }
 
