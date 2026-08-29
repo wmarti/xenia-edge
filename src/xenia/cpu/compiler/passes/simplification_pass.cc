@@ -14,6 +14,10 @@
 #include "xenia/base/byte_order.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
+#include "xenia/cpu/ppc/ppc_context.h"
+
+#include <unordered_map>
+#include <vector>
 namespace xe {
 namespace cpu {
 namespace compiler {
@@ -32,9 +36,191 @@ SimplificationPass::~SimplificationPass() {}
 
 static bool IsNeverF64Denormal(hir::Value* v, int depth);
 
+// A single-precision op screens its operands for a double denormal, and the
+// screen folds away only when every operand is proven never denormal. The
+// proof walks definitions, so it stops dead at a load_context: an FPR that
+// crosses a block boundary loses it even when every store that can reach the
+// load is provably clean. Carry the proof across blocks and tag those loads,
+// which the flag check ahead of the walk then answers in constant time.
+//
+// A forward must-analysis over the 32 FPR slots. A slot is clean where every
+// path to it stored a clean value; anything that can write guest context
+// behind our back clears all of them. Blocks start optimistically so a value
+// that stays clean around a loop is not lost to its own back edge.
+namespace {
+
+constexpr size_t kGuestFPRCount = 32;
+constexpr uint32_t kGuestFPRBase =
+    static_cast<uint32_t>(offsetof(ppc::PPCContext, f));
+constexpr uint32_t kGuestFPRSize =
+    static_cast<uint32_t>(sizeof(double) * kGuestFPRCount);
+
+// Exactly one whole FPR, which is the only shape the proof describes.
+bool GuestFPRSlot(uint32_t offset, TypeName type, size_t* out_index) {
+  if (type != FLOAT64_TYPE || offset < kGuestFPRBase ||
+      offset >= kGuestFPRBase + kGuestFPRSize) {
+    return false;
+  }
+  const uint32_t byte = offset - kGuestFPRBase;
+  if (byte % sizeof(double)) {
+    return false;
+  }
+  *out_index = byte / sizeof(double);
+  return true;
+}
+
+// Anything that can reach guest context without going through a store we can
+// see. Deliberately not OPCODE_FLAG_VOLATILE: a conditional branch carries
+// that flag but writes nothing, and treating it as a barrier would discard
+// the proof at the end of nearly every block.
+bool ClobbersGuestContext(const Instr* i) {
+  switch (i->GetOpcodeNum()) {
+    case OPCODE_CALL:
+    case OPCODE_CALL_TRUE:
+    case OPCODE_CALL_INDIRECT:
+    case OPCODE_CALL_INDIRECT_TRUE:
+    case OPCODE_CALL_EXTERN:
+    case OPCODE_CHECK_PREEMPT:
+    case OPCODE_TRAP:
+    case OPCODE_TRAP_TRUE:
+    case OPCODE_DEBUG_BREAK:
+    case OPCODE_DEBUG_BREAK_TRUE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
+bool SimplificationPass::PropagateGuestFPRDenormalProof(HIRBuilder* builder) {
+  std::vector<Block*> blocks;
+  std::unordered_map<const Block*, size_t> index;
+  for (Block* b = builder->first_block(); b; b = b->next) {
+    index.emplace(b, blocks.size());
+    blocks.push_back(b);
+  }
+  if (blocks.empty()) {
+    return false;
+  }
+
+  constexpr uint32_t kAllClean = ~uint32_t(0);
+  // The entry block inherits the caller's registers, which say nothing.
+  std::vector<uint32_t> out(blocks.size(), kAllClean);
+  std::vector<uint32_t> in(blocks.size(), 0);
+
+  const auto transfer = [](Block* block, uint32_t clean) {
+    for (Instr* i = block->instr_head; i; i = i->next) {
+      if (ClobbersGuestContext(i)) {
+        clean = 0;
+        continue;
+      }
+      if (i->GetOpcodeNum() != OPCODE_STORE_CONTEXT) {
+        continue;
+      }
+      const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
+      Value* stored = i->src2.value;
+      size_t slot;
+      if (GuestFPRSlot(offset, stored->type, &slot)) {
+        if (IsNeverF64Denormal(stored, 4)) {
+          clean |= uint32_t(1) << slot;
+        } else {
+          clean &= ~(uint32_t(1) << slot);
+        }
+        continue;
+      }
+      // A store of another shape that lands anywhere in the register file
+      // leaves those registers holding bytes this proof never described.
+      const uint32_t size = static_cast<uint32_t>(GetTypeSize(stored->type));
+      const uint32_t end = offset + size;
+      if (end > kGuestFPRBase && offset < kGuestFPRBase + kGuestFPRSize) {
+        const uint32_t lo = offset < kGuestFPRBase ? 0 : offset - kGuestFPRBase;
+        const uint32_t hi = std::min(end - kGuestFPRBase, kGuestFPRSize);
+        for (uint32_t byte = lo; byte < hi; ++byte) {
+          clean &= ~(uint32_t(1) << (byte / sizeof(double)));
+        }
+      }
+    }
+    return clean;
+  };
+
+  // Descending to the greatest fixed point, so a loop keeps a proof that
+  // survives its own back edge. Bounded because a bug here would otherwise
+  // hang translation rather than produce a wrong answer.
+  for (size_t sweep = 0; sweep < 64; ++sweep) {
+    bool changed = false;
+    for (size_t bi = 0; bi < blocks.size(); ++bi) {
+      Block* block = blocks[bi];
+      uint32_t entry = kAllClean;
+      bool has_predecessor = false;
+      for (Edge* e = block->incoming_edge_head; e; e = e->incoming_next) {
+        const auto it = index.find(e->src);
+        entry &= it == index.cend() ? 0 : out[it->second];
+        has_predecessor = true;
+      }
+      if (!has_predecessor) {
+        entry = 0;
+      }
+      const uint32_t exit = transfer(block, entry);
+      if (entry != in[bi] || exit != out[bi]) {
+        in[bi] = entry;
+        out[bi] = exit;
+        changed = true;
+      }
+    }
+    if (!changed) {
+      break;
+    }
+  }
+
+  bool tagged = false;
+  for (size_t bi = 0; bi < blocks.size(); ++bi) {
+    uint32_t clean = in[bi];
+    for (Instr* i = blocks[bi]->instr_head; i; i = i->next) {
+      if (ClobbersGuestContext(i)) {
+        clean = 0;
+        continue;
+      }
+      const Opcode op = i->GetOpcodeNum();
+      const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
+      size_t slot;
+      if (op == OPCODE_LOAD_CONTEXT && i->dest &&
+          GuestFPRSlot(offset, i->dest->type, &slot) &&
+          (clean & (uint32_t(1) << slot)) &&
+          !(i->dest->flags & VALUE_NEVER_F64_DENORMAL)) {
+        i->dest->flags |= VALUE_NEVER_F64_DENORMAL;
+        tagged = true;
+      } else if (op == OPCODE_STORE_CONTEXT) {
+        Value* stored = i->src2.value;
+        if (GuestFPRSlot(offset, stored->type, &slot)) {
+          if (IsNeverF64Denormal(stored, 4)) {
+            clean |= uint32_t(1) << slot;
+          } else {
+            clean &= ~(uint32_t(1) << slot);
+          }
+        } else {
+          const uint32_t size =
+              static_cast<uint32_t>(GetTypeSize(stored->type));
+          const uint32_t end = offset + size;
+          if (end > kGuestFPRBase && offset < kGuestFPRBase + kGuestFPRSize) {
+            const uint32_t lo =
+                offset < kGuestFPRBase ? 0 : offset - kGuestFPRBase;
+            const uint32_t hi = std::min(end - kGuestFPRBase, kGuestFPRSize);
+            for (uint32_t byte = lo; byte < hi; ++byte) {
+              clean &= ~(uint32_t(1) << (byte / sizeof(double)));
+            }
+          }
+        }
+      }
+    }
+  }
+  return tagged;
+}
+
 bool SimplificationPass::Run(HIRBuilder* builder, bool& result) {
   result = false;
 
+  result |= PropagateGuestFPRDenormalProof(builder);
   result |= SimplifyBitArith(builder);
   result |= EliminateConversions(builder);
   result |= SimplifyAssignments(builder);
