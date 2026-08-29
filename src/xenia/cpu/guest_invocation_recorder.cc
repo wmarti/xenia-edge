@@ -904,7 +904,9 @@ struct GuestInvocationRecorder::Impl {
         if (reject_unsupported) {
           return Reject(
               GuestInvocationRecorderRejection::kUnsupportedDependency,
-              "memory access uses an unsupported guest page",
+              fmt::format("memory access uses an unsupported guest page "
+                          "{:08X} (access {:08X}+{:X})",
+                          page_address, address, size),
               kGuestInvocationDependencyUnsupportedMappingOrProtection);
         }
         continue;
@@ -932,7 +934,9 @@ struct GuestInvocationRecorder::Impl {
       if (!IsSupportedPageAddress(page_address)) {
         return Reject(
             GuestInvocationRecorderRejection::kUnsupportedDependency,
-            "host protection granule contains an unsupported guest page",
+            fmt::format("host protection granule contains an unsupported "
+                        "guest page {:08X}",
+                        page_address),
             kGuestInvocationDependencyUnsupportedMappingOrProtection);
       }
       pages->push_back(page_address);
