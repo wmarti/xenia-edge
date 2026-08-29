@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "xenia/apu/audio_media_player.h"
@@ -94,6 +95,55 @@ class Emulator {
 
   // Folder persistent internal emulator data is stored in.
   const std::filesystem::path& storage_root() const { return storage_root_; }
+
+  // The work one guest function did during a sampling window. A live view and
+  // the capture sweep rank from this same call, so what is shown on screen is
+  // what the sweep will arm for.
+  struct HotGuestFunction {
+    uint32_t address = 0;
+    uint32_t end_address = 0;
+    // Entries counted since the sampler's previous call, not since boot: a
+    // function the title hammered during a load screen is not hot now.
+    uint64_t entries = 0;
+    // Smoothed over several windows. A single window is short enough that
+    // per-frame work lands in one sample and not the next, which reads as a
+    // function swinging while the scene is steady.
+    double entries_per_second = 0.0;
+    uint32_t emitted_bytes = 0;
+    // entries_per_second * guest instructions.
+    double weight = 0.0;
+  };
+  // Each caller keeps its own sampler, so a view polling twice a second cannot
+  // consume the window a sweep is about to rank from.
+  struct HotGuestFunctionSampler {
+    std::unordered_map<uint32_t, uint64_t> previous_entries;
+    std::unordered_map<uint32_t, double> smoothed_rate;
+    std::unordered_map<uint32_t, uint32_t> emitted_bytes;
+    uint32_t emitted_refresh_countdown = 0;
+  };
+  // Guest instructions, below which an invocation costs less to run than the
+  // page reset around it and timing it measures the harness.
+  static constexpr uint32_t kSmallestGuestFunctionWorthTiming = 8;
+  // Ranked heaviest first, with entry points into an already-ranked body
+  // dropped. Empty in a build without capture support.
+  // elapsed_seconds is the wall time the caller let pass since its previous
+  // call; a rate needs it because a stuttering title does not deliver frames
+  // on a fixed cadence.
+  std::vector<HotGuestFunction> RankHotGuestFunctions(
+      HotGuestFunctionSampler* sampler, double elapsed_seconds);
+
+  // Captures a replayable bundle for each of the hottest guest functions, one
+  // after another, into out_dir. Blocks while the title keeps running, so the
+  // caller must not be the thread the guest runs on. Returns NOT_SUPPORTED
+  // without a capture build.
+  // on_progress reports each function as it finishes, so a caller can show
+  // that a capture lasting minutes is still moving.
+  using HotInvocationProgress = std::function<void(
+      uint32_t done, uint32_t attempted, uint32_t wanted, uint32_t address,
+      bool captured, const std::string& detail)>;
+  X_STATUS CaptureHotInvocations(const std::filesystem::path& out_dir,
+                                 uint32_t wanted, std::string* summary,
+                                 HotInvocationProgress on_progress = nullptr);
 
   // Folder guest content is stored in.
   const std::filesystem::path& content_root() const { return content_root_; }
@@ -444,6 +494,7 @@ class Emulator {
   static void PrepareCaptureForQuickExitThunk(void* context) noexcept;
   void PrepareCaptureForQuickExit() noexcept;
   X_STATUS InitializeGuestInvocationCapture();
+
   void ShutdownGuestInvocationCapture();
   void ShutdownGuestInvocationCaptureLocked();
   X_STATUS InitializeGuestExecutionSessionCaptureProvider();

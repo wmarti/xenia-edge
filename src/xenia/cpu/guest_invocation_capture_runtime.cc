@@ -434,6 +434,17 @@ bool GuestInvocationCaptureRuntime::IsRequested() {
   return CurrentConfig().IsRequested();
 }
 
+void GuestInvocationCaptureRuntime::SetTarget(
+    const std::filesystem::path& output_directory, uint32_t root_address,
+    uint32_t root_end_address, uint32_t occurrence) {
+  cvars::guest_invocation_capture_output = output_directory;
+  cvars::guest_invocation_capture_root_address =
+      fmt::format("{:08X}", root_address);
+  cvars::guest_invocation_capture_root_end_address =
+      fmt::format("{:08X}", root_end_address);
+  cvars::guest_invocation_capture_occurrence = occurrence;
+}
+
 std::unique_ptr<GuestInvocationCaptureRuntime>
 GuestInvocationCaptureRuntime::Create(Memory& memory, Processor& processor,
                                       bool guest_scheduler_enabled,

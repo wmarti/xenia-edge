@@ -45,6 +45,12 @@ class GuestInvocationCaptureRuntime final {
  public:
   static bool IsRequested();
 
+  // Points the next Create() at one function. The configuration is read fresh
+  // every time a capture is armed, so one run can capture several in turn.
+  static void SetTarget(const std::filesystem::path& output_directory,
+                        uint32_t root_address, uint32_t root_end_address,
+                        uint32_t occurrence);
+
   // Creates and attaches the capture sink. guest_scheduler_enabled is passed
   // explicitly to keep the CPU runtime independent of kernel configuration.
   static std::unique_ptr<GuestInvocationCaptureRuntime> Create(

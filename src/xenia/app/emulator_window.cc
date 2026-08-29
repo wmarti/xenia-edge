@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <set>
 #include <span>
 #include <sstream>
@@ -1597,6 +1598,9 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     case ui::VirtualKey::kF9: {
       DumpJitCorpus();
     } break;
+    case ui::VirtualKey::kF10: {
+      ShowCaptureHeat(true);
+    } break;
     case ui::VirtualKey::kF11: {
       ToggleFullscreen();
     } break;
@@ -1732,6 +1736,195 @@ void EmulatorWindow::OnMouseUp(const ui::MouseEvent& e) {
 
 // Writes what the JIT has compiled up to this moment, so a heavy scene can be
 // captured while it is on screen and profiled offline afterwards.
+
+// Live view of what the title is spending guest CPU on, and of what the
+// capture sweep did with each of those functions. Ranked from the same call
+// the sweep arms from, so a function shown here as hot and refused is exactly
+// one that is being skipped.
+class CaptureHeatDialog final : public ui::ImGuiDialog {
+ public:
+  struct Outcome {
+    bool attempted = false;
+    bool captured = false;
+    std::string detail;
+  };
+  struct State {
+    std::mutex mutex;
+    bool open = false;
+    bool sweeping = false;
+    uint32_t kept = 0;
+    uint32_t tried = 0;
+    uint32_t ranked = 0;
+    uint32_t current = 0;
+    std::unordered_map<uint32_t, Outcome> outcomes;
+  };
+  static State& state() {
+    static State s;
+    return s;
+  }
+  CaptureHeatDialog(ui::ImGuiDrawer* drawer, Emulator* emulator)
+      : ImGuiDialog(drawer), emulator_(emulator) {}
+
+ protected:
+  void OnDraw(ImGuiIO& io) override {
+    auto& s = state();
+    {
+      std::lock_guard<std::mutex> lock(s.mutex);
+      if (!s.open) {
+        return;
+      }
+    }
+    // The counters are cumulative, so a fixed cadence is what turns them into
+    // a rate. Sampling every frame would divide by a frame time that the
+    // capture itself is busy distorting.
+    const double now = ImGui::GetTime();
+    bool sweeping = false;
+    {
+      std::lock_guard<std::mutex> lock(s.mutex);
+      sweeping = s.sweeping;
+    }
+    if (!sweeping && now - last_sample_time_ >= kSampleSeconds) {
+      const double elapsed = last_sample_time_ ? now - last_sample_time_ : 0.0;
+      rows_ = emulator_->RankHotGuestFunctions(&sampler_, elapsed);
+      last_sample_time_ = now;
+    }
+
+    ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(760.0f, 420.0f), ImGuiCond_FirstUseEver);
+    bool open = true;
+    if (!ImGui::Begin("Guest CPU heat", &open)) {
+      ImGui::End();
+      if (!open) {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        s.open = false;
+      }
+      return;
+    }
+
+    double total_weight = 0.0;
+    for (const auto& row : rows_) {
+      total_weight += row.weight;
+    }
+
+    double refused_weight = 0.0;
+    double captured_weight = 0.0;
+    {
+      std::lock_guard<std::mutex> lock(s.mutex);
+      for (const auto& row : rows_) {
+        const auto outcome = s.outcomes.find(row.address);
+        if (outcome == s.outcomes.cend() || !outcome->second.attempted) {
+          continue;
+        }
+        (outcome->second.captured ? captured_weight : refused_weight) +=
+            row.weight;
+      }
+      if (s.sweeping) {
+        ImGui::Text("sweeping   kept %u   tried %u   of %u ranked", s.kept,
+                    s.tried, s.ranked);
+        if (s.ranked) {
+          ImGui::ProgressBar(float(s.tried) / float(s.ranked));
+        }
+        ImGui::Text("arming  %08X", s.current);
+      } else if (s.tried) {
+        ImGui::Text("sweep finished   %u captured of %u tried", s.kept,
+                    s.tried);
+      } else {
+        ImGui::TextUnformatted("press F9 to capture bundles for these");
+      }
+    }
+
+    const auto share = [total_weight](double weight) {
+      return total_weight > 0.0 ? 100.0 * weight / total_weight : 0.0;
+    };
+    ImGui::Separator();
+    ImGui::Text("%zu functions running", rows_.size());
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "  captured %.1f%%",
+                       share(captured_weight));
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "  skipped %.1f%%",
+                       share(refused_weight));
+    ImGui::TextDisabled(
+        "share of estimated work (entries x guest instructions), not measured "
+        "time");
+    ImGui::Separator();
+
+    constexpr ImGuiTableFlags kFlags =
+        ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
+    if (ImGui::BeginTable("heat", 6, kFlags)) {
+      ImGui::TableSetupScrollFreeze(0, 1);
+      ImGui::TableSetupColumn("function");
+      ImGui::TableSetupColumn("work %");
+      ImGui::TableSetupColumn("entries/s");
+      ImGui::TableSetupColumn("guest ops");
+      ImGui::TableSetupColumn("host");
+      ImGui::TableSetupColumn("capture", ImGuiTableColumnFlags_WidthStretch);
+      ImGui::TableHeadersRow();
+
+      std::lock_guard<std::mutex> lock(s.mutex);
+      for (const auto& row : rows_) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("%08X", row.address);
+        ImGui::TableNextColumn();
+        ImGui::Text("%5.2f", share(row.weight));
+        ImGui::TableNextColumn();
+        ImGui::Text("%9.0f", row.entries_per_second);
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", (row.end_address - row.address) / 4 + 1);
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", row.emitted_bytes);
+        ImGui::TableNextColumn();
+        if (row.address == s.current && s.sweeping) {
+          ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "capturing...");
+          continue;
+        }
+        const auto outcome = s.outcomes.find(row.address);
+        if (outcome == s.outcomes.cend() || !outcome->second.attempted) {
+          if ((row.end_address - row.address) / 4 + 1 <
+              Emulator::kSmallestGuestFunctionWorthTiming) {
+            ImGui::TextDisabled("too small to time");
+          } else {
+            ImGui::TextDisabled("not tried yet");
+          }
+          continue;
+        }
+        if (outcome->second.captured) {
+          ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "captured");
+          continue;
+        }
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s",
+                           outcome->second.detail.empty()
+                               ? "refused"
+                               : outcome->second.detail.c_str());
+      }
+      ImGui::EndTable();
+    }
+    ImGui::End();
+    if (!open) {
+      std::lock_guard<std::mutex> lock(s.mutex);
+      s.open = false;
+    }
+  }
+
+ private:
+  static constexpr double kSampleSeconds = 0.5;
+  Emulator* emulator_ = nullptr;
+  Emulator::HotGuestFunctionSampler sampler_;
+  std::vector<Emulator::HotGuestFunction> rows_;
+  double last_sample_time_ = 0.0;
+};
+
+void EmulatorWindow::ShowCaptureHeat(bool toggle) {
+  if (!capture_heat_dialog_ && imgui_drawer()) {
+    capture_heat_dialog_ = new CaptureHeatDialog(imgui_drawer(), emulator());
+  }
+  auto& st = CaptureHeatDialog::state();
+  std::lock_guard<std::mutex> lock(st.mutex);
+  st.open = toggle ? !st.open : true;
+}
+
 void EmulatorWindow::DumpJitCorpus() {
   auto* processor = emulator()->processor();
   if (!processor) {
@@ -1770,6 +1963,49 @@ void EmulatorWindow::DumpJitCorpus() {
                                      notification_text, 0);
     }
   });
+
+  // Then the replayable half, on its own thread: each capture needs the title
+  // to keep running until the function it selected is entered again.
+  const auto bundle_dir = corpus_path / fmt::format("bundles - {}", datetime);
+  ShowCaptureHeat();
+  {
+    auto& st = CaptureHeatDialog::state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    st.kept = 0;
+    st.tried = 0;
+    st.ranked = 0;
+    st.current = 0;
+    st.outcomes.clear();
+    st.sweeping = true;
+  }
+  std::thread([this, bundle_dir]() {
+    std::string summary;
+    emulator()->CaptureHotInvocations(
+        bundle_dir, 32, &summary,
+        [](uint32_t done, uint32_t attempted, uint32_t ranked, uint32_t address,
+           bool captured, const std::string& detail) {
+          auto& st = CaptureHeatDialog::state();
+          std::lock_guard<std::mutex> lock(st.mutex);
+          st.kept = done;
+          st.tried = attempted;
+          st.ranked = ranked;
+          st.current = address;
+          st.outcomes[address] = {true, captured, detail};
+        });
+    {
+      auto& st = CaptureHeatDialog::state();
+      std::lock_guard<std::mutex> lock(st.mutex);
+      st.sweeping = false;
+      st.current = 0;
+    }
+    XELOGI("Hot invocation capture: {}", summary);
+    app_context_.CallInUIThread([this, summary]() {
+      if (imgui_drawer()) {
+        new ui::HostNotificationWindow(imgui_drawer(), "Bundles Captured",
+                                       summary, 0);
+      }
+    });
+  }).detach();
 }
 
 void EmulatorWindow::TakeScreenshot() {

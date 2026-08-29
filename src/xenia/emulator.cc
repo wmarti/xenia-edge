@@ -12,6 +12,9 @@
 #include "xenia/emulator.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <unordered_map>
 #include "config.h"
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/apu/audio_system.h"
@@ -28,12 +31,15 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
 #include "xenia/base/system.h"
+#include "xenia/base/threading.h"
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
 #if XE_ENABLE_GUEST_INVOCATION_CAPTURE
+#include "xenia/cpu/backend/a64/a64_guest_invocation_capture.h"
 #include "xenia/cpu/guest_execution_session_capture_runtime.h"
 #include "xenia/cpu/guest_invocation_capture_runtime.h"
+#include "xenia/cpu/guest_invocation_replay_config.h"
 #include "xenia/cpu/processor.h"
 #endif
 #include "xenia/cpu/thread_state.h"
@@ -411,6 +417,279 @@ void Emulator::PrepareCaptureForQuickExit() noexcept {
   ShutdownGuestInvocationCaptureLocked();
 }
 #endif
+
+std::vector<Emulator::HotGuestFunction> Emulator::RankHotGuestFunctions(
+    HotGuestFunctionSampler* sampler, double elapsed_seconds) {
+  std::vector<HotGuestFunction> ranked;
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (!processor_ || !sampler) {
+    return ranked;
+  }
+  // Walking every module costs far more than reading the counters, and an
+  // emitted size only changes when the JIT compiles something new.
+  if (!sampler->emitted_refresh_countdown) {
+    sampler->emitted_bytes.clear();
+    for (cpu::Module* module : processor_->GetModules()) {
+      module->ForEachFunction([&](cpu::Function* function) {
+        if (!function->is_guest()) {
+          return;
+        }
+        auto* guest_function = static_cast<cpu::GuestFunction*>(function);
+        const size_t emitted = guest_function->machine_code_length();
+        if (!guest_function->machine_code() || !emitted ||
+            emitted > std::numeric_limits<uint32_t>::max()) {
+          return;
+        }
+        sampler->emitted_bytes[guest_function->address()] =
+            static_cast<uint32_t>(emitted);
+      });
+    }
+    sampler->emitted_refresh_countdown = 8;
+  }
+  --sampler->emitted_refresh_countdown;
+
+  const auto heat = cpu::backend::a64::ReadGuestFunctionEntryHeat(8192);
+  // Fade every rate first, so a function that stopped running decays out
+  // instead of holding its last reading forever.
+  constexpr double kSmoothing = 0.35;
+  for (auto& rate : sampler->smoothed_rate) {
+    rate.second *= 1.0 - kSmoothing;
+  }
+  std::unordered_map<uint32_t, uint64_t> window_entries;
+  for (const auto& fn : heat) {
+    const auto previous = sampler->previous_entries.find(fn.address);
+    const bool first_sighting = previous == sampler->previous_entries.cend();
+    const uint64_t baseline = first_sighting ? 0 : previous->second;
+    sampler->previous_entries[fn.address] = fn.entries;
+    // A function seen for the first time has no window behind it. Counting
+    // its lifetime total as one window's work is what made a steady scene
+    // read as violent: the snapshot is the hottest 8192 by cumulative count,
+    // so functions cross in and out of it continuously.
+    if (first_sighting || elapsed_seconds <= 0.0) {
+      continue;
+    }
+    const uint64_t entries = fn.entries - std::min(baseline, fn.entries);
+    window_entries[fn.address] = entries;
+    if (entries) {
+      sampler->smoothed_rate[fn.address] +=
+          kSmoothing * (double(entries) / elapsed_seconds);
+    }
+  }
+
+  std::vector<HotGuestFunction> sampled;
+  sampled.reserve(heat.size());
+  for (const auto& fn : heat) {
+    const auto emitted = sampler->emitted_bytes.find(fn.address);
+    const auto rate = sampler->smoothed_rate.find(fn.address);
+    if (emitted == sampler->emitted_bytes.cend() ||
+        rate == sampler->smoothed_rate.cend() || rate->second < 1.0) {
+      continue;
+    }
+    const auto entries = window_entries.find(fn.address);
+    // Entries alone rank a one-line leaf called a million times above the
+    // function a title actually spends its time in. Multiplying by the guest
+    // instructions each entry runs through estimates executed work instead.
+    const double guest_instructions =
+        double((fn.end_address - fn.address) / 4 + 1);
+    sampled.push_back({fn.address, fn.end_address,
+                       entries == window_entries.cend() ? 0 : entries->second,
+                       rate->second, emitted->second,
+                       rate->second * guest_instructions});
+  }
+  // Rates that have decayed to nothing would otherwise accumulate for every
+  // function the title ever ran.
+  std::erase_if(sampler->smoothed_rate,
+                [](const auto& entry) { return entry.second < 0.01; });
+
+  std::sort(sampled.begin(), sampled.end(),
+            [](const HotGuestFunction& a, const HotGuestFunction& b) {
+              return a.weight > b.weight;
+            });
+  // The function table can name several entry points into one body. Only the
+  // heaviest is worth arming for: the others are reached by a branch rather
+  // than a call, so they never present a return boundary to record against.
+  for (const HotGuestFunction& fn : sampled) {
+    const bool overlaps = std::any_of(ranked.cbegin(), ranked.cend(),
+                                      [&fn](const HotGuestFunction& kept) {
+                                        return fn.address <= kept.end_address &&
+                                               kept.address <= fn.end_address;
+                                      });
+    if (!overlaps) {
+      ranked.push_back(fn);
+    }
+  }
+#else
+  (void)sampler;
+  (void)elapsed_seconds;
+#endif
+  return ranked;
+}
+
+X_STATUS Emulator::CaptureHotInvocations(const std::filesystem::path& out_dir,
+                                         uint32_t wanted, std::string* summary,
+                                         HotInvocationProgress on_progress) {
+#if defined(XE_ENABLE_GUEST_INVOCATION_CAPTURE) && \
+    XE_ENABLE_GUEST_INVOCATION_CAPTURE
+  if (!processor_) {
+    if (summary) {
+      *summary = "no processor";
+    }
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  // Oversampled, because a hot function can still refuse to capture and the
+  // next one down is just as good a benchmark.
+  // Entry counts come from the capture build's own hook, so no coverage
+  // instrumentation is needed - and none may be used, because it would change
+  // the code a replay has to reproduce.
+  // Counters run from process start, so a function the title hammered during a
+  // load screen keeps outranking one it is executing now, and the capture then
+  // waits out its whole deadline for an entry that never comes. Two samples a
+  // moment apart rank what is running while the key is held.
+  HotGuestFunctionSampler sampler;
+  RankHotGuestFunctions(&sampler, 0.0);
+  xe::threading::Sleep(std::chrono::milliseconds(500));
+  std::vector<HotGuestFunction> hot = RankHotGuestFunctions(&sampler, 0.5);
+  if (hot.empty()) {
+    if (summary) {
+      *summary = "no guest function has been entered yet";
+    }
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  hot.erase(std::remove_if(hot.begin(), hot.end(),
+                           [](const HotGuestFunction& fn) {
+                             return (fn.end_address - fn.address) / 4 + 1 <
+                                    kSmallestGuestFunctionWorthTiming;
+                           }),
+            hot.end());
+  if (hot.empty()) {
+    if (summary) {
+      *summary = "nothing running now is large enough to be worth timing";
+    }
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  // Every bundle would be refused one at a time for the same reason, so the
+  // controls a timed replay fixes are checked once, here, where the message
+  // can name what to relaunch with.
+  {
+    cpu::GuestInvocationReplayConfig replay_config;
+    std::string config_error;
+    if (!cpu::CaptureCurrentGuestInvocationReplayConfig(
+            *processor_->backend(), &replay_config, &config_error) ||
+        !cpu::ValidateGuestInvocationReplayBenchmarkConfig(replay_config,
+                                                           &config_error)) {
+      if (summary) {
+        *summary = fmt::format("{}; relaunch with that set", config_error);
+      }
+      return X_STATUS_INVALID_PARAMETER;
+    }
+  }
+
+  // The capture refuses an output whose parent does not exist, and every
+  // bundle below is a child of this one.
+  std::error_code ec;
+  std::filesystem::create_directories(out_dir, ec);
+  if (ec) {
+    if (summary) {
+      *summary = fmt::format("could not create {}: {}",
+                             xe::path_to_utf8(out_dir), ec.message());
+    }
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  // One loop at a time: a second press would otherwise spend its whole ranking
+  // being told the first press still owns the capture.
+  static std::atomic<bool> capturing{false};
+  bool expected = false;
+  if (!capturing.compare_exchange_strong(expected, true)) {
+    if (summary) {
+      *summary = "a capture is already running";
+    }
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  struct Release {
+    ~Release() { capturing.store(false); }
+  } release;
+
+  uint32_t captured = 0;
+  uint32_t attempted = 0;
+  // A scene changes while the sweep runs, so a sweep that outlasts the scene
+  // ends up capturing something the user has already walked away from.
+  const auto sweep_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(45);
+  for (const auto& fn : hot) {
+    if (captured >= wanted ||
+        std::chrono::steady_clock::now() >= sweep_deadline) {
+      break;
+    }
+    ++attempted;
+    cpu::GuestInvocationCaptureRuntime::SetTarget(
+        out_dir / fmt::format("{:08X}", fn.address), fn.address, fn.end_address,
+        1);
+    if (InitializeGuestInvocationCapture() != X_STATUS_SUCCESS) {
+      // Arming can only fail for reasons that will not clear by trying the
+      // next function, so stop rather than spend the whole ranking on it.
+      if (summary) {
+        *summary = fmt::format("{} kept, {} tried, then arming failed",
+                               captured, attempted);
+      }
+      return captured ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+      cpu::GuestInvocationCaptureState state;
+      {
+        std::lock_guard<std::recursive_mutex> lock(guest_capture_mutex_);
+        if (!guest_invocation_capture_) {
+          break;
+        }
+        state = guest_invocation_capture_->status().state;
+      }
+      if (state != cpu::GuestInvocationCaptureState::kRecording &&
+          state != cpu::GuestInvocationCaptureState::kPublishing) {
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        break;
+      }
+      xe::threading::Sleep(std::chrono::milliseconds(50));
+    }
+    bool published = false;
+    std::string detail;
+    {
+      std::lock_guard<std::recursive_mutex> lock(guest_capture_mutex_);
+      if (guest_invocation_capture_) {
+        const auto status = guest_invocation_capture_->status();
+        published =
+            status.state == cpu::GuestInvocationCaptureState::kPublished;
+        detail = status.message;
+      }
+    }
+    ShutdownGuestInvocationCapture();
+    if (published) {
+      ++captured;
+    }
+    XELOGI("Hot invocation {:08X} ({} entries): {}{}{}", fn.address, fn.entries,
+           published ? "captured" : "refused", detail.empty() ? "" : " - ",
+           detail);
+    if (on_progress) {
+      on_progress(captured, attempted, wanted, fn.address, published, detail);
+    }
+  }
+  if (summary) {
+    *summary = fmt::format("{} of {} attempted, {} ranked", captured, attempted,
+                           hot.size());
+  }
+  return captured ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+#else
+  (void)out_dir;
+  (void)wanted;
+  if (summary) {
+    *summary = "not a capture build";
+  }
+  return X_STATUS_NOT_SUPPORTED;
+#endif
+}
 
 void Emulator::Shutdown() {
   XELOGI("Emulator::Shutdown: starting teardown");

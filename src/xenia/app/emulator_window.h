@@ -95,7 +95,9 @@ class EmulatorWindow {
   void SetInitializingShaderStorage(bool initializing);
 
   void TakeScreenshot();
+  void ShowCaptureHeat(bool toggle = false);
   void DumpJitCorpus();
+  ui::ImGuiDialog* capture_heat_dialog_ = nullptr;
   void ExportScreenshot(const xe::ui::RawImage& image);
   void SaveImage(const std::filesystem::path& path,
                  const xe::ui::RawImage& image);
