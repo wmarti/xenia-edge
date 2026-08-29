@@ -189,6 +189,14 @@ bool GuestInvocationCaptureCoordinator::Poll() {
   return FinishCallbackLocked(recorder_->Poll());
 }
 
+bool GuestInvocationCaptureCoordinator::HasPendingDefinitionSnapshots() const {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  if (IsTerminalLocked()) {
+    return false;
+  }
+  return recorder_->has_pending_definition_snapshots();
+}
+
 bool GuestInvocationCaptureCoordinator::OnFunctionDependency(
     uint32_t source_address, uint32_t dependency_address) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);

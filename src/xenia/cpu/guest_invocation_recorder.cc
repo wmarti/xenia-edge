@@ -1684,6 +1684,10 @@ GuestInvocationRecorderState GuestInvocationRecorder::state() const {
   return impl_->state;
 }
 
+bool GuestInvocationRecorder::has_pending_definition_snapshots() const {
+  return !impl_->pending_definition_snapshots.empty();
+}
+
 bool GuestInvocationRecorder::is_recording_attempt() const {
   return impl_->IsRecordingAttempt();
 }

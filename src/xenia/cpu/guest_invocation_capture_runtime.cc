@@ -27,6 +27,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/string.h"
+#include "xenia/base/threading.h"
 #include "xenia/cpu/execution_jit_corpus.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/guest_invocation_capture_bundle.h"
@@ -497,6 +498,23 @@ GuestInvocationCaptureRuntime::Create(Memory& memory, Processor& processor,
 
   auto runtime = std::unique_ptr<GuestInvocationCaptureRuntime>(
       new GuestInvocationCaptureRuntime(std::move(impl)));
+  // Before the sink goes live, so a function already running cannot report an
+  // entry against a closure that has not been told the function exists.
+  processor.ReplayGuestInvocationCaptureTranslationHistory(
+      runtime->impl_->coordinator.get(), selection.root_address);
+  // Replaying a whole run's history at once leaves the code-page snapshots
+  // that were contended outstanding, and a function entry rejects while any
+  // remain. Nothing can enter until the sink is attached below, so settle them
+  // here rather than leaving the first entry to lose the race.
+  for (int attempt = 0;
+       attempt < 200 &&
+       runtime->impl_->coordinator->HasPendingDefinitionSnapshots();
+       ++attempt) {
+    if (!runtime->impl_->coordinator->Poll()) {
+      break;
+    }
+    xe::threading::MaybeYield();
+  }
   if (!processor.TrySetGuestInvocationCaptureSink(
           nullptr, runtime->impl_->coordinator.get())) {
     Fail(error, "capture event sink was registered during startup");

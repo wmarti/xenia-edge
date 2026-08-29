@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/processor.h"
 
+#include <unordered_set>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -412,6 +414,12 @@ void Processor::ReleaseGuestInvocationCaptureSink(
 
 void Processor::NotifyGuestInvocationCaptureFunctionDependency(
     uint32_t source_address, uint32_t target_address) {
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_invocation_capture_translation_history_mutex_);
+    guest_invocation_capture_translation_history_.push_back(
+        {source_address, target_address, false});
+  }
   const uint64_t control = guest_invocation_capture_control();
   GuestInvocationCaptureSinkLease lease =
       AcquireGuestInvocationCaptureSink(control, 0);
@@ -423,6 +431,12 @@ void Processor::NotifyGuestInvocationCaptureFunctionDependency(
 
 void Processor::NotifyGuestInvocationCaptureFunctionDefined(
     uint32_t address, uint32_t end_address) {
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_invocation_capture_translation_history_mutex_);
+    guest_invocation_capture_translation_history_.push_back(
+        {address, end_address, true});
+  }
   const uint64_t control = guest_invocation_capture_control();
   GuestInvocationCaptureSinkLease lease =
       AcquireGuestInvocationCaptureSink(control, 0);
@@ -430,6 +444,58 @@ void Processor::NotifyGuestInvocationCaptureFunctionDefined(
     return;
   }
   lease.sink()->OnFunctionDefined(address, end_address);
+}
+
+void Processor::ReplayGuestInvocationCaptureTranslationHistory(
+    GuestInvocationCaptureEventSink* sink, uint32_t root_address) const {
+  if (!sink) {
+    return;
+  }
+  std::vector<GuestInvocationCaptureTranslationEvent> history;
+  {
+    std::lock_guard<std::mutex> lock(
+        guest_invocation_capture_translation_history_mutex_);
+    history = guest_invocation_capture_translation_history_;
+  }
+
+  // Callees of each caller, so the walk below can follow them from the root.
+  std::unordered_map<uint32_t, std::vector<uint32_t>> callees;
+  for (const GuestInvocationCaptureTranslationEvent& event : history) {
+    if (!event.is_definition) {
+      callees[event.source].push_back(event.target);
+    }
+  }
+  std::unordered_set<uint32_t> closure;
+  std::vector<uint32_t> pending = {root_address};
+  closure.insert(root_address);
+  while (!pending.empty()) {
+    const uint32_t address = pending.back();
+    pending.pop_back();
+    const auto edges = callees.find(address);
+    if (edges == callees.cend()) {
+      continue;
+    }
+    for (uint32_t target : edges->second) {
+      if (closure.insert(target).second) {
+        pending.push_back(target);
+      }
+    }
+  }
+
+  // In the recorded order, so a dependency still precedes the definition of
+  // the function that named it.
+  for (const GuestInvocationCaptureTranslationEvent& event : history) {
+    if (!closure.contains(event.source)) {
+      continue;
+    }
+    const bool accepted =
+        event.is_definition
+            ? sink->OnFunctionDefined(event.source, event.target)
+            : sink->OnFunctionDependency(event.source, event.target);
+    if (!accepted) {
+      return;
+    }
+  }
 }
 #endif
 

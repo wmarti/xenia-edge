@@ -156,6 +156,14 @@ class Processor {
                                                       uint32_t target_address);
   void NotifyGuestInvocationCaptureFunctionDefined(uint32_t address,
                                                    uint32_t end_address);
+  // Every dependency and definition already reported, in the order it was
+  // reported. A sink attached partway through a run replays this first so its
+  // translation closure holds the same history a sink attached before the
+  // title translated would have observed. Only what root_address can reach is
+  // replayed: a capture needs its own closure, and snapshotting every
+  // translated function costs more than the capture it is arming for.
+  void ReplayGuestInvocationCaptureTranslationHistory(
+      GuestInvocationCaptureEventSink* sink, uint32_t root_address) const;
 
   // Orthogonal to the one-invocation event sink above. Continuous capture must
   // install one observer before title dispatch, then arm and disarm internally.
@@ -516,6 +524,17 @@ class Processor {
   void ReleaseGuestInvocationCaptureSink(GuestInvocationCaptureEventSink* sink,
                                          uint32_t generation,
                                          ppc::PPCContext* context);
+
+  // Ordered because a dependency is only meaningful ahead of the definition of
+  // the function that named it.
+  struct GuestInvocationCaptureTranslationEvent {
+    uint32_t source;
+    uint32_t target;
+    bool is_definition;
+  };
+  mutable std::mutex guest_invocation_capture_translation_history_mutex_;
+  std::vector<GuestInvocationCaptureTranslationEvent>
+      guest_invocation_capture_translation_history_;
 
   GuestInvocationCaptureEventSink* guest_invocation_capture_sink_ = nullptr;
   std::atomic<uint64_t> guest_invocation_capture_control_{0};

@@ -201,6 +201,9 @@ class GuestInvocationRecorder {
   bool OnAsyncReentry(const GuestInvocationRecorderIdentity& identity);
 
   GuestInvocationRecorderState state() const;
+  // A definition whose code pages were contended when it was registered is
+  // snapshotted later by Poll. Entry rejects while any remain outstanding.
+  bool has_pending_definition_snapshots() const;
   bool is_recording_attempt() const;
   bool is_recording_identity(
       const GuestInvocationRecorderIdentity& identity) const;

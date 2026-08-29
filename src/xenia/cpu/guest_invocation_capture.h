@@ -173,6 +173,9 @@ class GuestInvocationCaptureCoordinator final
       const GuestInvocationCaptureCoordinator&) = delete;
 
   bool Poll() override;
+  // Lets an owner drain contended definition snapshots before guest events can
+  // reach this sink, so a function entry never lands on a half-built closure.
+  bool HasPendingDefinitionSnapshots() const;
   bool OnFunctionDependency(uint32_t source_address,
                             uint32_t dependency_address) override;
   bool OnFunctionDefined(uint32_t address, uint32_t end_address) override;
