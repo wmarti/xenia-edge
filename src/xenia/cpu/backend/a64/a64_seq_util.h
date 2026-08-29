@@ -388,21 +388,15 @@ extern "C" volatile uint64_t xe_a64_physical_remap_hits;
 inline void ApplyPhysicalRemapW0(A64Emitter& e,
                                  const Xbyak_aarch64::WReg& src) {
   using namespace Xbyak_aarch64;
-  // Addresses at or above 0xE0000000 are exactly those whose top three bits
-  // are all set, which is the same as ~address having none of them set, and
-  // 0xE0000000 is a valid logical immediate. So the bound never has to be
-  // materialized either way.
+  // ThreadState allocates PPCContext so the low 32 bits of x20 are 0xE0000000,
+  // and cmp cannot encode that as an arithmetic immediate, so compare with w20.
   if (!cvars::count_physical_remap_hits) {
     // Four instructions, same as the branching form, but no branch. This runs
     // on every guest memory address, and the branch is almost never taken, so
     // it costs branch density rather than mispredictions: measured 0.65%
     // faster on a replayed title function than the branching form, in both
     // orderings of the A/B.
-    if (!e.PhysicalRemapBoundValid()) {
-      e.mov(e.w7, static_cast<uint64_t>(0xE0000000u));
-      e.MarkPhysicalRemapBoundValid();
-    }
-    e.cmp(src, e.w7);
+    e.cmp(src, WReg(e.GetContextReg().getIdx()));
     e.add(e.w17, src, 1, 12);
     e.csel(e.w0, e.w17, src, HS);
     return;

@@ -223,13 +223,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     fused_addr_mask_dest_reg_ = -1;
     fused_cmp_branch_reg_ = -1;
     x0_constant_valid_ = false;
-    remap_bound_valid_ = false;
   }
-  // w7 is outside both the allocatable set and the scratch set, so the remap
-  // bound can live there until something calls out of the block.
-  bool PhysicalRemapBoundValid() const { return remap_bound_valid_; }
-  void MarkPhysicalRemapBoundValid() { remap_bound_valid_ = true; }
-  void DropPhysicalRemapBound() { remap_bound_valid_ = false; }
   void ShiftFlagsZeroTest() {
     // An armed mask that nothing read means the AND emitted nothing and the
     // access it fed computed its address without it, which is a wrong guest
@@ -521,7 +515,6 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   Xbyak_aarch64::Cond fused_cmp_branch_cond_ = Xbyak_aarch64::EQ;
   uint64_t x0_constant_ = 0;
   bool x0_constant_valid_ = false;
-  bool remap_bound_valid_ = false;
   bool x0_constant_stale_ = false;
 
   static const uint32_t gpr_reg_map_[GPR_COUNT];

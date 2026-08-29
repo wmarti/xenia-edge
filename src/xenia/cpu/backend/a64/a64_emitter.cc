@@ -1154,9 +1154,9 @@ bool A64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
                          : ppc::GuestInvocationRecorderMemoryAccess::kRead);
 #endif
   if (xe::memory::allocation_granularity() > 0x1000) {
-    // Branch-free: w15 = w14 + 0x1000, keep it only when w14 >= 0xE0000000.
-    mov(w15, 0xE0000000u);
-    cmp(w14, w15);
+    // Branch-free: w15 = w14 + 0x1000, keep it only when w14 >= 0xE0000000,
+    // which the context pointer's low half already holds.
+    cmp(w14, w20);
     add(w15, w14, 1, 12);  // w15 = w14 + 0x1000 via LSL #12
     csel(w14, w14, w15, LO);
   }
@@ -1413,7 +1413,6 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
 void A64Emitter::CallNative(void* fn) { CallNativeSafe(fn); }
 
 void A64Emitter::CallNativeSafe(void* fn) {
-  DropPhysicalRemapBound();
   // The guest-to-host thunk unconditionally reinstalls fpcr_fpu on the way
   // back, so whatever mode this emitter thinks is live is stale afterwards.
   // Call, CallIndirect and CallExtern already do this; without it here a VMX
