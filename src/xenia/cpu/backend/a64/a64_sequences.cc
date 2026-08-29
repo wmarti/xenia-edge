@@ -5608,6 +5608,68 @@ struct UNPACK_SINGLE
 EMITTER_OPCODE_TABLE(OPCODE_UNPACK_SINGLE, UNPACK_SINGLE);
 
 // ============================================================================
+// OPCODE_PACK_SINGLE
+// ============================================================================
+// The stfs direction of the lfs rule. Testing the double in place costs one
+// fcmp, so unlike the widening twin this never has to pull the value into a
+// general register just to ask whether it is a NaN.
+struct PACK_SINGLE
+    : Sequence<PACK_SINGLE, I<OPCODE_PACK_SINGLE, I32Op, F64Op>> {
+  static void Emit(A64Emitter& e, const EmitArgType& i) {
+    e.ChangeFpcrMode(FPCRMode::Fpu);
+    Xbyak_aarch64::DReg src =
+        i.src1.is_constant ? e.d0 : Xbyak_aarch64::DReg(i.src1.reg().getIdx());
+    if (i.src1.is_constant) {
+      union {
+        double d;
+        uint64_t u;
+      } c;
+      c.d = i.src1.constant();
+      e.mov(e.x0, c.u);
+      e.fmov(e.d0, e.x0);
+    }
+    const Xbyak_aarch64::WReg dest(i.dest.reg().getIdx());
+    auto& done = e.NewCachedLabel();
+
+    e.fcvt(e.s0, src);
+    e.fmov(dest, e.s0);
+    e.fcmp(src, src);
+
+    // By value: the tail runs after this Emit returns, so a capture of the
+    // argument pack would dangle.
+    auto emit_snan_fixup = [dest, src, &done](A64Emitter& e) {
+      // The convert force-set the single's quiet bit; put back what the
+      // double's says. Only that one bit differs, the payload already crossed.
+      e.fmov(e.x17, src);
+      e.lsr(e.x17, e.x17, 51 - 22);
+      e.and_(e.w17, e.w17, uint64_t(1u << 22));
+      e.and_(dest, dest, uint64_t(~(1u << 22)));
+      e.orr(dest, dest, e.w17);
+      e.b(done);
+    };
+
+    const bool tail_ok = e.near_tail_branches_safe();
+    Xbyak_aarch64::Label* snan_path;
+    if (tail_ok) {
+      snan_path =
+          &e.AddToTail([emit_snan_fixup](A64Emitter& e, Xbyak_aarch64::Label&) {
+            emit_snan_fixup(e);
+          });
+    } else {
+      snan_path = &e.NewCachedLabel();
+    }
+    e.b_near(VS, *snan_path);
+    if (!tail_ok) {
+      e.b(done);
+      e.L(*snan_path);
+      emit_snan_fixup(e);
+    }
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_PACK_SINGLE, PACK_SINGLE);
+
+// ============================================================================
 // OPCODE_SET_NJM
 // ============================================================================
 struct SET_NJM : Sequence<SET_NJM, I<OPCODE_SET_NJM, VoidOp, I8Op>> {

@@ -320,6 +320,9 @@ enum Opcode {
   // Widen a single's bit pattern to double the way ppc lfs does, leaving a
   // signaling NaN signaling where the host convert would quiet it.
   OPCODE_UNPACK_SINGLE,
+  // The stfs direction of the same rule: narrow to a single's bit pattern,
+  // carrying the signaling bit the host convert would quiet.
+  OPCODE_PACK_SINGLE,
   OPCODE_SET_NJM,
   OPCODE_DELAY_EXECUTION,  // for db16cyc
   OPCODE_RESERVED_LOAD,

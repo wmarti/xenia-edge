@@ -929,18 +929,7 @@ int InstrEmit_lfdx(PPCHIRBuilder& f, const InstrData& i) {
 
 // double -> single, returning the 32-bit single bit pattern.
 Value* PackSingleKeepNaN(HIRBuilder& f, Value* value) {
-  Value* dbits = f.Cast(value, INT64_TYPE);
-  Value* sbits = f.Cast(f.Convert(value, FLOAT32_TYPE), INT32_TYPE);
-  // NaN if abs(double) > +inf bits.
-  Value* is_nan =
-      f.CompareUGT(f.And(dbits, f.LoadConstantUint64(0x7FFFFFFFFFFFFFFFull)),
-                   f.LoadConstantUint64(0x7FF0000000000000ull));
-  // single quiet bit (22) <- double quiet bit (51)
-  Value* qbit =
-      f.Truncate(f.And(f.Shr(dbits, 51 - 22), f.LoadConstantUint64(1ull << 22)),
-                 INT32_TYPE);
-  Value* nan_bits = f.Or(f.And(sbits, f.LoadConstantUint32(~(1u << 22))), qbit);
-  return f.Select(is_nan, nan_bits, sbits);
+  return f.PackSingle(value);
 }
 
 // single (raw 32-bit pattern) -> double value.

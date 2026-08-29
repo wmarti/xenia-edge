@@ -486,6 +486,36 @@ struct UNPACK_SINGLE
 EMITTER_OPCODE_TABLE(OPCODE_UNPACK_SINGLE, UNPACK_SINGLE);
 
 // ============================================================================
+// OPCODE_PACK_SINGLE
+// ============================================================================
+// See the arm64 twin: the double is tested in place, so only a NaN pays for
+// carrying the signaling bit across.
+struct PACK_SINGLE
+    : Sequence<PACK_SINGLE, I<OPCODE_PACK_SINGLE, I32Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xbyak::Xmm srcreg = GetInputRegOrConstant(e, i.src1, e.xmm1);
+    e.vcvtsd2ss(e.xmm0, srcreg);
+    e.vmovd(i.dest, e.xmm0);
+
+    Xbyak::Label done;
+    e.vmovq(e.rax, srcreg);
+    e.mov(e.rdx, e.rax);
+    e.and_(e.rdx, 0x7FFFFFFFFFFFFFFFull);
+    e.mov(e.rcx, 0x7FF0000000000000ull);
+    e.cmp(e.rdx, e.rcx);
+    e.jbe(done);
+    // The convert force-set the single's quiet bit; put back what the double's
+    // says. Only that one bit differs, the payload already crossed.
+    e.shr(e.rax, 51 - 22);
+    e.and_(e.eax, 1u << 22);
+    e.and_(i.dest, ~(1u << 22));
+    e.or_(i.dest, e.eax);
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_PACK_SINGLE, PACK_SINGLE);
+// ============================================================================
 // OPCODE_ROUND
 // ============================================================================
 struct ROUND_F32 : Sequence<ROUND_F32, I<OPCODE_ROUND, F32Op, F32Op>> {
