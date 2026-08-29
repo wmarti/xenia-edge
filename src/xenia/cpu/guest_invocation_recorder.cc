@@ -628,6 +628,21 @@ struct GuestInvocationRecorder::Impl {
     return true;
   }
 
+  // A jump table or a branch back to the entry point re-enters a function with
+  // the link register still holding whatever the last call left there. Such an
+  // entry has no return boundary of its own, so it is not an invocation of the
+  // selected root and the selection waits for one that is.
+  bool RootEntryIsCall(const GuestPPCRegisterState& state) const {
+    if (!state.link_register ||
+        state.link_register > std::numeric_limits<uint32_t>::max() ||
+        (state.link_register & 3)) {
+      return false;
+    }
+    const uint32_t return_address = static_cast<uint32_t>(state.link_register);
+    return return_address < selection.root_address ||
+           return_address > selection.root_end_address;
+  }
+
   CodePageReadResult SnapshotSuppliedDataPages(
       std::map<uint32_t, std::array<uint8_t, kGuestPageSize>>* output) {
     output->clear();
@@ -1393,6 +1408,9 @@ bool GuestInvocationRecorder::OnFunctionEntry(
       return impl_->Reject(GuestInvocationRecorderRejection::kInvalidEvent,
                            "root occurrence has an invalid identity");
     }
+    if (!impl_->RootEntryIsCall(entry_state)) {
+      return true;
+    }
     ++impl_->root_occurrence_count;
     if (impl_->root_occurrence_count < impl_->selection.occurrence) {
       return true;
@@ -1425,6 +1443,9 @@ bool GuestInvocationRecorder::OnFunctionEntry(
     if (end_address != impl_->selection.root_end_address) {
       return impl_->Reject(GuestInvocationRecorderRejection::kInvalidEvent,
                            "selected root extent changed before retry");
+    }
+    if (!impl_->RootEntryIsCall(entry_state)) {
+      return true;
     }
     return impl_->BeginAttempt(entry_state);
   }
