@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/guest_invocation_artifact.h"
 
+#include "third_party/fmt/include/fmt/format.h"
+
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -450,6 +452,71 @@ bool ReadPage(Reader* reader, GuestInvocationPage* page) {
 }
 
 }  // namespace
+
+std::string DescribeGuestPPCRegisterStateDifference(
+    const GuestPPCRegisterState& expected,
+    const GuestPPCRegisterState& actual) {
+  std::vector<std::string> differences;
+  const auto note = [&differences](std::string text) {
+    if (differences.size() < 6) {
+      differences.push_back(std::move(text));
+    }
+  };
+  for (size_t i = 0; i < expected.gpr.size(); ++i) {
+    if (expected.gpr[i] != actual.gpr[i]) {
+      note(fmt::format("r{}={:016X} want {:016X}", i, actual.gpr[i],
+                       expected.gpr[i]));
+    }
+  }
+  for (size_t i = 0; i < expected.fpr_bits.size(); ++i) {
+    if (expected.fpr_bits[i] != actual.fpr_bits[i]) {
+      note(fmt::format("f{}={:016X} want {:016X}", i, actual.fpr_bits[i],
+                       expected.fpr_bits[i]));
+    }
+  }
+  for (size_t i = 0; i < expected.vector_registers.size(); ++i) {
+    if (expected.vector_registers[i] != actual.vector_registers[i]) {
+      note(fmt::format("v{}", i));
+    }
+  }
+  const auto field_bytes = [](const std::array<uint8_t, 4>& field) {
+    return fmt::format("{:02X}{:02X}{:02X}{:02X}", field[0], field[1], field[2],
+                       field[3]);
+  };
+  for (size_t i = 0; i < expected.condition_register_fields.size(); ++i) {
+    if (expected.condition_register_fields[i] !=
+        actual.condition_register_fields[i]) {
+      note(fmt::format("cr{}={} want {}", i,
+                       field_bytes(actual.condition_register_fields[i]),
+                       field_bytes(expected.condition_register_fields[i])));
+    }
+  }
+  const auto scalar = [&note](const char* name, uint64_t got, uint64_t want) {
+    if (got != want) {
+      note(fmt::format("{}={:X} want {:X}", name, got, want));
+    }
+  };
+  scalar("lr", actual.link_register, expected.link_register);
+  scalar("ctr", actual.count_register, expected.count_register);
+  scalar("msr", actual.machine_state_register, expected.machine_state_register);
+  scalar("fpscr", actual.fpscr, expected.fpscr);
+  scalar("vrsave", actual.vrsave, expected.vrsave);
+  scalar("xer_ca", actual.xer_ca, expected.xer_ca);
+  scalar("xer_ov", actual.xer_ov, expected.xer_ov);
+  scalar("xer_so", actual.xer_so, expected.xer_so);
+  scalar("vscr_sat", actual.vscr_sat, expected.vscr_sat);
+  if (expected.vscr_vector != actual.vscr_vector) {
+    note("vscr");
+  }
+  if (differences.empty()) {
+    return "no architectural field differs";
+  }
+  std::string text = differences[0];
+  for (size_t i = 1; i < differences.size(); ++i) {
+    text += ", " + differences[i];
+  }
+  return text;
+}
 
 GuestPPCRegisterState CaptureGuestPPCRegisterState(
     const PPCContext_s& context) {

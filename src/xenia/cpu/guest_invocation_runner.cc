@@ -931,10 +931,14 @@ bool GuestInvocationRunner::Invoke(std::string* error) {
 }
 
 bool GuestInvocationRunner::VerifyCurrentState(std::string* error) const {
-  if (ppc::CaptureGuestPPCRegisterState(*thread_state_->context()) !=
-      invocation_->expected_output) {
+  const ppc::GuestPPCRegisterState actual =
+      ppc::CaptureGuestPPCRegisterState(*thread_state_->context());
+  if (actual != invocation_->expected_output) {
     return Fail(error,
-                "guest invocation architectural output does not match capture");
+                fmt::format("guest invocation architectural output does not "
+                            "match capture: {}",
+                            ppc::DescribeGuestPPCRegisterStateDifference(
+                                invocation_->expected_output, actual)));
   }
 
   for (const ppc::GuestInvocationPage& input_page :

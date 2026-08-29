@@ -90,6 +90,10 @@ struct GuestPPCRegisterState {
 // Copies only the architectural fields above. RestoreGuestPPCRegisterState
 // leaves all replay-assigned and host-specific PPCContext fields untouched.
 GuestPPCRegisterState CaptureGuestPPCRegisterState(const PPCContext_s& context);
+// Names the first few architectural fields that differ, so a replay mismatch
+// says which register drifted instead of only that one did.
+std::string DescribeGuestPPCRegisterStateDifference(
+    const GuestPPCRegisterState& expected, const GuestPPCRegisterState& actual);
 void RestoreGuestPPCRegisterState(const GuestPPCRegisterState& state,
                                   PPCContext_s* context);
 
