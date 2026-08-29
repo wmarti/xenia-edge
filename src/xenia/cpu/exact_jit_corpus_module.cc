@@ -156,7 +156,7 @@ ExactJitCorpusModule::ExactJitCorpusModule(
     : Module(processor),
       name_(name),
       functions_(corpus.functions()),
-      saverest_records_(corpus.saverest_records()),
+      declaration_records_(corpus.declaration_records()),
       resume_entries_(std::move(resume_entries)) {
   const std::vector<uint32_t>& page_addresses = corpus.page_addresses();
   for (size_t i = 0; i < page_addresses.size();) {
@@ -174,14 +174,13 @@ ExactJitCorpusModule::ExactJitCorpusModule(
 
 ExactJitCorpusModule::~ExactJitCorpusModule() = default;
 
-const ExecutionJitCorpus::SaverestRecord* ExactJitCorpusModule::FindSaverest(
-    uint32_t entry_address) const {
+const ExecutionJitCorpus::DeclarationRecord*
+ExactJitCorpusModule::FindDeclaration(uint32_t entry_address) const {
   const auto it = std::lower_bound(
-      saverest_records_.cbegin(), saverest_records_.cend(), entry_address,
-      [](const ExecutionJitCorpus::SaverestRecord& saverest, uint32_t address) {
-        return saverest.address < address;
-      });
-  return it != saverest_records_.cend() && it->address == entry_address
+      declaration_records_.cbegin(), declaration_records_.cend(), entry_address,
+      [](const ExecutionJitCorpus::DeclarationRecord& declaration,
+         uint32_t address) { return declaration.address < address; });
+  return it != declaration_records_.cend() && it->address == entry_address
              ? &*it
              : nullptr;
 }
@@ -211,7 +210,7 @@ const ExactJitCorpusModule::ResumeEntry* ExactJitCorpusModule::FindResumeEntry(
 bool ExactJitCorpusModule::ContainsAddress(uint32_t address) {
   return FindFunction(address) != nullptr ||
          FindResumeEntry(address) != nullptr ||
-         FindSaverest(address) != nullptr;
+         FindDeclaration(address) != nullptr;
 }
 
 Symbol::Status ExactJitCorpusModule::DeclareFunction(uint32_t address,
@@ -222,20 +221,21 @@ Symbol::Status ExactJitCorpusModule::DeclareFunction(uint32_t address,
   *out_function = nullptr;
   const ExecutionJitCorpus::FunctionRecord* record = FindFunction(address);
   const ResumeEntry* resume_entry = FindResumeEntry(address);
-  const ExecutionJitCorpus::SaverestRecord* saverest = FindSaverest(address);
-  if (!record && !resume_entry && !saverest) {
+  const ExecutionJitCorpus::DeclarationRecord* declaration =
+      FindDeclaration(address);
+  if (!record && !resume_entry && !declaration) {
     return Symbol::Status::kFailed;
   }
-  // A saverest declaration has an extent and metadata but no body and no
-  // pages, so it reuses the function-record metadata path with a zero host
-  // size rather than a second decoder.
-  const ExecutionJitCorpus::FunctionRecord saverest_record =
-      saverest ? ExecutionJitCorpus::FunctionRecord{saverest->address,
-                                                    saverest->end_address, 0,
-                                                    saverest->flags}
-               : ExecutionJitCorpus::FunctionRecord{};
-  if (saverest) {
-    record = &saverest_record;
+  // A declaration has an extent and metadata but no body and no pages, so it
+  // reuses the function-record metadata path with a zero host size rather
+  // than a second decoder.
+  const ExecutionJitCorpus::FunctionRecord declaration_record =
+      declaration ? ExecutionJitCorpus::FunctionRecord{declaration->address,
+                                                       declaration->end_address,
+                                                       0, declaration->flags}
+                  : ExecutionJitCorpus::FunctionRecord{};
+  if (declaration) {
+    record = &declaration_record;
   }
 
   const Symbol::Status status = Module::DeclareFunction(address, out_function);
@@ -260,7 +260,7 @@ Symbol::Status ExactJitCorpusModule::DeclareFunction(uint32_t address,
       (*out_function)->set_status(Symbol::Status::kFailed);
       return Symbol::Status::kFailed;
     }
-    (*out_function)->set_declaration_only(saverest != nullptr);
+    (*out_function)->set_declaration_only(declaration != nullptr);
     return status;
   }
   const uint32_t expected_end_address =
@@ -270,7 +270,7 @@ Symbol::Status ExactJitCorpusModule::DeclareFunction(uint32_t address,
                    : FunctionMetadataMatches(*record, **out_function);
   if ((*out_function)->end_address() != expected_end_address ||
       !metadata_matches ||
-      (*out_function)->is_declaration_only() != (saverest != nullptr)) {
+      (*out_function)->is_declaration_only() != (declaration != nullptr)) {
     (*out_function)->set_status(Symbol::Status::kFailed);
     return Symbol::Status::kFailed;
   }

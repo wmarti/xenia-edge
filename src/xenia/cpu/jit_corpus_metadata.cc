@@ -29,7 +29,11 @@ bool IsLegalSaverestIndex(SaveRestoreType type, uint8_t index) {
 
 bool IsLegalFunctionMetadata(const JitCorpus::FunctionMetadata& metadata) {
   if (metadata.saverest_type == SaveRestoreType::NONE) {
-    return metadata.behavior == Function::Behavior::kDefault &&
+    // A host-backed entry has no save/restore role: replay reaches it through
+    // its handler instead of inlining a helper's metadata.
+    return (metadata.behavior == Function::Behavior::kDefault ||
+            metadata.behavior == Function::Behavior::kBuiltin ||
+            metadata.behavior == Function::Behavior::kExtern) &&
            !metadata.is_restore && !metadata.saverest_index;
   }
   if (!IsLegalSaverestIndex(metadata.saverest_type, metadata.saverest_index)) {
@@ -76,8 +80,7 @@ bool JitCorpus::DecodeFunctionFlags(uint32_t flags,
       (flags & kFunctionBehaviorMask) >> kFunctionBehaviorShift;
   const uint32_t saverest_type_value =
       (flags & kFunctionSaverestTypeMask) >> kFunctionSaverestTypeShift;
-  if (behavior_value >
-          static_cast<uint32_t>(Function::Behavior::kEpilogReturn) ||
+  if (behavior_value > static_cast<uint32_t>(Function::Behavior::kExtern) ||
       saverest_type_value > static_cast<uint32_t>(SaveRestoreType::FPR)) {
     return false;
   }

@@ -109,7 +109,7 @@ class JitCorpus {
     // A function the loader synthesized and declared but never translated,
     // so it has an extent and metadata but no body and no pages. Replay
     // declares it exactly as the loader did rather than shipping its bytes.
-    kTagSaverest = 3,
+    kTagDeclaration = 3,
   };
 
   JitCorpus() = default;

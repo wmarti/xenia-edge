@@ -329,11 +329,19 @@ struct GuestInvocationCaptureRuntime::Impl {
             fmt::format("capture closure extent changed for function {:08X}",
                         dependency.address));
       }
+      // A host-backed call target is reached through a handler, so replay
+      // needs its declaration but never its bytes. Refusing one here would
+      // refuse every function with a lock or a kernel call on any path,
+      // whether or not the recorded invocation took that path.
       if (function->behavior() == Function::Behavior::kExtern ||
           function->behavior() == Function::Behavior::kBuiltin) {
-        return Fail(
-            error, fmt::format("capture closure function {:08X} is host-backed",
-                               dependency.address));
+        const ExecutionJitCorpus::DeclarationRecord declaration = {
+            function->address(), function->end_address(),
+            JitCorpus::EncodeFunctionFlags(*function)};
+        if (!corpus_builder.AddDeclaration(declaration, error)) {
+          return false;
+        }
+        continue;
       }
       auto* guest_function = static_cast<GuestFunction*>(function);
       const size_t host_code_size = guest_function->machine_code_length();
@@ -377,15 +385,16 @@ struct GuestInvocationCaptureRuntime::Impl {
     // undefined, and only this predicate keeps them out.
     for (uint32_t address : result.declared_only_dependencies) {
       Function* function = processor.LookupFunction(address);
-      if (!function || !function->is_guest() || !function->IsSaverest() ||
-          function->behavior() == Function::Behavior::kExtern ||
-          function->behavior() == Function::Behavior::kBuiltin) {
+      if (!function || !function->is_guest() ||
+          (!function->IsSaverest() &&
+           function->behavior() != Function::Behavior::kExtern &&
+           function->behavior() != Function::Behavior::kBuiltin)) {
         continue;
       }
-      const ExecutionJitCorpus::SaverestRecord saverest_record = {
+      const ExecutionJitCorpus::DeclarationRecord declaration_record = {
           function->address(), function->end_address(),
           JitCorpus::EncodeFunctionFlags(*function)};
-      if (!corpus_builder.AddSaverest(saverest_record, error)) {
+      if (!corpus_builder.AddDeclaration(declaration_record, error)) {
         return false;
       }
     }
