@@ -1652,6 +1652,15 @@ Value* HIRBuilder::ToSingle(Value* value) {
   i->src3.value = nullptr;
   return i->dest;
 }
+Value* HIRBuilder::UnpackSingle(Value* single_bits) {
+  assert_true(single_bits->type == INT32_TYPE);
+  Instr* i =
+      AppendInstr(OPCODE_UNPACK_SINGLE_info, 0, AllocValue(FLOAT64_TYPE));
+  i->set_src1(single_bits);
+  i->src2.value = nullptr;
+  i->src3.value = nullptr;
+  return i->dest;
+}
 Value* HIRBuilder::Add(Value* value1, Value* value2,
                        uint32_t arithmetic_flags) {
   ASSERT_TYPES_EQUAL(value1, value2);

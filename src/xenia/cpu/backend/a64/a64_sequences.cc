@@ -5546,6 +5546,68 @@ struct TOSINGLE : Sequence<TOSINGLE, I<OPCODE_TO_SINGLE, F64Op, F64Op>> {
 EMITTER_OPCODE_TABLE(OPCODE_TO_SINGLE, TOSINGLE);
 
 // ============================================================================
+// OPCODE_UNPACK_SINGLE
+// ============================================================================
+// lfs widens without quieting, so the only value the host convert gets wrong
+// is a signaling NaN, and the only thing wrong with it is the bit the convert
+// force-set. The test costs one AND and one CMN on the pattern already in a
+// general register, and the fixup sits in the tail: real float data is never
+// NaN, so the branch is as one-sided as a branch gets.
+struct UNPACK_SINGLE
+    : Sequence<UNPACK_SINGLE, I<OPCODE_UNPACK_SINGLE, F64Op, I32Op>> {
+  static void Emit(A64Emitter& e, const EmitArgType& i) {
+    e.ChangeFpcrMode(FPCRMode::Fpu);
+    Xbyak_aarch64::WReg src =
+        i.src1.is_constant ? e.w0 : Xbyak_aarch64::WReg(i.src1.reg().getIdx());
+    if (i.src1.is_constant) {
+      e.mov(e.w0, static_cast<uint64_t>(i.src1.constant()));
+    }
+    const Xbyak_aarch64::SReg narrow =
+        Xbyak_aarch64::SReg(i.dest.reg().getIdx());
+    auto& done = e.NewCachedLabel();
+
+    // The widened value is NaN exactly when the single was, so the convert's
+    // own result answers the question and no mask, constant or scratch
+    // register is needed. An infinity is not unordered and correctly skips a
+    // fixup it never needed.
+    e.fmov(narrow, src);
+    e.fcvt(i.dest, narrow);
+    e.fcmp(i.dest, i.dest);
+
+    // By value: the tail runs after this Emit returns, so a capture of the
+    // argument pack would dangle.
+    const Xbyak_aarch64::DReg wide(i.dest.reg().getIdx());
+    auto emit_snan_fixup = [wide, src, &done](A64Emitter& e) {
+      // A quiet NaN already carries the bit the convert set.
+      e.tbnz(src, 22, done);
+      e.fmov(e.x17, wide);
+      e.and_(e.x17, e.x17, ~(1ull << 51));
+      e.fmov(wide, e.x17);
+      e.b(done);
+    };
+
+    const bool tail_ok = e.near_tail_branches_safe();
+    Xbyak_aarch64::Label* snan_path;
+    if (tail_ok) {
+      snan_path =
+          &e.AddToTail([emit_snan_fixup](A64Emitter& e, Xbyak_aarch64::Label&) {
+            emit_snan_fixup(e);
+          });
+    } else {
+      snan_path = &e.NewCachedLabel();
+    }
+    e.b_near(VS, *snan_path);
+    if (!tail_ok) {
+      e.b(done);
+      e.L(*snan_path);
+      emit_snan_fixup(e);
+    }
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_UNPACK_SINGLE, UNPACK_SINGLE);
+
+// ============================================================================
 // OPCODE_SET_NJM
 // ============================================================================
 struct SET_NJM : Sequence<SET_NJM, I<OPCODE_SET_NJM, VoidOp, I8Op>> {

@@ -1454,6 +1454,10 @@ static bool IsNeverF64Denormal(hir::Value* v, int depth) {
       // x64_sequences.cc), so under it a double denormal passes through
       // unrounded and the proof does not hold. Found by adversarial review.
       return !cvars::no_round_to_single;
+    case OPCODE_UNPACK_SINGLE:
+      // Redundant with the flag UnpackSingleKeepNaN sets, which is tested
+      // ahead of the walk; here so a direct use still proves.
+      return true;
     case OPCODE_CONVERT:
       return def->src1.value && def->src1.value->type == FLOAT32_TYPE;
     case OPCODE_SELECT:

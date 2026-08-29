@@ -448,6 +448,43 @@ struct TOSINGLE_F64_F64
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_TO_SINGLE, TOSINGLE_F64_F64);
+
+// ============================================================================
+// OPCODE_UNPACK_SINGLE
+// ============================================================================
+// lfs widens without quieting, so only a signaling NaN needs the bit the host
+// convert force-set put back. Branchy for the same reason as the arm64 twin:
+// real float data is never NaN.
+struct UNPACK_SINGLE
+    : Sequence<UNPACK_SINGLE, I<OPCODE_UNPACK_SINGLE, F64Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    if (i.src1.is_constant) {
+      e.mov(e.eax, i.src1.constant());
+    } else {
+      e.mov(e.eax, i.src1);
+    }
+    e.vmovd(e.xmm0, e.eax);
+    e.vcvtss2sd(i.dest, e.xmm0);
+
+    Xbyak::Label done;
+    // Exponent all ones marks a NaN or an infinity; an infinity's bit 51 is
+    // already clear, so letting it through the fixup costs nothing.
+    e.mov(e.edx, e.eax);
+    e.and_(e.edx, 0x7FFFFFFFu);
+    e.cmp(e.edx, 0x7F800000u);
+    e.jb(done);
+    // A quiet NaN already carries the bit the convert set.
+    e.test(e.eax, 1u << 22);
+    e.jnz(done);
+    e.vmovq(e.rdx, i.dest);
+    e.btr(e.rdx, 51);
+    e.vmovq(i.dest, e.rdx);
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_UNPACK_SINGLE, UNPACK_SINGLE);
+
 // ============================================================================
 // OPCODE_ROUND
 // ============================================================================

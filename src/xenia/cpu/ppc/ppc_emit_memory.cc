@@ -945,24 +945,11 @@ Value* PackSingleKeepNaN(HIRBuilder& f, Value* value) {
 
 // single (raw 32-bit pattern) -> double value.
 Value* UnpackSingleKeepNaN(HIRBuilder& f, Value* sbits) {
-  Value* dbits =
-      f.Cast(f.Convert(f.Cast(sbits, FLOAT32_TYPE), FLOAT64_TYPE), INT64_TYPE);
-  // NaN if abs(single) > +inf bits.
-  Value* is_nan = f.CompareUGT(f.And(sbits, f.LoadConstantUint32(0x7FFFFFFFu)),
-                               f.LoadConstantUint32(0x7F800000u));
-  // double quiet bit (51) <- single quiet bit (22)
-  Value* qbit =
-      f.Shl(f.ZeroExtend(f.And(f.Shr(sbits, 22), f.LoadConstantUint32(1u)),
-                         INT64_TYPE),
-            51);
-  Value* nan_bits =
-      f.Or(f.And(dbits, f.LoadConstantUint64(~(1ull << 51))), qbit);
-  Value* out = f.Cast(f.Select(is_nan, nan_bits, dbits), FLOAT64_TYPE);
-  // Both arms carry a single's value widened to double: dbits is the
-  // conversion itself (exponent nonzero unless the value is a true zero) and
-  // nan_bits only rewrites the quiet bit of an all-ones exponent. A double
-  // denormal cannot come out of here, which DENORMAL_QUIRK simplification
-  // uses to fold the single-precision quirk screen over lfs-fed operands.
+  Value* out = f.UnpackSingle(sbits);
+  // Both the converted value and the signaling-NaN fixup carry a single's
+  // value widened to double, so a double denormal cannot come out of here,
+  // which DENORMAL_QUIRK simplification uses to fold the single-precision
+  // quirk screen over lfs-fed operands.
   out->flags |= VALUE_NEVER_F64_DENORMAL;
   return out;
 }
