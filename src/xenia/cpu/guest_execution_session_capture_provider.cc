@@ -56,23 +56,6 @@ bool IsSupportedPageAddress(Memory& memory, uint32_t address) {
   return memory.LookupHeap(address) != nullptr;
 }
 
-// Physical memory is reachable through the 0xA0000000, 0xC0000000 and
-// 0xE0000000 views and the XEX range through 0x80000000 and 0x90000000, so a
-// page is keyed by the lowest view that reaches it. PhysicalHeap places the
-// 0xE0000000 view 4 KiB further into physical memory than the others.
-uint32_t BackingPageAddress(uint32_t address) {
-  if (address >= 0xE0000000u && address < 0xFFD00000u) {
-    return address - 0xE0000000u + 0xA0001000u;
-  }
-  if (address >= 0xC0000000u && address < 0xE0000000u) {
-    return address - 0x20000000u;
-  }
-  if (address >= 0x90000000u && address < 0xA0000000u) {
-    return address - 0x10000000u;
-  }
-  return address;
-}
-
 bool HasWriteAccess(ppc::GuestInvocationRecorderMemoryAccess access) {
   return access == ppc::GuestInvocationRecorderMemoryAccess::kWrite ||
          access == ppc::GuestInvocationRecorderMemoryAccess::kReadWrite;
@@ -564,7 +547,8 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     snapshotting_definition_ = definition_address;
     std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> snapshots;
     for (uint32_t page_address : definition.code_pages) {
-      if (written_backing_pages.contains(BackingPageAddress(page_address))) {
+      if (written_backing_pages.contains(
+              ppc::GuestPageBackingAddress(page_address))) {
         RejectLocked(
             "capture provider guest code was written before definition");
         return CodeReadResult::kFailure;
@@ -1468,7 +1452,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
     std::map<uint32_t, std::array<uint8_t, kGuestPageSize>> new_pages;
     std::map<uint32_t, uint32_t> new_backing_views;
     for (uint32_t page : supplied_pages) {
-      const uint32_t backing = BackingPageAddress(page);
+      const uint32_t backing = ppc::GuestPageBackingAddress(page);
       const auto known_view = data_backing_views.find(backing);
       const auto new_view = new_backing_views.find(backing);
       if ((known_view != data_backing_views.cend() &&
@@ -1510,7 +1494,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
          page += kGuestPageSize) {
       const uint32_t page_address = static_cast<uint32_t>(page);
       dirty_data_pages.insert(page_address);
-      written_backing_pages.insert(BackingPageAddress(page_address));
+      written_backing_pages.insert(ppc::GuestPageBackingAddress(page_address));
     }
     return true;
   }
@@ -1567,7 +1551,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
           return RejectLocked(
               "capture provider closure lacks immutable code bytes");
         }
-        const uint32_t backing = BackingPageAddress(page_address);
+        const uint32_t backing = ppc::GuestPageBackingAddress(page_address);
         const auto backing_view = code_backing_views.find(backing);
         if (backing_view != code_backing_views.cend() &&
             backing_view->second != page_address) {
@@ -1678,7 +1662,7 @@ struct GuestExecutionSessionCaptureProvider::Impl {
            std::vector<uint8_t>(bytes.cbegin(), bytes.cend())});
     }
     for (const auto& [page_address, initial_bytes] : initial_data_pages) {
-      const uint32_t backing = BackingPageAddress(page_address);
+      const uint32_t backing = ppc::GuestPageBackingAddress(page_address);
       if (code_backing_views.contains(backing)) {
         continue;
       }

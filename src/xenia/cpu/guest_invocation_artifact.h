@@ -295,6 +295,32 @@ struct GuestInvocationArtifact {
   bool operator==(const GuestInvocationArtifact&) const = default;
 };
 
+// Ordinary virtual memory, the XEX range and its 0x9 alias, and the physical
+// views. Excludes the 0x7F guard band and the 0xFFD00000 builtin range, which
+// no guest data page reaches.
+constexpr bool IsSupportedGuestDataPageAddress(uint32_t address) {
+  return (address >= 0x00001000u && address <= 0x7EFFF000u) ||
+         (address >= 0x80000000u && address <= 0x9FFFF000u) ||
+         (address >= 0xA0000000u && address < 0xFFD00000u);
+}
+
+// Physical memory is reachable through the 0xA0000000, 0xC0000000 and
+// 0xE0000000 views and the XEX range through 0x80000000 and 0x90000000, so a
+// page is keyed by the lowest view that reaches it. PhysicalHeap places the
+// 0xE0000000 view 4 KiB further into physical memory than the others.
+constexpr uint32_t GuestPageBackingAddress(uint32_t address) {
+  if (address >= 0xE0000000u && address < 0xFFD00000u) {
+    return address - 0xE0000000u + 0xA0001000u;
+  }
+  if (address >= 0xC0000000u && address < 0xE0000000u) {
+    return address - 0x20000000u;
+  }
+  if (address >= 0x90000000u && address < 0xA0000000u) {
+    return address - 0x10000000u;
+  }
+  return address;
+}
+
 // Portable little-endian version 1 wire format. Every integer and byte array
 // is emitted field-by-field; raw C++ structs, host pointers and padding are
 // never serialized. Decoder limits are part of the format's resource-safety

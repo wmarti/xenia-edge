@@ -93,11 +93,6 @@ bool IsNonzeroHash(const std::array<uint8_t, 32>& hash) {
                      [](uint8_t value) { return value != 0; });
 }
 
-bool IsSupportedDataPageAddress(uint32_t guest_address) {
-  return (guest_address >= 0x00001000u && guest_address <= 0x7EFFF000u) ||
-         (guest_address >= 0x80000000u && guest_address <= 0x9FFFF000u);
-}
-
 bool InvocationWireSize(uint64_t input_page_count, uint64_t output_page_count,
                         uint64_t* size) {
   uint64_t page_count = 0;
@@ -122,7 +117,7 @@ bool ValidatePages(const std::vector<GuestInvocationPage>& pages,
       return Fail(error,
                   std::string(name) + " contains an unaligned guest page");
     }
-    if (!IsSupportedDataPageAddress(page.guest_address)) {
+    if (!IsSupportedGuestDataPageAddress(page.guest_address)) {
       return Fail(error, std::string(name) +
                              " contains a page outside supported ordinary "
                              "virtual/XEX memory");

@@ -37,16 +37,6 @@ bool IsValidFunctionExtent(uint32_t address, uint32_t end_address) {
              GuestInvocationArtifactCodec::kMaxFunctionSize;
 }
 
-bool IsSupportedPageAddress(uint32_t address) {
-  return (address >= 0x00001000u && address <= 0x7EFFF000u) ||
-         (address >= 0x80000000u && address <= 0x9FFFF000u);
-}
-
-uint32_t BackingPageAddress(uint32_t address) {
-  return address >= 0x90000000u && address < 0xA0000000u ? address - 0x10000000u
-                                                         : address;
-}
-
 bool HasWriteAccess(GuestInvocationRecorderMemoryAccess access) {
   return access == GuestInvocationRecorderMemoryAccess::kWrite ||
          access == GuestInvocationRecorderMemoryAccess::kReadWrite;
@@ -449,7 +439,7 @@ struct GuestInvocationRecorder::Impl {
             GuestInvocationRecorderRejection::kIncompleteTranslationClosure,
             "immutable code-page catalog is inconsistent");
       }
-      const uint32_t backing = BackingPageAddress(page_address);
+      const uint32_t backing = GuestPageBackingAddress(page_address);
       const auto code_backing = closure_code_backing_views.find(backing);
       const auto new_backing = new_backing_views.find(backing);
       if ((code_backing != closure_code_backing_views.cend() &&
@@ -480,7 +470,7 @@ struct GuestInvocationRecorder::Impl {
     for (uint32_t page_address : definition.code_page_addresses) {
       closure_code_pages.emplace(page_address,
                                  definition_code_pages.at(page_address));
-      closure_code_backing_views.emplace(BackingPageAddress(page_address),
+      closure_code_backing_views.emplace(GuestPageBackingAddress(page_address),
                                          page_address);
     }
     return true;
@@ -900,7 +890,7 @@ struct GuestInvocationRecorder::Impl {
     for (uint64_t page = first_page; page <= last_page;
          page += kGuestPageSize) {
       const uint32_t page_address = static_cast<uint32_t>(page);
-      if (!IsSupportedPageAddress(page_address)) {
+      if (!IsSupportedGuestDataPageAddress(page_address)) {
         if (reject_unsupported) {
           return Reject(
               GuestInvocationRecorderRejection::kUnsupportedDependency,
@@ -931,7 +921,7 @@ struct GuestInvocationRecorder::Impl {
     }
     for (uint64_t page = first_granule; page < end; page += kGuestPageSize) {
       const uint32_t page_address = static_cast<uint32_t>(page);
-      if (!IsSupportedPageAddress(page_address)) {
+      if (!IsSupportedGuestDataPageAddress(page_address)) {
         return Reject(
             GuestInvocationRecorderRejection::kUnsupportedDependency,
             fmt::format("host protection granule contains an unsupported "
@@ -984,7 +974,7 @@ struct GuestInvocationRecorder::Impl {
     return fmt::format(
         "another thread wrote a page in the capture closure: {} page {:08X} "
         "backing {:08X} known {} attempt {} state {} granule {}",
-        site, page, BackingPageAddress(page),
+        site, page, GuestPageBackingAddress(page),
         known_pages.contains(page) ? 1 : 0, attempt_count,
         static_cast<uint32_t>(state), limits.host_protection_page_size);
   }
@@ -1008,7 +998,7 @@ struct GuestInvocationRecorder::Impl {
     for (uint32_t page : pages) {
       if (state == GuestInvocationRecorderState::kRecordingFinalAttempt &&
           cross_thread_written_backing_pages.contains(
-              BackingPageAddress(page)) &&
+              GuestPageBackingAddress(page)) &&
           !RetakeFinalAttempt(CrossThreadDetail("owner-access", page))) {
         return false;
       }
@@ -1042,7 +1032,7 @@ struct GuestInvocationRecorder::Impl {
         backing_view_scratch;
     new_backing_views.clear();
     for (uint32_t page : supplied_pages) {
-      const uint32_t backing = BackingPageAddress(page);
+      const uint32_t backing = GuestPageBackingAddress(page);
       const auto code_backing = closure_code_backing_views.find(backing);
       if (code_backing != closure_code_backing_views.cend()) {
         if (code_backing->second != page) {
@@ -1086,11 +1076,11 @@ struct GuestInvocationRecorder::Impl {
                     kGuestInvocationDependencyPageDiscoveryOverflow);
     }
     std::erase_if(supplied_pages, [this](uint32_t page) {
-      return closure_code_backing_views.contains(BackingPageAddress(page));
+      return closure_code_backing_views.contains(GuestPageBackingAddress(page));
     });
     attempt_pages.insert(pages.cbegin(), pages.cend());
     for (uint32_t page : pages) {
-      attempt_read_backing_pages.insert(BackingPageAddress(page));
+      attempt_read_backing_pages.insert(GuestPageBackingAddress(page));
     }
     known_pages.insert(pages.cbegin(), pages.cend());
     supplied_data_pages.insert(supplied_pages.cbegin(), supplied_pages.cend());
@@ -1102,7 +1092,7 @@ struct GuestInvocationRecorder::Impl {
 
   bool AddCrossThreadWritePages(const std::vector<uint32_t>& pages) {
     for (uint32_t page : pages) {
-      if (closure_code_backing_views.contains(BackingPageAddress(page))) {
+      if (closure_code_backing_views.contains(GuestPageBackingAddress(page))) {
         return Reject(GuestInvocationRecorderRejection::kCrossThreadMutation,
                       CrossThreadDetail("foreign-write-code", page),
                       kGuestInvocationDependencyCrossThreadMutation);
@@ -1117,14 +1107,14 @@ struct GuestInvocationRecorder::Impl {
       return true;
     }
     for (uint32_t page : pages) {
-      if (attempt_read_backing_pages.contains(BackingPageAddress(page))) {
+      if (attempt_read_backing_pages.contains(GuestPageBackingAddress(page))) {
         return RetakeFinalAttempt(
             CrossThreadDetail("foreign-write-data", page));
       }
     }
     std::set<uint32_t> new_backing_pages;
     for (uint32_t page : pages) {
-      const uint32_t backing = BackingPageAddress(page);
+      const uint32_t backing = GuestPageBackingAddress(page);
       if (!cross_thread_written_backing_pages.contains(backing)) {
         new_backing_pages.insert(backing);
       }
@@ -1138,7 +1128,7 @@ struct GuestInvocationRecorder::Impl {
                     kGuestInvocationDependencyPageDiscoveryOverflow);
     }
     for (uint32_t page : pages) {
-      cross_thread_written_backing_pages.insert(BackingPageAddress(page));
+      cross_thread_written_backing_pages.insert(GuestPageBackingAddress(page));
     }
     return true;
   }
