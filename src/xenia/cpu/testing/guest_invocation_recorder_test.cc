@@ -1068,30 +1068,36 @@ TEST_CASE("guest invocation recorder rejects abnormal control flow",
                     GuestInvocationRecorderRejection::kRecursiveInvocation,
                     kGuestInvocationDependencyRecursiveInvocation);
   }
-  SECTION("unbalanced return") {
+  // An unbalanced return means the entry it was matched against was not a call
+  // boundary, so the attempt is abandoned and a later occurrence may still
+  // record. Only exhausting the attempt budget rejects.
+  SECTION("unbalanced return abandons the attempt") {
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
     Define(*recorder, kNestedAddress, kNestedEndAddress);
     EnterRoot(*recorder);
     REQUIRE(recorder->OnFunctionEntry(kOwner, kNestedAddress, kNestedEndAddress,
                                       MakeState(2)));
-    REQUIRE_FALSE(recorder->OnFunctionExit(kOwner, kRootAddress, kReturnAddress,
-                                           MakeState(3)));
-    RequireRejected(*recorder,
-                    GuestInvocationRecorderRejection::kUnbalancedReturn,
-                    kGuestInvocationDependencyUnbalancedReturn);
+    REQUIRE(recorder->OnFunctionExit(kOwner, kRootAddress, kReturnAddress,
+                                     MakeState(3)));
+    REQUIRE(recorder->state() ==
+            GuestInvocationRecorderState::kWaitingForDiscoveryAttempt);
   }
-  SECTION("wrong root continuation") {
+  SECTION("repeated unbalanced returns exhaust the attempt budget") {
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
-    EnterRoot(*recorder);
-    REQUIRE_FALSE(recorder->OnFunctionExit(kOwner, kRootAddress,
-                                           kReturnAddress + 4, MakeState(3)));
+    for (uint32_t attempt = 0; attempt < MakeLimits().max_attempts; ++attempt) {
+      EnterRoot(*recorder);
+      if (!recorder->OnFunctionExit(kOwner, kRootAddress, kReturnAddress + 4,
+                                    MakeState(3))) {
+        break;
+      }
+    }
     RequireRejected(*recorder,
                     GuestInvocationRecorderRejection::kUnbalancedReturn,
                     kGuestInvocationDependencyUnbalancedReturn);
   }
-  SECTION("wrong nested continuation") {
+  SECTION("wrong nested continuation abandons the attempt") {
     std::unique_ptr<GuestInvocationRecorder> recorder =
         MakeRecorder(reader, clock);
     Define(*recorder, kNestedAddress, kNestedEndAddress);
@@ -1100,11 +1106,10 @@ TEST_CASE("guest invocation recorder rejects abnormal control flow",
     nested_entry.link_register = kRootAddress + 8;
     REQUIRE(recorder->OnFunctionEntry(kOwner, kNestedAddress, kNestedEndAddress,
                                       nested_entry));
-    REQUIRE_FALSE(recorder->OnFunctionExit(kOwner, kNestedAddress,
-                                           kRootAddress + 12, MakeState(3)));
-    RequireRejected(*recorder,
-                    GuestInvocationRecorderRejection::kUnbalancedReturn,
-                    kGuestInvocationDependencyUnbalancedReturn);
+    REQUIRE(recorder->OnFunctionExit(kOwner, kNestedAddress, kRootAddress + 12,
+                                     MakeState(3)));
+    REQUIRE(recorder->state() ==
+            GuestInvocationRecorderState::kWaitingForDiscoveryAttempt);
   }
   SECTION("tail call replaces the calling frame") {
     reader.AddPage(kDataPageA, 1);

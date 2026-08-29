@@ -533,10 +533,8 @@ struct GuestInvocationRecorder::Impl {
     }
     const CodePageReadResult pending_snapshot = SnapshotPendingDefinitions();
     if (pending_snapshot == CodePageReadResult::kRetry) {
-      return Reject(
-          GuestInvocationRecorderRejection::kPageReadFailure,
-          "definition snapshot contention persisted until function entry",
-          kGuestInvocationDependencyUnsupportedMappingOrProtection);
+      attempt_snapshot_contended = true;
+      return false;
     }
     if (pending_snapshot == CodePageReadResult::kFailure) {
       return false;
@@ -682,7 +680,17 @@ struct GuestInvocationRecorder::Impl {
     entered_functions.insert(selection.root_address);
     if (!AddTranslationClosureSeed(selection.root_address,
                                    selection.root_end_address, true)) {
-      return false;
+      if (!attempt_snapshot_contended) {
+        return false;
+      }
+      attempt_snapshot_contended = false;
+      if (attempt_count < limits.max_attempts) {
+        return AbandonAttempt();
+      }
+      return Reject(
+          GuestInvocationRecorderRejection::kPageReadFailure,
+          "definition snapshot contention persisted until function entry",
+          kGuestInvocationDependencyUnsupportedMappingOrProtection);
     }
     attempt_entry_state = entry_state;
     attempt_return_address = return_address;
@@ -841,6 +849,21 @@ struct GuestInvocationRecorder::Impl {
     result = std::move(accepted);
     state = GuestInvocationRecorderState::kComplete;
     initial_pages.clear();
+    return true;
+  }
+
+  // A stale link register at entry is indistinguishable from a call boundary
+  // until the exit disagrees with it. Returning to the waiting state spends
+  // one attempt instead of the capture, so a later occurrence entered by a
+  // real call still records.
+  bool AbandonAttempt() {
+    call_stack.clear();
+    attempt_pages.clear();
+    attempt_read_backing_pages.clear();
+    cross_thread_written_backing_pages.clear();
+    inherited_return_address.reset();
+    initial_pages.clear();
+    state = GuestInvocationRecorderState::kWaitingForDiscoveryAttempt;
     return true;
   }
 
@@ -1212,6 +1235,9 @@ struct GuestInvocationRecorder::Impl {
   uint64_t access_count = 0;
   uint32_t root_occurrence_count = 0;
   uint32_t attempt_count = 0;
+  // Set when a code-page snapshot lost the global critical region to a guest
+  // thread. Transient, so the attempt is spent rather than the capture.
+  bool attempt_snapshot_contended = false;
   uint32_t attempt_return_address = 0;
   GuestPPCRegisterState attempt_entry_state = {};
 
@@ -1464,9 +1490,21 @@ bool GuestInvocationRecorder::OnFunctionExit(
   if (impl_->call_stack.empty() ||
       impl_->call_stack.back().address != address ||
       impl_->call_stack.back().return_address != return_address) {
-    return impl_->Reject(GuestInvocationRecorderRejection::kUnbalancedReturn,
-                         "function exit does not match the recorded call stack",
-                         kGuestInvocationDependencyUnbalancedReturn);
+    if (impl_->attempt_count < impl_->limits.max_attempts) {
+      return impl_->AbandonAttempt();
+    }
+    return impl_->Reject(
+        GuestInvocationRecorderRejection::kUnbalancedReturn,
+        fmt::format(
+            "function exit does not match the recorded call stack: "
+            "exit {:08X} return {:08X} depth {} top {:08X} return "
+            "{:08X}",
+            address, return_address, impl_->call_stack.size(),
+            impl_->call_stack.empty() ? 0 : impl_->call_stack.back().address,
+            impl_->call_stack.empty()
+                ? 0
+                : impl_->call_stack.back().return_address),
+        kGuestInvocationDependencyUnbalancedReturn);
   }
   impl_->call_stack.pop_back();
   impl_->inherited_return_address.reset();
