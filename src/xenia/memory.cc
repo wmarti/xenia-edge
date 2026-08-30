@@ -148,6 +148,180 @@ void RandomizeMemory(void* range_start, uint32_t size) {
   }
 }
 
+Memory::PhysicalMemoryWriteScope::~PhysicalMemoryWriteScope() { End(); }
+
+Memory::PhysicalMemoryWriteScope::PhysicalMemoryWriteScope(
+    PhysicalMemoryWriteScope&& other) noexcept
+    : memory_(other.memory_),
+      token_(other.token_),
+      start_(other.start_),
+      length_(other.length_) {
+  other.memory_ = nullptr;
+  other.token_ = 0;
+  other.start_ = 0;
+  other.length_ = 0;
+}
+
+Memory::PhysicalMemoryWriteScope& Memory::PhysicalMemoryWriteScope::operator=(
+    PhysicalMemoryWriteScope&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  End();
+  memory_ = other.memory_;
+  token_ = other.token_;
+  start_ = other.start_;
+  length_ = other.length_;
+  other.memory_ = nullptr;
+  other.token_ = 0;
+  other.start_ = 0;
+  other.length_ = 0;
+  return *this;
+}
+
+void Memory::PhysicalMemoryWriteScope::End(uint32_t written_length) {
+  if (!memory_) {
+    return;
+  }
+  Memory* memory = memory_;
+  const uint64_t token = token_;
+  const uint32_t start = start_;
+  const uint32_t declared_length = length_;
+  memory_ = nullptr;
+  token_ = 0;
+  start_ = 0;
+  length_ = 0;
+  memory->EndPhysicalMemoryWrite(token, start, declared_length, written_length);
+}
+
+void Memory::EnablePhysicalMemoryWriteTracking() {
+  physical_memory_write_tracking_users_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Memory::DisablePhysicalMemoryWriteTracking() {
+  const uint32_t previous = physical_memory_write_tracking_users_.fetch_sub(
+      1, std::memory_order_relaxed);
+  assert_not_zero(previous);
+}
+
+Memory::PhysicalMemoryWriteScope Memory::BeginPhysicalMemoryWrite(
+    uint32_t start, uint32_t length, bool force_callbacks) {
+  const bool track_in_progress = physical_memory_write_tracking_users_.load(
+                                     std::memory_order_relaxed) != 0;
+  if (!length || (!force_callbacks && !track_in_progress)) {
+    return {};
+  }
+  start &= UINT32_C(0x1FFFFFFF);
+  length = std::min(length, UINT32_C(0x20000000) - start);
+  if (!length) {
+    return {};
+  }
+  if (!track_in_progress) {
+    // XFile and trace playback must still publish the same invalidation
+    // callbacks they historically did, but with no snapshot consumer active
+    // there is no reason to register the write or take the second global lock
+    // at completion.
+    return PhysicalMemoryWriteScope(*this, 0, start, length);
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  ++physical_memory_write_token_;
+  if (!physical_memory_write_token_) {
+    // Keep the common path O(1). Only a 2^64 wrap needs to search for a token
+    // not held by an overlapping live scope.
+    do {
+      ++physical_memory_write_token_;
+    } while (!physical_memory_write_token_ ||
+             std::any_of(active_physical_memory_writes_.cbegin(),
+                         active_physical_memory_writes_.cend(),
+                         [this](const ActivePhysicalMemoryWrite& write) {
+                           return write.token == physical_memory_write_token_;
+                         }));
+  }
+  active_physical_memory_writes_.push_back(
+      {physical_memory_write_token_, start, length});
+  return PhysicalMemoryWriteScope(*this, physical_memory_write_token_, start,
+                                  length);
+}
+
+bool Memory::IsPhysicalMemoryWriteInProgress(
+    const global_unique_lock_type& global_lock, uint32_t start,
+    uint32_t length) const {
+  assert_true(global_lock.owns_lock());
+  if (!length) {
+    return false;
+  }
+  start &= UINT32_C(0x1FFFFFFF);
+  length = std::min(length, UINT32_C(0x20000000) - start);
+  if (!length) {
+    return false;
+  }
+  const uint32_t end = start + length - 1;
+  for (const ActivePhysicalMemoryWrite& write :
+       active_physical_memory_writes_) {
+    const uint32_t write_end = write.start + write.length - 1;
+    if (write_end >= start && write.start <= end) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void Memory::EndPhysicalMemoryWrite(uint64_t token, uint32_t start,
+                                    uint32_t declared_length,
+                                    uint32_t written_length) {
+  const uint32_t length = written_length == UINT32_MAX
+                              ? declared_length
+                              : std::min(written_length, declared_length);
+  bool invalidation_published = false;
+  if (length) {
+    auto complete_alias = [&](PhysicalHeap& heap) {
+      const uint32_t physical_offset =
+          heap.GetPhysicalAddress(heap.heap_base());
+      if (start + length <= physical_offset) {
+        return;
+      }
+      const uint32_t alias_physical_start = std::max(start, physical_offset);
+      const uint32_t alias_offset = alias_physical_start - physical_offset;
+      if (alias_offset >= heap.heap_size()) {
+        return;
+      }
+      const uint32_t alias_length =
+          std::min(length - (alias_physical_start - start),
+                   heap.heap_size() - alias_offset);
+      bool alias_watched = false;
+      auto global_lock = global_critical_region_.Acquire();
+      heap.TriggerCallbacks(
+          std::move(global_lock), heap.heap_base() + alias_offset, alias_length,
+          true, true, true, false, !invalidation_published, &alias_watched);
+      invalidation_published |= alias_watched;
+    };
+    // Access watches are armed independently on all three physical aliases.
+    // Publish the invalidation through the first watched alias, but clear and
+    // unprotect every alias so the raw write doesn't cause a duplicate fault.
+    complete_alias(heaps_.vA0000000);
+    complete_alias(heaps_.vC0000000);
+    complete_alias(heaps_.vE0000000);
+  }
+
+  // Keep the writer registered until every alias has been processed. A
+  // snapshot therefore sees either an active writer or the invalidation epoch
+  // published by completion, never a gap between them.
+  if (!token) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  auto found = std::find_if(active_physical_memory_writes_.begin(),
+                            active_physical_memory_writes_.end(),
+                            [token](const ActivePhysicalMemoryWrite& write) {
+                              return write.token == token;
+                            });
+  assert_true(found != active_physical_memory_writes_.end());
+  if (found != active_physical_memory_writes_.end()) {
+    *found = active_physical_memory_writes_.back();
+    active_physical_memory_writes_.pop_back();
+  }
+}
+
 Memory::Memory() {
   system_page_size_ = uint32_t(xe::memory::page_size());
   system_allocation_granularity_ =
@@ -158,6 +332,9 @@ Memory::Memory() {
 
 Memory::~Memory() {
   assert_true(active_memory_ == this);
+  assert_true(active_physical_memory_writes_.empty());
+  assert_zero(
+      physical_memory_write_tracking_users_.load(std::memory_order_relaxed));
   active_memory_ = nullptr;
 
   // Uninstall the MMIO handler, as we won't be able to service more
@@ -682,6 +859,14 @@ bool Memory::AccessViolationCallback(
   // Will be rounded to physical page boundaries internally, so just pass 1 as
   // the length - guranteed not to cross page boundaries also.
   auto physical_heap = static_cast<PhysicalHeap*>(heap);
+  if (is_write && physical_heap->QueryRangeAccess(
+                      global_lock_locked_once, virtual_address,
+                      virtual_address) != xe::memory::PageAccess::kReadWrite) {
+    // A read-only page may carry a logical invalidation watch solely for raw
+    // host writers. An illegal guest store must propagate without consuming
+    // that watch or pretending the access was handled once.
+    return false;
+  }
   return physical_heap->TriggerCallbacks(std::move(global_lock_locked_once),
                                          virtual_address, 1, is_write, false);
 }
@@ -979,12 +1164,16 @@ bool BaseHeap::Save(ByteStream* stream) {
       void* addr = TranslateRelative(i * page_size_);
 
       memory::PageAccess old_access;
-      memory::Protect(addr, page_size_, memory::PageAccess::kReadWrite,
-                      &old_access);
+      if (!skip_host_protect_) {
+        memory::Protect(addr, page_size_, memory::PageAccess::kReadWrite,
+                        &old_access);
+      }
 
       stream->Write(addr, page_size_);
 
-      memory::Protect(addr, page_size_, old_access, nullptr);
+      if (!skip_host_protect_) {
+        memory::Protect(addr, page_size_, old_access, nullptr);
+      }
     }
   }
 
@@ -1012,7 +1201,8 @@ bool BaseHeap::Restore(ByteStream* stream) {
 
     // Commit the memory if it isn't already. We do not need to reserve any
     // memory, as the mapping has already taken care of that.
-    if (page.state & kMemoryAllocationCommit) {
+    if ((page.state & kMemoryAllocationCommit) &&
+        !ShouldSkipHostCommit(*this)) {
       xe::memory::AllocFixed(TranslateRelative(i * page_size_), page_size_,
                              memory::AllocationType::kCommit,
                              memory::PageAccess::kReadWrite);
@@ -1023,12 +1213,22 @@ bool BaseHeap::Restore(ByteStream* stream) {
     // TODO(DrChat): read compressed with snappy.
     if (page.state & kMemoryAllocationCommit) {
       void* addr = TranslateRelative(i * page_size_);
-      xe::memory::Protect(addr, page_size_, memory::PageAccess::kReadWrite,
-                          nullptr);
+      Memory::PhysicalMemoryWriteScope physical_write;
+      if (heap_type_ == HeapType::kGuestPhysical && heap_base_ == 0) {
+        physical_write = memory_->BeginPhysicalMemoryWrite(
+            uint32_t(i * page_size_), page_size_);
+      }
+      if (!skip_host_protect_) {
+        xe::memory::Protect(addr, page_size_, memory::PageAccess::kReadWrite,
+                            nullptr);
+      }
 
       stream->Read(addr, page_size_);
+      physical_write.End();
 
-      xe::memory::Protect(addr, page_size_, page_access, nullptr);
+      if (!skip_host_protect_) {
+        xe::memory::Protect(addr, page_size_, page_access, nullptr);
+      }
     }
   }
 
@@ -1189,6 +1389,15 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
   }
 
   // Allocate from host.
+  auto scribble_allocated_range = [&](void* range) {
+    Memory::PhysicalMemoryWriteScope physical_write;
+    if (heap_type_ == HeapType::kGuestPhysical && heap_base_ == 0) {
+      physical_write = memory_->BeginPhysicalMemoryWrite(
+          start_page_number * page_size_, page_count * page_size_);
+    }
+    RandomizeMemory(range, page_count * page_size_);
+    physical_write.End();
+  };
   if (allocation_type == kMemoryAllocationReserve) {
     // Reserve is not needed, as we are mapped already.
   } else {
@@ -1205,11 +1414,11 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
       }
 
       if (cvars::scribble_heap && IsWritableProtect(protect)) {
-        RandomizeMemory(result, page_count * page_size_);
+        scribble_allocated_range(result);
       }
     } else if (cvars::scribble_heap && IsWritableProtect(protect)) {
-      RandomizeMemory(TranslateRelative(start_page_number * page_size_),
-                      page_count * page_size_);
+      scribble_allocated_range(
+          TranslateRelative(start_page_number * page_size_));
     }
   }
 
@@ -1377,6 +1586,16 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   RemoveFreeBlock(start_page_number, page_count);
 
   // Allocate from host.
+  auto scribble_allocated_range = [&](void* range) {
+    Memory::PhysicalMemoryWriteScope physical_write;
+    if (heap_type_ == HeapType::kGuestPhysical && heap_base_ == 0) {
+      physical_write = memory_->BeginPhysicalMemoryWrite(
+          start_page_number << page_size_shift_,
+          page_count << page_size_shift_);
+    }
+    RandomizeMemory(range, page_count << page_size_shift_);
+    physical_write.End();
+  };
   if (allocation_type == kMemoryAllocationReserve) {
     // Reserve is not needed, as we are mapped already.
   } else {
@@ -1395,11 +1614,11 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
       }
 
       if (cvars::scribble_heap && IsWritableProtect(protect)) {
-        RandomizeMemory(result, page_count << page_size_shift_);
+        scribble_allocated_range(result);
       }
     } else if (cvars::scribble_heap && IsWritableProtect(protect)) {
-      RandomizeMemory(TranslateRelative(start_page_number << page_size_shift_),
-                      page_count << page_size_shift_);
+      scribble_allocated_range(
+          TranslateRelative(start_page_number << page_size_shift_));
     }
   }
 
@@ -1790,35 +2009,36 @@ bool BaseHeap::QueryProtect(uint32_t address, uint32_t* out_protect) {
 
 xe::memory::PageAccess BaseHeap::QueryRangeAccess(uint32_t low_address,
                                                   uint32_t high_address) {
+  auto global_lock = global_critical_region_.Acquire();
+  return QueryRangeAccess(global_lock, low_address, high_address);
+}
+
+xe::memory::PageAccess BaseHeap::QueryRangeAccess(
+    const global_unique_lock_type& global_lock, uint32_t low_address,
+    uint32_t high_address) {
+  assert_true(global_lock.owns_lock());
   if (low_address > high_address || low_address < heap_base_ ||
       (high_address - heap_base_) >= heap_size_) {
     return xe::memory::PageAccess::kNoAccess;
   }
   uint32_t low_page_number = (low_address - heap_base_) >> page_size_shift_;
   uint32_t high_page_number = (high_address - heap_base_) >> page_size_shift_;
-  bool all_readable = true;
   bool all_writable = true;
-  {
-    auto global_lock = global_critical_region_.Acquire();
-    for (uint32_t i = low_page_number; i <= high_page_number; ++i) {
-      uint32_t page_protect = page_table_[i].current_protect;
-      if (!(page_protect & kMemoryProtectRead)) {
-        all_readable = false;
-      }
-      // Check if page is writable in any form (Write or WriteCombine)
-      if (!(page_protect & kMemoryProtectWrite) &&
-          !(page_protect & kMemoryProtectWriteCombine)) {
-        all_writable = false;
-      }
+  for (uint32_t i = low_page_number; i <= high_page_number; ++i) {
+    uint32_t page_protect = page_table_[i].current_protect;
+    if (!(page_protect & kMemoryProtectRead)) {
+      return xe::memory::PageAccess::kNoAccess;
+    }
+    // Check if page is writable in any form (Write or WriteCombine)
+    if (!(page_protect & kMemoryProtectWrite) &&
+        !(page_protect & kMemoryProtectWriteCombine)) {
+      all_writable = false;
     }
   }
-  if (all_readable && all_writable) {
+  if (all_writable) {
     return xe::memory::PageAccess::kReadWrite;
-  } else if (all_readable) {
-    return xe::memory::PageAccess::kReadOnly;
-  } else {
-    return xe::memory::PageAccess::kNoAccess;
   }
+  return xe::memory::PageAccess::kReadOnly;
 }
 
 VirtualHeap::VirtualHeap() = default;
@@ -2077,9 +2297,9 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   // Only invalidate if making writable again, for simplicity - not when simply
   // marking some range as immutable, for instance. The guest is announcing a
   // write rather than reacting to a fault, so invalidate even with no watch
-  // armed: a range that was read-only when it was last uploaded never got one,
-  // and would otherwise stay stale for as long as the guest keeps it read-only
-  // outside of its own writes.
+  // armed. Protection changes may cover inaccessible or not-yet-consumed
+  // ranges, and the conservative notification also preserves the historical
+  // allocation-alias behavior of this path.
   if (IsWritableProtect(protect)) {
     TriggerCallbacks(std::move(global_lock), address, size, true, true, false,
                      true);
@@ -2170,8 +2390,8 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
     // - Page seen as writable by the guest, but only needs data providers -
     //   just set the bits to enable invalidation notifications (already has
     //   even stricter protection than needed).
-    // - Page not writable as requested by the game - don't do anything (need
-    //   real access violations here).
+    // - Page read-only as requested by the game - record the logical watch but
+    //   keep the host protection unchanged so illegal guest writes still fail.
     // If enabling data providers:
     // - Page accessible (either read/write or read-only) and didn't need data
     //   providers initially - protect and enable data providers.
@@ -2202,18 +2422,18 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
     }
     xe::memory::PageAccess current_page_access = SystemPageGuestAccess(i);
     bool protect_system_page = false;
-    // Don't do anything with inaccessible pages - don't protect, don't enable
-    // callbacks - because real access violations are needed there. And don't
-    // enable invalidation notifications for read-only pages for the same
-    // reason.
+    // Don't do anything with inaccessible pages because real access violations
+    // are needed there. Read-only pages may still carry a logical invalidation
+    // watch for raw host writers, but must not have their protection changed.
     if (current_page_access != xe::memory::PageAccess::kNoAccess) {
       if constexpr (enable_invalidation_notifications) {
-        if (current_page_access != xe::memory::PageAccess::kReadOnly &&
-            (page_flags_block.notify_on_invalidation & page_flags_bit) == 0) {
+        if ((page_flags_block.notify_on_invalidation & page_flags_bit) == 0) {
           page_flags_block.notify_on_invalidation |= page_flags_bit;
           // A read-watched page is already protected no-access, stricter than
-          // read-only, so don't loosen it here.
-          if ((page_flags_block.notify_on_read & page_flags_bit) == 0) {
+          // read-only, so don't loosen it here. Guest read-only pages already
+          // have the required protection and only need the logical watch bit.
+          if (current_page_access != xe::memory::PageAccess::kReadOnly &&
+              (page_flags_block.notify_on_read & page_flags_bit) == 0) {
             protect_system_page = true;
           }
         }
@@ -2253,7 +2473,11 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
 bool PhysicalHeap::TriggerCallbacks(
     global_unique_lock_type global_lock_locked_once, uint32_t virtual_address,
     uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect,
-    bool invalidate_unwatched) {
+    bool invalidate_unwatched, bool invoke_invalidation_callbacks,
+    bool* any_watched_out) {
+  if (any_watched_out) {
+    *any_watched_out = false;
+  }
   if (virtual_address < heap_base_) {
     if (heap_base_ - virtual_address >= length) {
       return false;
@@ -2375,6 +2599,9 @@ bool PhysicalHeap::TriggerCallbacks(
       break;
     }
   }
+  if (any_watched_out) {
+    *any_watched_out = any_watched;
+  }
   if (!any_watched && !invalidate_unwatched) {
     // No watches on this page — another thread already cleared them (race
     // condition between the fault firing and acquiring the lock). Return true
@@ -2406,20 +2633,26 @@ bool PhysicalHeap::TriggerCallbacks(
       heap_size_ - (physical_address_start - physical_address_offset));
   uint32_t unwatch_first = 0;
   uint32_t unwatch_last = UINT32_MAX;
-  for (auto invalidation_callback :
-       memory_->physical_memory_invalidation_callbacks_) {
-    std::pair<uint32_t, uint32_t> callback_unwatch_range =
-        invalidation_callback->first(invalidation_callback->second,
-                                     physical_address_start, physical_length,
-                                     unwatch_exact_range);
-    if (!unwatch_exact_range) {
-      unwatch_first = std::max(unwatch_first, callback_unwatch_range.first);
-      unwatch_last = std::min(
-          unwatch_last,
-          xe::sat_add(
-              callback_unwatch_range.first,
-              std::max(callback_unwatch_range.second, uint32_t(1)) - 1));
+  if (invoke_invalidation_callbacks) {
+    for (auto invalidation_callback :
+         memory_->physical_memory_invalidation_callbacks_) {
+      std::pair<uint32_t, uint32_t> callback_unwatch_range =
+          invalidation_callback->first(invalidation_callback->second,
+                                       physical_address_start, physical_length,
+                                       unwatch_exact_range);
+      if (!unwatch_exact_range) {
+        unwatch_first = std::max(unwatch_first, callback_unwatch_range.first);
+        unwatch_last = std::min(
+            unwatch_last,
+            xe::sat_add(
+                callback_unwatch_range.first,
+                std::max(callback_unwatch_range.second, uint32_t(1)) - 1));
+      }
     }
+  } else {
+    // Suppression is used only to clear duplicate physical aliases after one
+    // alias has already published the callback for the same raw write.
+    assert_true(unwatch_exact_range);
   }
   if (!unwatch_exact_range) {
     // Always unwatch at least the requested pages.

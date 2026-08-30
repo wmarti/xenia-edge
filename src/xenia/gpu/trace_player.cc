@@ -146,8 +146,11 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data,
       case TraceCommandType::kPacketStart: {
         auto cmd = reinterpret_cast<const PacketStartCommand*>(trace_ptr);
         trace_ptr += sizeof(*cmd);
+        auto physical_write = memory->BeginPhysicalMemoryWrite(
+            cmd->base_ptr, cmd->count * uint32_t(sizeof(uint32_t)), true);
         std::memcpy(memory->TranslatePhysical(cmd->base_ptr), trace_ptr,
                     cmd->count * 4);
+        physical_write.End();
         trace_ptr += cmd->count * 4;
         pending_packet = cmd;
         break;
@@ -169,12 +172,13 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data,
       case TraceCommandType::kMemoryRead: {
         auto cmd = reinterpret_cast<const MemoryCommand*>(trace_ptr);
         trace_ptr += sizeof(*cmd);
+        auto physical_write = memory->BeginPhysicalMemoryWrite(
+            cmd->base_ptr, cmd->decoded_length, true);
         DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
                          memory->TranslatePhysical(cmd->base_ptr),
                          cmd->decoded_length);
+        physical_write.End();
         trace_ptr += cmd->encoded_length;
-        command_processor->TracePlaybackWroteMemory(cmd->base_ptr,
-                                                    cmd->decoded_length);
         break;
       }
       case TraceCommandType::kMemoryWrite: {

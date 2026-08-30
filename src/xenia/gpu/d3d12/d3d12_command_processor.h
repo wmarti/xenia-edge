@@ -80,8 +80,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   void RequestFrameTrace(const std::filesystem::path& root_path) override;
 
-  void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
-
   void RestoreEdramSnapshot(const void* snapshot) override;
 
   void PollCompletedSubmission() override;

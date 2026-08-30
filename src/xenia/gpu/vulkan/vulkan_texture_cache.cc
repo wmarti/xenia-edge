@@ -1191,9 +1191,9 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
       new VulkanTexture(*this, key, image, allocation));
 }
 
-bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
-                                                               bool load_base,
-                                                               bool load_mips) {
+bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(
+    Texture& texture, bool load_base, bool load_mips, Texture::CpuLoadSource*,
+    Texture::CpuLoadSource*) {
   SCOPE_profile_cpu_f("gpu");
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();

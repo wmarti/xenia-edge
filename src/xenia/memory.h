@@ -221,6 +221,9 @@ class BaseHeap {
   // range.
   xe::memory::PageAccess QueryRangeAccess(uint32_t low_address,
                                           uint32_t high_address);
+  xe::memory::PageAccess QueryRangeAccess(
+      const global_unique_lock_type& global_lock, uint32_t low_address,
+      uint32_t high_address);
 
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
@@ -325,7 +328,9 @@ class PhysicalHeap : public BaseHeap {
                         uint32_t virtual_address, uint32_t length,
                         bool is_write, bool unwatch_exact_range,
                         bool unprotect = true,
-                        bool invalidate_unwatched = false);
+                        bool invalidate_unwatched = false,
+                        bool invoke_invalidation_callbacks = true,
+                        bool* any_watched_out = nullptr);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
@@ -482,6 +487,52 @@ class Memory {
     return reinterpret_cast<T>(physical_membase_ +
                                (guest_address & 0x1FFFFFFF));
   }
+
+  // Raw physical_membase_ writes bypass the protected guest aliases. Writers
+  // must bracket them with this scope so GPU consumers can reject an in-flight
+  // snapshot and so normal physical-memory invalidation callbacks run after
+  // the bytes have been written.
+  class PhysicalMemoryWriteScope {
+   public:
+    PhysicalMemoryWriteScope() = default;
+    ~PhysicalMemoryWriteScope();
+    PhysicalMemoryWriteScope(const PhysicalMemoryWriteScope&) = delete;
+    PhysicalMemoryWriteScope& operator=(const PhysicalMemoryWriteScope&) =
+        delete;
+    PhysicalMemoryWriteScope(PhysicalMemoryWriteScope&& other) noexcept;
+    PhysicalMemoryWriteScope& operator=(
+        PhysicalMemoryWriteScope&& other) noexcept;
+
+    explicit operator bool() const { return memory_ != nullptr; }
+    // Ends the write and invalidates the bytes actually written. Omitting the
+    // length conservatively invalidates the whole declared range.
+    void End(uint32_t written_length = UINT32_MAX);
+
+   private:
+    friend class Memory;
+    PhysicalMemoryWriteScope(Memory& memory, uint64_t token, uint32_t start,
+                             uint32_t length)
+        : memory_(&memory), token_(token), start_(start), length_(length) {}
+
+    Memory* memory_ = nullptr;
+    uint64_t token_ = 0;
+    uint32_t start_ = 0;
+    uint32_t length_ = 0;
+  };
+
+  // Active-writer tracking is opt-in because bracketing every command-processor
+  // and audio write takes the global lock. Callers that already required
+  // physical-memory callback delivery before this contract may force callback
+  // publication for one operation without enabling active-writer tracking.
+  // Tracking users are initialized and destroyed outside guest execution; they
+  // must not appear while a callback-only scope is in flight.
+  void EnablePhysicalMemoryWriteTracking();
+  void DisablePhysicalMemoryWriteTracking();
+  PhysicalMemoryWriteScope BeginPhysicalMemoryWrite(
+      uint32_t start, uint32_t length, bool force_callbacks = false);
+  bool IsPhysicalMemoryWriteInProgress(
+      const global_unique_lock_type& global_lock, uint32_t start,
+      uint32_t length) const;
 
   // Translates a host address to a guest virtual address.
   // Note that the contents at the returned host address are big-endian.
@@ -710,6 +761,18 @@ class Memory {
       physical_memory_invalidation_callbacks_;
   std::vector<std::pair<PhysicalMemoryReadCallback, void*>*>
       physical_memory_read_callbacks_;
+  struct ActivePhysicalMemoryWrite {
+    uint64_t token;
+    uint32_t start;
+    uint32_t length;
+  };
+  std::vector<ActivePhysicalMemoryWrite> active_physical_memory_writes_;
+  uint64_t physical_memory_write_token_ = 0;
+  std::atomic<uint32_t> physical_memory_write_tracking_users_{0};
+
+  void EndPhysicalMemoryWrite(uint64_t token, uint32_t start,
+                              uint32_t declared_length,
+                              uint32_t written_length);
 };
 
 }  // namespace xe

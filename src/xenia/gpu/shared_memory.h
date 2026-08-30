@@ -10,6 +10,8 @@
 #ifndef XENIA_GPU_SHARED_MEMORY_H_
 #define XENIA_GPU_SHARED_MEMORY_H_
 
+#include <atomic>
+
 #include "xenia/memory.h"
 
 namespace xe {
@@ -21,14 +23,22 @@ namespace gpu {
 class SharedMemory {
  public:
   // Invalidation-event diagnostics; see FireWatches.
-  uint64_t fire_watches_events() const { return fire_watches_events_; }
-  uint64_t fire_watches_pages() const { return fire_watches_pages_; }
-  uint64_t fire_watches_events_ = 0;
-  uint64_t fire_watches_pages_ = 0;
-  uint64_t fire_watches_gpu_events() const { return fire_watches_gpu_events_; }
-  uint64_t fire_watches_gpu_pages() const { return fire_watches_gpu_pages_; }
-  uint64_t fire_watches_gpu_events_ = 0;
-  uint64_t fire_watches_gpu_pages_ = 0;
+  uint64_t fire_watches_events() const {
+    return fire_watches_events_.load(std::memory_order_relaxed);
+  }
+  uint64_t fire_watches_pages() const {
+    return fire_watches_pages_.load(std::memory_order_relaxed);
+  }
+  uint64_t fire_watches_gpu_events() const {
+    return fire_watches_gpu_events_.load(std::memory_order_relaxed);
+  }
+  uint64_t fire_watches_gpu_pages() const {
+    return fire_watches_gpu_pages_.load(std::memory_order_relaxed);
+  }
+  std::atomic<uint64_t> fire_watches_events_{0};
+  std::atomic<uint64_t> fire_watches_pages_{0};
+  std::atomic<uint64_t> fire_watches_gpu_events_{0};
+  std::atomic<uint64_t> fire_watches_gpu_pages_{0};
 
   static constexpr uint32_t kBufferSizeLog2 = 29;
   static constexpr uint32_t kBufferSize = 1 << kBufferSizeLog2;
@@ -88,6 +98,37 @@ class SharedMemory {
   // memory copy. Hold the global critical region if relying on this for state
   // transitions such as watch installation.
   bool IsRangeValid(uint32_t start, uint32_t length) const;
+  // Returns whether no page in the range is currently valid in the host GPU
+  // memory copy. This is deliberately stricter than !IsRangeValid: a mixed
+  // CPU/GPU range is not safe to identify with a hash of guest RAM.
+  bool IsRangeInvalid(uint32_t start, uint32_t length) const;
+  // Returns whether every page is valid and none is GPU-authoritative. Used
+  // with a pre-request IsRangeInvalid snapshot to verify that an intervening
+  // GPU write did not become the source of a derived texture load.
+  bool IsRangeValidFromCpu(uint32_t start, uint32_t length) const;
+  // Returns the newest CPU or non-exact invalidation event touching the host
+  // pages covering the range. Unlike current validity, this survives a later
+  // RequestRange making the pages valid again. Must be queried while holding
+  // the global critical region when used in a snapshot publication token.
+  uint64_t GetRangeInvalidationEpoch(const global_unique_lock_type& global_lock,
+                                     uint32_t start, uint32_t length) const;
+  // Returns the newest GPU-write generation touching the range. Unlike the
+  // current GPU-written validity bits, this history survives a later CPU
+  // invalidation, so a consumer can prove that no GPU write happened since a
+  // CPU-backed snapshot was taken. Must be queried while holding the global
+  // critical region when used as part of a state transition.
+  uint64_t GetRangeGpuWriteGeneration(
+      const global_unique_lock_type& global_lock, uint32_t start,
+      uint32_t length) const;
+  // Allocates persistent per-guest-page GPU-write generations. Call only during
+  // backend initialization, before GPU submissions or guest writes can race
+  // this state. A backend that never calls this pays no per-write epoch cost.
+  bool InitializeWriteGenerationTracking(
+      const global_unique_lock_type& global_lock);
+  // Re-enables CPU write invalidation callbacks without changing shared-memory
+  // validity. Used when a derived texture is still current even though the
+  // coarse shared-memory page containing it remains invalid.
+  void WatchRangeForCpuWrites(uint32_t start, uint32_t length);
 
   Memory& memory() const { return memory_; }
 
@@ -232,6 +273,14 @@ class SharedMemory {
   uint64_t* system_page_flags_valid_ = nullptr;
   uint64_t* system_page_flags_valid_and_gpu_written_ = nullptr;
 
+  // Last GPU-write event touching each 4 KiB guest physical page. This is
+  // deliberately finer than the host page size on Apple Silicon: the current
+  // validity flags must be host-page-granular for mprotect, but persistent GPU
+  // provenance doesn't have that restriction.
+  static constexpr uint32_t kWriteGenerationPageSizeLog2 = 12;
+  uint64_t* guest_page_gpu_write_generations_ = nullptr;
+  uint64_t gpu_write_generation_ = 0;
+
   // Set when GPU-written flags change, so an unchanged frame skips the copy.
   bool gpu_written_data_dirty_ = false;
 
@@ -298,6 +347,12 @@ class SharedMemory {
   WatchRange* watch_range_first_free_ = nullptr;
   WatchNode* watch_node_first_free_ = nullptr;
 
+  // Last CPU or non-exact invalidation event touching each host page. Snapshot
+  // publication compares these epochs so a write followed by RequestRange
+  // can't make an in-flight upload appear current again.
+  std::vector<uint64_t> watch_page_invalidation_epochs_;
+  uint64_t watch_invalidation_epoch_ = 0;
+
   // GPU-written memory downloading for traces. <Start address, length>.
   std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;
   uint32_t trace_download_page_count_ = 0;
@@ -305,7 +360,7 @@ class SharedMemory {
   // Triggers the watches (global and per-range), removing triggered range
   // watches.
   void FireWatches(uint32_t page_first, uint32_t page_last,
-                   bool invalidated_by_gpu);
+                   bool invalidated_by_gpu, bool exact_gpu_range = false);
   // Unlinks and frees the range and its nodes. Call this in the global critical
   // region.
   void UnlinkWatchRange(WatchRange* range);

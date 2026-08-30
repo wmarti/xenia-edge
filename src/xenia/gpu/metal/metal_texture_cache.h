@@ -103,6 +103,9 @@ class MetalTextureCache : public TextureCache {
   void Shutdown();
   void ClearCache() override;
   void CompletedSubmissionUpdated(uint64_t completed_submission_index) override;
+  // Called if an uncommitted current command buffer is abandoned, since Metal
+  // won't invoke its completion handlers.
+  void NotifyCommandBufferDiscarded(MTL::CommandBuffer* command_buffer);
 
   bool UploadTexture2D(const TextureInfo& texture_info);
   bool UploadTextureCube(const TextureInfo& texture_info);
@@ -158,6 +161,7 @@ class MetalTextureCache : public TextureCache {
   void RequestTextures(uint32_t used_texture_mask) override;
 
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
+  bool SupportsTextureContentRevalidation() const override { return true; }
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
   bool EnsureScaledResolveMemoryCommitted(
       uint32_t start_unscaled, uint32_t length_unscaled,
@@ -180,16 +184,25 @@ class MetalTextureCache : public TextureCache {
   uint32_t GetMaxHostTextureDepthOrArraySize(
       xenos::DataDimension dimension) const override;
   std::unique_ptr<Texture> CreateTexture(TextureKey key) override;
-  bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
-                                             bool load_mips) override;
+  bool LoadTextureDataFromResidentMemoryImpl(
+      Texture& texture, bool load_base, bool load_mips,
+      Texture::CpuLoadSource* base_cpu_source,
+      Texture::CpuLoadSource* mips_cpu_source) override;
 
  private:
   // GPU-based texture loading entry point. Returns true on success.
-  bool TryGpuLoadTexture(Texture& texture, bool load_base, bool load_mips);
+  bool TryGpuLoadTexture(
+      Texture& texture, bool load_base, bool load_mips,
+      Texture::CpuLoadSource* base_cpu_source,
+      Texture::CpuLoadSource* mips_cpu_source,
+      Texture::ContentUploadCompletion& content_upload_completion_out);
   MTL::StorageMode GetCacheTextureStorageMode() const;
   bool ShouldUploadViaBlit() const;
+  Texture::ContentUploadCompletion GetContentUploadCompletion(
+      MTL::CommandBuffer* command_buffer);
+  void FailContentUploadCompletion(MTL::CommandBuffer* command_buffer);
   void BeginUploadCommandBufferBatch();
-  void CensusUpload(const Texture& texture);
+  void CensusUpload(Texture& texture, bool loaded_base, bool loaded_mips);
   // Creates the batch command buffer on the first upload that wants it, so a
   // request that uploads nothing costs none.
   MTL::CommandBuffer* EnsureUploadCommandBufferBatch();
@@ -303,6 +316,13 @@ class MetalTextureCache : public TextureCache {
   class UploadBufferPool;
   mutable std::mutex upload_buffer_pool_mutex_;
   std::shared_ptr<UploadBufferPool> upload_buffer_pool_;
+  // One completion token per in-flight command buffer. Weak ownership keeps
+  // discarded buffers from retaining state; textures and the completion
+  // handler own a token only when an upload was successfully encoded.
+  std::unordered_map<MTL::CommandBuffer*,
+                     std::weak_ptr<std::atomic<Texture::ContentUploadStatus>>>
+      content_upload_completions_;
+  uint32_t content_upload_completion_prune_count_ = 0;
   MTL::CommandBuffer* upload_batch_command_buffer_ = nullptr;
   bool upload_batch_command_buffer_has_work_ = false;
   uint32_t upload_batch_depth_ = 0;

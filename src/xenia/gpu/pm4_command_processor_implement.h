@@ -996,7 +996,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_REG_TO_MEM(
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
-  xe::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  {
+    auto physical_write_scope =
+        memory_->BeginPhysicalMemoryWrite(mem_addr, sizeof(uint32_t));
+    xe::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  }
   trace_writer_.WriteMemoryWrite(CpuToGpu(mem_addr), 4);
 
   return true;
@@ -1011,6 +1015,18 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_MEM_WRITE(
                                          write_addr & ~0x3, count - 1);
   }
 
+  const uint32_t write_base = write_addr & ~uint32_t(3);
+  const uint32_t write_length = (count - 1) * sizeof(uint32_t);
+  const uint32_t physical_write_base = write_base & UINT32_C(0x1FFFFFFF);
+  const uint32_t first_write_length =
+      std::min(write_length, UINT32_C(0x20000000) - physical_write_base);
+  auto first_physical_write_scope = memory_->BeginPhysicalMemoryWrite(
+      physical_write_base, first_write_length);
+  Memory::PhysicalMemoryWriteScope second_physical_write_scope;
+  if (first_write_length != write_length) {
+    second_physical_write_scope =
+        memory_->BeginPhysicalMemoryWrite(0, write_length - first_write_length);
+  }
   for (uint32_t i = 0; i < count - 1; i++) {
     uint32_t write_data = reader_.ReadAndSwap<uint32_t>();
 
@@ -1066,6 +1082,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
+      auto physical_write_scope =
+          memory_->BeginPhysicalMemoryWrite(write_reg_addr, sizeof(uint32_t));
       xe::store(memory_->TranslatePhysical(write_reg_addr), write_data);
       trace_writer_.WriteMemoryWrite(CpuToGpu(write_reg_addr), 4);
     } else {
@@ -1136,6 +1154,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   uint8_t* write_destination = memory_->TranslatePhysical(address);
+  bool write_destination_is_physical = true;
   if (address > 0x1FFFFFFF) {
     uint32_t writeback_base =
         register_file_->values[XE_GPU_REG_WRITEBACK_START];
@@ -1146,7 +1165,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
     if (writeback_base != 0 && writeback_offset < writeback_size) {
       write_destination =
           memory_->TranslateVirtual(0x7F000000 + writeback_offset);
+      write_destination_is_physical = false;
     }
+  }
+  Memory::PhysicalMemoryWriteScope physical_write_scope;
+  if (write_destination_is_physical) {
+    physical_write_scope =
+        memory_->BeginPhysicalMemoryWrite(address, sizeof(uint32_t));
   }
   xe::store(write_destination, data_value);
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
@@ -1188,6 +1213,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
 
   uint16_t* destination = (uint16_t*)memory_->TranslatePhysical(address);
 
+  auto physical_write_scope =
+      memory_->BeginPhysicalMemoryWrite(address, sizeof(extents));
   for (unsigned i = 0; i < 6; ++i) {
     destination[i] = extents[i];
   }
@@ -1255,6 +1282,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
         XenosZPDReport::QueryBatchFakeSamples(querybatch_zpd_sample_count_);
     if (report) {
       // Both QueryBatch and conventional fake samples skip elective saturation.
+      auto physical_write_scope = memory_->BeginPhysicalMemoryWrite(
+          report_record_base, sizeof(xe_gpu_depth_sample_counts));
       XenosZPDReport::WriteSampleCount(report, sample_count, false);
     }
     return true;
@@ -1270,6 +1299,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
       // Clear the record so the game knows the BEGIN was processed and
       // stale sentinel data from a prior query lifetime doesn't persist.
       if (report) {
+        auto physical_write_scope = memory_->BeginPhysicalMemoryWrite(
+            report_record_base, sizeof(xe_gpu_depth_sample_counts));
         std::memset(report, 0, sizeof(xe_gpu_depth_sample_counts));
       }
       COMMAND_PROCESSOR::BeginZPDReport(report_address);
@@ -1311,6 +1342,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
           ? static_cast<uint32_t>(cvars::occlusion_query_fake_upper_threshold)
           : fake_zpd_sample_count_ - 1;
 
+  auto physical_write_scope = memory_->BeginPhysicalMemoryWrite(
+      report_record_base, sizeof(xe_gpu_depth_sample_counts));
   XenosZPDReport::WriteSampleCount(report, fake_zpd_sample_count_, false);
   return true;
 }

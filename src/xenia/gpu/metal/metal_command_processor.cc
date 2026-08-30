@@ -612,6 +612,9 @@ MetalCommandProcessor::~MetalCommandProcessor() {
     current_render_encoder_ = nullptr;
   }
   if (current_command_buffer_) {
+    if (texture_cache_) {
+      texture_cache_->NotifyCommandBufferDiscarded(current_command_buffer_);
+    }
     current_command_buffer_->release();
     current_command_buffer_ = nullptr;
   }
@@ -1062,16 +1065,6 @@ MetalCommandProcessor::SpirvArgumentBufferPage::~SpirvArgumentBufferPage() {
   if (buffer) {
     buffer->release();
     buffer = nullptr;
-  }
-}
-
-void MetalCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr,
-                                                     uint32_t length) {
-  if (shared_memory_) {
-    shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
-  }
-  if (primitive_processor_) {
-    primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
   }
 }
 
@@ -2072,6 +2065,15 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           fprintf(cf, "reval_bytes_hashed %llu\n",
                   static_cast<unsigned long long>(
                       texture_cache_->reval_bytes_hashed()));
+          fprintf(cf, "revalidated_base %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->revalidated_base()));
+          fprintf(cf, "revalidated_mips %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->revalidated_mips()));
+          fprintf(cf, "revalidation_attempt_bytes_hashed %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->revalidation_bytes_hashed()));
           fprintf(cf, "upload_batches_all_revalidatable %llu\n",
                   static_cast<unsigned long long>(
                       texture_cache_->upload_batches_all_revalidatable()));

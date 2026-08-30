@@ -1573,9 +1573,9 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
       new D3D12Texture(*this, key, resource.Get(), resource_state));
 }
 
-bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
-                                                              bool load_base,
-                                                              bool load_mips) {
+bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(
+    Texture& texture, bool load_base, bool load_mips, Texture::CpuLoadSource*,
+    Texture::CpuLoadSource*) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
 

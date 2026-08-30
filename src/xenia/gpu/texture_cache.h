@@ -69,11 +69,22 @@ class TextureCache {
   uint64_t make_up_to_date_mips_invalid() const {
     return make_up_to_date_mips_invalid_;
   }
-  uint64_t watch_callbacks() const { return watch_callbacks_; }
-  uint64_t watch_callbacks_ = 0;
+  uint64_t watch_callbacks() const {
+    return watch_callbacks_.load(std::memory_order_relaxed);
+  }
+  uint64_t revalidated_base() const { return revalidated_base_; }
+  uint64_t revalidated_mips() const { return revalidated_mips_; }
+  uint64_t revalidation_bytes_hashed() const {
+    return revalidation_bytes_hashed_;
+  }
+  std::atomic<uint64_t> watch_callbacks_{0};
   uint64_t make_up_to_date_calls_ = 0;
   uint64_t make_up_to_date_base_invalid_ = 0;
   uint64_t make_up_to_date_mips_invalid_ = 0;
+  uint64_t revalidated_base_ = 0;
+  uint64_t revalidated_mips_ = 0;
+  uint64_t revalidation_bytes_hashed_ = 0;
+  bool physical_memory_write_tracking_enabled_ = false;
 
   // Hard limit, originating from the half-pixel offset filling hack in the
   // resolve shaders only filling up to 3 pixels, due to the bit counts used for
@@ -149,13 +160,17 @@ class TextureCache {
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);
+  // Reuses used texture parts whose bytes prove that a page-granular CPU watch
+  // invalidation was false sharing.
+  void TryRevalidateUsedOutdatedTextures(
+      const global_unique_lock_type& global_lock, uint32_t used_texture_mask);
   // Writes the guest memory of every used texture into the trace, if one is
   // being recorded.
   void RecordUsedTexturesInTrace(uint32_t used_texture_mask);
   // Returns whether RequestTextures(used_texture_mask) may need to process
   // bindings or reload texture data from guest memory. Used as a cheap
   // pre-check to skip the full RequestTextures call when nothing changed.
-  bool AnyUsedTextureRequestWorkPending(uint32_t used_texture_mask) const;
+  bool AnyUsedTextureRequestWorkPending(uint32_t used_texture_mask);
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -198,6 +213,20 @@ class TextureCache {
   }
 
  protected:
+  struct GuestTextureLoadRange {
+    uint32_t address = 0;
+    uint32_t length = 0;
+
+    explicit operator bool() const { return length != 0; }
+  };
+
+  // Texture load shaders may read a whole 128-bit chunk at the end of a
+  // level. Keep the exact consumed range centralized so eligibility,
+  // RequestRange, source capture, watches and hashes cannot disagree at the
+  // shared-memory boundary.
+  static GuestTextureLoadRange GetGuestTextureLoadRange(uint32_t guest_address,
+                                                        uint32_t guest_size);
+
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
     // constants so fewer bits can be used, while the maximum size (8192 for 2D)
@@ -319,12 +348,8 @@ class TextureCache {
     bool mips_outdated(const global_unique_lock_type& global_lock) const {
       return mips_outdated_;
     }
-    // Lockless accessors for pre-check optimization.
-    // Safe to read without lock - worst case is false positive (outdated when
-    // not).
-    bool base_outdated_lockless() const { return base_outdated_; }
-    bool mips_outdated_lockless() const { return mips_outdated_; }
-    bool MakeUpToDateAndWatch(const global_unique_lock_type& global_lock);
+    bool MakeUpToDateAndWatch(const global_unique_lock_type& global_lock,
+                              bool loaded_base, bool loaded_mips);
 
     void WatchCallback(const global_unique_lock_type& global_lock, bool is_mip,
                        bool invalidated_by_gpu);
@@ -333,16 +358,71 @@ class TextureCache {
     // be attributed to a guest write or to the GPU resolving into the range.
     static constexpr uint32_t kInvalidationOriginCpu = 1;
     static constexpr uint32_t kInvalidationOriginGpu = 2;
-    uint32_t invalidation_origin() const { return invalidation_origin_; }
-    void reset_invalidation_origin() { invalidation_origin_ = 0; }
+    uint32_t GetInvalidationOrigin(const global_unique_lock_type& global_lock,
+                                   bool loaded_base, bool loaded_mips) const;
+    bool HasGpuInvalidationOrigin(const global_unique_lock_type& global_lock,
+                                  bool is_mip) const {
+      assert_true(global_lock.owns_lock());
+      return ((is_mip ? mips_invalidation_origin_ : base_invalidation_origin_) &
+              kInvalidationOriginGpu) != 0;
+    }
 
     // Content hashes of the guest bytes a CPU-sourced load consumed. A watch
     // fires for the whole host page, so a write anywhere in it marks every
     // overlapping texture outdated; comparing the bytes tells a real change
     // apart from that false sharing.
-    void StoreCpuContentHashes(bool loaded_base, bool loaded_mips);
-    void ClearCpuContentHashes();
-    bool CpuContentUnchanged(uint64_t& bytes_hashed_out) const;
+    struct CpuLoadSource {
+      bool valid = false;
+      bool content_hash_valid = false;
+      uint32_t byte_length = 0;
+      // Persistent CPU/non-exact invalidation epoch for the covered host pages.
+      // This catches a write even if another RequestRange makes the shared
+      // memory copy valid again before the texture load is finalized.
+      uint64_t invalidation_epoch = 0;
+      uint64_t gpu_write_generation = 0;
+      // Hash of the immutable bytes actually consumed by the backend load.
+      // Backends supporting revalidation must fill this from their load source,
+      // not by rereading mutable guest RAM after encoding the upload.
+      uint64_t content_hash = 0;
+    };
+    CpuLoadSource CaptureCpuLoadSource(
+        const global_unique_lock_type& global_lock, bool is_mip,
+        bool was_fully_invalid_before_request) const;
+    enum class ContentUploadStatus : uint8_t {
+      kPending,
+      kSucceeded,
+      kFailed,
+    };
+    using ContentUploadCompletion =
+        std::shared_ptr<std::atomic<ContentUploadStatus>>;
+    // Completion is terminal. In particular, a command buffer discarded by a
+    // backend must never be revived by a late completion callback.
+    static bool TryCompleteContentUpload(
+        const ContentUploadCompletion& completion,
+        ContentUploadStatus terminal_status);
+    // For zero-copy asynchronous backends, the source bytes are not proven to
+    // have been consumed until the command buffer finishes successfully.
+    void SetContentUploadCompletion(const global_unique_lock_type& global_lock,
+                                    bool loaded_base, bool loaded_mips,
+                                    const ContentUploadCompletion& completion);
+    void StoreCpuContentHashes(const global_unique_lock_type& global_lock,
+                               bool loaded_base, bool loaded_mips,
+                               const CpuLoadSource& base_source,
+                               const CpuLoadSource& mips_source,
+                               bool base_source_current,
+                               bool mips_source_current);
+    bool IsCpuLoadSourceCurrent(const global_unique_lock_type& global_lock,
+                                bool is_mip, const CpuLoadSource& source) const;
+    bool FinalizeLoadAndWatch(const global_unique_lock_type& global_lock,
+                              bool loaded_base, bool loaded_mips,
+                              const CpuLoadSource& base_source,
+                              const CpuLoadSource& mips_source);
+    bool TryRevalidateCpuInvalidation(
+        const global_unique_lock_type& global_lock);
+    bool CpuContentUnchanged(const global_unique_lock_type& global_lock,
+                             bool check_base, bool check_mips,
+                             uint64_t& bytes_hashed_out,
+                             bool& eligible_out) const;
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
@@ -392,14 +472,24 @@ class TextureCache {
     bool base_outdated_ = false;
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
-    uint32_t invalidation_origin_ = 0;
+    uint32_t base_invalidation_origin_ = 0;
+    uint32_t mips_invalidation_origin_ = 0;
     uint64_t base_content_hash_ = 0;
     uint64_t mips_content_hash_ = 0;
+    uint64_t base_content_gpu_write_generation_ = 0;
+    uint64_t mips_content_gpu_write_generation_ = 0;
+    ContentUploadCompletion base_content_upload_completion_;
+    ContentUploadCompletion mips_content_upload_completion_;
     bool base_content_hash_valid_ = false;
     bool mips_content_hash_valid_ = false;
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
+
+    void MakeLoadedDataUpToDateAndWatch(
+        const global_unique_lock_type& global_lock, bool loaded_base,
+        bool loaded_mips);
+    void ClearCpuContentHash(bool is_mip);
   };
 
   // Rules of data access in load shaders:
@@ -613,6 +703,12 @@ class TextureCache {
   virtual bool IsSignedVersionSeparateForFormat(TextureKey key) const {
     return false;
   }
+  // Revalidation also needs backend-specific proof that an asynchronous
+  // upload consumed the exact bytes being hashed. Backends opt in only after
+  // supplying that completion contract.
+  virtual bool SupportsTextureContentRevalidation() const { return false; }
+  // Call from an opted-in derived constructor, before GPU submissions begin.
+  void InitializeTextureContentRevalidation();
   // Parameters like whether the texture is tiled and its dimensions are checked
   // externally, the implementation should take only format-related parameters
   // such as the format itself and the signedness into account.
@@ -662,9 +758,13 @@ class TextureCache {
   // shared memory or the scaled resolve memory. The shared memory management is
   // done outside this function, the implementation just needs to load the data
   // into the texture object.
-  virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture,
-                                                     bool load_base,
-                                                     bool load_mips) = 0;
+  virtual bool LoadTextureDataFromResidentMemoryImpl(
+      Texture& texture, bool load_base, bool load_mips,
+      Texture::CpuLoadSource* base_cpu_source,
+      Texture::CpuLoadSource* mips_cpu_source) = 0;
+  global_unique_lock_type AcquireGlobalLock() {
+    return global_critical_region_.Acquire();
+  }
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
@@ -677,8 +777,10 @@ class TextureCache {
   // this will cause another attempt to create a texture or to untile it if
   // there was an error.
   void ResetTextureBindings(bool from_destructor = false);
-  bool IsBindingOutdatedForUse(const TextureBinding& binding) const;
-  void InvalidateUsedOutdatedBindings(uint32_t used_texture_mask);
+  bool IsBindingOutdatedForUse(const global_unique_lock_type& global_lock,
+                               const TextureBinding& binding) const;
+  uint32_t InvalidateOutdatedBindings(
+      const global_unique_lock_type& global_lock);
 
   const TextureBinding* GetValidTextureBinding(
       uint32_t fetch_constant_index) const {
@@ -764,6 +866,10 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+  // Bindings made out of sync specifically because their texture data became
+  // outdated. Unlike the aggregate callback flag, this must survive across
+  // draws when an invalidated binding isn't currently used.
+  uint32_t texture_bindings_outdated_ = 0;
 };
 
 }  // namespace gpu

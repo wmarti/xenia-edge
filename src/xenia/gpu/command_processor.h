@@ -233,8 +233,6 @@ class CommandProcessor {
   virtual void BeginTracing(const std::filesystem::path& root_path);
   virtual void EndTracing();
 
-  virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
-
   // Shadowed by backends that route memory export through guest RAM (see
   // command_processor_memexport.inc). No-ops where export output never reaches
   // the CPU, so there is nothing to wait for.

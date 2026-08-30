@@ -352,9 +352,24 @@ void XmaContextNew::Consume(RingBuffer* XE_RESTRICT output_rb,
       ((kBytesPerFrameChannel / kOutputBytesPerBlock) << data->is_stereo) -
       current_frame_remaining_subframes_;
 
-  output_rb->Write(
+  const uint32_t output_write_length =
+      subframes_to_write * kOutputBytesPerBlock;
+  const uint32_t output_write_offset = output_rb->write_offset();
+  const uint32_t output_write_first_length = std::min(
+      output_write_length, output_rb->capacity() - output_write_offset);
+  const uint32_t output_write_second_length =
+      output_write_length - output_write_first_length;
+  auto output_write_first = memory()->BeginPhysicalMemoryWrite(
+      data->output_buffer_ptr + output_write_offset, output_write_first_length);
+  auto output_write_second = memory()->BeginPhysicalMemoryWrite(
+      data->output_buffer_ptr, output_write_second_length);
+  const uint32_t output_written = uint32_t(output_rb->Write(
       raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
-      subframes_to_write * kOutputBytesPerBlock);
+      output_write_length));
+  output_write_first.End(std::min(output_written, output_write_first_length));
+  output_write_second.End(output_written > output_write_first_length
+                              ? output_written - output_write_first_length
+                              : 0);
 
   // Reserve extra blocks as headroom when unk_skip_decode is set.
   // Only apply when the frame is fully consumed to avoid double-counting.

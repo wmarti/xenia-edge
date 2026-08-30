@@ -657,7 +657,23 @@ void XmaContextOld::Decode(XMA_CONTEXT_DATA* data) {
 
       auto byte_count = kBytesPerFrameChannel << data->is_stereo;
       assert_true(output_remaining_bytes >= byte_count);
-      output_rb.Write(raw_frame_.data(), byte_count);
+      const uint32_t output_write_offset = output_rb.write_offset();
+      const uint32_t output_write_first_length =
+          std::min(byte_count, output_rb.capacity() - output_write_offset);
+      const uint32_t output_write_second_length =
+          byte_count - output_write_first_length;
+      auto output_write_first = memory()->BeginPhysicalMemoryWrite(
+          data->output_buffer_ptr + output_write_offset,
+          output_write_first_length);
+      auto output_write_second = memory()->BeginPhysicalMemoryWrite(
+          data->output_buffer_ptr, output_write_second_length);
+      const uint32_t output_written =
+          uint32_t(output_rb.Write(raw_frame_.data(), byte_count));
+      output_write_first.End(
+          std::min(output_written, output_write_first_length));
+      output_write_second.End(output_written > output_write_first_length
+                                  ? output_written - output_write_first_length
+                                  : 0);
       output_remaining_bytes -= byte_count;
       data->output_buffer_write_offset = output_rb.write_offset() / 256;
 

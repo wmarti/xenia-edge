@@ -155,12 +155,6 @@ void VulkanCommandProcessor::InvalidateGpuMemory() {
   shared_memory_->InvalidateAllPages();
 }
 
-void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr,
-                                                      uint32_t length) {
-  shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
-  primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
-}
-
 void VulkanCommandProcessor::InitializeShaderStorage(
     const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
     std::function<void()> completion_callback) {

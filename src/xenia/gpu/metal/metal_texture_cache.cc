@@ -27,6 +27,7 @@
 #include "third_party/stb/stb_image_write.h"
 
 DECLARE_bool(texture_cache_revalidate_census);
+DECLARE_string(gpu_counters_file);
 #include "xenia/base/assert.h"
 #include "xenia/base/autorelease_pool_mac.h"
 #include "xenia/base/bit_stream.h"
@@ -35,6 +36,7 @@ DECLARE_bool(texture_cache_revalidate_census);
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/xxhash.h"
 #include "xenia/gpu/metal/metal_command_processor.h"
 #include "xenia/gpu/metal/metal_shared_memory.h"
 #include "xenia/gpu/shaders/bytecode/metal/texture_load_128bpb_cs.h"
@@ -362,10 +364,14 @@ class MetalTextureCache::UploadBufferPool
     }
     if (add_handler) {
       cmd->addCompletedHandler(^(MTL::CommandBuffer* completed_cmd) {
-        UploadBufferPool::HandleCommandBufferCompleted(completed_cmd);
+        UploadBufferPool::HandleCommandBufferFinished(completed_cmd);
       });
     }
   }
+
+  // Drains releases both after GPU completion and when an uncommitted command
+  // buffer is discarded. Metal doesn't run completion handlers for the latter.
+  static void HandleCommandBufferFinished(MTL::CommandBuffer* cmd);
 
   void Shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -428,8 +434,6 @@ class MetalTextureCache::UploadBufferPool
     return *pending_releases;
   }
 
-  static void HandleCommandBufferCompleted(MTL::CommandBuffer* cmd);
-
   mutable std::mutex mutex_;
   std::vector<Entry> entries_;
   MTL::Device* device_ = nullptr;
@@ -439,7 +443,7 @@ class MetalTextureCache::UploadBufferPool
   uint64_t transient_allocations_ = 0;
 };
 
-void MetalTextureCache::UploadBufferPool::HandleCommandBufferCompleted(
+void MetalTextureCache::UploadBufferPool::HandleCommandBufferFinished(
     MTL::CommandBuffer* cmd) {
   std::vector<PendingRelease> releases;
   {
@@ -466,7 +470,9 @@ MetalTextureCache::MetalTextureCache(MetalCommandProcessor* command_processor,
           register_file, shared_memory,
           command_processor ? &command_processor->trace_writer() : nullptr,
           draw_resolution_scale_x, draw_resolution_scale_y),
-      command_processor_(command_processor) {}
+      command_processor_(command_processor) {
+  InitializeTextureContentRevalidation();
+}
 
 MetalTextureCache::~MetalTextureCache() { Shutdown(); }
 
@@ -485,7 +491,7 @@ bool MetalTextureCache::ShouldUploadViaBlit() const {
 void MetalTextureCache::BeginUploadCommandBufferBatch() {
   if (!upload_batch_depth_) {
     upload_batch_all_forwardable_ = true;
-    upload_batch_all_revalidatable_ = true;
+    upload_batch_all_revalidatable_ = cvars::texture_cache_revalidate_census;
   }
   ++upload_batch_depth_;
 }
@@ -494,19 +500,34 @@ void MetalTextureCache::BeginUploadCommandBufferBatch() {
 // GPU-origin upload asks whether the resolve that wrote the range produced
 // exactly these texels - the case a host-side forward could serve without
 // reading guest memory back.
-void MetalTextureCache::CensusUpload(const Texture& texture) {
-  const uint32_t origin = texture.invalidation_origin();
-  // Would the bytes show this reload to be unnecessary? Observe only - nothing
-  // here clears an outdated flag or re-arms a watch.
+void MetalTextureCache::CensusUpload(Texture& texture, bool loaded_base,
+                                     bool loaded_mips) {
+  // The caller gates this diagnostic path on either the observe-only hash
+  // census or gpu_counters_file, so production uploads take no lock here.
+  uint32_t origin = 0;
+  bool revalidatable = false;
+  bool revalidation_eligible = false;
+  uint64_t revalidation_bytes = 0;
+  {
+    auto global_lock = AcquireGlobalLock();
+    origin =
+        texture.GetInvalidationOrigin(global_lock, loaded_base, loaded_mips);
+    if (cvars::texture_cache_revalidate_census &&
+        origin == Texture::kInvalidationOriginCpu) {
+      revalidatable = texture.CpuContentUnchanged(
+          global_lock, loaded_base, loaded_mips, revalidation_bytes,
+          revalidation_eligible);
+    }
+  }
+  // Would the bytes show this reload to be unnecessary? Observe only: hashing
+  // re-enables physical write callbacks to stabilize RAM, but does not clear
+  // an outdated flag or reinstall the texture's range watch.
   if (cvars::texture_cache_revalidate_census) {
-    bool revalidatable = false;
     if (origin == Texture::kInvalidationOriginCpu) {
-      uint64_t bytes = 0;
-      revalidatable = texture.CpuContentUnchanged(bytes);
-      reval_bytes_hashed_ += bytes;
+      reval_bytes_hashed_ += revalidation_bytes;
       if (revalidatable) {
         ++reval_match_;
-      } else if (bytes) {
+      } else if (revalidation_eligible) {
         ++reval_mismatch_;
       } else {
         ++reval_no_hash_;
@@ -516,7 +537,6 @@ void MetalTextureCache::CensusUpload(const Texture& texture) {
       upload_batch_all_revalidatable_ = false;
     }
   }
-  const_cast<Texture&>(texture).reset_invalidation_origin();
   const bool by_gpu = (origin & Texture::kInvalidationOriginGpu) != 0;
   const bool by_cpu = (origin & Texture::kInvalidationOriginCpu) != 0;
   if (by_gpu && by_cpu) {
@@ -535,6 +555,14 @@ void MetalTextureCache::CensusUpload(const Texture& texture) {
     return;
   }
   if (!command_processor_) {
+    upload_batch_all_forwardable_ = false;
+    return;
+  }
+  // Resolve forwarding is only defined for a single base-level upload. Mip
+  // ranges have different dimensions and may aggregate multiple levels, so
+  // classifying them against base metadata would produce false matches.
+  if (!loaded_base || loaded_mips) {
+    ++upload_gpu_no_resolve_;
     upload_batch_all_forwardable_ = false;
     return;
   }
@@ -605,6 +633,68 @@ MTL::CommandBuffer* MetalTextureCache::EnsureUploadCommandBufferBatch() {
   return cmd;
 }
 
+TextureCache::Texture::ContentUploadCompletion
+MetalTextureCache::GetContentUploadCompletion(
+    MTL::CommandBuffer* command_buffer) {
+  assert_not_null(command_buffer);
+  auto found = content_upload_completions_.find(command_buffer);
+  if (found != content_upload_completions_.end()) {
+    Texture::ContentUploadCompletion existing = found->second.lock();
+    if (existing && existing->load(std::memory_order_acquire) ==
+                        Texture::ContentUploadStatus::kPending) {
+      return existing;
+    }
+  }
+
+  auto completion = std::make_shared<std::atomic<Texture::ContentUploadStatus>>(
+      Texture::ContentUploadStatus::kPending);
+  if (++content_upload_completion_prune_count_ >= 256) {
+    content_upload_completion_prune_count_ = 0;
+    for (auto it = content_upload_completions_.begin();
+         it != content_upload_completions_.end();) {
+      auto old_completion = it->second.lock();
+      if (!old_completion || old_completion->load(std::memory_order_acquire) !=
+                                 Texture::ContentUploadStatus::kPending) {
+        it = content_upload_completions_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  content_upload_completions_[command_buffer] = completion;
+  // The handler owns only the token, never the cache or a texture. This makes
+  // it safe for completion to race shutdown. Discard paths explicitly publish
+  // kFailed because a discarded buffer never runs completion handlers.
+  command_buffer->addCompletedHandler(
+      [completion](MTL::CommandBuffer* completed_command_buffer) {
+        Texture::TryCompleteContentUpload(
+            completion, completed_command_buffer->status() ==
+                                MTL::CommandBufferStatusCompleted
+                            ? Texture::ContentUploadStatus::kSucceeded
+                            : Texture::ContentUploadStatus::kFailed);
+      });
+  return completion;
+}
+
+void MetalTextureCache::FailContentUploadCompletion(
+    MTL::CommandBuffer* command_buffer) {
+  auto found = content_upload_completions_.find(command_buffer);
+  if (found == content_upload_completions_.end()) {
+    return;
+  }
+  if (auto completion = found->second.lock()) {
+    Texture::TryCompleteContentUpload(completion,
+                                      Texture::ContentUploadStatus::kFailed);
+  }
+  content_upload_completions_.erase(found);
+}
+
+void MetalTextureCache::NotifyCommandBufferDiscarded(
+    MTL::CommandBuffer* command_buffer) {
+  FailContentUploadCompletion(command_buffer);
+  UploadBufferPool::HandleCommandBufferFinished(command_buffer);
+}
+
 void MetalTextureCache::EndUploadCommandBufferBatch() {
   if (!upload_batch_depth_) {
     return;
@@ -621,6 +711,7 @@ void MetalTextureCache::EndUploadCommandBufferBatch() {
     return;
   }
   if (!has_work) {
+    NotifyCommandBufferDiscarded(cmd);
     command_processor_->DiscardAccountedCommandBuffer(
         cmd, MetalCommandProcessor::CommandBufferKind::kTextureUploadBatch);
     cmd->release();
@@ -648,6 +739,7 @@ void MetalTextureCache::AbortUploadCommandBufferBatch(bool commit_if_has_work) {
     return;
   }
   if (!has_work || !commit_if_has_work) {
+    NotifyCommandBufferDiscarded(cmd);
     command_processor_->DiscardAccountedCommandBuffer(
         cmd, MetalCommandProcessor::CommandBufferKind::kTextureUploadBatch);
     cmd->release();
@@ -903,9 +995,13 @@ MTL::PixelFormat MetalTextureCache::GetPixelFormatForKey(TextureKey key) const {
   }
 }
 
-bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
-                                          bool load_mips) {
+bool MetalTextureCache::TryGpuLoadTexture(
+    Texture& texture, bool load_base, bool load_mips,
+    Texture::CpuLoadSource* base_cpu_source,
+    Texture::CpuLoadSource* mips_cpu_source,
+    Texture::ContentUploadCompletion& content_upload_completion_out) {
   SCOPE_profile_cpu_f("gpu");
+  content_upload_completion_out.reset();
   MetalTexture* metal_texture = static_cast<MetalTexture*>(&texture);
   if (!metal_texture || !metal_texture->metal_texture()) {
     return false;
@@ -1138,11 +1234,95 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
 
   size_t constants_size = xe::align(sizeof(MetalLoadConstants), size_t(16));
   size_t dispatch_count = stored_levels.size() * size_t(array_size);
-  size_t constants_buffer_size = constants_size * dispatch_count;
+  // Content revalidation must describe the bytes the load shader actually
+  // consumed. The main Metal shared-memory buffer aliases mutable guest RAM in
+  // the default zero-copy configuration, and not every raw physical-memory
+  // writer goes through the page-watch path. Append eligible parts to the
+  // constants buffer, which already has the exact command-buffer lifetime, and
+  // hash the same immutable bytes that are bound as the shader source.
+  constexpr size_t kSnapshotPartAlignment = 256;
+  constexpr size_t kSnapshotGuardSize = 16;
+  const size_t constants_payload_size = constants_size * dispatch_count;
+  size_t constants_buffer_size = constants_payload_size;
+  size_t base_snapshot_offset = 0;
+  size_t mips_snapshot_offset = 0;
+  bool base_snapshot_requested = false;
+  bool mips_snapshot_requested = false;
+  bool base_snapshot_valid = false;
+  bool mips_snapshot_valid = false;
+  if (!texture_resolution_scaled) {
+    auto reserve_snapshot_part = [&](Texture::CpuLoadSource* source,
+                                     bool load_part, size_t& part_offset,
+                                     bool& part_requested) {
+      if (!source) {
+        return;
+      }
+      source->content_hash_valid = false;
+      if (!load_part || !source->valid || !source->byte_length) {
+        return;
+      }
+      part_offset = xe::align(constants_buffer_size, kSnapshotPartAlignment);
+      constants_buffer_size = part_offset + source->byte_length;
+      part_requested = true;
+    };
+    reserve_snapshot_part(base_cpu_source, load_base, base_snapshot_offset,
+                          base_snapshot_requested);
+    reserve_snapshot_part(mips_cpu_source, load_mips, mips_snapshot_offset,
+                          mips_snapshot_requested);
+    if (base_snapshot_requested || mips_snapshot_requested) {
+      // The load kernels may issue a final vector read whose lanes are outside
+      // the logical texture extent. They discard those lanes, but the Metal
+      // buffer binding still needs mapped guard space for the access.
+      constexpr size_t kSnapshotFinalPadding =
+          kSnapshotGuardSize + kSnapshotPartAlignment - 1;
+      if (constants_buffer_size <=
+          std::numeric_limits<size_t>::max() - kSnapshotFinalPadding) {
+        constants_buffer_size = xe::align(
+            constants_buffer_size + kSnapshotGuardSize, kSnapshotPartAlignment);
+      } else {
+        constants_buffer_size = constants_payload_size;
+        base_snapshot_requested = false;
+        mips_snapshot_requested = false;
+      }
+    }
+  }
+
   MTL::Buffer* constants_buffer = acquire_buffer(constants_buffer_size);
+  if (!constants_buffer && constants_buffer_size != constants_payload_size) {
+    // Snapshot allocation is opportunistic. Preserve the normal upload if the
+    // larger combined buffer can't be allocated.
+    constants_buffer_size = constants_payload_size;
+    base_snapshot_requested = false;
+    mips_snapshot_requested = false;
+    constants_buffer = acquire_buffer(constants_buffer_size);
+  }
   if (!constants_buffer) {
     release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
     return false;
+  }
+
+  uint8_t* constants_data = static_cast<uint8_t*>(constants_buffer->contents());
+  const uint8_t* guest_data = metal_shared_memory.GetXboxRamBase();
+  if (constants_data && guest_data) {
+    auto copy_snapshot_part = [&](Texture::CpuLoadSource* source,
+                                  bool part_requested, uint32_t guest_address,
+                                  size_t part_offset, bool& part_valid) {
+      if (!source || !part_requested) {
+        return;
+      }
+      std::memcpy(constants_data + part_offset, guest_data + guest_address,
+                  source->byte_length);
+      source->content_hash =
+          XXH3_64bits(constants_data + part_offset, source->byte_length);
+      source->content_hash_valid = true;
+      part_valid = true;
+    };
+    copy_snapshot_part(base_cpu_source, base_snapshot_requested,
+                       base_guest_address, base_snapshot_offset,
+                       base_snapshot_valid);
+    copy_snapshot_part(mips_cpu_source, mips_snapshot_requested,
+                       mips_guest_address, mips_snapshot_offset,
+                       mips_snapshot_valid);
   }
 
   const bool use_blit_upload = ShouldUploadViaBlit();
@@ -1215,6 +1395,13 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
     return false;
   }
+  Texture::ContentUploadCompletion content_upload_completion;
+  if (use_blit_upload && (base_snapshot_valid || mips_snapshot_valid)) {
+    // Register before any path below can commit the command buffer. The source
+    // snapshot is immutable, but its hash is usable only after this exact
+    // command buffer successfully materializes the derived texture.
+    content_upload_completion = GetContentUploadCompletion(cmd);
+  }
   bool command_buffer_has_work = false;
   auto handle_upload_failure = [&](bool abort_batch) {
     if ((use_upload_batch || use_current_command_buffer) &&
@@ -1235,6 +1422,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
                command_processor_) {
       // A private command buffer abandoned without a commit - its completion
       // handler will never run.
+      NotifyCommandBufferDiscarded(cmd);
       command_processor_->DiscardAccountedCommandBuffer(
           cmd, MetalCommandProcessor::CommandBufferKind::kTextureUploadPrivate);
     }
@@ -1250,9 +1438,8 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     return false;
   }
   encoder->setComputePipelineState(pipeline);
-  if (!texture_resolution_scaled) {
-    encoder->setBuffer(shared_buffer, 0, 2);
-  }
+  MTL::Buffer* bound_guest_source_buffer = nullptr;
+  size_t bound_guest_source_offset = 0;
 
   uint32_t guest_x_blocks_per_group_log2 =
       load_shader_info.GetGuestXBlocksPerGroupLog2();
@@ -1272,6 +1459,24 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     const texture_util::TextureGuestLayout::Level& level_guest_layout =
         is_base_storage ? guest_layout.base
                         : guest_layout.mips[stored_level.level];
+
+    const bool use_part_snapshot =
+        !texture_resolution_scaled &&
+        (is_base_storage ? base_snapshot_valid : mips_snapshot_valid);
+    if (!texture_resolution_scaled) {
+      MTL::Buffer* desired_source_buffer =
+          use_part_snapshot ? constants_buffer : shared_buffer;
+      size_t desired_source_offset =
+          use_part_snapshot
+              ? (is_base_storage ? base_snapshot_offset : mips_snapshot_offset)
+              : 0;
+      if (desired_source_buffer != bound_guest_source_buffer ||
+          desired_source_offset != bound_guest_source_offset) {
+        encoder->setBuffer(desired_source_buffer, desired_source_offset, 2);
+        bound_guest_source_buffer = desired_source_buffer;
+        bound_guest_source_offset = desired_source_offset;
+      }
+    }
 
     if (texture_resolution_scaled &&
         (is_base_storage || !scaled_mips_source_set_up)) {
@@ -1297,7 +1502,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     }
 
     uint32_t level_guest_offset = 0;
-    if (!texture_resolution_scaled) {
+    if (!texture_resolution_scaled && !use_part_snapshot) {
       level_guest_offset =
           is_base_storage ? base_guest_address : mips_guest_address;
     }
@@ -1521,6 +1726,12 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     cmd->commit();
     cmd->waitUntilCompleted();
 
+    if (cmd->status() != MTL::CommandBufferStatusCompleted) {
+      release_buffer_immediate(constants_buffer, constants_buffer_size);
+      release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
+      return false;
+    }
+
     uint8_t* dest_data = static_cast<uint8_t*>(dest_buffer->contents());
     if (!dest_data) {
       release_buffer_immediate(constants_buffer, constants_buffer_size);
@@ -1627,6 +1838,8 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     release_buffer_immediate(constants_buffer, constants_buffer_size);
     release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
   }
+
+  content_upload_completion_out = std::move(content_upload_completion);
 
   return true;
 }
@@ -2033,6 +2246,8 @@ void MetalTextureCache::Shutdown() {
   AbortUploadCommandBufferBatch(false);
 
   ClearCache();
+  content_upload_completions_.clear();
+  content_upload_completion_prune_count_ = 0;
 
   for (size_t i = 0; i < kLoadShaderCount; ++i) {
     if (load_pipelines_[i]) {
@@ -3401,30 +3616,11 @@ std::unique_ptr<TextureCache::Texture> MetalTextureCache::CreateTexture(
 }
 
 // LoadTextureDataFromResidentMemoryImpl implementation
-bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
-                                                              bool load_base,
-                                                              bool load_mips) {
+bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(
+    Texture& texture, bool load_base, bool load_mips,
+    Texture::CpuLoadSource* base_cpu_source,
+    Texture::CpuLoadSource* mips_cpu_source) {
   SCOPE_profile_cpu_f("gpu");
-
-  // Diagnostic: is the ~469 uploads per present at the GTA IV docks many
-  // distinct textures (streaming) or a few re-uploaded constantly (churn)?
-  // Total uploads alone cannot tell those apart, and the answer decides
-  // whether the fix is in the cache's invalidation or nowhere.
-  ++upload_calls_;
-  CensusUpload(texture);
-  const bool census_load_base = load_base;
-  const bool census_load_mips = load_mips;
-  {
-    auto it = upload_key_counts_.find(texture.key());
-    if (it == upload_key_counts_.end()) {
-      upload_key_counts_.emplace(texture.key(), 1u);
-    } else {
-      ++it->second;
-      if (it->second > upload_key_max_repeats_) {
-        upload_key_max_repeats_ = it->second;
-      }
-    }
-  }
 
   MetalTexture* metal_texture = static_cast<MetalTexture*>(&texture);
   if (!metal_texture || !metal_texture->metal_texture()) {
@@ -3434,11 +3630,43 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 
   // GPU-based loading path for Metal texture_load_* shaders only (parity with
   // D3D12/Vulkan; no CPU untile fallback).
-  if (!TryGpuLoadTexture(texture, load_base, load_mips)) {
+  Texture::ContentUploadCompletion content_upload_completion;
+  if (!TryGpuLoadTexture(texture, load_base, load_mips, base_cpu_source,
+                         mips_cpu_source, content_upload_completion)) {
     return false;
   }
 
-  texture.StoreCpuContentHashes(census_load_base, census_load_mips);
+  if (cvars::texture_cache_revalidate_census ||
+      !cvars::gpu_counters_file.empty()) {
+    // Count only successfully encoded uploads, so the origin and revalidation
+    // outcome totals written beside this counter describe the same population.
+    ++upload_calls_;
+    {
+      auto it = upload_key_counts_.find(texture.key());
+      if (it == upload_key_counts_.end()) {
+        upload_key_counts_.emplace(texture.key(), 1u);
+      } else {
+        ++it->second;
+        if (it->second > upload_key_max_repeats_) {
+          upload_key_max_repeats_ = it->second;
+        }
+      }
+    }
+    CensusUpload(texture, load_base, load_mips);
+  }
+
+  // CensusUpload classifies the invalidation against the previous successful
+  // upload. Publish this upload's token only afterwards, but before the generic
+  // load path stores its new content hash.
+  const bool snapshot_base =
+      base_cpu_source && base_cpu_source->content_hash_valid;
+  const bool snapshot_mips =
+      mips_cpu_source && mips_cpu_source->content_hash_valid;
+  if (snapshot_base || snapshot_mips) {
+    auto global_lock = AcquireGlobalLock();
+    texture.SetContentUploadCompletion(
+        global_lock, snapshot_base, snapshot_mips, content_upload_completion);
+  }
 
   // The 3D-as-2D wrapper holds a copy of the base texture's data, so a reload
   // leaves it stale. Only a base texture ever owns one.

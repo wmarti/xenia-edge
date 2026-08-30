@@ -550,7 +550,9 @@ class D3D12TextureCache final : public TextureCache {
 
   // This binds pipelines, allocates descriptors, and copies!
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
-                                             bool load_mips) override;
+                                             bool load_mips,
+                                             Texture::CpuLoadSource*,
+                                             Texture::CpuLoadSource*) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 

@@ -57,6 +57,11 @@ bool MetalSharedMemory::Initialize() {
                                   MTL::ResourceStorageModeShared, nullptr);
       if (buffer_) {
         use_zero_copy_ = true;
+        // The Metal buffer aliases physical_membase_ directly. Guest
+        // protection remains tracked in the parent heap page table, but the
+        // pinned host view itself must stay writable for Metal and raw device
+        // writers until the buffer is released.
+        memory().SetPhysicalAliasSkipHostProtect(true);
         XELOGD("Metal shared memory: using bytes-no-copy buffer");
       } else {
         XELOGW("Metal shared memory: bytes-no-copy buffer creation failed");
@@ -188,6 +193,11 @@ void MetalSharedMemory::Shutdown() {
   if (buffer_) {
     buffer_->release();
     buffer_ = nullptr;
+  }
+  if (use_zero_copy_) {
+    // Keep the imported host range writable until Metal has released its
+    // bytes-no-copy buffer and no longer owns a pin on those pages.
+    memory().SetPhysicalAliasSkipHostProtect(false);
   }
   use_zero_copy_ = false;
 

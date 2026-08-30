@@ -170,6 +170,12 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
                 memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
+          Memory::PhysicalMemoryWriteScope physical_write;
+          if (buffer_physical_heap) {
+            physical_write = memory()->BeginPhysicalMemoryWrite(
+                buffer_physical_heap->GetPhysicalAddress(buffer_guest_address),
+                buffer_length, true);
+          }
           result = file_->ReadSync(
               std::span<uint8_t>(
                   buffer_physical_heap
@@ -179,13 +185,8 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
                       : memory()->TranslateVirtual(buffer_guest_address),
                   buffer_length),
               size_t(byte_offset), &bytes_read);
+          physical_write.End(uint32_t(bytes_read));
           if (XSUCCEEDED(result)) {
-            if (buffer_physical_heap) {
-              buffer_physical_heap->TriggerCallbacks(
-                  xe::global_critical_region::AcquireDirect(),
-                  buffer_guest_address, buffer_length, true, true);
-            }
-
             if (byte_offset) {
               position_.store(byte_offset);
             }

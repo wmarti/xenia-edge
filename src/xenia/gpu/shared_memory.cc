@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/shared_memory.h"
 
+#include <algorithm>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/bit_range.h"
 #include "xenia/base/logging.h"
@@ -110,6 +112,19 @@ void SharedMemory::ShutdownCommon() {
 
   system_page_flags_valid_and_gpu_written_ = nullptr;
   num_system_page_flags_ = 0;
+
+  if (guest_page_gpu_write_generations_) {
+    constexpr size_t kGuestPageGenerationCount =
+        size_t(kBufferSize) >> kWriteGenerationPageSizeLog2;
+    memory::DeallocFixed(guest_page_gpu_write_generations_,
+                         kGuestPageGenerationCount * sizeof(uint64_t),
+                         memory::DeallocationType::kRelease);
+    guest_page_gpu_write_generations_ = nullptr;
+  }
+  gpu_write_generation_ = 0;
+  watch_page_invalidation_epochs_.clear();
+  watch_page_invalidation_epochs_.shrink_to_fit();
+  watch_invalidation_epoch_ = 0;
 }
 
 void SharedMemory::InvalidateAllPages() {
@@ -279,20 +294,22 @@ void SharedMemory::UnwatchMemoryRange(WatchHandle handle) {
 }
 
 void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last,
-                               bool invalidated_by_gpu) {
+                               bool invalidated_by_gpu, bool exact_gpu_range) {
   // Diagnostic: how many watch callbacks does one invalidation event produce?
   // page_size_log2_ comes from the HOST page size (line 21), which is 16 KiB on
   // Apple Silicon against the Xbox 360's 4 KiB guest page, so one event covers
   // four guest pages and can invalidate textures the write never touched.
-  ++fire_watches_events_;
-  fire_watches_pages_ += uint64_t(page_last - page_first + 1);
+  fire_watches_events_.fetch_add(1, std::memory_order_relaxed);
+  fire_watches_pages_.fetch_add(uint64_t(page_last - page_first + 1),
+                                std::memory_order_relaxed);
   // Split on the flag so "the GPU resolved into this memory" can be told apart
   // from "the CPU wrote to it". The former means a resolve is invalidating
   // every texture overlapping its target extent, including ones whose bytes it
   // never wrote; the latter means the guest genuinely dirtied the data.
   if (invalidated_by_gpu) {
-    ++fire_watches_gpu_events_;
-    fire_watches_gpu_pages_ += uint64_t(page_last - page_first + 1);
+    fire_watches_gpu_events_.fetch_add(1, std::memory_order_relaxed);
+    fire_watches_gpu_pages_.fetch_add(uint64_t(page_last - page_first + 1),
+                                      std::memory_order_relaxed);
   }
   uint32_t address_first = page_first << page_size_log2_;
   uint32_t address_last =
@@ -301,6 +318,21 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last,
   uint32_t bucket_last = address_last >> kWatchBucketSizeLog2;
 
   auto global_lock = global_critical_region_.Acquire();
+
+  // A CPU invalidation, or a GPU invalidation without an exact byte interval,
+  // invalidates an in-flight CPU snapshot even if RequestRange makes the pages
+  // current again before publication.
+  if (!watch_page_invalidation_epochs_.empty()) {
+    uint64_t invalidation_epoch = watch_invalidation_epoch_;
+    if (invalidation_epoch != UINT64_MAX) {
+      invalidation_epoch = ++watch_invalidation_epoch_;
+    }
+    if (!invalidated_by_gpu || !exact_gpu_range) {
+      for (uint32_t page = page_first; page <= page_last; ++page) {
+        watch_page_invalidation_epochs_[page] = invalidation_epoch;
+      }
+    }
+  }
 
   // Fire global watches.
   for (const auto global_watch : global_watches_) {
@@ -340,17 +372,47 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last,
 
 void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length,
                                      bool written_to_buffer) {
-  if (length == 0 || start >= kBufferSize) {
+  if (length == 0) {
+    return;
+  }
+  if (start >= kBufferSize) {
     return;
   }
   length = std::min(length, kBufferSize - start);
   uint32_t end = start + length - 1;
   uint32_t page_first = start >> page_size_log2_;
   uint32_t page_last = end >> page_size_log2_;
+  uint64_t pending_gpu_write_generation = UINT64_MAX;
+
+  if (!guest_page_gpu_write_generations_) {
+    // Preserve the original feature-off path exactly: FireWatches and
+    // MakeRangeValid each take the global lock only for their own transition.
+    FireWatches(page_first, page_last, true, true);
+    MakeRangeValid(start, length, written_to_buffer);
+    return;
+  }
+
+  // Keep the watch callbacks, persistent provenance, and current validity
+  // state atomic with respect to texture revalidation. In particular, a
+  // texture watch may already have been removed by an earlier CPU fault.
+  auto global_lock = global_critical_region_.Acquire();
+  if (gpu_write_generation_ != UINT64_MAX) {
+    pending_gpu_write_generation = gpu_write_generation_ + 1;
+  }
 
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
-  FireWatches(page_first, page_last, true);
+  FireWatches(page_first, page_last, true, true);
+
+  if (guest_page_gpu_write_generations_) {
+    gpu_write_generation_ = pending_gpu_write_generation;
+    const uint32_t generation_page_first =
+        start >> kWriteGenerationPageSizeLog2;
+    const uint32_t generation_page_last = end >> kWriteGenerationPageSizeLog2;
+    for (uint32_t i = generation_page_first; i <= generation_page_last; ++i) {
+      guest_page_gpu_write_generations_[i] = gpu_write_generation_;
+    }
+  }
 
   // Mark the range as valid (so pages are not reuploaded until modified by the
   // CPU) and watch it so the CPU can reuse it and this will be caught.
@@ -366,6 +428,19 @@ bool SharedMemory::AllocateSparseHostGpuMemoryRange(
       "Sparse host GPU memory allocation has been initialized, but the "
       "implementation doesn't provide AllocateSparseHostGpuMemoryRange");
   return false;
+}
+
+void SharedMemory::WatchRangeForCpuWrites(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize ||
+      !memory_invalidation_callback_handle_) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  memory().EnablePhysicalMemoryAccessCallbacks(
+      page_first << page_size_log2_,
+      (page_last - page_first + 1) << page_size_log2_, true, false);
 }
 
 void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
@@ -405,9 +480,9 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
   }
 
   if (memory_invalidation_callback_handle_) {
-    // A page that isn't writable here gets no watch. A later guest
-    // protect-to-writable invalidates it unconditionally, so its writes are
-    // still caught.
+    // Guest read-only pages get a logical invalidation watch without loosening
+    // their host protection. This catches declared raw host writes while an
+    // illegal guest write still propagates as an access violation.
     memory().EnablePhysicalMemoryAccessCallbacks(
         valid_page_first << page_size_log2_,
         (valid_page_last - valid_page_first + 1) << page_size_log2_, true,
@@ -537,6 +612,131 @@ bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) const {
       return false;
     }
   }
+  return true;
+}
+
+bool SharedMemory::IsRangeInvalid(uint32_t start, uint32_t length) const {
+  if (!length) {
+    return true;
+  }
+  if (start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  const uint32_t block_first = page_first >> 6;
+  const uint32_t block_last = page_last >> 6;
+
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t range_mask = UINT64_MAX;
+    if (i == block_first) {
+      range_mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      range_mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (system_page_flags_valid_[i] & range_mask) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SharedMemory::IsRangeValidFromCpu(uint32_t start, uint32_t length) const {
+  if (!length) {
+    return true;
+  }
+  if (start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  const uint32_t block_first = page_first >> 6;
+  const uint32_t block_last = page_last >> 6;
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t range_mask = UINT64_MAX;
+    if (i == block_first) {
+      range_mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      range_mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if ((system_page_flags_valid_[i] & range_mask) != range_mask ||
+        (system_page_flags_valid_and_gpu_written_[i] & range_mask)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+uint64_t SharedMemory::GetRangeInvalidationEpoch(
+    const global_unique_lock_type& global_lock, uint32_t start,
+    uint32_t length) const {
+  assert_true(global_lock.owns_lock());
+  if (!length || start >= kBufferSize || length > kBufferSize - start ||
+      watch_page_invalidation_epochs_.empty()) {
+    return UINT64_MAX;
+  }
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  uint64_t epoch = 0;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    epoch = std::max(epoch, watch_page_invalidation_epochs_[page]);
+  }
+  return epoch;
+}
+
+uint64_t SharedMemory::GetRangeGpuWriteGeneration(
+    const global_unique_lock_type& global_lock, uint32_t start,
+    uint32_t length) const {
+  assert_true(global_lock.owns_lock());
+  if (!length || start >= kBufferSize) {
+    return 0;
+  }
+  if (!guest_page_gpu_write_generations_) {
+    return UINT64_MAX;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> kWriteGenerationPageSizeLog2;
+  const uint32_t page_last =
+      (start + length - 1) >> kWriteGenerationPageSizeLog2;
+  uint64_t generation = 0;
+  for (uint32_t i = page_first; i <= page_last; ++i) {
+    generation = std::max(generation, guest_page_gpu_write_generations_[i]);
+  }
+  return generation;
+}
+
+bool SharedMemory::InitializeWriteGenerationTracking(
+    const global_unique_lock_type& global_lock) {
+  assert_true(global_lock.owns_lock());
+  if (guest_page_gpu_write_generations_ &&
+      !watch_page_invalidation_epochs_.empty()) {
+    return true;
+  }
+  if (watch_page_invalidation_epochs_.empty()) {
+    watch_page_invalidation_epochs_.assign(kBufferSize >> page_size_log2_, 0);
+    watch_invalidation_epoch_ = 0;
+  }
+  if (guest_page_gpu_write_generations_) {
+    return true;
+  }
+  constexpr size_t kGuestPageGenerationCount =
+      size_t(kBufferSize) >> kWriteGenerationPageSizeLog2;
+  uint64_t* generations = static_cast<uint64_t*>(memory::AllocFixed(
+      nullptr, kGuestPageGenerationCount * sizeof(uint64_t),
+      memory::AllocationType::kReserveCommit, memory::PageAccess::kReadWrite));
+  if (!generations) {
+    XELOGE("SharedMemory: Failed to allocate write generations");
+    watch_page_invalidation_epochs_.clear();
+    watch_page_invalidation_epochs_.shrink_to_fit();
+    watch_invalidation_epoch_ = 0;
+    return false;
+  }
+  std::memset(generations, 0, kGuestPageGenerationCount * sizeof(uint64_t));
+  guest_page_gpu_write_generations_ = generations;
   return true;
 }
 

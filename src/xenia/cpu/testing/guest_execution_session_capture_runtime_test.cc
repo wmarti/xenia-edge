@@ -252,7 +252,6 @@ class TitleCaptureTestCommandProcessor final : public gpu::CommandProcessor {
   explicit TitleCaptureTestCommandProcessor(gpu::GraphicsSystem& graphics)
       : gpu::CommandProcessor(&graphics, nullptr) {}
 
-  void TracePlaybackWroteMemory(uint32_t, uint32_t) override {}
   void RestoreEdramSnapshot(const void*) override {}
 
  protected:

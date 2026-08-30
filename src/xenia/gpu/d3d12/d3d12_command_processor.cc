@@ -128,12 +128,6 @@ void D3D12CommandProcessor::RequestFrameTrace(
   CommandProcessor::RequestFrameTrace(root_path);
 }
 
-void D3D12CommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr,
-                                                     uint32_t length) {
-  shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
-  primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
-}
-
 void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
   // Starting a new frame because descriptors may be needed.
   if (!BeginSubmission(true)) {

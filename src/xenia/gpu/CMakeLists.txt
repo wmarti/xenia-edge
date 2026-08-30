@@ -15,6 +15,10 @@ if(WIN32 OR APPLE)
 endif()
 xe_target_defaults(xenia-gpu)
 
+if(XENIA_BUILD_TESTS)
+  add_subdirectory(testing)
+endif()
+
 if(XENIA_BUILD_MISC)
   # Shader compiler tool
   add_executable(xenia-gpu-shader-compiler

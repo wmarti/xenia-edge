@@ -231,7 +231,9 @@ class VulkanTextureCache final : public TextureCache {
   std::unique_ptr<Texture> CreateTexture(TextureKey key) override;
 
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
-                                             bool load_mips) override;
+                                             bool load_mips,
+                                             Texture::CpuLoadSource*,
+                                             Texture::CpuLoadSource*) override;
 
   bool EnsureScaledResolveMemoryCommitted(
       uint32_t start_unscaled, uint32_t length_unscaled,
