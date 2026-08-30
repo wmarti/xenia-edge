@@ -213,6 +213,30 @@ class MetalCommandProcessor : public CommandProcessor {
       uint32_t normalized_color_mask, const RegisterFile& regs);
   bool IssueCopy() override;
   void WriteRegister(uint32_t index, uint32_t value) override;
+  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
+                             uint32_t num_registers) override;
+  void WriteRegisterRangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                                  uint32_t num_registers) override;
+
+  // A range is fast-writable when every register in it is an ordinary register
+  // or lies wholly inside one shader constant class, so the whole run can be
+  // swapped in at once and the affected class dirtied a single time.
+  bool CanFastWriteRegisterRange(uint32_t start_index,
+                                 uint32_t num_registers) const;
+  bool TryWriteKnownRegisterRangeFromMem(uint32_t start_index, uint32_t* base,
+                                         uint32_t num_registers);
+  void WriteFastRegisterRangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                                      uint32_t num_registers);
+  void WriteShaderConstantsFromMem(uint32_t start_index, uint32_t* base,
+                                   uint32_t num_registers);
+  void WriteBoolLoopConstantsFromMem(uint32_t start_index, uint32_t* base,
+                                     uint32_t num_registers);
+  void WriteFetchConstantsFromMem(uint32_t start_index, uint32_t* base,
+                                  uint32_t num_registers);
+  bool FloatConstantRangeTouchesLive(uint32_t start_index,
+                                     uint32_t num_registers,
+                                     const uint64_t* constant_map,
+                                     uint32_t stage_first_constant) const;
 
  private:
   // Initialize shader translation pipeline
