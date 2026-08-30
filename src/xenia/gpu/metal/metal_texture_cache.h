@@ -73,6 +73,13 @@ class MetalTextureCache : public TextureCache {
   uint64_t upload_batches_all_forwardable() const {
     return upload_batches_all_forwardable_;
   }
+  uint64_t reval_match() const { return reval_match_; }
+  uint64_t reval_mismatch() const { return reval_mismatch_; }
+  uint64_t reval_no_hash() const { return reval_no_hash_; }
+  uint64_t reval_bytes_hashed() const { return reval_bytes_hashed_; }
+  uint64_t upload_batches_all_revalidatable() const {
+    return upload_batches_all_revalidatable_;
+  }
 
   // Which command buffer each texture upload landed in. Diagnostic only:
   // widening the upload batch corrupted the image twice, and the remaining
@@ -316,6 +323,12 @@ class MetalTextureCache : public TextureCache {
   uint64_t upload_gpu_mismatch_dims_ = 0;
   uint64_t upload_batches_committed_ = 0;
   uint64_t upload_batches_all_forwardable_ = 0;
+  uint64_t reval_match_ = 0;
+  uint64_t reval_mismatch_ = 0;
+  uint64_t reval_no_hash_ = 0;
+  uint64_t reval_bytes_hashed_ = 0;
+  uint64_t upload_batches_all_revalidatable_ = 0;
+  bool upload_batch_all_revalidatable_ = true;
   bool upload_batch_all_forwardable_ = true;
   uint64_t upload_branch_current_cb_ = 0;
   uint64_t upload_branch_batch_ = 0;

@@ -25,6 +25,8 @@
 #include <vector>
 
 #include "third_party/stb/stb_image_write.h"
+
+DECLARE_bool(texture_cache_revalidate_census);
 #include "xenia/base/assert.h"
 #include "xenia/base/autorelease_pool_mac.h"
 #include "xenia/base/bit_stream.h"
@@ -483,6 +485,7 @@ bool MetalTextureCache::ShouldUploadViaBlit() const {
 void MetalTextureCache::BeginUploadCommandBufferBatch() {
   if (!upload_batch_depth_) {
     upload_batch_all_forwardable_ = true;
+    upload_batch_all_revalidatable_ = true;
   }
   ++upload_batch_depth_;
 }
@@ -493,6 +496,26 @@ void MetalTextureCache::BeginUploadCommandBufferBatch() {
 // reading guest memory back.
 void MetalTextureCache::CensusUpload(const Texture& texture) {
   const uint32_t origin = texture.invalidation_origin();
+  // Would the bytes show this reload to be unnecessary? Observe only - nothing
+  // here clears an outdated flag or re-arms a watch.
+  if (cvars::texture_cache_revalidate_census) {
+    bool revalidatable = false;
+    if (origin == Texture::kInvalidationOriginCpu) {
+      uint64_t bytes = 0;
+      revalidatable = texture.CpuContentUnchanged(bytes);
+      reval_bytes_hashed_ += bytes;
+      if (revalidatable) {
+        ++reval_match_;
+      } else if (bytes) {
+        ++reval_mismatch_;
+      } else {
+        ++reval_no_hash_;
+      }
+    }
+    if (!revalidatable) {
+      upload_batch_all_revalidatable_ = false;
+    }
+  }
   const_cast<Texture&>(texture).reset_invalidation_origin();
   const bool by_gpu = (origin & Texture::kInvalidationOriginGpu) != 0;
   const bool by_cpu = (origin & Texture::kInvalidationOriginCpu) != 0;
@@ -606,6 +629,9 @@ void MetalTextureCache::EndUploadCommandBufferBatch() {
   ++upload_batches_committed_;
   if (upload_batch_all_forwardable_) {
     ++upload_batches_all_forwardable_;
+  }
+  if (upload_batch_all_revalidatable_) {
+    ++upload_batches_all_revalidatable_;
   }
   cmd->addCompletedHandler(^(MTL::CommandBuffer* completed_cmd) {
     completed_cmd->release();
@@ -3386,6 +3412,8 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   // whether the fix is in the cache's invalidation or nowhere.
   ++upload_calls_;
   CensusUpload(texture);
+  const bool census_load_base = load_base;
+  const bool census_load_mips = load_mips;
   {
     auto it = upload_key_counts_.find(texture.key());
     if (it == upload_key_counts_.end()) {
@@ -3409,6 +3437,8 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   if (!TryGpuLoadTexture(texture, load_base, load_mips)) {
     return false;
   }
+
+  texture.StoreCpuContentHashes(census_load_base, census_load_mips);
 
   // The 3D-as-2D wrapper holds a copy of the base texture's data, so a reload
   // leaves it stale. Only a base texture ever owns one.

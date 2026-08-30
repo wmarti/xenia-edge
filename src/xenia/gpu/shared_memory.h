@@ -89,6 +89,8 @@ class SharedMemory {
   // transitions such as watch installation.
   bool IsRangeValid(uint32_t start, uint32_t length) const;
 
+  Memory& memory() const { return memory_; }
+
   void TryFindUploadRange(const uint32_t& block_first,
                           const uint32_t& block_last,
                           const uint32_t& page_first, const uint32_t& page_last,
@@ -135,8 +137,6 @@ class SharedMemory {
   // much).
   static constexpr uint32_t kHostGpuMemoryOptimalSparseAllocationLog2 = 22;
   static_assert(kHostGpuMemoryOptimalSparseAllocationLog2 <= kBufferSizeLog2);
-
-  Memory& memory() const { return memory_; }
 
   uint32_t page_size_log2() const { return page_size_log2_; }
 

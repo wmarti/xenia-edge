@@ -14,9 +14,19 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/xxhash.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/shared_memory.h"
 
+DEFINE_bool(texture_cache_revalidate_census, false,
+            "Hash the guest bytes behind a texture after a CPU-sourced load "
+            "and report how many reloads the contents show to be unnecessary. "
+            "Diagnostic only - no reload is actually skipped.",
+            "GPU");
+DEFINE_uint32(texture_cache_revalidate_size_limit, 1024 * 1024,
+              "Largest guest texture range, in bytes, to hash for "
+              "texture_cache_revalidate_census.",
+              "GPU");
 DEFINE_int32(
     draw_resolution_scale_x, 1,
     "Integer pixel width scale used for scaling the rendering resolution "
@@ -709,11 +719,102 @@ void TextureCache::Texture::MarkAsUsed() {
   texture_cache_.texture_used_last_ = this;
 }
 
+namespace {
+// The load path reads whole 128-bit chunks, so the hash has to cover the same
+// 16-byte-aligned extent - hashing only the unaligned extent could revalidate a
+// texture whose trailing chunk bytes changed.
+uint32_t GetHashedGuestRangeLength(uint32_t guest_address,
+                                   uint32_t guest_size) {
+  return std::min(xe::align(guest_size, UINT32_C(16)),
+                  SharedMemory::kBufferSize - guest_address);
+}
+}  // namespace
+
+void TextureCache::Texture::StoreCpuContentHashes(bool loaded_base,
+                                                  bool loaded_mips) {
+  if (!cvars::texture_cache_revalidate_census || key().scaled_resolve) {
+    ClearCpuContentHashes();
+    return;
+  }
+  SharedMemory& shared_memory = texture_cache().shared_memory();
+  Memory& memory = shared_memory.memory();
+  const uint32_t size_limit = cvars::texture_cache_revalidate_size_limit;
+  if (loaded_base) {
+    const uint32_t base_size = GetGuestBaseSize();
+    const uint32_t base_address = key().base_page << 12;
+    const uint32_t hashed =
+        base_size ? GetHashedGuestRangeLength(base_address, base_size) : 0;
+    // A range that is not wholly valid was not sourced from guest memory
+    // alone, so its bytes are not what a later comparison would be against.
+    base_content_hash_valid_ = hashed != 0 && base_size <= size_limit &&
+                               shared_memory.IsRangeValid(base_address, hashed);
+    if (base_content_hash_valid_) {
+      base_content_hash_ =
+          XXH3_64bits(memory.TranslatePhysical(base_address), hashed);
+    }
+  }
+  if (loaded_mips) {
+    const uint32_t mips_size = GetGuestMipsSize();
+    const uint32_t mips_address = key().mip_page << 12;
+    const uint32_t hashed =
+        mips_size ? GetHashedGuestRangeLength(mips_address, mips_size) : 0;
+    mips_content_hash_valid_ = hashed != 0 && mips_size <= size_limit &&
+                               shared_memory.IsRangeValid(mips_address, hashed);
+    if (mips_content_hash_valid_) {
+      mips_content_hash_ =
+          XXH3_64bits(memory.TranslatePhysical(mips_address), hashed);
+    }
+  }
+}
+
+void TextureCache::Texture::ClearCpuContentHashes() {
+  base_content_hash_valid_ = false;
+  mips_content_hash_valid_ = false;
+}
+
+bool TextureCache::Texture::CpuContentUnchanged(
+    uint64_t& bytes_hashed_out) const {
+  Memory& memory = texture_cache().shared_memory().memory();
+  bool any_checked = false;
+  if (base_outdated_) {
+    if (!base_content_hash_valid_) {
+      return false;
+    }
+    const uint32_t base_address = key().base_page << 12;
+    const uint32_t hashed =
+        GetHashedGuestRangeLength(base_address, GetGuestBaseSize());
+    bytes_hashed_out += hashed;
+    any_checked = true;
+    if (XXH3_64bits(memory.TranslatePhysical(base_address), hashed) !=
+        base_content_hash_) {
+      return false;
+    }
+  }
+  if (mips_outdated_) {
+    if (!mips_content_hash_valid_) {
+      return false;
+    }
+    const uint32_t mips_address = key().mip_page << 12;
+    const uint32_t hashed =
+        GetHashedGuestRangeLength(mips_address, GetGuestMipsSize());
+    bytes_hashed_out += hashed;
+    any_checked = true;
+    if (XXH3_64bits(memory.TranslatePhysical(mips_address), hashed) !=
+        mips_content_hash_) {
+      return false;
+    }
+  }
+  return any_checked;
+}
+
 void TextureCache::Texture::WatchCallback(
     [[maybe_unused]] const global_unique_lock_type& global_lock, bool is_mip,
     bool invalidated_by_gpu) {
   invalidation_origin_ |=
       invalidated_by_gpu ? kInvalidationOriginGpu : kInvalidationOriginCpu;
+  if (invalidated_by_gpu) {
+    ClearCpuContentHashes();
+  }
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;

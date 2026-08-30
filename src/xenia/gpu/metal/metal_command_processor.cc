@@ -1934,6 +1934,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   // Completion handlers land a frame or two behind, which a window this wide
   // absorbs.
   static constexpr uint32_t kGpuTimeWindowFrames = 60;
+  ++gpu_counters_total_frames_;
   if (++gpu_time_window_frames_ >= kGpuTimeWindowFrames) {
     uint64_t now_ns = completed_gpu_time_ns_.load(std::memory_order_relaxed);
     COUNT_profile_set("gpu/gpu_busy_us_per_frame",
@@ -1968,6 +1969,8 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     if (!cvars::gpu_counters_file.empty()) {
       FILE* cf = fopen(cvars::gpu_counters_file.string().c_str(), "wb");
       if (cf) {
+        fprintf(cf, "total_frames %llu\n",
+                static_cast<unsigned long long>(gpu_counters_total_frames_));
         fprintf(cf, "frames %llu\n",
                 static_cast<unsigned long long>(gpu_time_window_frames_));
         static const char* const kKindNames[] = {"submission_other",
@@ -2057,6 +2060,21 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           fprintf(cf, "upload_gpu_mismatch_dims %llu\n",
                   static_cast<unsigned long long>(
                       texture_cache_->upload_gpu_mismatch_dims()));
+          fprintf(
+              cf, "reval_match %llu\n",
+              static_cast<unsigned long long>(texture_cache_->reval_match()));
+          fprintf(cf, "reval_mismatch %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->reval_mismatch()));
+          fprintf(
+              cf, "reval_no_hash %llu\n",
+              static_cast<unsigned long long>(texture_cache_->reval_no_hash()));
+          fprintf(cf, "reval_bytes_hashed %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->reval_bytes_hashed()));
+          fprintf(cf, "upload_batches_all_revalidatable %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_batches_all_revalidatable()));
           fprintf(cf, "upload_batches_committed %llu\n",
                   static_cast<unsigned long long>(
                       texture_cache_->upload_batches_committed()));

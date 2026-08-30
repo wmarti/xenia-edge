@@ -772,6 +772,9 @@ class MetalCommandProcessor : public CommandProcessor {
   // Created command buffers by kind, to attribute that per-frame count.
   static constexpr size_t kCommandBufferKindCount =
       size_t(CommandBufferKind::kCount);
+  // Cumulative, so a counters dump can be normalised without pairing it
+  // against a frame count read from the log at a different instant.
+  uint64_t gpu_counters_total_frames_ = 0;
   uint64_t command_buffer_kind_counts_[kCommandBufferKindCount] = {};
   uint64_t command_buffer_kind_window_start_[kCommandBufferKindCount] = {};
   CommandBufferKind next_submission_kind_ = CommandBufferKind::kSubmissionOther;

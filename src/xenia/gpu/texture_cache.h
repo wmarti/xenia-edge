@@ -336,6 +336,14 @@ class TextureCache {
     uint32_t invalidation_origin() const { return invalidation_origin_; }
     void reset_invalidation_origin() { invalidation_origin_ = 0; }
 
+    // Content hashes of the guest bytes a CPU-sourced load consumed. A watch
+    // fires for the whole host page, so a write anywhere in it marks every
+    // overlapping texture outdated; comparing the bytes tells a real change
+    // apart from that false sharing.
+    void StoreCpuContentHashes(bool loaded_base, bool loaded_mips);
+    void ClearCpuContentHashes();
+    bool CpuContentUnchanged(uint64_t& bytes_hashed_out) const;
+
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
     // referenced by any GPU work in the implementation to make sure it's not
@@ -385,6 +393,10 @@ class TextureCache {
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
     uint32_t invalidation_origin_ = 0;
+    uint64_t base_content_hash_ = 0;
+    uint64_t mips_content_hash_ = 0;
+    bool base_content_hash_valid_ = false;
+    bool mips_content_hash_valid_ = false;
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
