@@ -44,6 +44,36 @@ class MetalTextureCache : public TextureCache {
   uint64_t upload_distinct_keys() const { return upload_key_counts_.size(); }
   uint32_t upload_max_repeats() const { return upload_key_max_repeats_; }
 
+  // Why each upload happened, and whether the GPU resolve that invalidated the
+  // texture already wrote exactly the texels the upload is about to rebuild.
+  uint64_t upload_origin_gpu_only() const { return upload_origin_gpu_only_; }
+  uint64_t upload_origin_cpu_only() const { return upload_origin_cpu_only_; }
+  uint64_t upload_origin_both() const { return upload_origin_both_; }
+  uint64_t upload_origin_none() const { return upload_origin_none_; }
+  uint64_t upload_gpu_no_resolve() const { return upload_gpu_no_resolve_; }
+  uint64_t upload_gpu_match() const { return upload_gpu_match_; }
+  uint64_t upload_gpu_mismatch_base() const {
+    return upload_gpu_mismatch_base_;
+  }
+  uint64_t upload_gpu_mismatch_format() const {
+    return upload_gpu_mismatch_format_;
+  }
+  uint64_t upload_gpu_mismatch_endian() const {
+    return upload_gpu_mismatch_endian_;
+  }
+  uint64_t upload_gpu_mismatch_pitch() const {
+    return upload_gpu_mismatch_pitch_;
+  }
+  uint64_t upload_gpu_mismatch_dims() const {
+    return upload_gpu_mismatch_dims_;
+  }
+  uint64_t upload_batches_committed() const {
+    return upload_batches_committed_;
+  }
+  uint64_t upload_batches_all_forwardable() const {
+    return upload_batches_all_forwardable_;
+  }
+
   // Which command buffer each texture upload landed in. Diagnostic only:
   // widening the upload batch corrupted the image twice, and the remaining
   // suspect is that holding a batch open moves uploads out of the current draw
@@ -152,6 +182,7 @@ class MetalTextureCache : public TextureCache {
   MTL::StorageMode GetCacheTextureStorageMode() const;
   bool ShouldUploadViaBlit() const;
   void BeginUploadCommandBufferBatch();
+  void CensusUpload(const Texture& texture);
   // Creates the batch command buffer on the first upload that wants it, so a
   // request that uploads nothing costs none.
   MTL::CommandBuffer* EnsureUploadCommandBufferBatch();
@@ -272,6 +303,20 @@ class MetalTextureCache : public TextureCache {
   uint32_t upload_key_max_repeats_ = 0;
   std::unordered_map<TextureKey, uint32_t, TextureKey::Hasher>
       upload_key_counts_;
+  uint64_t upload_origin_gpu_only_ = 0;
+  uint64_t upload_origin_cpu_only_ = 0;
+  uint64_t upload_origin_both_ = 0;
+  uint64_t upload_origin_none_ = 0;
+  uint64_t upload_gpu_no_resolve_ = 0;
+  uint64_t upload_gpu_match_ = 0;
+  uint64_t upload_gpu_mismatch_base_ = 0;
+  uint64_t upload_gpu_mismatch_format_ = 0;
+  uint64_t upload_gpu_mismatch_endian_ = 0;
+  uint64_t upload_gpu_mismatch_pitch_ = 0;
+  uint64_t upload_gpu_mismatch_dims_ = 0;
+  uint64_t upload_batches_committed_ = 0;
+  uint64_t upload_batches_all_forwardable_ = 0;
+  bool upload_batch_all_forwardable_ = true;
   uint64_t upload_branch_current_cb_ = 0;
   uint64_t upload_branch_batch_ = 0;
   uint64_t upload_branch_private_ = 0;

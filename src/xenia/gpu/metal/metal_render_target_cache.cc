@@ -3546,6 +3546,8 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
     return true;
   }
 
+  command_processor_.NoteResolveForCensus(resolve_info);
+
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
   const auto& coord = resolve_info.coordinate_info;

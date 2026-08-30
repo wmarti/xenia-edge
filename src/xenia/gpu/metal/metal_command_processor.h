@@ -81,6 +81,24 @@ class MetalCommandProcessor : public CommandProcessor {
   bool IsResolvedMemory(uint32_t base_ptr, uint32_t length) const;
   void ClearResolvedMemory();
 
+  // What a resolve wrote, kept so a later texture upload of the same range can
+  // be asked whether the resolve already produced exactly those texels.
+  struct ResolveCensusRecord {
+    uint32_t dest_base = 0;
+    uint32_t extent_start = 0;
+    uint32_t extent_length = 0;
+    uint32_t format = 0;
+    uint32_t endian = 0;
+    uint32_t pitch = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint64_t serial = 0;
+  };
+  void NoteResolveForCensus(const draw_util::ResolveInfo& resolve_info);
+  const ResolveCensusRecord* FindResolveCovering(uint32_t address,
+                                                 uint32_t length) const;
+  uint64_t resolve_census_serial() const { return resolve_census_serial_; }
+
   ui::metal::MetalProvider& GetMetalProvider() const;
 
   // Get the Metal device and command queue
@@ -810,6 +828,12 @@ class MetalCommandProcessor : public CommandProcessor {
     uint32_t length;
   };
   std::vector<ResolvedRange> resolved_memory_ranges_;
+
+  static constexpr size_t kResolveCensusRecordCount = 64;
+  std::array<ResolveCensusRecord, kResolveCensusRecordCount>
+      resolve_census_records_ = {};
+  size_t resolve_census_next_ = 0;
+  uint64_t resolve_census_serial_ = 0;
 };
 
 }  // namespace metal

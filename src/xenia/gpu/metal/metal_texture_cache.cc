@@ -10,6 +10,7 @@
 #include "xenia/gpu/metal/metal_texture_cache.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/metal/metal_heap_pool.h"
+#include "xenia/gpu/texture_info.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -480,7 +481,69 @@ bool MetalTextureCache::ShouldUploadViaBlit() const {
 }
 
 void MetalTextureCache::BeginUploadCommandBufferBatch() {
+  if (!upload_batch_depth_) {
+    upload_batch_all_forwardable_ = true;
+  }
   ++upload_batch_depth_;
+}
+
+// Attributes one upload to the write that invalidated the texture, and for a
+// GPU-origin upload asks whether the resolve that wrote the range produced
+// exactly these texels - the case a host-side forward could serve without
+// reading guest memory back.
+void MetalTextureCache::CensusUpload(const Texture& texture) {
+  const uint32_t origin = texture.invalidation_origin();
+  const_cast<Texture&>(texture).reset_invalidation_origin();
+  const bool by_gpu = (origin & Texture::kInvalidationOriginGpu) != 0;
+  const bool by_cpu = (origin & Texture::kInvalidationOriginCpu) != 0;
+  if (by_gpu && by_cpu) {
+    ++upload_origin_both_;
+  } else if (by_gpu) {
+    ++upload_origin_gpu_only_;
+  } else if (by_cpu) {
+    ++upload_origin_cpu_only_;
+  } else {
+    ++upload_origin_none_;
+  }
+  if (!by_gpu || by_cpu) {
+    // A guest write to the range means the resolve is not the only producer,
+    // so the upload cannot be served from the resolve result.
+    upload_batch_all_forwardable_ = false;
+    return;
+  }
+  if (!command_processor_) {
+    upload_batch_all_forwardable_ = false;
+    return;
+  }
+  const TextureKey& key = texture.key();
+  const uint32_t base_address = key.base_page << 12;
+  const auto* record = command_processor_->FindResolveCovering(
+      base_address, texture.GetGuestBaseSize());
+  if (!record) {
+    ++upload_gpu_no_resolve_;
+    upload_batch_all_forwardable_ = false;
+    return;
+  }
+  uint64_t* mismatch = nullptr;
+  if (record->dest_base != base_address) {
+    mismatch = &upload_gpu_mismatch_base_;
+  } else if (ColorFormatToTextureFormat(xenos::ColorFormat(record->format)) !=
+             key.format) {
+    mismatch = &upload_gpu_mismatch_format_;
+  } else if (record->endian != uint32_t(key.endianness)) {
+    mismatch = &upload_gpu_mismatch_endian_;
+  } else if (record->pitch != (uint32_t(key.pitch) << 5)) {
+    mismatch = &upload_gpu_mismatch_pitch_;
+  } else if (record->width != uint32_t(key.width_minus_1) + 1 ||
+             record->height != uint32_t(key.height_minus_1) + 1) {
+    mismatch = &upload_gpu_mismatch_dims_;
+  }
+  if (mismatch) {
+    ++*mismatch;
+    upload_batch_all_forwardable_ = false;
+    return;
+  }
+  ++upload_gpu_match_;
 }
 
 MTL::CommandBuffer* MetalTextureCache::EnsureUploadCommandBufferBatch() {
@@ -539,6 +602,10 @@ void MetalTextureCache::EndUploadCommandBufferBatch() {
         cmd, MetalCommandProcessor::CommandBufferKind::kTextureUploadBatch);
     cmd->release();
     return;
+  }
+  ++upload_batches_committed_;
+  if (upload_batch_all_forwardable_) {
+    ++upload_batches_all_forwardable_;
   }
   cmd->addCompletedHandler(^(MTL::CommandBuffer* completed_cmd) {
     completed_cmd->release();
@@ -3318,6 +3385,7 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   // Total uploads alone cannot tell those apart, and the answer decides
   // whether the fix is in the cache's invalidation or nowhere.
   ++upload_calls_;
+  CensusUpload(texture);
   {
     auto it = upload_key_counts_.find(texture.key());
     if (it == upload_key_counts_.end()) {

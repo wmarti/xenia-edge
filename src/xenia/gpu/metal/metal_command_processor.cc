@@ -1147,6 +1147,45 @@ uint64_t MetalCommandProcessor::GetCompletedSubmission() const {
   return completed_command_buffers_.load(std::memory_order_acquire);
 }
 
+void MetalCommandProcessor::NoteResolveForCensus(
+    const draw_util::ResolveInfo& resolve_info) {
+  if (!resolve_info.copy_dest_extent_length) {
+    return;
+  }
+  ResolveCensusRecord& record = resolve_census_records_[resolve_census_next_];
+  resolve_census_next_ = (resolve_census_next_ + 1) % kResolveCensusRecordCount;
+  record.dest_base = resolve_info.copy_dest_base;
+  record.extent_start = resolve_info.copy_dest_extent_start;
+  record.extent_length = resolve_info.copy_dest_extent_length;
+  record.format = uint32_t(resolve_info.copy_dest_info.copy_dest_format);
+  record.endian = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
+  record.pitch = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32
+                 << 5;
+  record.width = resolve_info.coordinate_info.width_div_8 << 3;
+  record.height = resolve_info.height_div_8 << 3;
+  record.serial = ++resolve_census_serial_;
+}
+
+const MetalCommandProcessor::ResolveCensusRecord*
+MetalCommandProcessor::FindResolveCovering(uint32_t address,
+                                           uint32_t length) const {
+  const ResolveCensusRecord* best = nullptr;
+  for (const ResolveCensusRecord& record : resolve_census_records_) {
+    if (!record.serial) {
+      continue;
+    }
+    if (address < record.extent_start ||
+        uint64_t(address) + length >
+            uint64_t(record.extent_start) + record.extent_length) {
+      continue;
+    }
+    if (!best || record.serial > best->serial) {
+      best = &record;
+    }
+  }
+  return best;
+}
+
 void MetalCommandProcessor::MarkResolvedMemory(uint32_t base_ptr,
                                                uint32_t length) {
   if (length == 0) {
@@ -1985,6 +2024,45 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           fprintf(cf, "upload_max_repeats %llu\n",
                   static_cast<unsigned long long>(
                       texture_cache_->upload_max_repeats()));
+          fprintf(cf, "upload_origin_gpu_only %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_origin_gpu_only()));
+          fprintf(cf, "upload_origin_cpu_only %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_origin_cpu_only()));
+          fprintf(cf, "upload_origin_both %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_origin_both()));
+          fprintf(cf, "upload_origin_none %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_origin_none()));
+          fprintf(cf, "upload_gpu_no_resolve %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_gpu_no_resolve()));
+          fprintf(cf, "upload_gpu_match %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_gpu_match()));
+          fprintf(cf, "upload_gpu_mismatch_base %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_gpu_mismatch_base()));
+          fprintf(cf, "upload_gpu_mismatch_format %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_gpu_mismatch_format()));
+          fprintf(cf, "upload_gpu_mismatch_endian %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_gpu_mismatch_endian()));
+          fprintf(cf, "upload_gpu_mismatch_pitch %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_gpu_mismatch_pitch()));
+          fprintf(cf, "upload_gpu_mismatch_dims %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_gpu_mismatch_dims()));
+          fprintf(cf, "upload_batches_committed %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_batches_committed()));
+          fprintf(cf, "upload_batches_all_forwardable %llu\n",
+                  static_cast<unsigned long long>(
+                      texture_cache_->upload_batches_all_forwardable()));
           fprintf(cf, "uptodate_calls %llu\n",
                   static_cast<unsigned long long>(
                       texture_cache_->make_up_to_date_calls()));

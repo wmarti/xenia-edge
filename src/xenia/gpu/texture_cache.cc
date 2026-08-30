@@ -710,7 +710,10 @@ void TextureCache::Texture::MarkAsUsed() {
 }
 
 void TextureCache::Texture::WatchCallback(
-    [[maybe_unused]] const global_unique_lock_type& global_lock, bool is_mip) {
+    [[maybe_unused]] const global_unique_lock_type& global_lock, bool is_mip,
+    bool invalidated_by_gpu) {
+  invalidation_origin_ |=
+      invalidated_by_gpu ? kInvalidationOriginGpu : kInvalidationOriginCpu;
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
@@ -727,7 +730,7 @@ void TextureCache::WatchCallback(const global_unique_lock_type& global_lock,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
   ++texture.texture_cache().watch_callbacks_;
-  texture.WatchCallback(global_lock, argument != 0);
+  texture.WatchCallback(global_lock, argument != 0, invalidated_by_gpu);
   texture.texture_cache().texture_became_outdated_.store(
       true, std::memory_order_release);
 }
