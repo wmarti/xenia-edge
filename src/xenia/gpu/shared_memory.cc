@@ -513,7 +513,8 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   watch_range_first_free_ = range;
 }
 
-// todo: optimize, an enormous amount of cpu time (1.34%) is spent here.
+// TODO: Batch draw-resource range requests to amortize the global critical
+// region acquisition. Validity checks must remain serialized with CPU writes.
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   if (!length) {
     // Some texture or buffer is empty, for example - safe to draw in this case.
@@ -535,33 +536,6 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
 
   uint32_t block_first = page_first >> 6;
   uint32_t block_last = page_last >> 6;
-
-  // Lockless fast-path: check if all pages are already valid.
-  // This avoids lock acquisition for the common case where pages are resident.
-  uint64_t* valid_flags = system_page_flags_valid_;
-  if (valid_flags) {
-    bool all_valid = true;
-    for (uint32_t i = block_first; i <= block_last && all_valid; ++i) {
-      uint64_t block_valid = valid_flags[i];
-      if (i == block_first) {
-        // Mask out pages before page_first
-        uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
-        block_valid |= block_before;
-      }
-      if (i == block_last && (page_last & 63) != 63) {
-        // Mask out pages after page_last
-        uint64_t block_after = ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
-        block_valid |= block_after;
-      }
-      if (block_valid != ~uint64_t(0)) {
-        all_valid = false;
-      }
-    }
-    if (all_valid) {
-      // All pages already valid, nothing to upload
-      return true;
-    }
-  }
 
   upload_ranges_.clear();
 
