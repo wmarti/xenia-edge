@@ -422,7 +422,7 @@ MTL::ComputePipelineState* CreateComputePipelineFromEmbeddedLibrary(
 }
 
 constexpr uint32_t kPipelineDiskCacheMagic = 0x43504D58;  // 'XMPC'
-constexpr uint32_t kPipelineDiskCacheVersion = 2;
+constexpr uint32_t kPipelineDiskCacheVersion = 3;
 constexpr size_t kPipelineDiskCacheMaxEntrySize = 1 << 20;
 
 XEPACKEDSTRUCT(PipelineDiskCacheHeader, {
@@ -445,7 +445,6 @@ XEPACKEDSTRUCT(PipelineDiskCacheEntryBase, {
   uint32_t stencil_format;
   uint32_t color_formats[4];
   uint32_t normalized_color_mask;
-  uint32_t alpha_to_mask_enable;
   uint32_t blendcontrol[4];
   uint32_t vertex_attribute_count;
   uint32_t vertex_layout_count;
@@ -931,7 +930,9 @@ MTL::RenderPipelineState* MetalCommandProcessor::CreateMslPipelineState(
   desc->setDepthAttachmentPixelFormat(request.depth_format);
   desc->setStencilAttachmentPixelFormat(request.stencil_format);
   desc->setSampleCount(request.sample_count);
-  desc->setAlphaToCoverageEnabled(request.alpha_to_mask_enable != 0);
+  // Xenos alpha-to-mask is already emitted as a shader sample mask. Enabling
+  // native alpha-to-coverage would intersect it with a second mask.
+  desc->setAlphaToCoverageEnabled(false);
 
   NS::Error* error = nullptr;
   MTL::RenderPipelineState* pipeline =
@@ -4547,7 +4548,8 @@ MetalCommandProcessor::GetOrCreateDxilTessellationPipelineState(
   desc->setDepthAttachmentPixelFormat(request.depth_format);
   desc->setStencilAttachmentPixelFormat(request.stencil_format);
   desc->setRasterSampleCount(request.sample_count);
-  desc->setAlphaToCoverageEnabled(request.alpha_to_mask_enable != 0);
+  // The translated pixel shader already implements Xenos alpha-to-mask.
+  desc->setAlphaToCoverageEnabled(false);
 
   IRGeometryTessellationEmulationPipelineDescriptor ir_desc = {};
   // No stage-in: the guest fetches vertices from shared memory, so the host
@@ -6524,7 +6526,6 @@ MetalCommandProcessor::GetOrCreateMslTessPipelineState(
     normalized_color_mask = draw_util::GetNormalizedColorMask(
         regs, pixel_shader_writes_color_targets);
   }
-  auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
   struct TessPipelineKey {
     const void* ds;
     const void* ps;
@@ -6535,7 +6536,6 @@ MetalCommandProcessor::GetOrCreateMslTessPipelineState(
     uint32_t stencil_format;
     uint32_t color_formats[4];
     uint32_t normalized_color_mask;
-    uint32_t alpha_to_mask_enable;
     uint32_t blendcontrol[4];
   } key_data = {};
   key_data.ds = domain_translation;
@@ -6549,7 +6549,6 @@ MetalCommandProcessor::GetOrCreateMslTessPipelineState(
     key_data.color_formats[i] = uint32_t(color_formats[i]);
   }
   key_data.normalized_color_mask = normalized_color_mask;
-  key_data.alpha_to_mask_enable = rb_colorcontrol.alpha_to_mask_enable ? 1 : 0;
   for (uint32_t i = 0; i < 4; ++i) {
     // The blend register is only read below for a bound RT with a non-zero
     // write mask; zeroing it elsewhere lets those draws share one pipeline.
@@ -6609,7 +6608,8 @@ MetalCommandProcessor::GetOrCreateMslTessPipelineState(
       MTL::TessellationControlPointIndexTypeNone);
 
   // Render target attachments with blend state (same as non-tess pipeline).
-  desc->setAlphaToCoverageEnabled(key_data.alpha_to_mask_enable != 0);
+  // The translated pixel shader already implements Xenos alpha-to-mask.
+  desc->setAlphaToCoverageEnabled(false);
   for (uint32_t i = 0; i < 4; ++i) {
     auto* color_attachment = desc->colorAttachments()->object(i);
     color_attachment->setPixelFormat(color_formats[i]);
@@ -6902,7 +6902,6 @@ uint64_t MetalCommandProcessor::PopulatePipelineCompileRequest(
     uint32_t stencil_format;
     uint32_t color_formats[4];
     uint32_t normalized_color_mask;
-    uint32_t alpha_to_mask_enable;
     uint32_t blendcontrol[4];
   } key_data = {};
   key_data.vs = vertex_translation;
@@ -6921,8 +6920,6 @@ uint64_t MetalCommandProcessor::PopulatePipelineCompileRequest(
     key_data.normalized_color_mask = draw_util::GetNormalizedColorMask(
         regs, pixel_shader_writes_color_targets);
   }
-  auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
-  key_data.alpha_to_mask_enable = rb_colorcontrol.alpha_to_mask_enable ? 1 : 0;
   for (uint32_t i = 0; i < 4; ++i) {
     // ApplyColorAttachmentState only reads the blend register for a bound RT
     // with a non-zero write mask; zeroing it elsewhere lets those draws share
@@ -6950,7 +6947,6 @@ uint64_t MetalCommandProcessor::PopulatePipelineCompileRequest(
   request.depth_format = depth_format;
   request.stencil_format = stencil_format;
   request.normalized_color_mask = key_data.normalized_color_mask;
-  request.alpha_to_mask_enable = key_data.alpha_to_mask_enable;
   request.priority = pixel_translation ? 2 : 1;
   for (uint32_t i = 0; i < 4; ++i) {
     request.color_formats[i] = color_formats[i];
