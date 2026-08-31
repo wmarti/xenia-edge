@@ -364,7 +364,7 @@ class MetalCommandProcessor : public CommandProcessor {
   SpirvShaderTranslator::Modification GetCurrentSpirvVertexShaderModification(
       const Shader& shader,
       Shader::HostVertexShaderType host_vertex_shader_type,
-      uint32_t interpolator_mask) const;
+      uint32_t interpolator_mask, bool ps_param_gen_used) const;
   SpirvShaderTranslator::Modification GetCurrentSpirvPixelShaderModification(
       const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
       reg::RB_DEPTHCONTROL normalized_depth_control,

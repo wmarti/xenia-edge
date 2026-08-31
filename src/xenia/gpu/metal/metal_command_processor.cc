@@ -3288,7 +3288,8 @@ bool MetalCommandProcessor::IssueDrawMsl(
   // Compute SPIRV shader modifications.
   SpirvShaderTranslator::Modification vertex_shader_modification =
       GetCurrentSpirvVertexShaderModification(
-          *msl_vertex_shader, host_vertex_shader_type, interpolator_mask);
+          *msl_vertex_shader, host_vertex_shader_type, interpolator_mask,
+          ps_param_gen_pos != UINT32_MAX);
   SpirvShaderTranslator::Modification pixel_shader_modification =
       msl_pixel_shader
           ? GetCurrentSpirvPixelShaderModification(
@@ -4620,7 +4621,8 @@ bool MetalCommandProcessor::IssueDrawDxil(
 
   SpirvShaderTranslator::Modification vertex_shader_modification =
       GetCurrentSpirvVertexShaderModification(
-          *dxil_vertex_shader, host_vertex_shader_type, interpolator_mask);
+          *dxil_vertex_shader, host_vertex_shader_type, interpolator_mask,
+          ps_param_gen_pos != UINT32_MAX);
   SpirvShaderTranslator::Modification pixel_shader_modification =
       dxil_pixel_shader
           ? GetCurrentSpirvPixelShaderModification(
@@ -6677,7 +6679,7 @@ MetalCommandProcessor::GetOrCreateMslTessPipelineState(
 SpirvShaderTranslator::Modification
 MetalCommandProcessor::GetCurrentSpirvVertexShaderModification(
     const Shader& shader, Shader::HostVertexShaderType host_vertex_shader_type,
-    uint32_t interpolator_mask) const {
+    uint32_t interpolator_mask, bool ps_param_gen_used) const {
   const auto& regs = *register_file_;
 
   SpirvShaderTranslator::Modification modification(
@@ -6688,17 +6690,30 @@ MetalCommandProcessor::GetCurrentSpirvVertexShaderModification(
 
   modification.vertex.interpolator_mask = interpolator_mask;
 
+  if (Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type)) {
+    modification.vertex.tessellation_mode =
+        regs.Get<reg::VGT_HOS_CNTL>().tess_mode;
+  }
+
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   uint32_t user_clip_planes =
       pa_cl_clip_cntl.clip_disable ? 0 : pa_cl_clip_cntl.ucp_ena;
   modification.vertex.user_clip_plane_count = xe::bit_count(user_clip_planes);
   modification.vertex.user_clip_plane_cull =
       uint32_t(user_clip_planes && pa_cl_clip_cntl.ucp_cull_only_ena);
+  modification.vertex.vertex_kill_and =
+      uint32_t((shader.writes_point_size_edge_flag_kill_vertex() & 0b100) &&
+               !pa_cl_clip_cntl.vtx_kill_or);
 
-  modification.vertex.output_point_parameters =
-      uint32_t((shader.writes_point_size_edge_flag_kill_vertex() & 0b001) &&
-               regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type ==
-                   xenos::PrimitiveType::kPointList);
+  if (host_vertex_shader_type ==
+      Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
+    modification.vertex.output_point_parameters = uint32_t(ps_param_gen_used);
+  } else {
+    modification.vertex.output_point_parameters =
+        uint32_t((shader.writes_point_size_edge_flag_kill_vertex() & 0b001) &&
+                 regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type ==
+                     xenos::PrimitiveType::kPointList);
+  }
 
   return modification;
 }
@@ -6737,10 +6752,17 @@ MetalCommandProcessor::GetCurrentSpirvPixelShaderModification(
 
   using DepthStencilMode =
       SpirvShaderTranslator::Modification::DepthStencilMode;
-  if (shader.implicit_early_z_write_allowed() &&
-      (!shader.writes_color_target(0) ||
-       !draw_util::DoesCoverageDependOnAlpha(
-           regs.Get<reg::RB_COLORCONTROL>()))) {
+  if (::cvars::depth_float24_convert_in_pixel_shader &&
+      normalized_depth_control.z_enable &&
+      regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
+          xenos::DepthRenderTargetFormat::kD24FS8) {
+    modification.pixel.depth_stencil_mode =
+        ::cvars::depth_float24_round ? DepthStencilMode::kFloat24Rounding
+                                     : DepthStencilMode::kFloat24Truncating;
+  } else if (shader.implicit_early_z_write_allowed() &&
+             (!shader.writes_color_target(0) ||
+              !draw_util::DoesCoverageDependOnAlpha(
+                  regs.Get<reg::RB_COLORCONTROL>()))) {
     modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
   } else {
     modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
