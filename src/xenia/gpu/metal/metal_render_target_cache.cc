@@ -109,6 +109,15 @@ class ScopedAutoreleasePool {
   NS::AutoreleasePool* pool_;
 };
 
+void EndSharedMemoryUploadBlitEncoderForCommandBuffer(
+    MetalCommandProcessor& command_processor,
+    MTL::CommandBuffer* command_buffer) {
+  if (command_buffer &&
+      command_buffer == command_processor.GetCurrentCommandBuffer()) {
+    command_processor.EndSharedMemoryUploadBlitEncoder();
+  }
+}
+
 #if XE_PLATFORM_IOS
 constexpr size_t kTransferInstanceBufferMaxBytes = 64ull * 1024ull * 1024ull;
 #else
@@ -2798,6 +2807,14 @@ bool MetalRenderTargetCache::DirectResolveRenderTargets(
   ScopedAutoreleasePool autorelease_pool;
   bool owns_command_buffer = false;
   MTL::CommandBuffer* cmd = command_buffer;
+  if (cmd && cmd != command_processor_.GetCurrentCommandBuffer()) {
+    command_processor_.SubmitSharedMemoryUploadsAndWait();
+  }
+  if (!cmd && !command_processor_.HasActiveRenderEncoder()) {
+    // A staged destination upload creates a main submission. Keep the resolve
+    // behind that upload in the same command buffer when possible.
+    cmd = command_processor_.GetCurrentCommandBuffer();
+  }
   if (!cmd) {
     cmd = command_processor_.CreateAccountedCommandBuffer(
         MetalCommandProcessor::CommandBufferKind::kRenderTargetResolve);
@@ -2806,6 +2823,7 @@ bool MetalRenderTargetCache::DirectResolveRenderTargets(
     }
     owns_command_buffer = true;
   }
+  EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_, cmd);
   MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
   if (!encoder) {
     return false;
@@ -2965,6 +2983,15 @@ bool MetalRenderTargetCache::DirectResolveRenderTargets(
   }
 
   encoder->endEncoding();
+  std::pair<uint32_t, uint32_t> shared_memory_range = {
+      resolve_info.copy_dest_extent_start,
+      resolve_info.copy_dest_extent_length};
+  if (cmd == command_processor_.GetCurrentCommandBuffer()) {
+    shared->MarkGpuAccess(shared_memory_range.first, shared_memory_range.second,
+                          command_processor_.GetCurrentSubmission());
+  } else {
+    shared->TrackStandaloneGpuAccess(cmd, &shared_memory_range, 1);
+  }
   if (owns_command_buffer) {
     cmd->commit();
     cmd->waitUntilCompleted();
@@ -3835,6 +3862,15 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
         ScopedAutoreleasePool autorelease_pool;
         bool owns_command_buffer = false;
         MTL::CommandBuffer* cmd = command_buffer;
+        if (cmd && cmd != command_processor_.GetCurrentCommandBuffer()) {
+          command_processor_.SubmitSharedMemoryUploadsAndWait();
+        }
+        if (!cmd && !command_processor_.HasActiveRenderEncoder()) {
+          // RequestRange may have opened the main command buffer for a staged
+          // upload. Encode the resolve after it rather than committing an
+          // unrelated standalone buffer ahead of the upload.
+          cmd = command_processor_.GetCurrentCommandBuffer();
+        }
         if (!cmd) {
           cmd = command_processor_.CreateAccountedCommandBuffer(
               MetalCommandProcessor::CommandBufferKind::kRenderTargetResolve);
@@ -3847,6 +3883,8 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
           owns_command_buffer = true;
         }
         if (cmd) {
+          EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_,
+                                                           cmd);
           MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
           if (!encoder) {
             XELOGE(
@@ -3877,6 +3915,18 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
                 MTL::Size::Make(8, 8, 1));
 
             encoder->endEncoding();
+            if (!draw_resolution_scaled && shared) {
+              std::pair<uint32_t, uint32_t> shared_memory_range = {
+                  resolve_info.copy_dest_extent_start,
+                  resolve_info.copy_dest_extent_length};
+              if (cmd == command_processor_.GetCurrentCommandBuffer()) {
+                shared->MarkGpuAccess(
+                    shared_memory_range.first, shared_memory_range.second,
+                    command_processor_.GetCurrentSubmission());
+              } else {
+                shared->TrackStandaloneGpuAccess(cmd, &shared_memory_range, 1);
+              }
+            }
             if (owns_command_buffer) {
               cmd->commit();
               cmd->waitUntilCompleted();

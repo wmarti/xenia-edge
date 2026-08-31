@@ -1768,6 +1768,7 @@ void MetalCommandProcessor::WaitForPendingCompletionHandlers() {
 }
 
 void MetalCommandProcessor::ShutdownContext() {
+  EndSharedMemoryUploadBlitEncoder();
   // End any active render encoder before shutdown
   if (current_render_encoder_) {
     current_render_encoder_->endEncoding();
@@ -2236,6 +2237,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 
   // End any active render encoder
   EndRenderEncoder();
+  EndSharedMemoryUploadBlitEncoder();
 
   // Submit and wait for command buffer
   if (current_command_buffer_) {
@@ -2893,11 +2895,14 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 }
 
 bool MetalCommandProcessor::RequestDrawSharedMemoryRanges(
-    const Shader& vertex_shader, const RegisterFile& regs) {
+    const Shader& vertex_shader,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    const RegisterFile& regs) {
   SCOPE_profile_cpu_f("gpu");
   if (!shared_memory_) {
     return true;
   }
+  const uint64_t submission = GetCurrentSubmission();
   const Shader::ConstantRegisterMap& constant_map_vertex =
       vertex_shader.constant_register_map();
   for (uint32_t i = 0; i < xe::countof(constant_map_vertex.vertex_fetch_bitmap);
@@ -2943,6 +2948,7 @@ bool MetalCommandProcessor::RequestDrawSharedMemoryRanges(
             buffer_offset, buffer_length);
         return false;
       }
+      shared_memory_->MarkGpuAccess(buffer_offset, buffer_length, submission);
     }
   }
 
@@ -2955,6 +2961,33 @@ bool MetalCommandProcessor::RequestDrawSharedMemoryRanges(
           base_bytes, memexport_range.size_bytes);
       return false;
     }
+    shared_memory_->MarkGpuAccess(base_bytes, memexport_range.size_bytes,
+                                  submission);
+  }
+
+  if (primitive_processing_result.index_buffer_type ==
+      PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA) {
+    const xenos::IndexFormat guest_index_format =
+        regs.Get<reg::VGT_DRAW_INITIATOR>().index_size;
+    const uint32_t guest_index_stride =
+        guest_index_format == xenos::IndexFormat::kInt16 ? sizeof(uint16_t)
+                                                         : sizeof(uint32_t);
+    const uint64_t guest_index_length =
+        uint64_t(primitive_processing_result.guest_draw_vertex_count) *
+        guest_index_stride;
+    if (primitive_processing_result.guest_index_base >
+            SharedMemory::kBufferSize ||
+        SharedMemory::kBufferSize -
+                primitive_processing_result.guest_index_base <
+            guest_index_length) {
+      XELOGE("Metal: Shader-loaded guest index buffer range is out of bounds");
+      return false;
+    }
+    // The host built-in index buffer only expands primitives. The vertex
+    // shader still reads the original guest indices from shared memory.
+    shared_memory_->MarkGpuAccess(primitive_processing_result.guest_index_base,
+                                  static_cast<uint32_t>(guest_index_length),
+                                  submission);
   }
   return true;
 }
@@ -3255,24 +3288,6 @@ bool MetalCommandProcessor::ResolveDrawIndexBuffer(
       return false;
   }
 
-  auto request_guest_index_range = [&](uint64_t index_base,
-                                       uint32_t index_count,
-                                       MTL::IndexType index_type) -> bool {
-    if (!shared_memory_) {
-      return false;
-    }
-    uint32_t index_stride = (index_type == MTL::IndexTypeUInt16)
-                                ? sizeof(uint16_t)
-                                : sizeof(uint32_t);
-    uint64_t index_length = uint64_t(index_count) * index_stride;
-    if (index_base > SharedMemory::kBufferSize ||
-        SharedMemory::kBufferSize - index_base < index_length) {
-      return false;
-    }
-    return shared_memory_->RequestRange(static_cast<uint32_t>(index_base),
-                                        static_cast<uint32_t>(index_length));
-  };
-
   bool use_expansion_triangle_list_fallback = false;
   index_buffer_out.index_count =
       primitive_processing_result.host_draw_vertex_count;
@@ -3318,11 +3333,29 @@ bool MetalCommandProcessor::ResolveDrawIndexBuffer(
       index_buffer_out.buffer =
           shared_memory_ ? shared_memory_->GetBuffer() : nullptr;
       index_buffer_out.offset = primitive_processing_result.guest_index_base;
-      if (!request_guest_index_range(index_buffer_out.offset,
-                                     index_buffer_out.index_count,
-                                     index_buffer_out.index_type)) {
-        XELOGE("Metal: Failed to validate guest index buffer range");
+      if (!shared_memory_) {
+        XELOGE("Metal: Shared memory unavailable for guest index buffer");
         return false;
+      }
+      {
+        uint32_t index_stride =
+            index_buffer_out.index_type == MTL::IndexTypeUInt16
+                ? sizeof(uint16_t)
+                : sizeof(uint32_t);
+        uint64_t index_length =
+            uint64_t(index_buffer_out.index_count) * index_stride;
+        if (index_buffer_out.offset > SharedMemory::kBufferSize ||
+            SharedMemory::kBufferSize - index_buffer_out.offset <
+                index_length) {
+          XELOGE("Metal: Guest index buffer range is out of bounds");
+          return false;
+        }
+        // PrimitiveProcessor::Process requested this exact guest DMA source
+        // before the render encoder was opened. Only stamp here; a second
+        // late request could insert a blit after draw state has been bound.
+        shared_memory_->MarkGpuAccess(
+            static_cast<uint32_t>(index_buffer_out.offset),
+            static_cast<uint32_t>(index_length), GetCurrentSubmission());
       }
       break;
     case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
@@ -3549,7 +3582,14 @@ bool MetalCommandProcessor::IssueDrawMsl(
     return true;
   }
 
-  if (!RequestDrawSharedMemoryRanges(*msl_vertex_shader, regs)) {
+  if (!RequestDrawSharedMemoryRanges(*msl_vertex_shader,
+                                     primitive_processing_result, regs)) {
+    return false;
+  }
+  EndSharedMemoryUploadBlitEncoder();
+  BeginCommandBuffer();
+  if (!current_render_encoder_) {
+    XELOGE("SPIRV-Cross: failed to resume render encoder after uploads");
     return false;
   }
 
@@ -4809,7 +4849,14 @@ bool MetalCommandProcessor::IssueDrawDxil(
     return true;
   }
 
-  if (!RequestDrawSharedMemoryRanges(*dxil_vertex_shader, regs)) {
+  if (!RequestDrawSharedMemoryRanges(*dxil_vertex_shader,
+                                     primitive_processing_result, regs)) {
+    return false;
+  }
+  EndSharedMemoryUploadBlitEncoder();
+  BeginCommandBuffer();
+  if (!current_render_encoder_) {
+    XELOGE("DXIL: failed to resume render encoder after uploads");
     return false;
   }
 
@@ -5035,6 +5082,7 @@ bool MetalCommandProcessor::IssueCopy() {
 
   // Resolve touched guest memory in a draw-containing submission; commit now
   // so following packets don't observe stale resolve results.
+  EndSharedMemoryUploadBlitEncoder();
   ScheduleSpirvUniformBufferRelease(copy_command_buffer);
   ScheduleSpirvArgumentBufferRelease(copy_command_buffer);
   copy_command_buffer->commit();
@@ -5380,6 +5428,49 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
   return current_command_buffer_;
 }
 
+MTL::BlitCommandEncoder*
+MetalCommandProcessor::GetSharedMemoryUploadBlitEncoder() {
+  if (shared_memory_upload_blit_encoder_) {
+    return shared_memory_upload_blit_encoder_;
+  }
+
+  // Metal permits only one active encoder per command buffer. Ending the
+  // render pass keeps the upload ordered after earlier draws without forcing
+  // a submission boundary; the next draw reopens the pass after this blit.
+  EndRenderEncoder();
+  MTL::CommandBuffer* command_buffer = EnsureCommandBuffer();
+  if (!command_buffer) {
+    return nullptr;
+  }
+  shared_memory_upload_blit_encoder_ = command_buffer->blitCommandEncoder();
+  if (!shared_memory_upload_blit_encoder_) {
+    XELOGE("Metal: failed to create shared-memory upload blit encoder");
+    return nullptr;
+  }
+  shared_memory_upload_blit_encoder_->retain();
+  shared_memory_upload_blit_encoder_->setLabel(
+      NS::String::string("XeniaSharedMemoryUpload", NS::UTF8StringEncoding));
+  return shared_memory_upload_blit_encoder_;
+}
+
+void MetalCommandProcessor::EndSharedMemoryUploadBlitEncoder() {
+  if (!shared_memory_upload_blit_encoder_) {
+    return;
+  }
+  shared_memory_upload_blit_encoder_->endEncoding();
+  shared_memory_upload_blit_encoder_->release();
+  shared_memory_upload_blit_encoder_ = nullptr;
+}
+
+void MetalCommandProcessor::SubmitSharedMemoryUploadsAndWait() {
+  if (!shared_memory_upload_blit_encoder_) {
+    return;
+  }
+  const uint64_t submission = GetCurrentSubmission();
+  EndCommandBuffer(CommandBufferKind::kTextureOther);
+  AwaitSubmissionCompletion(submission);
+}
+
 void MetalCommandProcessor::ProcessCompletedSubmissions() {
   const uint64_t completed =
       completed_command_buffers_.load(std::memory_order_relaxed);
@@ -5559,6 +5650,7 @@ void MetalCommandProcessor::BeginCommandBuffer() {
   if (!EnsureCommandBuffer()) {
     return;
   }
+  EndSharedMemoryUploadBlitEncoder();
 
   // The visibility result buffer has to be on the descriptor before the encoder
   // is created, so a segment waiting to open needs the pool allocated now.
@@ -6209,6 +6301,7 @@ void MetalCommandProcessor::EndCommandBuffer(CommandBufferKind next_kind) {
     next_submission_kind_ = next_kind;
   }
   EndRenderEncoder();
+  EndSharedMemoryUploadBlitEncoder();
   ResetMslCrossEncoderReuseCaches();
 
   if (current_command_buffer_) {

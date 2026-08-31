@@ -691,6 +691,8 @@ void MetalTextureCache::FailContentUploadCompletion(
 
 void MetalTextureCache::NotifyCommandBufferDiscarded(
     MTL::CommandBuffer* command_buffer) {
+  static_cast<MetalSharedMemory&>(shared_memory())
+      .CancelStandaloneGpuAccess(command_buffer);
   FailContentUploadCompletion(command_buffer);
   UploadBufferPool::HandleCommandBufferFinished(command_buffer);
 }
@@ -1326,6 +1328,34 @@ bool MetalTextureCache::TryGpuLoadTexture(
   }
 
   const bool use_blit_upload = ShouldUploadViaBlit();
+  std::pair<uint32_t, uint32_t> shared_memory_ranges[2] = {};
+  uint32_t shared_memory_range_count = 0;
+  if (!texture_resolution_scaled) {
+    auto append_shared_memory_range = [&](bool load, bool snapshot_valid,
+                                          uint32_t guest_address,
+                                          uint32_t guest_size) {
+      if (!load || snapshot_valid) {
+        return;
+      }
+      GuestTextureLoadRange range =
+          GetGuestTextureLoadRange(guest_address, guest_size);
+      if (range) {
+        shared_memory_ranges[shared_memory_range_count++] = {range.address,
+                                                             range.length};
+      }
+    };
+    append_shared_memory_range(load_base, base_snapshot_valid,
+                               base_guest_address, texture.GetGuestBaseSize());
+    append_shared_memory_range(load_mips, mips_snapshot_valid,
+                               mips_guest_address, texture.GetGuestMipsSize());
+  }
+
+  // The CPU replacement path below commits and waits a standalone command
+  // buffer. If its prerequisite upload was staged into the main submission,
+  // submit that upload first so commit order can't be inverted.
+  if (!use_blit_upload && command_processor_) {
+    command_processor_->SubmitSharedMemoryUploadsAndWait();
+  }
 
   auto find_stored_level =
       [&](bool is_base_storage,
@@ -1428,7 +1458,28 @@ bool MetalTextureCache::TryGpuLoadTexture(
     }
   };
 
+  if (shared_memory_range_count) {
+    if (use_current_command_buffer) {
+      for (uint32_t i = 0; i < shared_memory_range_count; ++i) {
+        metal_shared_memory.MarkGpuAccess(
+            shared_memory_ranges[i].first, shared_memory_ranges[i].second,
+            command_processor_->GetCurrentSubmission());
+      }
+    } else {
+      // Reserve standalone source pages before encoding. A batch may stay open
+      // while later texture requests observe guest invalidations, so waiting
+      // until batch commit would leave already-encoded reads vulnerable to a
+      // direct CPU mirror update.
+      metal_shared_memory.TrackStandaloneGpuAccess(cmd, shared_memory_ranges,
+                                                   shared_memory_range_count);
+    }
+  }
+
   MTL::ComputeCommandEncoder* encoder = nullptr;
+  if (command_processor_ &&
+      cmd == command_processor_->GetCurrentCommandBuffer()) {
+    command_processor_->EndSharedMemoryUploadBlitEncoder();
+  }
   {
     SCOPE_profile_cpu_i("gpu", "MetalTextureCache::ComputeEncoderCreate");
     encoder = cmd->computeCommandEncoder();

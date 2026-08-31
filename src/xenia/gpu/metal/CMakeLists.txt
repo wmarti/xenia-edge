@@ -20,12 +20,15 @@ add_library(xenia-gpu-metal STATIC
   metal_shader_converter.h
   metal_shared_memory.cc
   metal_shared_memory.h
+  metal_shared_memory_util.h
   metal_tessellation_shaders.cc
   metal_tessellation_shaders.h
   metal_texture_cache.cc
   metal_texture_cache.h
   metal_transfer_spirv_cross.cc
   metal_transfer_spirv_cross.h
+  metal_upload_buffer_pool.cc
+  metal_upload_buffer_pool.h
   metal_zpd_visibility_pool.cc
   metal_zpd_visibility_pool.h
   msl_bindings.h

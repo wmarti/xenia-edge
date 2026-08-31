@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "xenia/gpu/register_file.h"

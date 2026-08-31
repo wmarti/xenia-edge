@@ -132,6 +132,13 @@ class MetalCommandProcessor : public CommandProcessor {
   };
 
   MTL::CommandBuffer* EnsureCommandBuffer();
+  // Shared-memory uploads that would overwrite pages still used by the GPU
+  // are copied through this submission's ordered blit encoder.
+  MTL::BlitCommandEncoder* GetSharedMemoryUploadBlitEncoder();
+  void EndSharedMemoryUploadBlitEncoder();
+  // Used only by standalone consumers that can't join the submission holding
+  // their prerequisite staged upload.
+  void SubmitSharedMemoryUploadsAndWait();
   // Creates a command buffer with GPU time accounting attached. Every command
   // buffer the backend commits outside the submission one has to come from
   // here, or its work is missing from gpu_busy_us_per_frame.
@@ -299,8 +306,10 @@ class MetalCommandProcessor : public CommandProcessor {
 
   // Makes the vertex fetch and memexport ranges the draw touches resident in
   // shared memory.
-  bool RequestDrawSharedMemoryRanges(const Shader& vertex_shader,
-                                     const RegisterFile& regs);
+  bool RequestDrawSharedMemoryRanges(
+      const Shader& vertex_shader,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+      const RegisterFile& regs);
   void ComputeDrawViewportInfo(const RegisterFile& regs,
                                const Shader* pixel_shader,
                                reg::RB_DEPTHCONTROL normalized_depth_control,
@@ -464,6 +473,7 @@ class MetalCommandProcessor : public CommandProcessor {
 
   // Current command buffer and encoder
   MTL::CommandBuffer* current_command_buffer_ = nullptr;
+  MTL::BlitCommandEncoder* shared_memory_upload_blit_encoder_ = nullptr;
   MTL::RenderCommandEncoder* current_render_encoder_ = nullptr;
   MTL::RenderPassDescriptor* current_render_pass_descriptor_ = nullptr;
   NS::AutoreleasePool* command_buffer_autorelease_pool_ = nullptr;
