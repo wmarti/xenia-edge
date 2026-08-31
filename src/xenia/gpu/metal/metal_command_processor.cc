@@ -5527,6 +5527,11 @@ void MetalCommandProcessor::BeginCommandBuffer() {
   if (zpd_segment_pending && IsZPDQueryPoolReady()) {
     pass_descriptor->setVisibilityResultBuffer(
         zpd_visibility_pool_->visibility_buffer());
+    // One guest query segment may span multiple render encoders. Preserve the
+    // visibility value written by earlier encoders instead of resetting it
+    // when this encoder is created.
+    pass_descriptor->setVisibilityResultType(
+        MTL::VisibilityResultTypeAccumulate);
   } else {
     pass_descriptor->setVisibilityResultBuffer(nullptr);
   }
