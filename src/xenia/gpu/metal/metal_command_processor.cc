@@ -6368,11 +6368,9 @@ void MetalCommandProcessor::ApplyRasterizerState(bool primitive_polygonal) {
   float polygon_offset = 0.0f;
   draw_util::GetPreferredFacePolygonOffset(
       regs, primitive_polygonal, polygon_offset_scale, polygon_offset);
-  float depth_bias_factor = regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
-                                    xenos::DepthRenderTargetFormat::kD24S8
-                                ? draw_util::kD3D10PolygonOffsetFactorUnorm24
-                                : draw_util::kD3D10PolygonOffsetFactorFloat24;
-  float depth_bias_constant = polygon_offset * depth_bias_factor;
+  float depth_bias_constant =
+      static_cast<float>(draw_util::GetD3D10IntegerPolygonOffset(
+          regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset));
   float depth_bias_slope =
       polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit *
       float(std::max(render_target_cache_->draw_resolution_scale_x(),
