@@ -5666,6 +5666,11 @@ void MetalCommandProcessor::BeginCommandBuffer() {
       return;
     }
     current_render_encoder_->retain();
+    // A non-null encoder will execute the descriptor's first-use clears when
+    // the pass ends. Keep them pending across encoder-creation failures.
+    if (render_target_cache_) {
+      render_target_cache_->ConsumeRenderPassDescriptorClears(pass_descriptor);
+    }
     ++render_passes_total_;
     current_render_encoder_->setLabel(
         NS::String::string("XeniaRenderEncoder", NS::UTF8StringEncoding));
