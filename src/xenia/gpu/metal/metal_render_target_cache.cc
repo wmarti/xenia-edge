@@ -557,18 +557,6 @@ struct TransferClearDepthConstants {
 
 }  // namespace
 
-bool MetalRenderTargetCache::IsKey64bpp(RenderTargetKey key) const {
-  // For host texture storage and transfers, gamma-as-unorm16 uses RGBA16Unorm
-  // which is 64bpp. This is needed for correct transfer calculations.
-  // NOTE: EDRAM dump path needs special handling - the EDRAM buffer is still
-  // 32bpp even when host storage is 64bpp. See DumpRenderTargets.
-  return key.Is64bpp() ||
-         (!key.is_depth &&
-          key.GetColorFormat() ==
-              xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA &&
-          gamma_render_target_as_unorm16_);
-}
-
 // MetalRenderTarget implementation
 MetalRenderTargetCache::MetalRenderTarget::~MetalRenderTarget() {
   if (stencil_view_) {
@@ -1330,7 +1318,7 @@ bool MetalRenderTargetCache::BuildTransferRectanglePlans(
     plan.transfer_index = transfer_index;
     plan.rectangle_count = transfer.GetRectangles(
         dest_key.base_tiles, dest_key.GetPitchTiles(), dest_key.msaa_samples,
-        IsKey64bpp(dest_key), plan.rectangles.data(), cutout);
+        dest_key.Is64bpp(), plan.rectangles.data(), cutout);
     if (!plan.rectangle_count) {
       if (require_all_rectangles) {
         transfer_rectangles_out.clear();
@@ -4364,7 +4352,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
         uint32_t rectangle_count = transfer.GetRectangles(
             dest_key.base_tiles, dest_key.pitch_tiles_at_32bpp,
-            dest_key.msaa_samples, IsKey64bpp(dest_key), rectangles,
+            dest_key.msaa_samples, dest_key.Is64bpp(), rectangles,
             resolve_clear_rectangle);
         if (!rectangle_count) {
           return false;
@@ -4399,7 +4387,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           }
           uint32_t tile_width_pixels =
               tile_width_samples >>
-              ((IsKey64bpp(dest_key) ? 1u : 0u) +
+              ((dest_key.Is64bpp() ? 1u : 0u) +
                uint32_t(dest_key.msaa_samples >= xenos::MsaaSamples::k4X));
           uint32_t tile_height_pixels =
               tile_height_samples >>
@@ -4564,7 +4552,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
         uint32_t rectangle_count = transfer.GetRectangles(
             dest_key.base_tiles, dest_key.GetPitchTiles(),
-            dest_key.msaa_samples, IsKey64bpp(dest_key), rectangles,
+            dest_key.msaa_samples, dest_key.Is64bpp(), rectangles,
             resolve_clear_rectangle);
         if (rectangle_count != 1 || !is_full_target_rectangle(rectangles[0])) {
           return false;
@@ -4850,7 +4838,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
                   rectangles[Transfer::kMaxRectanglesWithCutout];
               uint32_t rectangle_count = transfer.GetRectangles(
                   dest_key.base_tiles, dest_key.GetPitchTiles(),
-                  dest_key.msaa_samples, IsKey64bpp(dest_key), rectangles,
+                  dest_key.msaa_samples, dest_key.Is64bpp(), rectangles,
                   resolve_clear_rectangle);
               for (uint32_t rect_index = 0; rect_index < rectangle_count;
                    ++rect_index) {
@@ -5237,7 +5225,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
             uint32_t rectangle_count =
                 transfer_invocations_[merged_index].transfer.GetRectangles(
                     dest_key.base_tiles, dest_key.GetPitchTiles(),
-                    dest_key.msaa_samples, IsKey64bpp(dest_key), rectangles,
+                    dest_key.msaa_samples, dest_key.Is64bpp(), rectangles,
                     resolve_clear_rectangle);
             for (uint32_t rect_index = 0; rect_index < rectangle_count;
                  ++rect_index) {
