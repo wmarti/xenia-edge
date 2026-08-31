@@ -581,8 +581,6 @@ class MetalCommandProcessor : public CommandProcessor {
   // memory instead of using a uniform value).
   MTL::ComputePipelineState* tess_factor_pipeline_adaptive_tri_ = nullptr;
   MTL::ComputePipelineState* tess_factor_pipeline_adaptive_quad_ = nullptr;
-  MTL::Buffer* tess_factor_buffer_ = nullptr;
-  uint32_t tess_factor_buffer_patch_capacity_ = 0;
   std::unordered_map<uint64_t, MTL::RenderPipelineState*>
       msl_tess_pipeline_cache_;
   bool InitializeMslTessellation();
@@ -592,7 +590,6 @@ class MetalCommandProcessor : public CommandProcessor {
       MslShader::MslTranslation* pixel_translation,
       Shader::HostVertexShaderType host_vertex_shader_type,
       const RegisterFile& regs);
-  bool EnsureTessFactorBuffer(uint32_t patch_count);
 
   struct DepthStencilStateKey {
     uint32_t depth_control;

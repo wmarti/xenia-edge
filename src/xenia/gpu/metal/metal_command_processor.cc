@@ -168,6 +168,26 @@ IRRuntimeTessellationPipelineConfig BuildTessellationPipelineConfig(
   return config;
 }
 
+uint32_t GetMslTessellationControlPointCount(
+    const PrimitiveProcessor::ProcessingResult& primitive) {
+  switch (primitive.host_vertex_shader_type) {
+    case Shader::HostVertexShaderType::kTriangleDomainCPIndexed:
+      return 3;
+    case Shader::HostVertexShaderType::kQuadDomainCPIndexed:
+      return 4;
+    case Shader::HostVertexShaderType::kTriangleDomainPatchIndexed:
+      return primitive.tessellation_mode == xenos::TessellationMode::kAdaptive
+                 ? 3
+                 : 1;
+    case Shader::HostVertexShaderType::kQuadDomainPatchIndexed:
+      return primitive.tessellation_mode == xenos::TessellationMode::kAdaptive
+                 ? 4
+                 : 1;
+    default:
+      return 0;
+  }
+}
+
 void GetBoundRenderTargetSize(const MetalRenderTargetCache* render_target_cache,
                               uint32_t fallback_width, uint32_t fallback_height,
                               uint32_t& width_out, uint32_t& height_out) {
@@ -4063,24 +4083,20 @@ bool MetalCommandProcessor::IssueDrawMsl(
     float max_tess = std::max(
         1.0f, regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f);
 
-    // Determine control points per patch and patch count from the draw.
-    // The primitive processor passes patch count in host_draw_vertex_count
-    // for tessellated draws (vertex count = cp_per_patch * patch_count).
-    uint32_t cp_per_patch = 1;
+    // Patch-indexed draws use one control point except in adaptive mode, where
+    // the guest index buffer contains one factor per patch edge.
+    uint32_t cp_per_patch =
+        GetMslTessellationControlPointCount(primitive_processing_result);
+    if (!cp_per_patch) {
+      XELOGE("SPIRV-Cross: Unsupported tessellation host vertex shader type {}",
+             uint32_t(host_vertex_shader_type));
+      return false;
+    }
     bool is_quad_domain = false;
     switch (host_vertex_shader_type) {
-      case Shader::HostVertexShaderType::kTriangleDomainCPIndexed:
-      case Shader::HostVertexShaderType::kTriangleDomainPatchIndexed:
-        cp_per_patch = 3;
-        break;
       case Shader::HostVertexShaderType::kQuadDomainCPIndexed:
       case Shader::HostVertexShaderType::kQuadDomainPatchIndexed:
-        cp_per_patch = 4;
         is_quad_domain = true;
-        break;
-      case Shader::HostVertexShaderType::kLineDomainCPIndexed:
-      case Shader::HostVertexShaderType::kLineDomainPatchIndexed:
-        cp_per_patch = 2;
         break;
       default:
         break;
@@ -4091,11 +4107,28 @@ bool MetalCommandProcessor::IssueDrawMsl(
       return true;  // Nothing to draw.
     }
 
-    // Ensure tessellation factor buffer is large enough.
-    if (!EnsureTessFactorBuffer(patch_count)) {
+    constexpr uint32_t kTriangleFactorSize = 8;
+    constexpr uint32_t kQuadFactorSize = 12;
+    uint64_t factor_bytes =
+        uint64_t(patch_count) *
+        (is_quad_domain ? kQuadFactorSize : kTriangleFactorSize);
+    if (factor_bytes > UINT32_MAX) {
       XELOGE(
-          "SPIRV-Cross: Failed to allocate tess factor buffer for {} "
+          "SPIRV-Cross: Tessellation factor buffer size is too large for {} "
           "patches",
+          patch_count);
+      return false;
+    }
+
+    // Keep each draw's factors in a unique command-buffer-scoped slice. The
+    // page is returned to the pool only after the command buffer completes.
+    MTL::Buffer* tess_factor_buffer = nullptr;
+    NS::UInteger tess_factor_offset = 0;
+    if (!AcquireSpirvArgumentBufferSlice(uint32_t(factor_bytes), 4,
+                                         &tess_factor_buffer,
+                                         &tess_factor_offset)) {
+      XELOGE(
+          "SPIRV-Cross: Failed to allocate tess factor buffer for {} patches",
           patch_count);
       return false;
     }
@@ -4150,7 +4183,8 @@ bool MetalCommandProcessor::IssueDrawMsl(
     auto tess_mode = regs.Get<reg::VGT_HOS_CNTL>().tess_mode;
 
     uint8_t* factor_data =
-        static_cast<uint8_t*>(tess_factor_buffer_->contents());
+        static_cast<uint8_t*>(tess_factor_buffer->contents()) +
+        tess_factor_offset;
 
     if (tess_mode == xenos::TessellationMode::kAdaptive && shared_memory_) {
       // ------------------------------------------------------------------
@@ -4270,10 +4304,9 @@ bool MetalCommandProcessor::IssueDrawMsl(
     }
 
     // Draw with tessellation.
-    assert_not_null(tess_factor_buffer_);
-    UseRenderEncoderResource(tess_factor_buffer_, MTL::ResourceUsageRead);
-    current_render_encoder_->setTessellationFactorBuffer(tess_factor_buffer_, 0,
-                                                         0);
+    UseRenderEncoderResource(tess_factor_buffer, MTL::ResourceUsageRead);
+    current_render_encoder_->setTessellationFactorBuffer(tess_factor_buffer,
+                                                         tess_factor_offset, 0);
     // drawPatches signature:
     //   numberOfPatchControlPoints, patchStart, patchCount,
     //   patchIndexBuffer, patchIndexBufferOffset,
@@ -4910,6 +4943,7 @@ bool MetalCommandProcessor::IssueCopy() {
   // Resolve touched guest memory in a draw-containing submission; commit now
   // so following packets don't observe stale resolve results.
   ScheduleSpirvUniformBufferRelease(copy_command_buffer);
+  ScheduleSpirvArgumentBufferRelease(copy_command_buffer);
   copy_command_buffer->commit();
   copy_command_buffer->release();
   current_command_buffer_ = nullptr;
@@ -6380,11 +6414,6 @@ void MetalCommandProcessor::ShutdownMslTessellation() {
     }
   }
   msl_tess_pipeline_cache_.clear();
-  if (tess_factor_buffer_) {
-    tess_factor_buffer_->release();
-    tess_factor_buffer_ = nullptr;
-    tess_factor_buffer_patch_capacity_ = 0;
-  }
   if (tess_factor_pipeline_tri_) {
     tess_factor_pipeline_tri_->release();
     tess_factor_pipeline_tri_ = nullptr;
@@ -6401,35 +6430,6 @@ void MetalCommandProcessor::ShutdownMslTessellation() {
     tess_factor_pipeline_adaptive_quad_->release();
     tess_factor_pipeline_adaptive_quad_ = nullptr;
   }
-}
-
-bool MetalCommandProcessor::EnsureTessFactorBuffer(uint32_t patch_count) {
-  // MTLQuadTessellationFactorsHalf is the larger of the two (12 bytes vs 8).
-  constexpr size_t kMaxFactorSize = 12;
-  size_t needed = size_t(patch_count) * kMaxFactorSize;
-  if (tess_factor_buffer_ && tess_factor_buffer_->length() >= needed) {
-    // Buffer already large enough; don't reduce the tracked capacity.
-    return true;
-  }
-  if (tess_factor_buffer_) {
-    tess_factor_buffer_->release();
-  }
-  // Round up and over-allocate for future growth.
-  size_t alloc_size = std::max(needed, size_t(4096));
-  alloc_size = (alloc_size + 4095) & ~size_t(4095);
-  // Use Shared storage so the CPU can fill tessellation factors directly
-  // (avoids needing a separate compute encoder for uniform factors).
-  tess_factor_buffer_ =
-      device_->newBuffer(alloc_size, MTL::ResourceStorageModeShared);
-  if (!tess_factor_buffer_) {
-    XELOGE("Failed to allocate tessellation factor buffer ({} bytes)",
-           alloc_size);
-    return false;
-  }
-  tess_factor_buffer_->setLabel(
-      NS::String::string("Xenia Tess Factor Buffer", NS::UTF8StringEncoding));
-  tess_factor_buffer_patch_capacity_ = uint32_t(alloc_size / kMaxFactorSize);
-  return true;
 }
 
 MTL::RenderPipelineState*
