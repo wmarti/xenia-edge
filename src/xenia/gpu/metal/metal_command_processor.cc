@@ -188,6 +188,54 @@ uint32_t GetMslTessellationControlPointCount(
   }
 }
 
+bool GetTextureSize(MTL::Texture* texture, uint32_t& width_out,
+                    uint32_t& height_out) {
+  if (!texture) {
+    return false;
+  }
+  width_out = std::max(static_cast<uint32_t>(texture->width()), uint32_t(1));
+  height_out = std::max(static_cast<uint32_t>(texture->height()), uint32_t(1));
+  return true;
+}
+
+bool GetRenderPassDescriptorSize(MTL::RenderPassDescriptor* pass_descriptor,
+                                 uint32_t& width_out, uint32_t& height_out) {
+  if (!pass_descriptor) {
+    return false;
+  }
+
+  uint32_t constrained_width =
+      static_cast<uint32_t>(pass_descriptor->renderTargetWidth());
+  uint32_t constrained_height =
+      static_cast<uint32_t>(pass_descriptor->renderTargetHeight());
+  if (constrained_width && constrained_height) {
+    width_out = constrained_width;
+    height_out = constrained_height;
+    return true;
+  }
+
+  if (auto* color_attachments = pass_descriptor->colorAttachments()) {
+    for (uint32_t i = 0; i < 8; ++i) {
+      auto* attachment = color_attachments->object(i);
+      if (attachment &&
+          GetTextureSize(attachment->texture(), width_out, height_out)) {
+        return true;
+      }
+    }
+  }
+  if (auto* depth_attachment = pass_descriptor->depthAttachment()) {
+    if (GetTextureSize(depth_attachment->texture(), width_out, height_out)) {
+      return true;
+    }
+  }
+  if (auto* stencil_attachment = pass_descriptor->stencilAttachment()) {
+    if (GetTextureSize(stencil_attachment->texture(), width_out, height_out)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void GetBoundRenderTargetSize(const MetalRenderTargetCache* render_target_cache,
                               uint32_t fallback_width, uint32_t fallback_height,
                               uint32_t& width_out, uint32_t& height_out) {
@@ -196,20 +244,29 @@ void GetBoundRenderTargetSize(const MetalRenderTargetCache* render_target_cache,
   if (!render_target_cache) {
     return;
   }
-  MTL::Texture* pass_size_texture = render_target_cache->GetColorTarget(0);
-  if (!pass_size_texture) {
-    pass_size_texture = render_target_cache->GetDepthTarget();
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (GetTextureSize(render_target_cache->GetColorTargetForDraw(i), width_out,
+                       height_out)) {
+      return;
+    }
   }
-  if (!pass_size_texture) {
-    pass_size_texture = render_target_cache->GetDummyColorTarget();
-  }
-  if (!pass_size_texture) {
+  if (GetTextureSize(render_target_cache->GetDepthTargetForDraw(), width_out,
+                     height_out)) {
     return;
   }
-  width_out =
-      std::max(static_cast<uint32_t>(pass_size_texture->width()), uint32_t(1));
-  height_out =
-      std::max(static_cast<uint32_t>(pass_size_texture->height()), uint32_t(1));
+  GetTextureSize(render_target_cache->GetDummyColorTargetForDraw(), width_out,
+                 height_out);
+}
+
+void GetActiveRenderTargetSize(
+    MTL::RenderPassDescriptor* pass_descriptor,
+    const MetalRenderTargetCache* render_target_cache, uint32_t fallback_width,
+    uint32_t fallback_height, uint32_t& width_out, uint32_t& height_out) {
+  if (GetRenderPassDescriptorSize(pass_descriptor, width_out, height_out)) {
+    return;
+  }
+  GetBoundRenderTargetSize(render_target_cache, fallback_width, fallback_height,
+                           width_out, height_out);
 }
 
 void ClampScissorToBounds(draw_util::Scissor& scissor, uint32_t width,
@@ -2945,8 +3002,9 @@ void MetalCommandProcessor::ApplyViewportAndScissor(
   // Clamp scissor to actual render target bounds (Metal requires this).
   uint32_t rt_width = 1;
   uint32_t rt_height = 1;
-  GetBoundRenderTargetSize(render_target_cache_.get(), render_target_width_,
-                           render_target_height_, rt_width, rt_height);
+  GetActiveRenderTargetSize(current_render_pass_descriptor_,
+                            render_target_cache_.get(), render_target_width_,
+                            render_target_height_, rt_width, rt_height);
   ClampScissorToBounds(scissor, rt_width, rt_height);
 
   MTL::Viewport mtl_viewport;
@@ -5582,15 +5640,14 @@ void MetalCommandProcessor::BeginCommandBuffer() {
     ff_blend_factor_valid_ = false;
     current_render_pass_descriptor_ = pass_descriptor;
 
-    // Start the encoder off covering the whole bound render target rather than
-    // a hard-coded 1280x720. Prefer color RT 0 from the MetalRenderTargetCache,
-    // falling back to depth (depth-only passes) and then legacy
-    // render_target_width_/height_ when needed. Every draw applies the guest's
-    // own viewport and scissor over this before it runs.
+    // Start the encoder off covering the whole active render pass rather than
+    // a hard-coded 1280x720. Every draw applies the guest's own viewport and
+    // scissor over this before it runs.
     uint32_t rt_width = 1;
     uint32_t rt_height = 1;
-    GetBoundRenderTargetSize(render_target_cache_.get(), render_target_width_,
-                             render_target_height_, rt_width, rt_height);
+    GetActiveRenderTargetSize(pass_descriptor, render_target_cache_.get(),
+                              render_target_width_, render_target_height_,
+                              rt_width, rt_height);
     MTL::Viewport viewport = {
         0.0, 0.0, static_cast<double>(rt_width), static_cast<double>(rt_height),
         0.0, 1.0};
