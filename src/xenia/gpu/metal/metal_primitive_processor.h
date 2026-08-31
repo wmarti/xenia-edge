@@ -43,7 +43,7 @@ class MetalPrimitiveProcessor : public PrimitiveProcessor {
     return expansion_triangle_list_index_buffer_;
   }
   MTL::Buffer* GetConvertedIndexBuffer(size_t handle,
-                                       uint64_t& offset_bytes_out) const;
+                                       uint64_t& offset_bytes_out);
 
  protected:
   bool InitializeBuiltinIndexBuffer(
@@ -78,6 +78,7 @@ class MetalPrimitiveProcessor : public PrimitiveProcessor {
     MTL::Buffer* buffer = nullptr;
     size_t size = 0;
     uint64_t last_frame_used = 0;
+    uint64_t last_submission_used = 0;
   };
   std::vector<FrameIndexBuffer> frame_index_buffers_;
 };

@@ -10,6 +10,8 @@
 #ifndef XENIA_GPU_METAL_METAL_SUBMISSION_UTIL_H_
 #define XENIA_GPU_METAL_METAL_SUBMISSION_UTIL_H_
 
+#include <cstdint>
+
 namespace xe {
 namespace gpu {
 namespace metal {
@@ -32,6 +34,13 @@ constexpr DrawTextureRequestBarrier GetDrawTextureRequestBarrier(
   return has_active_render_encoder
              ? DrawTextureRequestBarrier::kEndRenderEncoder
              : DrawTextureRequestBarrier::kNone;
+}
+
+constexpr bool CanReuseConvertedIndexBuffer(bool referenced_in_current_frame,
+                                            uint64_t last_submission_used,
+                                            uint64_t completed_submission) {
+  return !referenced_in_current_frame &&
+         last_submission_used <= completed_submission;
 }
 
 }  // namespace metal
