@@ -68,9 +68,6 @@ bool MetalSharedMemory::Initialize() {
   }
 
   if (cvars::shared_memory_zero_copy) {
-    XELOGW(
-        "Metal shared memory: zero-copy is experimental; guest writes are not "
-        "versioned against in-flight GPU reads");
     size_t system_page_size = xe::memory::page_size();
     if (reinterpret_cast<uintptr_t>(xbox_ram) % system_page_size == 0) {
       buffer_ = device->newBuffer(xbox_ram, kBufferSize,
