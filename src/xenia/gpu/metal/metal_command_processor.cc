@@ -48,6 +48,7 @@
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/gpu/metal/metal_graphics_system.h"
 #include "xenia/gpu/metal/metal_shader_cache.h"
+#include "xenia/gpu/metal/metal_submission_util.h"
 #include "xenia/gpu/metal/metal_tessellation_shaders.h"
 #include "xenia/gpu/packet_disassembler.h"
 #include "xenia/gpu/registers.h"
@@ -3091,9 +3092,43 @@ bool MetalCommandProcessor::PrepareDrawTextures(uint32_t used_texture_mask,
     }
   }
 
-  if (texture_cache_ && used_texture_mask &&
-      texture_cache_->AnyUsedTextureRequestWorkPending(used_texture_mask)) {
+  const bool texture_request_work_pending =
+      texture_cache_ && used_texture_mask &&
+      texture_cache_->AnyUsedTextureRequestWorkPending(used_texture_mask);
+  const DrawTextureRequestBarrier texture_request_barrier =
+      GetDrawTextureRequestBarrier(
+          texture_request_work_pending, current_command_buffer_ != nullptr,
+          current_render_encoder_ != nullptr,
+          texture_cache_ &&
+              texture_cache_->CanUploadTexturesInCurrentCommandBuffer());
+  switch (texture_request_barrier) {
+    case DrawTextureRequestBarrier::kEndRenderEncoder:
+      // Draws already encoded in this command buffer must sample the old
+      // texture contents. Put the reload after them in the same command buffer,
+      // then start a new render encoder for the requesting draw.
+      EndRenderEncoder();
+      break;
+    case DrawTextureRequestBarrier::kEndCommandBuffer:
+      // The CPU-replacement upload path can't join an open command buffer.
+      // Commit all earlier work before it is allowed to replace the texture.
+      EndCommandBuffer();
+      ClearResolvedMemory();
+      break;
+    case DrawTextureRequestBarrier::kNone:
+      break;
+  }
+
+  if (texture_request_work_pending) {
     texture_cache_->RequestTextures(used_texture_mask);
+  }
+  if (texture_request_barrier != DrawTextureRequestBarrier::kNone) {
+    BeginCommandBuffer();
+    if (!current_command_buffer_ || !current_render_encoder_) {
+      XELOGE(
+          "Metal: failed to re-begin command buffer after ordered texture "
+          "request");
+      return false;
+    }
   }
   return true;
 }

@@ -159,6 +159,9 @@ class MetalTextureCache : public TextureCache {
 
   // TextureCache virtual method overrides
   void RequestTextures(uint32_t used_texture_mask) override;
+  bool CanUploadTexturesInCurrentCommandBuffer() const {
+    return ShouldUploadViaBlit();
+  }
 
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool SupportsTextureContentRevalidation() const override { return true; }
