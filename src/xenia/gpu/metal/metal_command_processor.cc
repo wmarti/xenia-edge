@@ -7312,16 +7312,17 @@ void MetalCommandProcessor::UpdateSpirvSystemConstantValues(
   flags |= uint32_t(alpha_test_function)
            << SpirvShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
 
-  // Gamma correction for render targets.
-  reg::RB_COLOR_INFO color_infos[4];
-  for (uint32_t i = 0; i < 4; ++i) {
-    color_infos[i] = regs.Get<reg::RB_COLOR_INFO>(
-        reg::RB_COLOR_INFO::rt_register_indices[i]);
-  }
-  for (uint32_t i = 0; i < 4; ++i) {
-    if (color_infos[i].color_format ==
-        xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
-      flags |= SpirvShaderTranslator::kSysFlag_ConvertColor0ToGamma << i;
+  // Gamma correction for render targets. RGBA16Unorm gamma targets contain
+  // linear values; their linear-to-gamma conversion happens on the EDRAM
+  // store, so the pixel shader must not pre-encode them.
+  if (!render_target_cache_->gamma_render_target_as_unorm16()) {
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      auto color_info = regs.Get<reg::RB_COLOR_INFO>(
+          reg::RB_COLOR_INFO::rt_register_indices[i]);
+      if (color_info.color_format ==
+          xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+        flags |= SpirvShaderTranslator::kSysFlag_ConvertColor0ToGamma << i;
+      }
     }
   }
 
