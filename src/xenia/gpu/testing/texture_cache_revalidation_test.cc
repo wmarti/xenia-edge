@@ -956,6 +956,29 @@ TEST_CASE("unused invalidated texture binding reloads when used later",
   REQUIRE(fixture.texture_cache().load_count() == 3);
 }
 
+TEST_CASE("fetch write preserves pending texture invalidation",
+          "[texture-revalidation][bindings]") {
+  ScopedTextureRevalidationConfig config;
+  cvars::texture_cache_revalidate_unchanged = false;
+  cvars::texture_cache_revalidate_census = false;
+  TextureRevalidationFixture fixture;
+  REQUIRE(fixture.Initialize());
+  constexpr uint32_t kFirstBinding = UINT32_C(1) << 0;
+  fixture.SetLinear8BitTextureFetch(0, kGuestPhysicalAddress);
+
+  fixture.RequestTextures(kFirstBinding);
+  REQUIRE(fixture.texture_cache().load_count() == 1);
+
+  fixture.WriteGuestByte(0, 0x6B);
+  REQUIRE(fixture.TriggerCpuWrite(0));
+  fixture.texture_cache().TextureFetchConstantWritten(0);
+
+  fixture.RequestTextures(kFirstBinding);
+  REQUIRE(fixture.texture_cache().load_count() == 2);
+  fixture.RequestTextures(kFirstBinding);
+  REQUIRE(fixture.texture_cache().load_count() == 2);
+}
+
 TEST_CASE("unused invalidated texture binding revalidates when used later",
           "[texture-revalidation][bindings]") {
   ScopedTextureRevalidationConfig config;

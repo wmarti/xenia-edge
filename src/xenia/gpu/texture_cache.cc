@@ -634,13 +634,10 @@ uint32_t TextureCache::InvalidateOutdatedBindings(
     const global_unique_lock_type& global_lock) {
   assert_true(global_lock.owns_lock());
   uint32_t invalidated_bindings = 0;
-  uint32_t in_sync = texture_bindings_in_sync_;
-  uint32_t index = 0;
-  while (xe::bit_scan_forward(in_sync, &index)) {
-    uint32_t index_bit = UINT32_C(1) << index;
-    in_sync = xe::clear_lowest_bit(in_sync);
+  for (uint32_t index = 0; index < texture_bindings_.size(); ++index) {
+    const uint32_t index_bit = UINT32_C(1) << index;
     const TextureBinding& binding = texture_bindings_[index];
-    if (IsBindingOutdatedForUse(global_lock, binding)) {
+    if (binding.key.is_valid && IsBindingOutdatedForUse(global_lock, binding)) {
       texture_bindings_in_sync_ &= ~index_bit;
       invalidated_bindings |= index_bit;
     }
