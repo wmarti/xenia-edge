@@ -118,12 +118,6 @@ void EndSharedMemoryUploadBlitEncoderForCommandBuffer(
   }
 }
 
-#if XE_PLATFORM_IOS
-constexpr size_t kTransferInstanceBufferMaxBytes = 64ull * 1024ull * 1024ull;
-#else
-constexpr size_t kTransferInstanceBufferMaxBytes = 256ull * 1024ull * 1024ull;
-#endif
-
 MTL::ComputePipelineState* CreateComputePipelineFromEmbeddedLibrary(
     MTL::Device* device, const void* metallib_data, size_t metallib_size,
     const char* debug_name, const char* entry_point_name = "entry_xe") {
@@ -775,22 +769,6 @@ void MetalRenderTargetCache::Shutdown(bool from_destructor) {
     transfer_dummy_buffer_->release();
     transfer_dummy_buffer_ = nullptr;
   }
-  for (auto& buffer : transfer_instance_buffers_) {
-    if (buffer) {
-      buffer->release();
-      buffer = nullptr;
-    }
-  }
-  for (auto& retired_list : transfer_instance_retired_buffers_) {
-    for (auto* buffer : retired_list) {
-      if (buffer) {
-        buffer->release();
-      }
-    }
-    retired_list.clear();
-  }
-  transfer_instance_buffer_sizes_.fill(0);
-  transfer_instance_buffer_offset_ = 0;
   for (size_t i = 0; i < xe::countof(transfer_dummy_color_float_); ++i) {
     if (transfer_dummy_color_float_[i]) {
       transfer_dummy_color_float_[i]->release();
@@ -1124,11 +1102,10 @@ void MetalRenderTargetCache::BeginFrame() {
       (frame_id_ % uint64_t(::cvars::metal_memory_log_rate)) == 0) {
     XELOGI(
         "Metal mem: frame={} rt={} map={} dummy={} pipelines={} "
-        "transfer_shaders={} inst_buf_sizes=[{}, {}, {}]",
+        "transfer_shaders={}",
         frame_id_, render_target_map_.size(), render_target_map_.size(),
         dummy_color_targets_.size(), transfer_pipelines_.size(),
-        transfer_fragment_functions_.size(), transfer_instance_buffer_sizes_[0],
-        transfer_instance_buffer_sizes_[1], transfer_instance_buffer_sizes_[2]);
+        transfer_fragment_functions_.size());
   }
 }
 
@@ -1157,13 +1134,10 @@ bool MetalRenderTargetCache::Update(
         0) {
       XELOGI(
           "Metal mem: frame={} rt={} map={} dummy={} pipelines={} "
-          "transfer_shaders={} inst_buf_sizes=[{}, {}, {}]",
+          "transfer_shaders={}",
           frame_id_, render_target_map_.size(), render_target_map_.size(),
           dummy_color_targets_.size(), transfer_pipelines_.size(),
-          transfer_fragment_functions_.size(),
-          transfer_instance_buffer_sizes_[0],
-          transfer_instance_buffer_sizes_[1],
-          transfer_instance_buffer_sizes_[2]);
+          transfer_fragment_functions_.size());
     }
   }
 
@@ -4331,129 +4305,6 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
       return true;
     };
 
-    auto allocate_instance_buffer = [&](size_t size, MTL::Buffer*& buffer,
-                                        size_t& offset) -> bool {
-      if (!device_) {
-        return false;
-      }
-      uint32_t buffer_index =
-          uint32_t(frame_id_ % kTransferInstanceBufferCount);
-      if (transfer_instance_buffer_frame_id_ != frame_id_) {
-        transfer_instance_buffer_frame_id_ = frame_id_;
-        transfer_instance_buffer_offset_ = 0;
-        auto& retired_buffers =
-            transfer_instance_retired_buffers_[buffer_index];
-        for (auto* retired_buffer : retired_buffers) {
-          if (retired_buffer) {
-            retired_buffer->release();
-          }
-        }
-        retired_buffers.clear();
-      }
-      constexpr size_t kAlignment = 256;
-      size_t aligned_offset =
-          xe::align(transfer_instance_buffer_offset_, size_t(kAlignment));
-      if (size > kTransferInstanceBufferMaxBytes ||
-          aligned_offset > kTransferInstanceBufferMaxBytes ||
-          aligned_offset > (kTransferInstanceBufferMaxBytes - size)) {
-        return false;
-      }
-      size_t required = aligned_offset + size;
-      if (transfer_instance_buffers_[buffer_index] &&
-          transfer_instance_buffer_sizes_[buffer_index] < required &&
-          aligned_offset != 0) {
-        return false;
-      }
-      if (!transfer_instance_buffers_[buffer_index] ||
-          transfer_instance_buffer_sizes_[buffer_index] < required) {
-        size_t new_size = xe::round_up<size_t>(required, 65536);
-        if (new_size > kTransferInstanceBufferMaxBytes) {
-          new_size = kTransferInstanceBufferMaxBytes;
-        }
-        if (new_size < required) {
-          return false;
-        }
-        if (transfer_instance_buffers_[buffer_index]) {
-          transfer_instance_retired_buffers_[buffer_index].push_back(
-              transfer_instance_buffers_[buffer_index]);
-          transfer_instance_buffers_[buffer_index] = nullptr;
-        }
-        MTL::ResourceOptions options = MTL::ResourceStorageModeShared |
-                                       MTL::ResourceCPUCacheModeWriteCombined;
-        MTL::Buffer* new_buffer = device_->newBuffer(new_size, options);
-        if (!new_buffer) {
-          transfer_instance_buffer_sizes_[buffer_index] = 0;
-          return false;
-        }
-        transfer_instance_buffers_[buffer_index] = new_buffer;
-        transfer_instance_buffer_sizes_[buffer_index] = new_size;
-      }
-      buffer = transfer_instance_buffers_[buffer_index];
-      if (!buffer) {
-        return false;
-      }
-      offset = aligned_offset;
-      transfer_instance_buffer_offset_ = aligned_offset + size;
-      return true;
-    };
-
-    auto build_rect_instance_stream =
-        [&](const Transfer::Rectangle* rectangles, uint32_t rectangle_count,
-            MTL::Buffer*& out_buffer, size_t& out_buffer_offset,
-            uint32_t& out_instance_count) -> bool {
-      out_buffer = nullptr;
-      out_buffer_offset = 0;
-      out_instance_count = 0;
-      if (!rectangles || !rectangle_count) {
-        return false;
-      }
-      size_t buffer_size =
-          size_t(rectangle_count) * sizeof(TransferRectInstance);
-      if (!buffer_size) {
-        return false;
-      }
-      MTL::Buffer* buffer = nullptr;
-      size_t buffer_offset = 0;
-      if (!allocate_instance_buffer(buffer_size, buffer, buffer_offset)) {
-        return false;
-      }
-      if (!buffer) {
-        return false;
-      }
-      auto* instances = reinterpret_cast<TransferRectInstance*>(
-          reinterpret_cast<uint8_t*>(buffer->contents()) + buffer_offset);
-      if (!instances) {
-        return false;
-      }
-      uint32_t instance_count = 0;
-      for (uint32_t rect_index = 0; rect_index < rectangle_count;
-           ++rect_index) {
-        uint32_t scaled_x = 0;
-        uint32_t scaled_y = 0;
-        uint32_t scaled_width = 0;
-        uint32_t scaled_height = 0;
-        if (!get_scaled_rect(rectangles[rect_index], scaled_x, scaled_y,
-                             scaled_width, scaled_height)) {
-          continue;
-        }
-        if (!scaled_width || !scaled_height) {
-          continue;
-        }
-        TransferRectInstance& instance = instances[instance_count++];
-        instance.origin_x = float(scaled_x);
-        instance.origin_y = float(scaled_y);
-        instance.size_x = float(scaled_width);
-        instance.size_y = float(scaled_height);
-      }
-      if (!instance_count) {
-        return false;
-      }
-      out_buffer = buffer;
-      out_buffer_offset = buffer_offset;
-      out_instance_count = instance_count;
-      return true;
-    };
-
     std::vector<Transfer> filtered_transfers;
     bool used_blit = false;
     MTL::BlitCommandEncoder* blit_encoder = nullptr;
@@ -5024,11 +4875,6 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         uint32_t last_transfer_stencil_reference = 0;
         bool transfer_vertex_constants_valid = false;
         TransferVertexConstants last_transfer_vertex_constants = {};
-        enum class TransferVertexSlot1Binding { kNone, kBuffer, kBytes };
-        TransferVertexSlot1Binding last_transfer_vertex_slot_1_binding =
-            TransferVertexSlot1Binding::kNone;
-        MTL::Buffer* last_transfer_vertex_buffer_1 = nullptr;
-        size_t last_transfer_vertex_buffer_1_offset = 0;
         bool last_transfer_vertex_bytes_1_valid = false;
         TransferRectInstance last_transfer_vertex_bytes_1 = {};
         auto bind_transfer_pipeline = [&](MTL::RenderPipelineState* pipeline) {
@@ -5322,36 +5168,15 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
             last_transfer_scissor_valid = true;
           }
         };
-        auto bind_transfer_vertex_buffer_1 = [&](MTL::Buffer* buffer,
-                                                 size_t offset) {
-          if (last_transfer_vertex_slot_1_binding !=
-                  TransferVertexSlot1Binding::kBuffer ||
-              last_transfer_vertex_buffer_1 != buffer ||
-              last_transfer_vertex_buffer_1_offset != offset) {
-            encoder->setVertexBuffer(buffer, offset, 1);
-            mark_encoder_mutation(kDrawPassTransferEncoderMutationVertexSlot1);
-            last_transfer_vertex_slot_1_binding =
-                TransferVertexSlot1Binding::kBuffer;
-            last_transfer_vertex_buffer_1 = buffer;
-            last_transfer_vertex_buffer_1_offset = offset;
-            last_transfer_vertex_bytes_1_valid = false;
-          }
-        };
         auto bind_transfer_vertex_bytes_1 =
             [&](const TransferRectInstance& rect_instance) {
-              if (last_transfer_vertex_slot_1_binding !=
-                      TransferVertexSlot1Binding::kBytes ||
-                  !last_transfer_vertex_bytes_1_valid ||
+              if (!last_transfer_vertex_bytes_1_valid ||
                   std::memcmp(&last_transfer_vertex_bytes_1, &rect_instance,
                               sizeof(rect_instance)) != 0) {
                 encoder->setVertexBytes(&rect_instance, sizeof(rect_instance),
                                         1);
                 mark_encoder_mutation(
                     kDrawPassTransferEncoderMutationVertexSlot1);
-                last_transfer_vertex_slot_1_binding =
-                    TransferVertexSlot1Binding::kBytes;
-                last_transfer_vertex_buffer_1 = nullptr;
-                last_transfer_vertex_buffer_1_offset = 0;
                 last_transfer_vertex_bytes_1 = rect_instance;
                 last_transfer_vertex_bytes_1_valid = true;
               }
@@ -5368,10 +5193,6 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
                   1);
               mark_encoder_mutation(
                   kDrawPassTransferEncoderMutationVertexSlot1);
-              last_transfer_vertex_slot_1_binding =
-                  TransferVertexSlot1Binding::kBytes;
-              last_transfer_vertex_buffer_1 = nullptr;
-              last_transfer_vertex_buffer_1_offset = 0;
               last_transfer_vertex_bytes_1_valid = false;
             };
         auto set_full_transfer_viewport_scissor = [&]() {
@@ -5554,37 +5375,26 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           const uint32_t rectangle_count =
               uint32_t(merged_transfer_rectangles.size());
 
-          MTL::Buffer* rect_instance_buffer = nullptr;
-          size_t rect_instance_buffer_offset = 0;
-          uint32_t rect_instance_count = 0;
           std::vector<TransferRectInstance> rect_instance_fallback;
-          if (rectangle_count > 1) {
-            build_rect_instance_stream(merged_transfer_rectangles.data(),
-                                       rectangle_count, rect_instance_buffer,
-                                       rect_instance_buffer_offset,
-                                       rect_instance_count);
-          }
-          if (!rect_instance_buffer || !rect_instance_count) {
-            rect_instance_fallback.reserve(rectangle_count);
-            for (uint32_t rect_index = 0; rect_index < rectangle_count;
-                 ++rect_index) {
-              uint32_t scaled_x = 0;
-              uint32_t scaled_y = 0;
-              uint32_t scaled_width = 0;
-              uint32_t scaled_height = 0;
-              if (!get_scaled_rect(merged_transfer_rectangles[rect_index],
-                                   scaled_x, scaled_y, scaled_width,
-                                   scaled_height) ||
-                  !scaled_width || !scaled_height) {
-                continue;
-              }
-              TransferRectInstance rect_instance = {};
-              rect_instance.origin_x = float(scaled_x);
-              rect_instance.origin_y = float(scaled_y);
-              rect_instance.size_x = float(scaled_width);
-              rect_instance.size_y = float(scaled_height);
-              rect_instance_fallback.push_back(rect_instance);
+          rect_instance_fallback.reserve(rectangle_count);
+          for (uint32_t rect_index = 0; rect_index < rectangle_count;
+               ++rect_index) {
+            uint32_t scaled_x = 0;
+            uint32_t scaled_y = 0;
+            uint32_t scaled_width = 0;
+            uint32_t scaled_height = 0;
+            if (!get_scaled_rect(merged_transfer_rectangles[rect_index],
+                                 scaled_x, scaled_y, scaled_width,
+                                 scaled_height) ||
+                !scaled_width || !scaled_height) {
+              continue;
             }
+            TransferRectInstance rect_instance = {};
+            rect_instance.origin_x = float(scaled_x);
+            rect_instance.origin_y = float(scaled_y);
+            rect_instance.size_x = float(scaled_width);
+            rect_instance.size_y = float(scaled_height);
+            rect_instance_fallback.push_back(rect_instance);
           }
 
           MTL::RenderPipelineState* pipeline = GetOrCreateTransferPipelines(
@@ -5606,14 +5416,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
                   : 1;
 
           auto draw_transfer_rects = [&]() {
-            if (rect_instance_buffer && rect_instance_count) {
-              set_full_transfer_viewport_scissor();
-              bind_transfer_vertex_buffer_1(rect_instance_buffer,
-                                            rect_instance_buffer_offset);
-              encoder->drawPrimitives(MTL::PrimitiveTypeTriangleStrip,
-                                      NS::UInteger(0), NS::UInteger(4),
-                                      NS::UInteger(rect_instance_count));
-            } else if (!rect_instance_fallback.empty()) {
+            if (!rect_instance_fallback.empty()) {
               set_full_transfer_viewport_scissor();
               constexpr uint32_t kTransferRectInlineBatchMax = 240;
               const TransferRectInstance* rect_instances =
