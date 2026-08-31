@@ -136,6 +136,11 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   // encoder already recording holds the attachments in tile memory instead.
   MTL::RenderPassDescriptor* GetRenderPassDescriptor(
       uint32_t expected_sample_count, bool render_encoder_pending);
+  // Whether an existing encoder's descriptor still binds the textures needed
+  // by the current guest render-target configuration.
+  bool IsRenderPassDescriptorCompatible(
+      MTL::RenderPassDescriptor* pass_descriptor,
+      uint32_t expected_sample_count) const;
   // Marks first-use clears baked into this descriptor as executed. Call only
   // after a render encoder has been created successfully from the descriptor.
   void ConsumeRenderPassDescriptorClears(

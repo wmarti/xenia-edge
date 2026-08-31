@@ -688,6 +688,10 @@ MetalCommandProcessor::~MetalCommandProcessor() {
     current_render_encoder_->release();
     current_render_encoder_ = nullptr;
   }
+  if (current_render_pass_descriptor_) {
+    current_render_pass_descriptor_->release();
+    current_render_pass_descriptor_ = nullptr;
+  }
   if (current_command_buffer_) {
     if (texture_cache_) {
       texture_cache_->NotifyCommandBufferDiscarded(current_command_buffer_);
@@ -1842,6 +1846,10 @@ void MetalCommandProcessor::ShutdownContext() {
   if (current_render_encoder_) {
     current_render_encoder_->release();
     current_render_encoder_ = nullptr;
+  }
+  if (current_render_pass_descriptor_) {
+    current_render_pass_descriptor_->release();
+    current_render_pass_descriptor_ = nullptr;
   }
   if (current_command_buffer_) {
     current_command_buffer_->release();
@@ -5604,6 +5612,10 @@ void MetalCommandProcessor::ResetMslCrossEncoderReuseCaches() {
 void MetalCommandProcessor::EndRenderEncoder() {
   SCOPE_profile_cpu_f("gpu");
   if (!current_render_encoder_) {
+    if (current_render_pass_descriptor_) {
+      current_render_pass_descriptor_->release();
+      current_render_pass_descriptor_ = nullptr;
+    }
     render_encoder_has_zpd_visibility_ = false;
     return;
   }
@@ -5616,7 +5628,10 @@ void MetalCommandProcessor::EndRenderEncoder() {
   current_render_encoder_->endEncoding();
   current_render_encoder_->release();
   current_render_encoder_ = nullptr;
-  current_render_pass_descriptor_ = nullptr;
+  if (current_render_pass_descriptor_) {
+    current_render_pass_descriptor_->release();
+    current_render_pass_descriptor_ = nullptr;
+  }
   render_encoder_has_zpd_visibility_ = false;
   ResetMslRenderEncoderStateCache();
 }
@@ -5675,12 +5690,25 @@ void MetalCommandProcessor::BeginCommandBuffer() {
   // Obtain the render pass descriptor. Prefer the one provided by
   // MetalRenderTargetCache (host render-target path), falling back to the
   // legacy descriptor if needed.
-  MTL::RenderPassDescriptor* pass_descriptor = render_pass_descriptor_;
+  MTL::RenderPassDescriptor* pass_descriptor =
+      current_render_encoder_ ? current_render_pass_descriptor_
+                              : render_pass_descriptor_;
   if (render_target_cache_) {
-    if (MTL::RenderPassDescriptor* cache_desc =
-            render_target_cache_->GetRenderPassDescriptor(
-                1, !current_render_encoder_)) {
-      pass_descriptor = cache_desc;
+    // Check attachment identity before asking the cache to rebuild a dirty
+    // descriptor. Rebuilding releases the cache-owned descriptor, and an
+    // allocator may reuse the same address even though the active encoder has
+    // already captured its old attachments.
+    if (current_render_encoder_ &&
+        !render_target_cache_->IsRenderPassDescriptorCompatible(
+            current_render_pass_descriptor_, 1)) {
+      EndRenderEncoder();
+      pass_descriptor = render_pass_descriptor_;
+    }
+    if (!current_render_encoder_) {
+      if (MTL::RenderPassDescriptor* cache_desc =
+              render_target_cache_->GetRenderPassDescriptor(1, true)) {
+        pass_descriptor = cache_desc;
+      }
     }
   }
   if (!pass_descriptor) {
@@ -5771,6 +5799,7 @@ void MetalCommandProcessor::BeginCommandBuffer() {
                                   zpd_visibility_pool_->visibility_buffer());
     ff_blend_factor_valid_ = false;
     current_render_pass_descriptor_ = pass_descriptor;
+    current_render_pass_descriptor_->retain();
 
     // Start the encoder off covering the whole active render pass rather than
     // a hard-coded 1280x720. Every draw applies the guest's own viewport and

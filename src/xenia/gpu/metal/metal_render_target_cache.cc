@@ -2412,6 +2412,76 @@ void MetalRenderTargetCache::ConsumeRenderPassDescriptorClears(
   }
 }
 
+bool MetalRenderTargetCache::IsRenderPassDescriptorCompatible(
+    MTL::RenderPassDescriptor* pass_descriptor,
+    uint32_t expected_sample_count) const {
+  if (pass_descriptor && pass_descriptor == cached_render_pass_descriptor_ &&
+      !render_pass_descriptor_dirty_ &&
+      cached_render_pass_descriptor_sample_count_ == expected_sample_count) {
+    return true;
+  }
+  if (!pass_descriptor) {
+    return false;
+  }
+
+  auto* depth_attachment = pass_descriptor->depthAttachment();
+  auto* stencil_attachment = pass_descriptor->stencilAttachment();
+  MTL::Texture* expected_depth =
+      current_depth_target_ ? current_depth_target_->draw_texture() : nullptr;
+  if (expected_depth) {
+    if (!depth_attachment || depth_attachment->texture() != expected_depth) {
+      return false;
+    }
+    MTL::PixelFormat depth_format = expected_depth->pixelFormat();
+    bool expects_stencil =
+        depth_format == MTL::PixelFormatDepth32Float_Stencil8 ||
+        depth_format == MTL::PixelFormatDepth24Unorm_Stencil8 ||
+        depth_format == MTL::PixelFormatX32_Stencil8;
+    if (expects_stencil) {
+      if (!stencil_attachment ||
+          stencil_attachment->texture() != expected_depth) {
+        return false;
+      }
+    } else if (stencil_attachment && stencil_attachment->texture()) {
+      return false;
+    }
+  } else if ((depth_attachment && depth_attachment->texture()) ||
+             (stencil_attachment && stencil_attachment->texture())) {
+    return false;
+  }
+
+  bool has_current_color_target = false;
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (current_color_targets_[i] &&
+        current_color_targets_[i]->draw_texture()) {
+      has_current_color_target = true;
+      break;
+    }
+  }
+  auto* color_attachments = pass_descriptor->colorAttachments();
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    MTL::Texture* actual_color = color_attachments->object(i)->texture();
+    MTL::Texture* expected_color =
+        current_color_targets_[i] ? current_color_targets_[i]->draw_texture()
+                                  : nullptr;
+    if (expected_color) {
+      if (actual_color != expected_color) {
+        return false;
+      }
+    } else if (actual_color && (has_current_color_target || i != 0)) {
+      return false;
+    }
+  }
+
+  if (has_current_color_target) {
+    return true;
+  }
+  MTL::Texture* expected_dummy =
+      dummy_color_target_ ? dummy_color_target_->draw_texture() : nullptr;
+  return expected_dummy &&
+         color_attachments->object(0)->texture() == expected_dummy;
+}
+
 MTL::Texture* MetalRenderTargetCache::GetColorTarget(uint32_t index) const {
   if (index >= 4 || !current_color_targets_[index]) {
     return nullptr;
