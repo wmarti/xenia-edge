@@ -3540,11 +3540,36 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
     return true;
   }
 
-  bool is_depth = resolve_info.IsCopyingDepth();
+  auto perform_resolve_clear = [&]() {
+    bool clear_depth = resolve_info.IsClearingDepth();
+    bool clear_color = resolve_info.IsClearingColor();
+    if (!clear_depth && !clear_color) {
+      return;
+    }
+    Transfer::Rectangle clear_rectangle;
+    RenderTarget* clear_targets[2] = {};
+    std::vector<Transfer> clear_transfers[2];
+    if (PrepareHostRenderTargetsResolveClear(
+            resolve_info, clear_rectangle, clear_targets[0], clear_transfers[0],
+            clear_targets[1], clear_transfers[1])) {
+      uint64_t clear_values[2];
+      clear_values[0] = resolve_info.rb_depth_clear;
+      clear_values[1] = resolve_info.rb_color_clear |
+                        (uint64_t(resolve_info.rb_color_clear_lo) << 32);
+      PerformTransfersAndResolveClears(2, clear_targets, clear_transfers,
+                                       clear_values, &clear_rectangle,
+                                       command_buffer);
+    }
+  };
 
   if (!resolve_info.copy_dest_extent_length) {
+    // A malformed or entirely clipped copy destination drops only the copy.
+    // The guest's post-resolve EDRAM clear is independent and must still run.
+    perform_resolve_clear();
     return true;
   }
+
+  bool is_depth = resolve_info.IsCopyingDepth();
 
   command_processor_.NoteResolveForCensus(resolve_info);
 
@@ -3623,24 +3648,7 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
       }
     }
 
-    bool clear_depth = resolve_info.IsClearingDepth();
-    bool clear_color = resolve_info.IsClearingColor();
-    if (clear_depth || clear_color) {
-      Transfer::Rectangle clear_rectangle;
-      RenderTarget* clear_targets[2] = {};
-      std::vector<Transfer> clear_transfers[2];
-      if (PrepareHostRenderTargetsResolveClear(
-              resolve_info, clear_rectangle, clear_targets[0],
-              clear_transfers[0], clear_targets[1], clear_transfers[1])) {
-        uint64_t clear_values[2];
-        clear_values[0] = resolve_info.rb_depth_clear;
-        clear_values[1] = resolve_info.rb_color_clear |
-                          (uint64_t(resolve_info.rb_color_clear_lo) << 32);
-        PerformTransfersAndResolveClears(2, clear_targets, clear_transfers,
-                                         clear_values, &clear_rectangle,
-                                         command_buffer);
-      }
-    }
+    perform_resolve_clear();
     return true;
   };
 
