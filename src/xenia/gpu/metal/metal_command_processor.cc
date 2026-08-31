@@ -7404,6 +7404,9 @@ void MetalCommandProcessor::UpdateSpirvSystemConstantValues(
       consts.texture_swizzled_signs[i >> 2] |= uint32_t(texture_signs)
                                                << signs_shift;
 
+      consts.texture_integer_scale_bits[i] =
+          texture_cache_->GetActiveIntegerScaleBits(i);
+
       // Host swizzles: 12 bits per texture, 2 textures per uint32.
       uint32_t texture_swizzle = texture_cache_->GetActiveTextureHostSwizzle(i);
       uint32_t swizzle_shift = 12 * (i & 1);
