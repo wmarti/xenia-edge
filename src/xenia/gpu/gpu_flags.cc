@@ -10,27 +10,17 @@
 #include "xenia/gpu/gpu_flags.h"
 
 #include "xenia/base/logging.h"
-#include "xenia/base/platform.h"
 #include "xenia/ui/renderdoc_api.h"
 
-// Unified-memory hosts (Apple Silicon, Windows on ARM) benefit from aliasing
-// guest RAM directly. x86-64 hosts are overwhelmingly discrete, where it is
-// slow, so default off there.
-#if XE_ARCH_ARM64
-#define XE_GPU_ZERO_COPY_DEFAULT true
-#else
-#define XE_GPU_ZERO_COPY_DEFAULT false
-#endif
 DEFINE_bool(
-    shared_memory_zero_copy, XE_GPU_ZERO_COPY_DEFAULT,
+    shared_memory_zero_copy, false,
     "Alias guest RAM directly as the GPU shared-memory buffer instead "
     "of uploading dirty pages each frame. Removes upload copies and "
     "keeps memexport and resolve output coherent with the CPU for free. "
-    "Default on for ARM64 (unified-memory) builds, off for x86-64. "
-    "Turn off on discrete GPUs, where shared-memory fetches cross PCIe "
-    "and are slow.",
+    "Experimental and disabled by default because guest writes are not "
+    "versioned against in-flight GPU reads. It may also be slow on discrete "
+    "GPUs, where shared-memory fetches cross PCIe.",
     "GPU");
-#undef XE_GPU_ZERO_COPY_DEFAULT
 
 DEFINE_bool(use_50Hz_mode, false, "Enables usage of PAL-50 mode.", "Console");
 
