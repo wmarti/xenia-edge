@@ -1259,7 +1259,9 @@ void MetalRenderTargetCache::SetCachedRenderPassLoadActions(
 }
 
 uint32_t MetalRenderTargetCache::GetPendingDrawPassLoadDontCareMask() {
-  if (!HasPendingDrawPassTransfers()) {
+  // An encoder already wrote these attachments, so a reopen has to load them.
+  if (render_pass_encoder_created_since_targets_changed_ ||
+      !HasPendingDrawPassTransfers()) {
     return 0;
   }
   TransferAttachmentFormats attachment_formats;
@@ -2109,19 +2111,8 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
       cached_render_pass_descriptor_sample_count_ == expected_sample_count) {
     // Queuing transfers deliberately does not dirty the descriptor, so their
     // load actions are the one thing this path still has to bring up to date.
-    // An encoder already recording keeps the attachments in tile memory, with
-    // no load left for a DontCare to skip.
     if (render_encoder_pending) {
-      if (render_pass_encoder_created_since_targets_changed_) {
-        // Reopening after a mid-pass split, such as one made for a texture
-        // reload. What the ended encoder wrote is in the attachments now, so
-        // the new one has to load it back instead of discarding it.
-        SetCachedRenderPassLoadActions(pending_draw_pass_load_dontcare_mask_,
-                                       MTL::LoadActionLoad);
-        pending_draw_pass_load_dontcare_mask_ = 0;
-      } else {
-        ApplyPendingDrawPassLoadActions();
-      }
+      ApplyPendingDrawPassLoadActions();
     }
     return cached_render_pass_descriptor_;
   }
@@ -2149,13 +2140,7 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
   // Queued transfers that rewrite a destination in full make loading its old
   // contents into tile memory pointless, but only for the pass that actually
   // encodes them - ClearPendingDrawPassTransfers restores this if it doesn't.
-  // A rebuild always hands the command processor a new descriptor, so an
-  // encoder is always created from it. Reopening the same attachments after an
-  // encoder has already written them is the one case with contents to keep.
-  pending_draw_pass_load_dontcare_mask_ =
-      render_pass_encoder_created_since_targets_changed_
-          ? 0
-          : GetPendingDrawPassLoadDontCareMask();
+  pending_draw_pass_load_dontcare_mask_ = GetPendingDrawPassLoadDontCareMask();
   auto pending_load_dontcare = [this](uint32_t pending_index) {
     return (pending_draw_pass_load_dontcare_mask_ &
             (uint32_t(1) << pending_index)) != 0;
@@ -2847,13 +2832,8 @@ bool MetalRenderTargetCache::DirectResolveRenderTargets(
 
   ScopedAutoreleasePool autorelease_pool;
   bool owns_command_buffer = false;
-  // The caller sampled command_buffer before RequestRange above, which can end
-  // it to submit a staged upload, so it is only a hint. Encoding the resolve
-  // into the current command buffer also keeps it behind that upload.
-  MTL::CommandBuffer* cmd = command_buffer;
-  if (cmd != command_processor_.GetCurrentCommandBuffer()) {
-    cmd = command_processor_.GetCurrentCommandBuffer();
-  }
+  // RequestRange above may have ended the command buffer the caller sampled.
+  MTL::CommandBuffer* cmd = command_processor_.GetCurrentCommandBuffer();
   if (!cmd) {
     cmd = command_processor_.CreateAccountedCommandBuffer(
         MetalCommandProcessor::CommandBufferKind::kRenderTargetResolve);
@@ -3128,8 +3108,7 @@ void MetalRenderTargetCache::DumpRenderTargets(
 
   ScopedAutoreleasePool autorelease_pool;
   bool owns_command_buffer = false;
-  // A staged shared-memory upload can end the command buffer the caller
-  // sampled, so the argument is only a hint.
+  // A staged upload may have ended the command buffer the caller sampled.
   MTL::CommandBuffer* cmd = command_buffer;
   if (cmd && cmd != command_processor_.GetCurrentCommandBuffer()) {
     cmd = command_processor_.GetCurrentCommandBuffer();
@@ -3906,13 +3885,9 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
       } else {
         ScopedAutoreleasePool autorelease_pool;
         bool owns_command_buffer = false;
-        // RequestRange above can end the command buffer the caller sampled to
-        // submit a staged upload, so command_buffer is only a hint. Encoding
-        // into the current one also keeps the resolve behind that upload.
-        MTL::CommandBuffer* cmd = command_buffer;
-        if (cmd != command_processor_.GetCurrentCommandBuffer()) {
-          cmd = command_processor_.GetCurrentCommandBuffer();
-        }
+        // RequestRange above may have ended the command buffer the caller
+        // sampled.
+        MTL::CommandBuffer* cmd = command_processor_.GetCurrentCommandBuffer();
         if (!cmd) {
           cmd = command_processor_.CreateAccountedCommandBuffer(
               MetalCommandProcessor::CommandBufferKind::kRenderTargetResolve);
@@ -4111,21 +4086,13 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
   // no command buffer either.
   MTL::CommandBuffer* cmd = nullptr;
   if (!use_active_render_encoder) {
-    // A staged shared-memory upload can end the command buffer the caller
-    // sampled, so the argument is only a hint.
-    if (command_buffer &&
-        command_buffer != command_processor_.GetCurrentCommandBuffer()) {
-      command_buffer = nullptr;
-    }
-    cmd = command_buffer ? command_buffer
-                         : command_processor_.RequestTransferCommandBuffer();
+    cmd = command_processor_.RequestTransferCommandBuffer();
     if (!cmd) {
       XELOGE(
           "MetalRenderTargetCache::PerformTransfersAndResolveClears: no "
           "command buffer");
       return false;
     }
-    command_processor_.EndEncodersForCommandBuffer(cmd);
   }
 
   uint32_t scale_x = draw_resolution_scale_x();

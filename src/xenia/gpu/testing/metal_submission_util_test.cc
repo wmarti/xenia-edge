@@ -37,11 +37,11 @@ TEST_CASE("texture reload is ordered after earlier draw work",
 
 TEST_CASE("converted index buffers wait for submission completion",
           "[metal][submission]") {
-  CHECK_FALSE(CanReuseConvertedIndexBuffer(true, 4, 4));
-  CHECK_FALSE(CanReuseConvertedIndexBuffer(false, 4, 3));
-  CHECK(CanReuseConvertedIndexBuffer(false, 4, 4));
-  CHECK(CanReuseConvertedIndexBuffer(false, 4, 5));
-  CHECK(CanReuseConvertedIndexBuffer(false, 0, 0));
+  CHECK_FALSE(CanReuseConvertedIndexBuffer(7, 7, 4, 4));
+  CHECK_FALSE(CanReuseConvertedIndexBuffer(6, 7, 4, 3));
+  CHECK(CanReuseConvertedIndexBuffer(6, 7, 4, 4));
+  CHECK(CanReuseConvertedIndexBuffer(6, 7, 4, 5));
+  CHECK(CanReuseConvertedIndexBuffer(0, 1, 0, 0));
 }
 
 }  // namespace test

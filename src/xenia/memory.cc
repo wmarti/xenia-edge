@@ -297,21 +297,15 @@ void Memory::EndPhysicalMemoryWrite(uint64_t token, uint32_t start,
           std::min(length - (alias_physical_start - start),
                    heap.heap_size() - alias_offset);
       bool alias_watched = false;
-      const bool invoke_invalidation_callbacks = !invalidation_published;
       auto global_lock = global_critical_region_.Acquire();
       heap.TriggerCallbacks(std::move(global_lock),
                             heap.heap_base() + alias_offset, alias_length, true,
                             true, true, force_callbacks,
-                            invoke_invalidation_callbacks, &alias_watched);
-      invalidation_published |=
-          invoke_invalidation_callbacks && (alias_watched || force_callbacks);
+                            !invalidation_published, &alias_watched);
+      invalidation_published |= alias_watched || force_callbacks;
     };
-    // Access watches are armed independently on all three physical aliases.
-    // Publish the invalidation through the first watched alias, but clear and
-    // unprotect every alias so the raw write doesn't cause a duplicate fault.
-    // A forced write publishes through the first alias even with no watch
-    // armed - the caller knows the bytes changed and every consumer of the
-    // range has to hear about it.
+    // Publish through the first watched alias (the first alias when forced),
+    // but clear and unprotect every alias so the raw write doesn't fault twice.
     complete_alias(heaps_.vA0000000);
     complete_alias(heaps_.vC0000000);
     complete_alias(heaps_.vE0000000);

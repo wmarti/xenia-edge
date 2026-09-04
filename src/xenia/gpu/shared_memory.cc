@@ -395,9 +395,7 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length,
   // state atomic with respect to texture revalidation. In particular, a
   // texture watch may already have been removed by an earlier CPU fault.
   auto global_lock = global_critical_region_.Acquire();
-  // Publish the provenance before the callbacks, so a consumer reached from one
-  // of them observes the write that is being announced rather than the state
-  // preceding it.
+  // Publish the provenance before the callbacks that read it.
   if (gpu_write_generation_ != UINT64_MAX) {
     ++gpu_write_generation_;
   }
