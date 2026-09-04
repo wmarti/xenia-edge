@@ -37,6 +37,7 @@ TEST_CASE("converted index buffers wait for submission completion",
   CHECK_FALSE(CanReuseConvertedIndexBuffer(false, 4, 3));
   CHECK(CanReuseConvertedIndexBuffer(false, 4, 4));
   CHECK(CanReuseConvertedIndexBuffer(false, 4, 5));
+  CHECK(CanReuseConvertedIndexBuffer(false, 0, 0));
 }
 
 }  // namespace test

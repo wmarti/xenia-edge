@@ -698,6 +698,14 @@ MetalCommandProcessor::~MetalCommandProcessor() {
     }
     current_command_buffer_->release();
     current_command_buffer_ = nullptr;
+    // Nothing runs the completion handler of a buffer that was never
+    // committed, so retire its submission here rather than leaving a waiter
+    // blocked on an index that can never be reached.
+    {
+      std::lock_guard<std::mutex> lock(completion_mutex_);
+      PublishCompletedSubmission(submission_current_);
+      completion_cond_.notify_all();
+    }
   }
   WaitForPendingCompletionHandlers();
   ShutdownMslAsyncCompilation();
@@ -1216,11 +1224,15 @@ ui::metal::MetalProvider& MetalCommandProcessor::GetMetalProvider() const {
 }
 
 uint64_t MetalCommandProcessor::GetCurrentSubmission() const {
-  return submission_current_ ? submission_current_ : 1;
+  // Callers tag resources with this, so with no command buffer open the answer
+  // has to be the submission that will be opened next: the last one is already
+  // committed and naming it would retire the tag a submission too early.
+  return current_command_buffer_ ? submission_current_
+                                 : submission_current_ + 1;
 }
 
 uint64_t MetalCommandProcessor::GetCompletedSubmission() const {
-  return completed_command_buffers_.load(std::memory_order_acquire);
+  return submission_completed_.load(std::memory_order_acquire);
 }
 
 void MetalCommandProcessor::NoteResolveForCensus(
@@ -2472,11 +2484,19 @@ void MetalCommandProcessor::AddGpuTimeHandler(
   });
 }
 
+void MetalCommandProcessor::PublishCompletedSubmission(uint64_t submission) {
+  uint64_t completed = submission_completed_.load(std::memory_order_relaxed);
+  while (completed < submission &&
+         !submission_completed_.compare_exchange_weak(
+             completed, submission, std::memory_order_acq_rel,
+             std::memory_order_relaxed)) {
+  }
+}
+
 void MetalCommandProcessor::AwaitSubmissionCompletion(uint64_t submission) {
   std::unique_lock<std::mutex> lock(completion_mutex_);
   completion_cond_.wait(lock, [this, submission]() {
-    return completed_command_buffers_.load(std::memory_order_acquire) >=
-           submission;
+    return submission_completed_.load(std::memory_order_acquire) >= submission;
   });
 }
 
@@ -5400,17 +5420,18 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
   }
 
   ++submission_current_;
+  const uint64_t submission = submission_current_;
   ++command_buffer_kind_counts_[size_t(next_submission_kind_)];
   next_submission_kind_ = CommandBufferKind::kSubmissionOther;
   AddGpuTimeHandler(current_command_buffer_);
   pending_completion_handlers_.fetch_add(1, std::memory_order_relaxed);
   current_command_buffer_->addCompletedHandler(
-      [this](MTL::CommandBuffer* command_buffer) {
+      [this, submission](MTL::CommandBuffer* command_buffer) {
         std::lock_guard<std::mutex> lock(completion_mutex_);
-        completed_command_buffers_.fetch_add(1, std::memory_order_release);
+        PublishCompletedSubmission(submission);
         pending_completion_handlers_.fetch_sub(1, std::memory_order_release);
         // Notify under the lock: a waiter that evaluated the predicate before
-        // the increment would otherwise miss the wakeup, and
+        // the publish would otherwise miss the wakeup, and
         // WaitForPendingCompletionHandlers can see the counter reach zero and
         // let the object be destroyed out from under notify_all().
         completion_cond_.notify_all();
@@ -5481,7 +5502,7 @@ void MetalCommandProcessor::SubmitSharedMemoryUploadsAndWait() {
 
 void MetalCommandProcessor::ProcessCompletedSubmissions() {
   const uint64_t completed =
-      completed_command_buffers_.load(std::memory_order_relaxed);
+      submission_completed_.load(std::memory_order_acquire);
   if (completed <= submission_completed_processed_) {
     return;
   }

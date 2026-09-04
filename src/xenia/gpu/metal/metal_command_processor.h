@@ -286,6 +286,10 @@ class MetalCommandProcessor : public CommandProcessor {
   void AwaitSubmissionCompletion(uint64_t submission);
   // Commits the open submission, then blocks until every submission completes.
   void AwaitAllQueueOperationsCompletion();
+  // Raises the completed submission high-water mark. Metal documents that a
+  // queue schedules command buffers in the order they were enqueued, but not
+  // the order their completion handlers run, so never lower it.
+  void PublishCompletedSubmission(uint64_t submission);
   void AddGpuTimeHandler(MTL::CommandBuffer* command_buffer);
   void WaitForPendingCompletionHandlers();
   void ProcessCompletedSubmissions();
@@ -764,7 +768,10 @@ class MetalCommandProcessor : public CommandProcessor {
   float ff_blend_factor_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   bool ff_blend_factor_valid_ = false;
 
-  std::atomic<uint64_t> completed_command_buffers_{0};
+  // Highest submission index whose command buffer has reported completion, not
+  // a count of finished command buffers - the two only agree when every
+  // created buffer is committed and they retire in creation order.
+  std::atomic<uint64_t> submission_completed_{0};
   std::atomic<uint32_t> pending_completion_handlers_{0};
   // Summed GPU busy time of the completed command buffers, from Metal's own
   // timestamps rather than the wall clock, so it isn't confounded by whatever

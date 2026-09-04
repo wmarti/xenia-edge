@@ -228,17 +228,13 @@ void* MetalPrimitiveProcessor::RequestHostConvertedIndexBufferForCurrentFrame(
   uint64_t current_frame = current_frame_;
   uint64_t completed_submission = command_processor_.GetCompletedSubmission();
 
-  // First try to find a completed buffer that's large enough and isn't already
-  // referenced by this frame's primitive conversion cache.
+  // First try to find a completed buffer that's large enough. Every handout
+  // stamps last_frame_used, so the frame compare is the cheap equivalent of
+  // scanning this frame's primitive conversion cache for the buffer.
   for (auto& frame_buffer : frame_index_buffers_) {
-    bool referenced_in_current_frame = std::any_of(
-        converted_index_buffers_.cbegin(), converted_index_buffers_.cend(),
-        [&frame_buffer](const ConvertedIndexBufferBinding& binding) {
-          return binding.buffer == frame_buffer.buffer;
-        });
     if (frame_buffer.size >= required_size &&
-        CanReuseConvertedIndexBuffer(referenced_in_current_frame,
-                                     frame_buffer.last_submission_used,
+        frame_buffer.last_frame_used != current_frame &&
+        CanReuseConvertedIndexBuffer(false, frame_buffer.last_submission_used,
                                      completed_submission)) {
       chosen_buffer = &frame_buffer;
       break;
