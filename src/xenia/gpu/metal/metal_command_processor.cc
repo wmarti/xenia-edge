@@ -5416,6 +5416,7 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
   current_command_buffer_->retain();
   current_command_buffer_->setLabel(
       NS::String::string("XeniaCommandBuffer", NS::UTF8StringEncoding));
+  shared_memory_uploads_staged_ = false;
 
   if (!UseDxilPath() && !EnsureSpirvUniformBuffer()) {
     static auto last_ensure_uniforms_fail_log =
@@ -5471,17 +5472,31 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
   return current_command_buffer_;
 }
 
+void MetalCommandProcessor::EndEncodersForCommandBuffer(
+    MTL::CommandBuffer* command_buffer) {
+  if (command_buffer != current_command_buffer_) {
+    return;
+  }
+  EndSharedMemoryUploadBlitEncoder();
+  EndRenderEncoder();
+}
+
+MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer() {
+  // Only one encoder at a time may append commands to a command buffer, so the
+  // upload blit and the render pass both close here. Ending the pass keeps the
+  // caller's work ordered after earlier draws without forcing a submission
+  // boundary; the next draw reopens the pass.
+  EndEncodersForCommandBuffer(current_command_buffer_);
+  return EnsureCommandBuffer();
+}
+
 MTL::BlitCommandEncoder*
 MetalCommandProcessor::GetSharedMemoryUploadBlitEncoder() {
   if (shared_memory_upload_blit_encoder_) {
     return shared_memory_upload_blit_encoder_;
   }
 
-  // Metal permits only one active encoder per command buffer. Ending the
-  // render pass keeps the upload ordered after earlier draws without forcing
-  // a submission boundary; the next draw reopens the pass after this blit.
-  EndRenderEncoder();
-  MTL::CommandBuffer* command_buffer = EnsureCommandBuffer();
+  MTL::CommandBuffer* command_buffer = RequestTransferCommandBuffer();
   if (!command_buffer) {
     return nullptr;
   }
@@ -5493,6 +5508,7 @@ MetalCommandProcessor::GetSharedMemoryUploadBlitEncoder() {
   shared_memory_upload_blit_encoder_->retain();
   shared_memory_upload_blit_encoder_->setLabel(
       NS::String::string("XeniaSharedMemoryUpload", NS::UTF8StringEncoding));
+  shared_memory_uploads_staged_ = true;
   return shared_memory_upload_blit_encoder_;
 }
 
@@ -5506,7 +5522,22 @@ void MetalCommandProcessor::EndSharedMemoryUploadBlitEncoder() {
 }
 
 void MetalCommandProcessor::SubmitSharedMemoryUploadsAndWait() {
-  if (!shared_memory_upload_blit_encoder_) {
+  // The encoder may already have closed for another encoder on the same
+  // command buffer, so the copies are pending until the buffer is committed,
+  // not until the encoder ends.
+  if (!current_command_buffer_ || !shared_memory_uploads_staged_) {
+    return;
+  }
+  if (current_render_encoder_) {
+    // Committing here would drop the pass the caller is still building, and it
+    // has no way to rebuild it. Draws split the command buffer before opening
+    // the pass instead (PrepareDrawTextures).
+    static bool submit_inside_render_pass_logged = false;
+    if (!submit_inside_render_pass_logged) {
+      submit_inside_render_pass_logged = true;
+      XELOGE(
+          "Metal: shared-memory uploads left staged - a render pass is open");
+    }
     return;
   }
   const uint64_t submission = GetCurrentSubmission();

@@ -109,15 +109,6 @@ class ScopedAutoreleasePool {
   NS::AutoreleasePool* pool_;
 };
 
-void EndSharedMemoryUploadBlitEncoderForCommandBuffer(
-    MetalCommandProcessor& command_processor,
-    MTL::CommandBuffer* command_buffer) {
-  if (command_buffer &&
-      command_buffer == command_processor.GetCurrentCommandBuffer()) {
-    command_processor.EndSharedMemoryUploadBlitEncoder();
-  }
-}
-
 MTL::ComputePipelineState* CreateComputePipelineFromEmbeddedLibrary(
     MTL::Device* device, const void* metallib_data, size_t metallib_size,
     const char* debug_name, const char* entry_point_name = "entry_xe") {
@@ -2856,13 +2847,11 @@ bool MetalRenderTargetCache::DirectResolveRenderTargets(
 
   ScopedAutoreleasePool autorelease_pool;
   bool owns_command_buffer = false;
+  // The caller sampled command_buffer before RequestRange above, which can end
+  // it to submit a staged upload, so it is only a hint. Encoding the resolve
+  // into the current command buffer also keeps it behind that upload.
   MTL::CommandBuffer* cmd = command_buffer;
-  if (cmd && cmd != command_processor_.GetCurrentCommandBuffer()) {
-    command_processor_.SubmitSharedMemoryUploadsAndWait();
-  }
-  if (!cmd && !command_processor_.HasActiveRenderEncoder()) {
-    // A staged destination upload creates a main submission. Keep the resolve
-    // behind that upload in the same command buffer when possible.
+  if (cmd != command_processor_.GetCurrentCommandBuffer()) {
     cmd = command_processor_.GetCurrentCommandBuffer();
   }
   if (!cmd) {
@@ -2873,7 +2862,7 @@ bool MetalRenderTargetCache::DirectResolveRenderTargets(
     }
     owns_command_buffer = true;
   }
-  EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_, cmd);
+  command_processor_.EndEncodersForCommandBuffer(cmd);
   MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
   if (!encoder) {
     return false;
@@ -3139,7 +3128,12 @@ void MetalRenderTargetCache::DumpRenderTargets(
 
   ScopedAutoreleasePool autorelease_pool;
   bool owns_command_buffer = false;
+  // A staged shared-memory upload can end the command buffer the caller
+  // sampled, so the argument is only a hint.
   MTL::CommandBuffer* cmd = command_buffer;
+  if (cmd && cmd != command_processor_.GetCurrentCommandBuffer()) {
+    cmd = command_processor_.GetCurrentCommandBuffer();
+  }
   if (!cmd) {
     cmd = command_processor_.CreateAccountedCommandBuffer(
         MetalCommandProcessor::CommandBufferKind::kRenderTargetDump);
@@ -3150,6 +3144,7 @@ void MetalRenderTargetCache::DumpRenderTargets(
     owns_command_buffer = true;
   }
 
+  command_processor_.EndEncodersForCommandBuffer(cmd);
   MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
   if (!encoder) {
     XELOGE("MetalRenderTargetCache::DumpRenderTargets: no compute encoder");
@@ -3911,14 +3906,11 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
       } else {
         ScopedAutoreleasePool autorelease_pool;
         bool owns_command_buffer = false;
+        // RequestRange above can end the command buffer the caller sampled to
+        // submit a staged upload, so command_buffer is only a hint. Encoding
+        // into the current one also keeps the resolve behind that upload.
         MTL::CommandBuffer* cmd = command_buffer;
-        if (cmd && cmd != command_processor_.GetCurrentCommandBuffer()) {
-          command_processor_.SubmitSharedMemoryUploadsAndWait();
-        }
-        if (!cmd && !command_processor_.HasActiveRenderEncoder()) {
-          // RequestRange may have opened the main command buffer for a staged
-          // upload. Encode the resolve after it rather than committing an
-          // unrelated standalone buffer ahead of the upload.
+        if (cmd != command_processor_.GetCurrentCommandBuffer()) {
           cmd = command_processor_.GetCurrentCommandBuffer();
         }
         if (!cmd) {
@@ -3933,8 +3925,7 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
           owns_command_buffer = true;
         }
         if (cmd) {
-          EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_,
-                                                           cmd);
+          command_processor_.EndEncodersForCommandBuffer(cmd);
           MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
           if (!encoder) {
             XELOGE(
@@ -4120,15 +4111,21 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
   // no command buffer either.
   MTL::CommandBuffer* cmd = nullptr;
   if (!use_active_render_encoder) {
+    // A staged shared-memory upload can end the command buffer the caller
+    // sampled, so the argument is only a hint.
+    if (command_buffer &&
+        command_buffer != command_processor_.GetCurrentCommandBuffer()) {
+      command_buffer = nullptr;
+    }
     cmd = command_buffer ? command_buffer
-                         : command_processor_.EnsureCommandBuffer();
+                         : command_processor_.RequestTransferCommandBuffer();
     if (!cmd) {
       XELOGE(
           "MetalRenderTargetCache::PerformTransfersAndResolveClears: no "
           "command buffer");
       return false;
     }
-    command_processor_.EndRenderEncoder();
+    command_processor_.EndEncodersForCommandBuffer(cmd);
   }
 
   uint32_t scale_x = draw_resolution_scale_x();
@@ -4183,6 +4180,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         HostDepthStoreRenderTargetConstant render_target_constant =
             GetHostDepthStoreRenderTargetConstant(dest_key.pitch_tiles_at_32bpp,
                                                   msaa_2x_supported_);
+        command_processor_.EndEncodersForCommandBuffer(cmd);
         MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
         if (!encoder) {
           XELOGE(
@@ -4386,6 +4384,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     MTL::BlitCommandEncoder* blit_encoder = nullptr;
     auto ensure_blit_encoder = [&]() -> MTL::BlitCommandEncoder* {
       if (!blit_encoder) {
+        command_processor_.EndEncodersForCommandBuffer(cmd);
         blit_encoder = cmd->blitCommandEncoder();
       }
       return blit_encoder;
@@ -4822,6 +4821,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           ca->setClearColor(resolve_clear_color);
         }
       }
+      command_processor_.EndEncodersForCommandBuffer(cmd);
       transfer_encoder = cmd->renderCommandEncoder(rp);
       return transfer_encoder;
     };

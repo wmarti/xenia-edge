@@ -1476,10 +1476,7 @@ bool MetalTextureCache::TryGpuLoadTexture(
   }
 
   MTL::ComputeCommandEncoder* encoder = nullptr;
-  if (command_processor_ &&
-      cmd == command_processor_->GetCurrentCommandBuffer()) {
-    command_processor_->EndSharedMemoryUploadBlitEncoder();
-  }
+  command_processor_->EndEncodersForCommandBuffer(cmd);
   {
     SCOPE_profile_cpu_i("gpu", "MetalTextureCache::ComputeEncoderCreate");
     encoder = cmd->computeCommandEncoder();
@@ -1636,6 +1633,7 @@ bool MetalTextureCache::TryGpuLoadTexture(
   MTL::Texture* mtl_texture = metal_texture->metal_texture();
   if (use_blit_upload) {
     SCOPE_profile_cpu_i("gpu", "MetalTextureCache::EncodeUploadBlits");
+    command_processor_->EndEncodersForCommandBuffer(cmd);
     MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
     if (!blit) {
       handle_upload_failure(true);
@@ -3494,6 +3492,7 @@ bool MetalTextureCache::EnsureScaledResolveBufferRange(uint64_t start_scaled,
       }
     }
 
+    command_processor_->EndEncodersForCommandBuffer(cmd);
     MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
     if (!blit) {
       new_buffer->release();

@@ -139,6 +139,12 @@ class MetalCommandProcessor : public CommandProcessor {
   // Used only by standalone consumers that can't join the submission holding
   // their prerequisite staged upload.
   void SubmitSharedMemoryUploadsAndWait();
+  // A command buffer accepts commands from one encoder at a time, so every
+  // encoder open on it has to end before another is created. Both are no-ops
+  // for a command buffer that isn't the current one.
+  void EndEncodersForCommandBuffer(MTL::CommandBuffer* command_buffer);
+  // The current command buffer, ready for an encoder of the caller's own.
+  MTL::CommandBuffer* RequestTransferCommandBuffer();
   // Creates a command buffer with GPU time accounting attached. Every command
   // buffer the backend commits outside the submission one has to come from
   // here, or its work is missing from gpu_busy_us_per_frame.
@@ -478,6 +484,10 @@ class MetalCommandProcessor : public CommandProcessor {
   // Current command buffer and encoder
   MTL::CommandBuffer* current_command_buffer_ = nullptr;
   MTL::BlitCommandEncoder* shared_memory_upload_blit_encoder_ = nullptr;
+  // Set when the current command buffer has taken upload copies, and stays set
+  // after the encoder closes - the copies are still uncommitted until the
+  // command buffer is.
+  bool shared_memory_uploads_staged_ = false;
   MTL::RenderCommandEncoder* current_render_encoder_ = nullptr;
   // Retained for the lifetime of current_render_encoder_. The render target
   // cache may rebuild and release its cached descriptor between draws.
