@@ -511,13 +511,18 @@ class Memory {
    private:
     friend class Memory;
     PhysicalMemoryWriteScope(Memory& memory, uint64_t token, uint32_t start,
-                             uint32_t length)
-        : memory_(&memory), token_(token), start_(start), length_(length) {}
+                             uint32_t length, bool force_callbacks)
+        : memory_(&memory),
+          token_(token),
+          start_(start),
+          length_(length),
+          force_callbacks_(force_callbacks) {}
 
     Memory* memory_ = nullptr;
     uint64_t token_ = 0;
     uint32_t start_ = 0;
     uint32_t length_ = 0;
+    bool force_callbacks_ = false;
   };
 
   // Active-writer tracking is opt-in because bracketing every command-processor
@@ -771,8 +776,8 @@ class Memory {
   std::atomic<uint32_t> physical_memory_write_tracking_users_{0};
 
   void EndPhysicalMemoryWrite(uint64_t token, uint32_t start,
-                              uint32_t declared_length,
-                              uint32_t written_length);
+                              uint32_t declared_length, uint32_t written_length,
+                              bool force_callbacks);
 };
 
 }  // namespace xe

@@ -382,7 +382,6 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length,
   uint32_t end = start + length - 1;
   uint32_t page_first = start >> page_size_log2_;
   uint32_t page_last = end >> page_size_log2_;
-  uint64_t pending_gpu_write_generation = UINT64_MAX;
 
   if (!guest_page_gpu_write_generations_) {
     // Preserve the original feature-off path exactly: FireWatches and
@@ -396,23 +395,21 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length,
   // state atomic with respect to texture revalidation. In particular, a
   // texture watch may already have been removed by an earlier CPU fault.
   auto global_lock = global_critical_region_.Acquire();
+  // Publish the provenance before the callbacks, so a consumer reached from one
+  // of them observes the write that is being announced rather than the state
+  // preceding it.
   if (gpu_write_generation_ != UINT64_MAX) {
-    pending_gpu_write_generation = gpu_write_generation_ + 1;
+    ++gpu_write_generation_;
+  }
+  const uint32_t generation_page_first = start >> kWriteGenerationPageSizeLog2;
+  const uint32_t generation_page_last = end >> kWriteGenerationPageSizeLog2;
+  for (uint32_t i = generation_page_first; i <= generation_page_last; ++i) {
+    guest_page_gpu_write_generations_[i] = gpu_write_generation_;
   }
 
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
   FireWatches(page_first, page_last, true, true);
-
-  if (guest_page_gpu_write_generations_) {
-    gpu_write_generation_ = pending_gpu_write_generation;
-    const uint32_t generation_page_first =
-        start >> kWriteGenerationPageSizeLog2;
-    const uint32_t generation_page_last = end >> kWriteGenerationPageSizeLog2;
-    for (uint32_t i = generation_page_first; i <= generation_page_last; ++i) {
-      guest_page_gpu_write_generations_[i] = gpu_write_generation_;
-    }
-  }
 
   // Mark the range as valid (so pages are not reuploaded until modified by the
   // CPU) and watch it so the CPU can reuse it and this will be caught.

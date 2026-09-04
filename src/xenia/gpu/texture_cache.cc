@@ -102,10 +102,12 @@ TextureCache::GuestTextureLoadRange TextureCache::GetGuestTextureLoadRange(
   }
   const uint64_t aligned_size =
       (uint64_t(guest_size) + UINT64_C(15)) & ~UINT64_C(15);
-  if (aligned_size > SharedMemory::kBufferSize - guest_address) {
-    return {};
-  }
-  return {guest_address, uint32_t(aligned_size)};
+  // Clamp to the end of the shared memory buffer instead of rejecting the
+  // range - a texture reaching the end of physical memory still needs to be
+  // uploaded, watched and hashed.
+  return {guest_address,
+          uint32_t(std::min(aligned_size, uint64_t(SharedMemory::kBufferSize -
+                                                   guest_address)))};
 }
 
 const TextureCache::LoadShaderInfo
@@ -856,8 +858,8 @@ void TextureCache::Texture::MakeLoadedDataUpToDateAndWatch(
         GetGuestTextureLoadRange(key().base_page << 12, GetGuestBaseSize());
     assert_true(bool(range));
     base_watch_handle_ = shared_memory.WatchMemoryRange(
-        range.address, GetGuestBaseSize(), TextureCache::WatchCallback, this,
-        nullptr, 0);
+        range.address, range.length, TextureCache::WatchCallback, this, nullptr,
+        0);
     base_outdated_ = false;
     base_invalidation_origin_ = 0;
   }
@@ -867,8 +869,8 @@ void TextureCache::Texture::MakeLoadedDataUpToDateAndWatch(
         GetGuestTextureLoadRange(key().mip_page << 12, GetGuestMipsSize());
     assert_true(bool(range));
     mips_watch_handle_ = shared_memory.WatchMemoryRange(
-        range.address, GetGuestMipsSize(), TextureCache::WatchCallback, this,
-        nullptr, 1);
+        range.address, range.length, TextureCache::WatchCallback, this, nullptr,
+        1);
     mips_outdated_ = false;
     mips_invalidation_origin_ = 0;
   }
@@ -1078,11 +1080,12 @@ bool TextureCache::Texture::FinalizeLoadAndWatch(
   const bool mips_source_current =
       mips_snapshotted &&
       IsCpuLoadSourceCurrent(global_lock, true, mips_source);
-  const bool finalize_base =
-      loaded_base && (!base_snapshotted || base_source_current);
-  const bool finalize_mips =
-      loaded_mips && (!mips_snapshotted || mips_source_current);
-  if (!MakeUpToDateAndWatch(global_lock, finalize_base, finalize_mips)) {
+  // The upload itself happened, so take the up-to-date transition and arm the
+  // watch whether or not the source can still be proven unchanged. A part left
+  // outdated here would be re-uploaded on every draw for as long as its page
+  // keeps being falsely shared. Only the content hash is withheld, so the next
+  // invalidation reloads instead of revalidating.
+  if (!MakeUpToDateAndWatch(global_lock, loaded_base, loaded_mips)) {
     StoreCpuContentHashes(global_lock, loaded_base, loaded_mips, {}, {}, false,
                           false);
     // RequestTextures marks bindings in sync before loading. Publish the
@@ -1094,13 +1097,7 @@ bool TextureCache::Texture::FinalizeLoadAndWatch(
   }
   StoreCpuContentHashes(global_lock, loaded_base, loaded_mips, base_source,
                         mips_source, base_source_current, mips_source_current);
-  const bool source_current = (!base_snapshotted || base_source_current) &&
-                              (!mips_snapshotted || mips_source_current);
-  if (!source_current) {
-    texture_cache().texture_became_outdated_.store(true,
-                                                   std::memory_order_release);
-  }
-  return source_current;
+  return true;
 }
 
 void TextureCache::Texture::ClearCpuContentHash(bool is_mip) {

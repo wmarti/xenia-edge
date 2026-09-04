@@ -155,11 +155,13 @@ Memory::PhysicalMemoryWriteScope::PhysicalMemoryWriteScope(
     : memory_(other.memory_),
       token_(other.token_),
       start_(other.start_),
-      length_(other.length_) {
+      length_(other.length_),
+      force_callbacks_(other.force_callbacks_) {
   other.memory_ = nullptr;
   other.token_ = 0;
   other.start_ = 0;
   other.length_ = 0;
+  other.force_callbacks_ = false;
 }
 
 Memory::PhysicalMemoryWriteScope& Memory::PhysicalMemoryWriteScope::operator=(
@@ -172,10 +174,12 @@ Memory::PhysicalMemoryWriteScope& Memory::PhysicalMemoryWriteScope::operator=(
   token_ = other.token_;
   start_ = other.start_;
   length_ = other.length_;
+  force_callbacks_ = other.force_callbacks_;
   other.memory_ = nullptr;
   other.token_ = 0;
   other.start_ = 0;
   other.length_ = 0;
+  other.force_callbacks_ = false;
   return *this;
 }
 
@@ -187,11 +191,14 @@ void Memory::PhysicalMemoryWriteScope::End(uint32_t written_length) {
   const uint64_t token = token_;
   const uint32_t start = start_;
   const uint32_t declared_length = length_;
+  const bool force_callbacks = force_callbacks_;
   memory_ = nullptr;
   token_ = 0;
   start_ = 0;
   length_ = 0;
-  memory->EndPhysicalMemoryWrite(token, start, declared_length, written_length);
+  force_callbacks_ = false;
+  memory->EndPhysicalMemoryWrite(token, start, declared_length, written_length,
+                                 force_callbacks);
 }
 
 void Memory::EnablePhysicalMemoryWriteTracking() {
@@ -221,7 +228,7 @@ Memory::PhysicalMemoryWriteScope Memory::BeginPhysicalMemoryWrite(
     // callbacks they historically did, but with no snapshot consumer active
     // there is no reason to register the write or take the second global lock
     // at completion.
-    return PhysicalMemoryWriteScope(*this, 0, start, length);
+    return PhysicalMemoryWriteScope(*this, 0, start, length, force_callbacks);
   }
   auto global_lock = global_critical_region_.Acquire();
   ++physical_memory_write_token_;
@@ -240,7 +247,7 @@ Memory::PhysicalMemoryWriteScope Memory::BeginPhysicalMemoryWrite(
   active_physical_memory_writes_.push_back(
       {physical_memory_write_token_, start, length});
   return PhysicalMemoryWriteScope(*this, physical_memory_write_token_, start,
-                                  length);
+                                  length, force_callbacks);
 }
 
 bool Memory::IsPhysicalMemoryWriteInProgress(
@@ -268,7 +275,8 @@ bool Memory::IsPhysicalMemoryWriteInProgress(
 
 void Memory::EndPhysicalMemoryWrite(uint64_t token, uint32_t start,
                                     uint32_t declared_length,
-                                    uint32_t written_length) {
+                                    uint32_t written_length,
+                                    bool force_callbacks) {
   const uint32_t length = written_length == UINT32_MAX
                               ? declared_length
                               : std::min(written_length, declared_length);
@@ -289,15 +297,21 @@ void Memory::EndPhysicalMemoryWrite(uint64_t token, uint32_t start,
           std::min(length - (alias_physical_start - start),
                    heap.heap_size() - alias_offset);
       bool alias_watched = false;
+      const bool invoke_invalidation_callbacks = !invalidation_published;
       auto global_lock = global_critical_region_.Acquire();
-      heap.TriggerCallbacks(
-          std::move(global_lock), heap.heap_base() + alias_offset, alias_length,
-          true, true, true, false, !invalidation_published, &alias_watched);
-      invalidation_published |= alias_watched;
+      heap.TriggerCallbacks(std::move(global_lock),
+                            heap.heap_base() + alias_offset, alias_length, true,
+                            true, true, force_callbacks,
+                            invoke_invalidation_callbacks, &alias_watched);
+      invalidation_published |=
+          invoke_invalidation_callbacks && (alias_watched || force_callbacks);
     };
     // Access watches are armed independently on all three physical aliases.
     // Publish the invalidation through the first watched alias, but clear and
     // unprotect every alias so the raw write doesn't cause a duplicate fault.
+    // A forced write publishes through the first alias even with no watch
+    // armed - the caller knows the bytes changed and every consumer of the
+    // range has to hear about it.
     complete_alias(heaps_.vA0000000);
     complete_alias(heaps_.vC0000000);
     complete_alias(heaps_.vE0000000);

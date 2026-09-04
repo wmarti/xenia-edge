@@ -552,10 +552,17 @@ TEST_CASE("texture revalidation rejects false sharing during snapshot upload",
     REQUIRE(fixture.shared_memory().RequestRange(kGuestPhysicalAddress, 16));
   });
   // RequestRange restored current validity after the neighboring write, but the
-  // persistent invalidation epoch must still conservatively reject publication
-  // of the in-flight snapshot. The next uncontended load succeeds.
-  REQUIRE_FALSE(fixture.LoadTexture());
+  // persistent invalidation epoch must still conservatively reject the content
+  // hash of the in-flight snapshot. The upload itself happened, so the texture
+  // is up to date and the next invalidation reloads it.
+  REQUIRE(fixture.LoadTexture());
   REQUIRE(fixture.texture_cache().load_count() == 1);
+  REQUIRE(fixture.LoadTexture());
+  REQUIRE(fixture.texture_cache().load_count() == 1);
+
+  fixture.WriteGuestByte(32, 0x8D);
+  REQUIRE(fixture.TriggerCpuWrite(32));
+  REQUIRE_FALSE(fixture.TryRevalidate());
   REQUIRE(fixture.LoadTexture());
   REQUIRE(fixture.texture_cache().load_count() == 2);
 }
@@ -573,15 +580,52 @@ TEST_CASE("texture revalidation rejects changed bytes after snapshot",
   });
 
   // The backend uploaded the pre-write snapshot. The persistent invalidation
-  // epoch must leave this part outdated even though RequestRange made the
+  // epoch must withhold its content hash even though RequestRange made the
   // shared-memory page valid again before publication.
-  REQUIRE_FALSE(fixture.LoadTexture());
+  REQUIRE(fixture.LoadTexture());
   REQUIRE(fixture.texture_cache().load_count() == 1);
+
+  fixture.WriteGuestByte(0, 0x7C);
+  REQUIRE(fixture.TriggerCpuWrite(0));
+  REQUIRE_FALSE(fixture.TryRevalidate());
   REQUIRE(fixture.LoadTexture());
   REQUIRE(fixture.texture_cache().load_count() == 2);
 }
 
-TEST_CASE("texture binding retries a snapshot rejected during publication",
+TEST_CASE("texture upload publishes when its snapshot proof fails",
+          "[texture-revalidation][snapshot]") {
+  ScopedTextureRevalidationConfig config;
+  TextureRevalidationFixture fixture;
+  REQUIRE(fixture.Initialize());
+  fixture.SetLoadHook([&fixture]() {
+    fixture.WriteGuestByte(32, 0x6B);
+    REQUIRE(fixture.TriggerCpuWrite(32));
+    REQUIRE(fixture.shared_memory().RequestRange(kGuestPhysicalAddress, 16));
+  });
+
+  // The bytes were uploaded, so the part must leave the outdated state even
+  // though its source can no longer be proven unchanged. Otherwise every draw
+  // re-uploads it for as long as the neighboring writes keep coming.
+  REQUIRE(fixture.LoadTexture());
+  REQUIRE(fixture.texture_cache().load_count() == 1);
+  REQUIRE(fixture.TryRevalidate());
+  REQUIRE(fixture.texture_cache().watch_callbacks() == 0);
+
+  // The watch was armed by the same transition, so this write reaches the
+  // texture.
+  fixture.WriteGuestByte(32, 0x8D);
+  REQUIRE(fixture.TriggerCpuWrite(32));
+  REQUIRE(fixture.texture_cache().watch_callbacks() == 1);
+
+  // Only the content hash was withheld, so the invalidation reloads instead of
+  // revalidating bytes no hash covers.
+  REQUIRE_FALSE(fixture.TryRevalidate());
+  REQUIRE(fixture.texture_cache().revalidated_base() == 0);
+  REQUIRE(fixture.LoadTexture());
+  REQUIRE(fixture.texture_cache().load_count() == 2);
+}
+
+TEST_CASE("texture binding stops reloading a snapshot rejected at publication",
           "[texture-revalidation][bindings][snapshot]") {
   ScopedTextureRevalidationConfig config;
   TextureRevalidationFixture fixture;
@@ -599,7 +643,7 @@ TEST_CASE("texture binding retries a snapshot rejected during publication",
 
   // Race another write with the replacement snapshot. RequestRange restores
   // current shared-memory validity, but the advanced invalidation epoch makes
-  // FinalizeLoadAndWatch reject publication and leave the texture outdated.
+  // FinalizeLoadAndWatch withhold the content hash.
   fixture.SetLoadHook([&fixture]() {
     fixture.WriteGuestByte(0, 0x7C);
     REQUIRE(fixture.TriggerCpuWrite(0));
@@ -609,15 +653,21 @@ TEST_CASE("texture binding retries a snapshot rejected during publication",
   fixture.RequestTextures(kFirstBinding);
   REQUIRE(fixture.texture_cache().load_count() == 2);
 
-  // The failed publication must leave the binding pending so the next use
-  // retries instead of treating the stale snapshot as in sync forever.
+  // The upload happened, so the binding is in sync - re-uploading it on every
+  // subsequent draw would be pure churn.
+  fixture.RequestTextures(kFirstBinding);
+  REQUIRE(fixture.texture_cache().load_count() == 2);
+
+  // Without a stored hash, the next invalidation has to reload.
+  fixture.WriteGuestByte(0, 0x8D);
+  REQUIRE(fixture.TriggerCpuWrite(0));
   fixture.RequestTextures(kFirstBinding);
   REQUIRE(fixture.texture_cache().load_count() == 3);
   fixture.RequestTextures(kFirstBinding);
   REQUIRE(fixture.texture_cache().load_count() == 3);
 }
 
-TEST_CASE("new texture binding retries a snapshot rejected during publication",
+TEST_CASE("new texture binding stops reloading a rejected first snapshot",
           "[texture-revalidation][bindings][snapshot]") {
   ScopedTextureRevalidationConfig config;
   TextureRevalidationFixture fixture;
@@ -636,6 +686,11 @@ TEST_CASE("new texture binding retries a snapshot rejected during publication",
   fixture.RequestTextures(kFirstBinding);
   REQUIRE(fixture.texture_cache().load_count() == 1);
 
+  fixture.RequestTextures(kFirstBinding);
+  REQUIRE(fixture.texture_cache().load_count() == 1);
+
+  fixture.WriteGuestByte(0, 0x7C);
+  REQUIRE(fixture.TriggerCpuWrite(0));
   fixture.RequestTextures(kFirstBinding);
   REQUIRE(fixture.texture_cache().load_count() == 2);
   fixture.RequestTextures(kFirstBinding);
@@ -696,8 +751,13 @@ TEST_CASE("texture revalidation rejects a direct GPU write during encoding",
     // persistent GPU generation is what proves the source changed.
     fixture.shared_memory().RangeWrittenByGpu(kGuestPhysicalAddress, 16, false);
   });
-  REQUIRE_FALSE(fixture.LoadTexture());
+  REQUIRE(fixture.LoadTexture());
   REQUIRE(fixture.texture_cache().load_count() == 1);
+
+  // No hash may have been stored, so the next invalidation reloads.
+  fixture.WriteGuestByte(32, 0x6B);
+  REQUIRE(fixture.TriggerCpuWrite(32));
+  REQUIRE_FALSE(fixture.TryRevalidate());
   REQUIRE(fixture.LoadTexture());
   REQUIRE(fixture.texture_cache().load_count() == 2);
 }
@@ -715,7 +775,9 @@ TEST_CASE("texture revalidation rejects guarded raw writes during publication",
       REQUIRE(static_cast<bool>(raw_write));
       fixture.WriteGuestByte(0, 0x6B);
     });
-    REQUIRE_FALSE(fixture.LoadTexture());
+    // No hash is stored while a raw writer is active, so completing the write
+    // invalidates the freshly armed watch and forces a reload.
+    REQUIRE(fixture.LoadTexture());
     REQUIRE(fixture.texture_cache().load_count() == 1);
     raw_write.End(1);
     REQUIRE(fixture.LoadTexture());
@@ -847,7 +909,7 @@ TEST_CASE("texture load publication trusts the backend snapshot hash",
   REQUIRE(fixture.texture_cache().load_count() == 2);
 }
 
-TEST_CASE("texture load rejects an aligned range crossing physical memory",
+TEST_CASE("texture load clamps an aligned range crossing physical memory",
           "[texture-revalidation][range-bounds]") {
   ScopedTextureRevalidationConfig config;
   TextureRevalidationFixture fixture;
@@ -855,13 +917,16 @@ TEST_CASE("texture load rejects an aligned range crossing physical memory",
       SharedMemory::kBufferSize - kAllocationSize;
 
   // A linear 8-bit texture with this height consumes 64 KiB + 1 byte before
-  // 128-bit tail alignment. At the final 64 KiB physical allocation, its
-  // canonical load range is outside the 512 MiB shared-memory buffer and must
-  // be rejected before the backend sees it.
+  // 128-bit tail alignment. At the final 64 KiB physical allocation, that
+  // extent leaves the 512 MiB shared-memory buffer, so it is clamped to the
+  // end of it rather than dropped - the texture still has to be uploaded.
   REQUIRE(fixture.Initialize(2049, true, false, true, kLastAllocationAddress));
   REQUIRE(fixture.texture().GetGuestBaseSize() == kAllocationSize + 1);
-  REQUIRE_FALSE(fixture.LoadTexture());
-  REQUIRE(fixture.texture_cache().load_count() == 0);
+  REQUIRE(TestTextureCache::GetGuestTextureLoadRangeLengthForTest(
+              kLastAllocationAddress, kAllocationSize + 1) == kAllocationSize);
+  REQUIRE(fixture.LoadTexture());
+  REQUIRE(fixture.texture_cache().load_count() == 1);
+  REQUIRE(fixture.texture_cache().last_load_base());
 }
 
 TEST_CASE("texture load accepts the exact physical-memory end and zero mips",
@@ -876,7 +941,9 @@ TEST_CASE("texture load accepts the exact physical-memory end and zero mips",
   REQUIRE(TestTextureCache::GetGuestTextureLoadRangeLengthForTest(
               SharedMemory::kBufferSize - 16, 0) == 0);
   REQUIRE(TestTextureCache::GetGuestTextureLoadRangeLengthForTest(
-              SharedMemory::kBufferSize - 16, 17) == 0);
+              SharedMemory::kBufferSize - 16, 17) == 16);
+  REQUIRE(TestTextureCache::GetGuestTextureLoadRangeLengthForTest(
+              SharedMemory::kBufferSize, 16) == 0);
 
   REQUIRE(fixture.Initialize(2048, true, false, true, kLastAllocationAddress));
   REQUIRE(fixture.texture().GetGuestBaseSize() == kAllocationSize - 31);
