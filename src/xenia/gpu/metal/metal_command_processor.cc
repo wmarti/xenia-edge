@@ -3153,12 +3153,23 @@ bool MetalCommandProcessor::PrepareDrawTextures(uint32_t used_texture_mask,
     }
   }
 
-  const bool texture_request_work_pending =
-      texture_cache_ && used_texture_mask &&
-      texture_cache_->AnyUsedTextureRequestWorkPending(used_texture_mask);
+  bool texture_request_work_pending = false;
+  bool texture_request_will_load_data = false;
+  if (texture_cache_ && used_texture_mask) {
+    texture_request_work_pending =
+        texture_cache_->AnyUsedTextureRequestWorkPending(used_texture_mask);
+    if (texture_request_work_pending) {
+      // Bindings whose guest bytes prove the page-granular watch invalidation
+      // was false sharing are revalidated here, ahead of the barrier decision,
+      // so they don't split the pass for a reload that won't happen.
+      texture_cache_->TryRevalidateUsedOutdatedTextures(used_texture_mask);
+      texture_request_will_load_data =
+          texture_cache_->MayRequestTexturesLoadData(used_texture_mask);
+    }
+  }
   const DrawTextureRequestBarrier texture_request_barrier =
       GetDrawTextureRequestBarrier(
-          texture_request_work_pending, current_command_buffer_ != nullptr,
+          texture_request_will_load_data, current_command_buffer_ != nullptr,
           current_render_encoder_ != nullptr,
           texture_cache_ &&
               texture_cache_->CanUploadTexturesInCurrentCommandBuffer());
@@ -3169,12 +3180,15 @@ bool MetalCommandProcessor::PrepareDrawTextures(uint32_t used_texture_mask,
       // then start a new render encoder for the requesting draw.
       EndRenderEncoder();
       break;
-    case DrawTextureRequestBarrier::kEndCommandBuffer:
-      // The CPU-replacement upload path can't join an open command buffer.
-      // Commit all earlier work before it is allowed to replace the texture.
+    case DrawTextureRequestBarrier::kEndCommandBuffer: {
+      // The CPU-replacement upload path can't join an open command buffer, and
+      // it writes the texture directly. Committing earlier work isn't enough -
+      // its readers have to have retired before the bytes are overwritten.
+      const uint64_t submission = GetCurrentSubmission();
       EndCommandBuffer();
       ClearResolvedMemory();
-      break;
+      AwaitSubmissionCompletion(submission);
+    } break;
     case DrawTextureRequestBarrier::kNone:
       break;
   }

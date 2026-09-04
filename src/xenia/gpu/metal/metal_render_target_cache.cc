@@ -1063,6 +1063,7 @@ void MetalRenderTargetCache::ClearCache() {
   }
   current_depth_target_ = nullptr;
   render_pass_descriptor_dirty_ = true;
+  render_pass_encoder_created_since_targets_changed_ = false;
 
   // Clear the tracking of which render targets have been cleared
   cleared_render_targets_this_frame_.clear();
@@ -1230,6 +1231,9 @@ bool MetalRenderTargetCache::Update(
   // Only mark render pass descriptor as dirty if targets actually changed
   if (targets_changed) {
     render_pass_descriptor_dirty_ = true;
+    // A different attachment set starts a pass of its own, with nothing an
+    // earlier encoder left in these attachments to preserve.
+    render_pass_encoder_created_since_targets_changed_ = false;
   }
 
   return true;
@@ -2117,7 +2121,16 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
     // An encoder already recording keeps the attachments in tile memory, with
     // no load left for a DontCare to skip.
     if (render_encoder_pending) {
-      ApplyPendingDrawPassLoadActions();
+      if (render_pass_encoder_created_since_targets_changed_) {
+        // Reopening after a mid-pass split, such as one made for a texture
+        // reload. What the ended encoder wrote is in the attachments now, so
+        // the new one has to load it back instead of discarding it.
+        SetCachedRenderPassLoadActions(pending_draw_pass_load_dontcare_mask_,
+                                       MTL::LoadActionLoad);
+        pending_draw_pass_load_dontcare_mask_ = 0;
+      } else {
+        ApplyPendingDrawPassLoadActions();
+      }
     }
     return cached_render_pass_descriptor_;
   }
@@ -2146,8 +2159,12 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
   // contents into tile memory pointless, but only for the pass that actually
   // encodes them - ClearPendingDrawPassTransfers restores this if it doesn't.
   // A rebuild always hands the command processor a new descriptor, so an
-  // encoder is always created from it.
-  pending_draw_pass_load_dontcare_mask_ = GetPendingDrawPassLoadDontCareMask();
+  // encoder is always created from it. Reopening the same attachments after an
+  // encoder has already written them is the one case with contents to keep.
+  pending_draw_pass_load_dontcare_mask_ =
+      render_pass_encoder_created_since_targets_changed_
+          ? 0
+          : GetPendingDrawPassLoadDontCareMask();
   auto pending_load_dontcare = [this](uint32_t pending_index) {
     return (pending_draw_pass_load_dontcare_mask_ &
             (uint32_t(1) << pending_index)) != 0;
@@ -2394,6 +2411,7 @@ void MetalRenderTargetCache::ConsumeRenderPassDescriptorClears(
   if (!pass_descriptor || pass_descriptor != cached_render_pass_descriptor_) {
     return;
   }
+  render_pass_encoder_created_since_targets_changed_ = true;
   bool any_consumed = false;
   for (MetalRenderTarget*& render_target :
        cached_render_pass_descriptor_pending_clears_) {

@@ -615,6 +615,78 @@ bool TextureCache::AnyUsedTextureRequestWorkPending(
   return false;
 }
 
+bool TextureCache::MayRequestTexturesLoadData(uint32_t used_texture_mask) {
+  if (!used_texture_mask) {
+    return false;
+  }
+  const auto& regs = register_file();
+  auto global_lock = global_critical_region_.Acquire();
+  auto is_texture_outdated = [&global_lock](const Texture* texture) {
+    return texture && (texture->base_outdated(global_lock) ||
+                       texture->mips_outdated(global_lock));
+  };
+  // A key with no texture yet resolves to one created outdated, so it loads.
+  auto key_may_need_load = [this, &is_texture_outdated](TextureKey key) {
+    auto texture_it = textures_.find(key);
+    return texture_it == textures_.end() ||
+           is_texture_outdated(texture_it->second.get());
+  };
+  uint32_t remaining_bits = used_texture_mask;
+  uint32_t index = 0;
+  while (xe::bit_scan_forward(remaining_bits, &index)) {
+    const uint32_t index_bit = UINT32_C(1) << index;
+    remaining_bits = xe::clear_lowest_bit(remaining_bits);
+    const TextureBinding& binding = texture_bindings_[index];
+    const TextureKey old_key = binding.key;
+    const uint8_t old_swizzled_signs = binding.swizzled_signs;
+    TextureKey new_key;
+    uint8_t new_swizzled_signs = kSwizzledSignsUnsigned;
+    if (texture_bindings_in_sync_ & index_bit) {
+      // The fetch constant hasn't been rewritten, so the stored key is what
+      // RequestTextures would parse.
+      new_key = old_key;
+      new_swizzled_signs = old_swizzled_signs;
+    } else {
+      BindingInfoFromFetchConstant(regs.GetTextureFetch(index), new_key,
+                                   &new_swizzled_signs);
+    }
+    if (!new_key.is_valid) {
+      continue;
+    }
+    const bool key_changed = new_key != old_key;
+    if (IsSignedVersionSeparateForFormat(new_key)) {
+      const bool any_sign_was_not_signed =
+          texture_util::IsAnySignNotSigned(old_swizzled_signs);
+      const bool any_sign_was_signed =
+          texture_util::IsAnySignSigned(old_swizzled_signs);
+      if (texture_util::IsAnySignNotSigned(new_swizzled_signs)) {
+        if (key_changed || !any_sign_was_not_signed) {
+          if (key_may_need_load(new_key)) {
+            return true;
+          }
+        } else if (is_texture_outdated(binding.texture)) {
+          return true;
+        }
+      }
+      if (texture_util::IsAnySignSigned(new_swizzled_signs)) {
+        TextureKey signed_key = new_key;
+        signed_key.signed_separate = 1;
+        if (key_changed || !any_sign_was_signed) {
+          if (key_may_need_load(signed_key)) {
+            return true;
+          }
+        } else if (is_texture_outdated(binding.texture_signed)) {
+          return true;
+        }
+      }
+    } else if (key_changed ? key_may_need_load(new_key)
+                           : is_texture_outdated(binding.texture)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool TextureCache::IsBindingOutdatedForUse(
     const global_unique_lock_type& global_lock,
     const TextureBinding& binding) const {
@@ -1254,6 +1326,16 @@ bool TextureCache::Texture::TryRevalidateCpuInvalidation(
     ++texture_cache().revalidated_mips_;
   }
   return !base_outdated_ && !mips_outdated_;
+}
+
+void TextureCache::TryRevalidateUsedOutdatedTextures(
+    uint32_t used_texture_mask) {
+  if (!used_texture_mask || !SupportsTextureContentRevalidation() ||
+      !cvars::texture_cache_revalidate_unchanged) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  TryRevalidateUsedOutdatedTextures(global_lock, used_texture_mask);
 }
 
 void TextureCache::TryRevalidateUsedOutdatedTextures(

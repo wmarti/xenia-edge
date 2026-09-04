@@ -22,10 +22,13 @@ enum class DrawTextureRequestBarrier {
   kEndCommandBuffer,
 };
 
+// request_will_load_data must be the prediction that an upload is going to be
+// encoded, not merely that bindings have to be reprocessed - a fetch constant
+// rewritten to the same key reloads nothing and must not split the pass.
 constexpr DrawTextureRequestBarrier GetDrawTextureRequestBarrier(
-    bool request_work_pending, bool has_current_command_buffer,
+    bool request_will_load_data, bool has_current_command_buffer,
     bool has_active_render_encoder, bool can_upload_in_current_command_buffer) {
-  if (!request_work_pending || !has_current_command_buffer) {
+  if (!request_will_load_data || !has_current_command_buffer) {
     return DrawTextureRequestBarrier::kNone;
   }
   if (!can_upload_in_current_command_buffer) {

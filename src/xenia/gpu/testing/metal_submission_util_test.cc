@@ -17,7 +17,11 @@ namespace test {
 
 TEST_CASE("texture reload is ordered after earlier draw work",
           "[metal][submission]") {
+  // Binding work that reloads nothing - a fetch constant rewritten to the same
+  // key - leaves the pass alone.
   CHECK(GetDrawTextureRequestBarrier(false, true, true, true) ==
+        DrawTextureRequestBarrier::kNone);
+  CHECK(GetDrawTextureRequestBarrier(false, true, true, false) ==
         DrawTextureRequestBarrier::kNone);
   CHECK(GetDrawTextureRequestBarrier(true, false, false, true) ==
         DrawTextureRequestBarrier::kNone);

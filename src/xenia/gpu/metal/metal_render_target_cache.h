@@ -471,6 +471,10 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   // created from the cached descriptor. Index 0 is depth, 1 + i are colors.
   std::array<MetalRenderTarget*, 1 + xenos::kMaxColorRenderTargets>
       cached_render_pass_descriptor_pending_clears_ = {};
+  // Whether an encoder has already been created for the current render target
+  // set. A later one reopens attachments that encoder wrote, so their contents
+  // have to be loaded back rather than discarded.
+  bool render_pass_encoder_created_since_targets_changed_ = false;
 
   // Dummy render target for when no render targets are bound
   struct DummyColorTargetEntry {
