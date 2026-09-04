@@ -316,6 +316,22 @@ constexpr int64_t kMslAsyncLogIntervalNs =
     int64_t(std::chrono::nanoseconds(std::chrono::seconds(1)).count());
 constexpr size_t kResolvedMemoryRangesMax = 8192;
 
+// Indexed by RenderEncoderEndReason, for the gpu_counters_file.
+const char* const kRenderEncoderEndReasonNames[] = {
+    "other",
+    "swap",
+    "texture_reload",
+    "resolve",
+    "rt_changed",
+    "rt_ops",
+    "texture_gpu_load",
+    "shared_memory_upload",
+    "zpd_query",
+    "command_buffer_end",
+};
+static_assert(std::size(kRenderEncoderEndReasonNames) ==
+              MetalCommandProcessor::kRenderEncoderEndReasonCount);
+
 // Indexed by CommandBufferKind, for the shutdown summary. Submission kinds
 // name what ended the previous submission.
 const char* const kCommandBufferKindNames[] = {
@@ -698,9 +714,7 @@ MetalCommandProcessor::~MetalCommandProcessor() {
     }
     current_command_buffer_->release();
     current_command_buffer_ = nullptr;
-    // Nothing runs the completion handler of a buffer that was never
-    // committed, so retire its submission here rather than leaving a waiter
-    // blocked on an index that can never be reached.
+    // Never committed, so retire its submission here instead of in a handler.
     {
       std::lock_guard<std::mutex> lock(completion_mutex_);
       PublishCompletedSubmission(submission_current_);
@@ -1224,9 +1238,7 @@ ui::metal::MetalProvider& MetalCommandProcessor::GetMetalProvider() const {
 }
 
 uint64_t MetalCommandProcessor::GetCurrentSubmission() const {
-  // Callers tag resources with this, so with no command buffer open the answer
-  // has to be the submission that will be opened next: the last one is already
-  // committed and naming it would retire the tag a submission too early.
+  // With no command buffer open, tag resources with the submission opened next.
   return current_command_buffer_ ? submission_current_
                                  : submission_current_ + 1;
 }
@@ -1386,11 +1398,9 @@ void MetalCommandProcessor::NoteMemexportRangesWritten() {
     uint32_t base_bytes = memexport_range.base_address_dwords << 2;
     shared_memory_->RangeWrittenByGpu(base_bytes, memexport_range.size_bytes);
     MarkMemexportPagesWritten(base_bytes, memexport_range.size_bytes);
-    // Written from the still-open command buffer, so a later draw sampling it
-    // as a texture needs the same split a resolve gets.
+    // A standalone upload reading it needs the same boundary a resolve gets.
     MarkResolvedMemory(base_bytes, memexport_range.size_bytes);
   }
-  copy_resolve_writes_pending_ = true;
 }
 
 void MetalCommandProcessor::ForceIssueSwap() {
@@ -1811,7 +1821,6 @@ void MetalCommandProcessor::ShutdownContext() {
     current_command_buffer_->release();
     current_command_buffer_ = nullptr;
     current_draw_index_ = 0;
-    copy_resolve_writes_pending_ = false;
   }
 
   // Even if we have no active command buffer at this point, there may be
@@ -2101,6 +2110,12 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                 static_cast<unsigned long long>(total));
         fprintf(cf, "render_passes_total %llu\n",
                 static_cast<unsigned long long>(render_passes_total_));
+        for (uint32_t i = 0; i < kRenderEncoderEndReasonCount; ++i) {
+          fprintf(cf, "render_encoder_end_%s %llu\n",
+                  kRenderEncoderEndReasonNames[i],
+                  static_cast<unsigned long long>(
+                      render_encoder_end_reason_counts_[i]));
+        }
         if (texture_cache_) {
           fprintf(cf, "upload_via_current_cb %llu\n",
                   static_cast<unsigned long long>(
@@ -2256,7 +2271,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   last_swap_height_ = frontbuffer_height;
 
   // End any active render encoder
-  EndRenderEncoder();
+  EndRenderEncoder(RenderEncoderEndReason::kSwap);
   EndSharedMemoryUploadBlitEncoder();
 
   // Submit and wait for command buffer
@@ -2267,7 +2282,6 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     current_command_buffer_->release();
     current_command_buffer_ = nullptr;
     current_draw_index_ = 0;
-    copy_resolve_writes_pending_ = false;
   }
 
   if (primitive_processor_ && frame_open_) {
@@ -2412,16 +2426,8 @@ void MetalCommandProcessor::OnPrimaryBufferEnd() {
   }
 
   // Keep command buffers open across primary-buffer boundaries unless a
-  // copy->draw visibility boundary is pending.
-  if (!copy_resolve_writes_pending_) {
-    return;
-  }
-
-  if (!cvars::submit_on_primary_buffer_end) {
-    return;
-  }
-
-  if (!copy_resolve_writes_pending_ && !CanEndSubmissionImmediately()) {
+  // resolve is waiting in the open one.
+  if (!HasPendingResolveWrites() || !cvars::submit_on_primary_buffer_end) {
     return;
   }
   EndCommandBuffer(CommandBufferKind::kSubmissionPrimaryBufferEnd);
@@ -2579,7 +2585,7 @@ CommandProcessor::QueryOpenResult MetalCommandProcessor::OpenZPDQuery(
         // The oldest slot is held by the submission being recorded. Commit it
         // so it can retire, and let the next draw retry the segment.
         if (can_close_submission) {
-          EndRenderEncoder();
+          EndRenderEncoder(RenderEncoderEndReason::kZpdQuery);
           EndCommandBuffer(CommandBufferKind::kSubmissionZpdQuery);
         }
         return QueryOpenResult::kDeferred;
@@ -2736,7 +2742,7 @@ bool MetalCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
       }
       return false;
     }
-    EndRenderEncoder();
+    EndRenderEncoder(RenderEncoderEndReason::kZpdQuery);
     EndCommandBuffer(CommandBufferKind::kSubmissionZpdQuery);
   }
 
@@ -3101,68 +3107,12 @@ void MetalCommandProcessor::ApplyViewportAndScissor(
 bool MetalCommandProcessor::PrepareDrawTextures(uint32_t used_texture_mask,
                                                 const RegisterFile& regs) {
   SCOPE_profile_cpu_f("gpu");
-  if (copy_resolve_writes_pending_ && used_texture_mask) {
-    auto overlaps_resolved_texture_ranges = [&](uint32_t texture_fetch_mask) {
-      uint32_t remaining_fetch_bits = texture_fetch_mask;
-      uint32_t fetch_index = 0;
-      while (xe::bit_scan_forward(remaining_fetch_bits, &fetch_index)) {
-        remaining_fetch_bits &= ~(uint32_t(1) << fetch_index);
-        xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_index);
-        uint32_t width_minus_1 = 0;
-        uint32_t height_minus_1 = 0;
-        uint32_t depth_or_array_size_minus_1 = 0;
-        uint32_t base_page = 0;
-        uint32_t mip_page = 0;
-        uint32_t mip_max_level = 0;
-        texture_util::GetSubresourcesFromFetchConstant(
-            fetch, &width_minus_1, &height_minus_1,
-            &depth_or_array_size_minus_1, &base_page, &mip_page, nullptr,
-            &mip_max_level);
-        if (!base_page && !mip_page) {
-          continue;
-        }
-        auto layout = texture_util::GetGuestTextureLayout(
-            fetch.dimension, fetch.pitch, width_minus_1 + 1, height_minus_1 + 1,
-            depth_or_array_size_minus_1 + 1, fetch.tiled, fetch.format,
-            fetch.packed_mips, true, mip_max_level);
-        const uint32_t base_size = layout.base.level_data_extent_bytes;
-        const uint32_t mip_size = layout.mips_total_extent_bytes;
-        if (base_page && base_size &&
-            IsResolvedMemory(base_page << 12, base_size)) {
-          return true;
-        }
-        if (mip_page && mip_size &&
-            IsResolvedMemory(mip_page << 12, mip_size)) {
-          return true;
-        }
-      }
-      return false;
-    };
-    if (overlaps_resolved_texture_ranges(used_texture_mask)) {
-      EndCommandBuffer(CommandBufferKind::kSubmissionCopyToDrawSync);
-      BeginCommandBuffer();
-      // The split put every resolve behind a queue boundary, discharging all
-      // of them - not just the range this draw hit.
-      ClearResolvedMemory();
-      if (!current_command_buffer_ || !current_render_encoder_) {
-        XELOGE(
-            "Metal: failed to re-begin command buffer for copy->draw sync "
-            "split");
-        return false;
-      }
-    }
-  }
-
   bool texture_request_work_pending = false;
   bool texture_request_will_load_data = false;
   if (texture_cache_ && used_texture_mask) {
     texture_request_work_pending =
         texture_cache_->AnyUsedTextureRequestWorkPending(used_texture_mask);
     if (texture_request_work_pending) {
-      // Bindings whose guest bytes prove the page-granular watch invalidation
-      // was false sharing are revalidated here, ahead of the barrier decision,
-      // so they don't split the pass for a reload that won't happen.
-      texture_cache_->TryRevalidateUsedOutdatedTextures(used_texture_mask);
       texture_request_will_load_data =
           texture_cache_->MayRequestTexturesLoadData(used_texture_mask);
     }
@@ -3178,15 +3128,13 @@ bool MetalCommandProcessor::PrepareDrawTextures(uint32_t used_texture_mask,
       // Draws already encoded in this command buffer must sample the old
       // texture contents. Put the reload after them in the same command buffer,
       // then start a new render encoder for the requesting draw.
-      EndRenderEncoder();
+      EndRenderEncoder(RenderEncoderEndReason::kTextureReload);
       break;
     case DrawTextureRequestBarrier::kEndCommandBuffer: {
-      // The CPU-replacement upload path can't join an open command buffer, and
-      // it writes the texture directly. Committing earlier work isn't enough -
-      // its readers have to have retired before the bytes are overwritten.
+      // CPU replacement overwrites the texture, so its readers must retire.
       const uint64_t submission = GetCurrentSubmission();
+      EndRenderEncoder(RenderEncoderEndReason::kTextureReload);
       EndCommandBuffer();
-      ClearResolvedMemory();
       AwaitSubmissionCompletion(submission);
     } break;
     case DrawTextureRequestBarrier::kNone:
@@ -5035,7 +4983,7 @@ bool MetalCommandProcessor::IssueCopy() {
   SCOPE_profile_cpu_f("gpu");
   // Finish any in-flight rendering so render target contents are visible to
   // resolve logic.
-  EndRenderEncoder();
+  EndRenderEncoder(RenderEncoderEndReason::kResolve);
   MTL::CommandBuffer* copy_command_buffer = EnsureCommandBuffer();
   if (!copy_command_buffer) {
     XELOGE("MetalCommandProcessor::IssueCopy: failed to get command buffer");
@@ -5056,83 +5004,26 @@ bool MetalCommandProcessor::IssueCopy() {
     return false;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode();
-  bool do_readback = (readback_mode != ReadbackResolveMode::kDisabled);
-  bool readback_scaled = false;
-  bool readback_scaled_gpu = false;
-  bool use_gpu_downscale = false;
-  bool readback_scheduled = false;
-  uint32_t write_index = 0;
-  uint32_t read_index = 0;
-  bool use_delayed_sync = false;
-  bool wait_for_completion = false;
-  bool should_copy = false;
-  bool is_cache_miss = false;
-  uint32_t source_length = 0;
-  uint32_t readback_length = 0;
-  uint32_t tile_count = 0;
-  uint32_t pixel_size_log2 = 0;
-  uint32_t scale_x = 1;
-  uint32_t scale_y = 1;
-  bool half_pixel_offset = false;
-  uint32_t source_offset_bytes = 0;
-  uint64_t scaled_range_offset_bytes = 0;
-  uint64_t readback_base_offset_bytes = 0;
-  uint64_t scaled_copy_length = 0;
-  size_t source_buffer_binding_offset = 0;
-  uint64_t source_offset_bytes_log = 0;
-
-  if (do_readback) {
-    // Early check: if destination memory is not accessible, skip readback.
-    VirtualHeap* physical_heap = memory_->GetPhysicalHeap();
-    bool memory_accessible = false;
-    if (physical_heap) {
-      HeapAllocationInfo alloc_info;
-      if (physical_heap->QueryRegionInfo(written_address, &alloc_info) &&
-          (alloc_info.state & kMemoryAllocationCommit) &&
-          IsWritableProtect(alloc_info.protect)) {
-        uint32_t end_address = written_address + written_length;
-        uint32_t region_end = alloc_info.base_address + alloc_info.region_size;
-        if (end_address <= region_end) {
-          memory_accessible = true;
-        }
-      }
-    }
-    if (!memory_accessible) {
-      do_readback = false;
-    }
-  }
   if (!written_length) {
     // Keep the submission open for no-op copies and let primary-buffer end,
     // swap, or explicit sync points choose the commit boundary.
     return true;
   }
 
-  // Track this region so a later draw sampling it as a texture is split off the
-  // command buffer that wrote it.
+  // The resolve stays in the open submission; only a standalone upload command
+  // buffer, which commits ahead of it, has to end the submission first.
   MarkResolvedMemory(written_address, written_length);
   // The resolve overwrote any export output here, so no fence need await it.
   ClearMemexportPages(written_address, written_length);
+  return true;
+}
 
-  // Keep copy-only resolve bursts open so multiple resolves can be coalesced,
-  // but commit draw-containing submissions so subsequent work observes the
-  // resolved guest memory immediately.
-  if (current_draw_index_ == 0) {
-    copy_resolve_writes_pending_ = true;
-    return true;
+bool MetalCommandProcessor::CommitPendingResolveWritesForRange(
+    uint32_t base_ptr, uint32_t length) {
+  if (!current_command_buffer_ || !IsResolvedMemory(base_ptr, length)) {
+    return false;
   }
-
-  // Resolve touched guest memory in a draw-containing submission; commit now
-  // so following packets don't observe stale resolve results.
-  EndSharedMemoryUploadBlitEncoder();
-  ScheduleSpirvUniformBufferRelease(copy_command_buffer);
-  ScheduleSpirvArgumentBufferRelease(copy_command_buffer);
-  copy_command_buffer->commit();
-  copy_command_buffer->release();
-  current_command_buffer_ = nullptr;
-  current_draw_index_ = 0;
-  copy_resolve_writes_pending_ = false;
-
+  EndCommandBuffer(CommandBufferKind::kSubmissionCopyToDrawSync);
   return true;
 }
 
@@ -5473,20 +5364,19 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
 }
 
 void MetalCommandProcessor::EndEncodersForCommandBuffer(
-    MTL::CommandBuffer* command_buffer) {
+    MTL::CommandBuffer* command_buffer, RenderEncoderEndReason reason) {
   if (command_buffer != current_command_buffer_) {
     return;
   }
   EndSharedMemoryUploadBlitEncoder();
-  EndRenderEncoder();
+  EndRenderEncoder(reason);
 }
 
-MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer() {
-  // Only one encoder at a time may append commands to a command buffer, so the
-  // upload blit and the render pass both close here. Ending the pass keeps the
-  // caller's work ordered after earlier draws without forcing a submission
-  // boundary; the next draw reopens the pass.
-  EndEncodersForCommandBuffer(current_command_buffer_);
+MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer(
+    RenderEncoderEndReason reason) {
+  // Ending the pass keeps the caller's work behind earlier draws; the next
+  // draw reopens it.
+  EndEncodersForCommandBuffer(current_command_buffer_, reason);
   return EnsureCommandBuffer();
 }
 
@@ -5496,7 +5386,8 @@ MetalCommandProcessor::GetSharedMemoryUploadBlitEncoder() {
     return shared_memory_upload_blit_encoder_;
   }
 
-  MTL::CommandBuffer* command_buffer = RequestTransferCommandBuffer();
+  MTL::CommandBuffer* command_buffer =
+      RequestTransferCommandBuffer(RenderEncoderEndReason::kSharedMemoryUpload);
   if (!command_buffer) {
     return nullptr;
   }
@@ -5522,16 +5413,13 @@ void MetalCommandProcessor::EndSharedMemoryUploadBlitEncoder() {
 }
 
 void MetalCommandProcessor::SubmitSharedMemoryUploadsAndWait() {
-  // The encoder may already have closed for another encoder on the same
-  // command buffer, so the copies are pending until the buffer is committed,
-  // not until the encoder ends.
+  // The copies stay pending until the command buffer commits, not until the
+  // encoder ends.
   if (!current_command_buffer_ || !shared_memory_uploads_staged_) {
     return;
   }
   if (current_render_encoder_) {
-    // Committing here would drop the pass the caller is still building, and it
-    // has no way to rebuild it. Draws split the command buffer before opening
-    // the pass instead (PrepareDrawTextures).
+    // Committing here would drop the pass the caller is still building.
     static bool submit_inside_render_pass_logged = false;
     if (!submit_inside_render_pass_logged) {
       submit_inside_render_pass_logged = true;
@@ -5675,7 +5563,7 @@ void MetalCommandProcessor::ResetMslCrossEncoderReuseCaches() {
   msl_last_argbuf_pixel_layout_uid_ = 0;
 }
 
-void MetalCommandProcessor::EndRenderEncoder() {
+void MetalCommandProcessor::EndRenderEncoder(RenderEncoderEndReason reason) {
   SCOPE_profile_cpu_f("gpu");
   if (!current_render_encoder_) {
     if (current_render_pass_descriptor_) {
@@ -5685,6 +5573,7 @@ void MetalCommandProcessor::EndRenderEncoder() {
     render_encoder_has_zpd_visibility_ = false;
     return;
   }
+  ++render_encoder_end_reason_counts_[uint32_t(reason)];
   // Visibility results are scoped to the render encoder and an offset can't be
   // selected again after it ends, so the segment closes here. The logical
   // report stays open and resumes on the next encoder.
@@ -5767,7 +5656,7 @@ void MetalCommandProcessor::BeginCommandBuffer() {
     if (current_render_encoder_ &&
         !render_target_cache_->IsRenderPassDescriptorCompatible(
             current_render_pass_descriptor_, 1)) {
-      EndRenderEncoder();
+      EndRenderEncoder(RenderEncoderEndReason::kRenderTargetsChanged);
       pass_descriptor = render_pass_descriptor_;
     }
     if (!current_render_encoder_) {
@@ -5836,7 +5725,7 @@ void MetalCommandProcessor::BeginCommandBuffer() {
   // restart the render encoder with the updated descriptor.
   if (current_render_encoder_ &&
       current_render_pass_descriptor_ != pass_descriptor) {
-    EndRenderEncoder();
+    EndRenderEncoder(RenderEncoderEndReason::kRenderTargetsChanged);
   }
 
   if (!current_render_encoder_) {
@@ -6395,7 +6284,7 @@ void MetalCommandProcessor::EndCommandBuffer(CommandBufferKind next_kind) {
   if (current_command_buffer_) {
     next_submission_kind_ = next_kind;
   }
-  EndRenderEncoder();
+  EndRenderEncoder(RenderEncoderEndReason::kCommandBufferEnd);
   EndSharedMemoryUploadBlitEncoder();
   ResetMslCrossEncoderReuseCaches();
 
@@ -6407,7 +6296,8 @@ void MetalCommandProcessor::EndCommandBuffer(CommandBufferKind next_kind) {
     current_command_buffer_ = nullptr;
     current_draw_index_ = 0;
   }
-  copy_resolve_writes_pending_ = false;
+  // Everything the submission resolved is behind a queue boundary now.
+  ClearResolvedMemory();
   DrainCommandBufferAutoreleasePool();
 }
 

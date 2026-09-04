@@ -1402,6 +1402,17 @@ bool MetalTextureCache::TryGpuLoadTexture(
 
   ScopedAutoreleasePool autorelease_pool;
   MTL::CommandBuffer* cmd = nullptr;
+  if (!use_current_command_buffer && command_processor_) {
+    // A standalone upload commits ahead of the open submission's resolves.
+    if (load_base) {
+      command_processor_->CommitPendingResolveWritesForRange(
+          base_guest_address, texture.GetGuestBaseSize());
+    }
+    if (load_mips) {
+      command_processor_->CommitPendingResolveWritesForRange(
+          mips_guest_address, texture.GetGuestMipsSize());
+    }
+  }
   // The current command buffer first - it needs no extra buffer at all. The
   // batch next, so a draw's uploads share one. Only then a private one.
   if (use_current_command_buffer) {
@@ -1476,7 +1487,8 @@ bool MetalTextureCache::TryGpuLoadTexture(
   }
 
   MTL::ComputeCommandEncoder* encoder = nullptr;
-  command_processor_->EndEncodersForCommandBuffer(cmd);
+  command_processor_->EndEncodersForCommandBuffer(
+      cmd, MetalCommandProcessor::RenderEncoderEndReason::kTextureGpuLoad);
   {
     SCOPE_profile_cpu_i("gpu", "MetalTextureCache::ComputeEncoderCreate");
     encoder = cmd->computeCommandEncoder();
@@ -1633,7 +1645,8 @@ bool MetalTextureCache::TryGpuLoadTexture(
   MTL::Texture* mtl_texture = metal_texture->metal_texture();
   if (use_blit_upload) {
     SCOPE_profile_cpu_i("gpu", "MetalTextureCache::EncodeUploadBlits");
-    command_processor_->EndEncodersForCommandBuffer(cmd);
+    command_processor_->EndEncodersForCommandBuffer(
+        cmd, MetalCommandProcessor::RenderEncoderEndReason::kTextureGpuLoad);
     MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
     if (!blit) {
       handle_upload_failure(true);
@@ -3492,7 +3505,8 @@ bool MetalTextureCache::EnsureScaledResolveBufferRange(uint64_t start_scaled,
       }
     }
 
-    command_processor_->EndEncodersForCommandBuffer(cmd);
+    command_processor_->EndEncodersForCommandBuffer(
+        cmd, MetalCommandProcessor::RenderEncoderEndReason::kTextureGpuLoad);
     MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
     if (!blit) {
       new_buffer->release();

@@ -79,6 +79,10 @@ class MetalCommandProcessor : public CommandProcessor {
   void MarkResolvedMemory(uint32_t base_ptr, uint32_t length);
   bool IsResolvedMemory(uint32_t base_ptr, uint32_t length) const;
   void ClearResolvedMemory();
+  // Resolve or memexport output still in the open submission.
+  bool HasPendingResolveWrites() const {
+    return !resolved_memory_ranges_.empty();
+  }
 
   // What a resolve wrote, kept so a later texture upload of the same range can
   // be asked whether the resolve already produced exactly those texels.
@@ -139,12 +143,33 @@ class MetalCommandProcessor : public CommandProcessor {
   // Used only by standalone consumers that can't join the submission holding
   // their prerequisite staged upload.
   void SubmitSharedMemoryUploadsAndWait();
-  // A command buffer accepts commands from one encoder at a time, so every
-  // encoder open on it has to end before another is created. Both are no-ops
-  // for a command buffer that isn't the current one.
-  void EndEncodersForCommandBuffer(MTL::CommandBuffer* command_buffer);
+  // Why an open render encoder ended, for the gpu_counters_file.
+  enum class RenderEncoderEndReason : uint32_t {
+    kOther,
+    kSwap,
+    kTextureReload,
+    kResolve,
+    kRenderTargetsChanged,
+    kRenderTargetOps,
+    kTextureGpuLoad,
+    kSharedMemoryUpload,
+    kZpdQuery,
+    kCommandBufferEnd,
+    kCount,
+  };
+  static constexpr uint32_t kRenderEncoderEndReasonCount =
+      uint32_t(RenderEncoderEndReason::kCount);
+  // Ends every encoder open on the command buffer; no-op unless it's current.
+  void EndEncodersForCommandBuffer(
+      MTL::CommandBuffer* command_buffer,
+      RenderEncoderEndReason reason = RenderEncoderEndReason::kRenderTargetOps);
+  // A standalone upload command buffer commits ahead of the open submission,
+  // so resolve output the open submission still holds for this range has to
+  // be committed first. Returns true when the submission was ended for it.
+  bool CommitPendingResolveWritesForRange(uint32_t base_ptr, uint32_t length);
   // The current command buffer, ready for an encoder of the caller's own.
-  MTL::CommandBuffer* RequestTransferCommandBuffer();
+  MTL::CommandBuffer* RequestTransferCommandBuffer(
+      RenderEncoderEndReason reason = RenderEncoderEndReason::kRenderTargetOps);
   // Creates a command buffer with GPU time accounting attached. Every command
   // buffer the backend commits outside the submission one has to come from
   // here, or its work is missing from gpu_busy_us_per_frame.
@@ -153,7 +178,8 @@ class MetalCommandProcessor : public CommandProcessor {
   // will never run, so the accounting has to be released by hand.
   void DiscardAccountedCommandBuffer(MTL::CommandBuffer* command_buffer,
                                      CommandBufferKind kind);
-  void EndRenderEncoder();
+  void EndRenderEncoder(
+      RenderEncoderEndReason reason = RenderEncoderEndReason::kOther);
   void ResetRenderEncoderResourceUsage();
   void UseRenderEncoderResource(MTL::Resource* resource,
                                 MTL::ResourceUsage usage);
@@ -484,9 +510,7 @@ class MetalCommandProcessor : public CommandProcessor {
   // Current command buffer and encoder
   MTL::CommandBuffer* current_command_buffer_ = nullptr;
   MTL::BlitCommandEncoder* shared_memory_upload_blit_encoder_ = nullptr;
-  // Set when the current command buffer has taken upload copies, and stays set
-  // after the encoder closes - the copies are still uncommitted until the
-  // command buffer is.
+  // Upload copies staged in the current command buffer, uncommitted with it.
   bool shared_memory_uploads_staged_ = false;
   MTL::RenderCommandEncoder* current_render_encoder_ = nullptr;
   // Retained for the lifetime of current_render_encoder_. The render target
@@ -805,6 +829,7 @@ class MetalCommandProcessor : public CommandProcessor {
   // Each render encoder is a tile store plus an attachment reload on a TBDR
   // GPU, so the count per frame is comparable against Vulkan's render passes.
   uint64_t render_passes_total_ = 0;
+  uint64_t render_encoder_end_reason_counts_[kRenderEncoderEndReasonCount] = {};
   uint64_t render_passes_window_start_ = 0;
   uint64_t submission_current_ = 0;
   uint64_t submission_completed_processed_ = 0;
@@ -838,7 +863,6 @@ class MetalCommandProcessor : public CommandProcessor {
   // Each draw uses a different region of the descriptor heap to avoid
   // overwriting previous draws' descriptors before GPU execution
   uint32_t current_draw_index_ = 0;
-  bool copy_resolve_writes_pending_ = false;
 
   // Memexport tracking for shared memory invalidation.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
