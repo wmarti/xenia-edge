@@ -164,9 +164,6 @@ class TextureCache {
   // invalidation was false sharing.
   void TryRevalidateUsedOutdatedTextures(
       const global_unique_lock_type& global_lock, uint32_t used_texture_mask);
-  // Takes the global lock itself, for callers that have to revalidate before
-  // RequestTextures rather than inside it.
-  void TryRevalidateUsedOutdatedTextures(uint32_t used_texture_mask);
   // Writes the guest memory of every used texture into the trace, if one is
   // being recorded.
   void RecordUsedTexturesInTrace(uint32_t used_texture_mask);
@@ -174,10 +171,9 @@ class TextureCache {
   // bindings or reload texture data from guest memory. Used as a cheap
   // pre-check to skip the full RequestTextures call when nothing changed.
   bool AnyUsedTextureRequestWorkPending(uint32_t used_texture_mask);
-  // Returns whether RequestTextures(used_texture_mask) may upload texture data,
-  // rather than only reprocessing bindings. Conservative and non-mutating -
-  // call TryRevalidateUsedOutdatedTextures first so an invalidation that turns
-  // out to be false sharing isn't counted as a reload.
+  // Returns whether RequestTextures(used_texture_mask) may upload texture data
+  // rather than only reprocess bindings, after revalidating false-sharing
+  // invalidations so they aren't counted as reloads.
   bool MayRequestTexturesLoadData(uint32_t used_texture_mask);
 
   // "ActiveTexture" means as of the latest RequestTextures call.

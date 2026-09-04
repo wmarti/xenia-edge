@@ -102,9 +102,7 @@ TextureCache::GuestTextureLoadRange TextureCache::GetGuestTextureLoadRange(
   }
   const uint64_t aligned_size =
       (uint64_t(guest_size) + UINT64_C(15)) & ~UINT64_C(15);
-  // Clamp to the end of the shared memory buffer instead of rejecting the
-  // range - a texture reaching the end of physical memory still needs to be
-  // uploaded, watched and hashed.
+  // Clamp to the end of the buffer - a texture ending there still uploads.
   return {guest_address,
           uint32_t(std::min(aligned_size, uint64_t(SharedMemory::kBufferSize -
                                                    guest_address)))};
@@ -623,15 +621,20 @@ bool TextureCache::MayRequestTexturesLoadData(uint32_t used_texture_mask) {
   }
   const auto& regs = register_file();
   auto global_lock = global_critical_region_.Acquire();
-  auto is_texture_outdated = [&global_lock](const Texture* texture) {
-    return texture && (texture->base_outdated(global_lock) ||
-                       texture->mips_outdated(global_lock));
-  };
+  const bool revalidate = SupportsTextureContentRevalidation() &&
+                          cvars::texture_cache_revalidate_unchanged;
   // A key with no texture yet resolves to one created outdated, so it loads.
-  auto key_may_need_load = [this, &is_texture_outdated](TextureKey key) {
+  auto key_needs_load = [&](TextureKey key) {
     auto texture_it = textures_.find(key);
-    return texture_it == textures_.end() ||
-           is_texture_outdated(texture_it->second.get());
+    if (texture_it == textures_.end()) {
+      return true;
+    }
+    Texture& texture = *texture_it->second;
+    if (revalidate) {
+      texture.TryRevalidateCpuInvalidation(global_lock);
+    }
+    return texture.base_outdated(global_lock) ||
+           texture.mips_outdated(global_lock);
   };
   uint32_t remaining_bits = used_texture_mask;
   uint32_t index = 0;
@@ -639,50 +642,44 @@ bool TextureCache::MayRequestTexturesLoadData(uint32_t used_texture_mask) {
     const uint32_t index_bit = UINT32_C(1) << index;
     remaining_bits = xe::clear_lowest_bit(remaining_bits);
     const TextureBinding& binding = texture_bindings_[index];
-    const TextureKey old_key = binding.key;
-    const uint8_t old_swizzled_signs = binding.swizzled_signs;
-    TextureKey new_key;
-    uint8_t new_swizzled_signs = kSwizzledSignsUnsigned;
     if (texture_bindings_in_sync_ & index_bit) {
-      // The fetch constant hasn't been rewritten, so the stored key is what
-      // RequestTextures would parse.
-      new_key = old_key;
-      new_swizzled_signs = old_swizzled_signs;
-    } else {
-      BindingInfoFromFetchConstant(regs.GetTextureFetch(index), new_key,
-                                   &new_swizzled_signs);
-    }
-    if (!new_key.is_valid) {
+      if (!binding.key.is_valid) {
+        continue;
+      }
+      if (revalidate) {
+        for (Texture* texture : {binding.texture, binding.texture_signed}) {
+          if (texture) {
+            texture->TryRevalidateCpuInvalidation(global_lock);
+          }
+        }
+      }
+      if (IsBindingOutdatedForUse(global_lock, binding)) {
+        return true;
+      }
       continue;
     }
-    const bool key_changed = new_key != old_key;
-    if (IsSignedVersionSeparateForFormat(new_key)) {
-      const bool any_sign_was_not_signed =
-          texture_util::IsAnySignNotSigned(old_swizzled_signs);
-      const bool any_sign_was_signed =
-          texture_util::IsAnySignSigned(old_swizzled_signs);
-      if (texture_util::IsAnySignNotSigned(new_swizzled_signs)) {
-        if (key_changed || !any_sign_was_not_signed) {
-          if (key_may_need_load(new_key)) {
-            return true;
-          }
-        } else if (is_texture_outdated(binding.texture)) {
-          return true;
-        }
+    // The fetch constant was rewritten, so the slot binds whatever
+    // RequestTextures is about to look up, not what the binding still holds.
+    TextureKey key;
+    uint8_t swizzled_signs = kSwizzledSignsUnsigned;
+    BindingInfoFromFetchConstant(regs.GetTextureFetch(index), key,
+                                 &swizzled_signs);
+    if (!key.is_valid) {
+      continue;
+    }
+    if (IsSignedVersionSeparateForFormat(key)) {
+      if (texture_util::IsAnySignNotSigned(swizzled_signs) &&
+          key_needs_load(key)) {
+        return true;
       }
-      if (texture_util::IsAnySignSigned(new_swizzled_signs)) {
-        TextureKey signed_key = new_key;
+      if (texture_util::IsAnySignSigned(swizzled_signs)) {
+        TextureKey signed_key = key;
         signed_key.signed_separate = 1;
-        if (key_changed || !any_sign_was_signed) {
-          if (key_may_need_load(signed_key)) {
-            return true;
-          }
-        } else if (is_texture_outdated(binding.texture_signed)) {
+        if (key_needs_load(signed_key)) {
           return true;
         }
       }
-    } else if (key_changed ? key_may_need_load(new_key)
-                           : is_texture_outdated(binding.texture)) {
+    } else if (key_needs_load(key)) {
       return true;
     }
   }
@@ -1080,11 +1077,8 @@ bool TextureCache::Texture::FinalizeLoadAndWatch(
   const bool mips_source_current =
       mips_snapshotted &&
       IsCpuLoadSourceCurrent(global_lock, true, mips_source);
-  // The upload itself happened, so take the up-to-date transition and arm the
-  // watch whether or not the source can still be proven unchanged. A part left
-  // outdated here would be re-uploaded on every draw for as long as its page
-  // keeps being falsely shared. Only the content hash is withheld, so the next
-  // invalidation reloads instead of revalidating.
+  // The upload happened, so go up to date either way; only the hash is
+  // withheld.
   if (!MakeUpToDateAndWatch(global_lock, loaded_base, loaded_mips)) {
     StoreCpuContentHashes(global_lock, loaded_base, loaded_mips, {}, {}, false,
                           false);
@@ -1323,16 +1317,6 @@ bool TextureCache::Texture::TryRevalidateCpuInvalidation(
     ++texture_cache().revalidated_mips_;
   }
   return !base_outdated_ && !mips_outdated_;
-}
-
-void TextureCache::TryRevalidateUsedOutdatedTextures(
-    uint32_t used_texture_mask) {
-  if (!used_texture_mask || !SupportsTextureContentRevalidation() ||
-      !cvars::texture_cache_revalidate_unchanged) {
-    return;
-  }
-  auto global_lock = global_critical_region_.Acquire();
-  TryRevalidateUsedOutdatedTextures(global_lock, used_texture_mask);
 }
 
 void TextureCache::TryRevalidateUsedOutdatedTextures(
